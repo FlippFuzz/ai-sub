@@ -4,7 +4,7 @@ version = "0.0.1"
 authors = [
   { name="FlippFuzz" },
 ]
-description = "Generate and translate English and Japanese subtitles using AI."
+description = "AI-Powered Subtitle Generation with Translation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
