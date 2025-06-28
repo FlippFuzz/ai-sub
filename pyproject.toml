@@ -1,0 +1,29 @@
+[project]
+name = "ai-sub"
+version = "0.0.1"
+authors = [
+  { name="FlippFuzz" },
+]
+description = "Generate and translate English and Japanese subtitles using AI."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pysubs2",
+    "google-genai",
+    "static-ffmpeg",
+    "pymediainfo",
+    "json-repair",
+    "pydantic",
+    "retrying",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/FlippFuzz/ai-sub"
+"Bug Tracker" = "https://github.com/FlippFuzz/ai-sub/issues"
+
+[project.scripts]
+ai-sub = "ai_sub.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
