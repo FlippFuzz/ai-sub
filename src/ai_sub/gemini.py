@@ -35,7 +35,8 @@ PROMPT_GENERATE_SUBTITLE_TEMPLATE = dedent(
     **Key Principles & Requirements:**
 
     1.  **TIMING ACCURACY (ABSOLUTE HIGHEST PRIORITY):**
-        *   **Ensure the `start` and `end` timestamps for each subtitle entry is meticulously accurate.** They must align perfectly with the *actual beginning and end of the spoken words* for that specific segment.
+        *   **Ensure the `start` and `end` timestamps for each subtitle entry are meticulously accurate.** Both must align perfectly with the *actual beginning and end of the spoken words* for that specific segment.
+        *   **CRITICAL: The `end` timestamp is frequently inaccurate and requires special attention.** It must precisely mark the *exact conclusion* of the spoken content for that subtitle entry.
         *   Timestamps must always be in `mm:ss` (minutes:seconds).
 
     2.  **CRITICAL: Holistic Translation, Contextual Understanding & Comprehensive Analysis:**
