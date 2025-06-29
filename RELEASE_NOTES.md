@@ -1,14 +1,28 @@
-# v0.0.2
+# AI Sub Release Notes
 
-This release includes minor updates and improvements to the project.
+## v0.0.2
 
-**Updates:**
-*   **Improved Subtitle Error Handling:** The subtitle error message and duration handling in `main.py` have been updated for better clarity and accuracy.
-*   **Showcase Expansion:** A new subtitle file has been added, and the `showcase/README.md` has been updated with a new video link to expand the project showcase.
-*   **Project Description Refinement:** The project description in `pyproject.toml` has been updated for improved clarity.
+This release includes changes to the default AI model, improvements in subtitle generation, and an expanded showcase.
 
-**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v0.0.1...v0.0.2
+**New Features & Improvements:**
 
-# v0.0.1
+*   **Default Model Update:** The default AI model has been updated to `gemini-2.5-pro`. This change was made possible by Google's updated free tier limits, which now allow up to 100 requests per day against `gemini-2.5-pro`, enabling enhanced performance and accuracy in subtitle generation.
+*   **AI Prompt Update:** Clarifications have been added regarding subtitle timing accuracy requirements, with an emphasis on the importance of the end timestamp in the prompt template to improve overall subtitle quality.
+*   **Showcase Expansion:** The project showcase has been updated with new video entries and corresponding SRT files.
+*   **Improved Subtitle Error Handling:** The subtitle error message and duration handling in [`src/ai_sub/main.py`](src/ai_sub/main.py) have been updated for better clarity and accuracy.
+*   **Project Description Refinement:** The project description in [`pyproject.toml`](pyproject.toml) has been updated for improved clarity.
 
-First Release
+**Other Changes:**
+
+*   The `RELEASE_NOTES.md` file has been added to the project for future release documentation.
+
+## v0.0.1
+
+This is the initial release of AI Sub.
+
+**Features:**
+
+*   **AI-Powered Subtitle Generation:** Leverages Google Gemini for generating English and Japanese subtitles with translation capabilities.
+*   **Video Segmentation:** Automatically segments input videos into configurable durations for processing.
+*   **Concurrent Processing:** Supports parallel processing of video segments for efficient subtitle generation.
+*   **Subtitle Compilation:** Combines all generated subtitle parts into a single, final subtitle file.
