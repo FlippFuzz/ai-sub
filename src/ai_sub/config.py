@@ -65,7 +65,7 @@ def parse_arguments() -> Namespace:
         "--rpm",
         type=int,
         default=5,
-        help="Requests per minute for Gemini API (default: 10).",
+        help="Requests per minute for Gemini API (default: 5).",
     )
     api_group.add_argument(
         "--tpm",
@@ -76,8 +76,8 @@ def parse_arguments() -> Namespace:
     api_group.add_argument(
         "--model",
         type=str,
-        default="gemini-2.5-flash",
-        help="Gemini model to use (default: gemini-2.5-flash).",
+        default="gemini-2.5-pro",
+        help="Gemini model to use (default: gemini-2.5-pro).",
     )
     api_group.add_argument(
         "--thinking_budget",
