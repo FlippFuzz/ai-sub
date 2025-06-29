@@ -140,8 +140,8 @@ def main():
             current_subtitles.append(
                 SSAEvent(
                     start=0,
-                    end=10000,
-                    text="Error processing subtitles for this segment. Re-run script to retry.",
+                    end=get_video_duration_ms(video_path),
+                    text="Error processing subtitles for this segment.",
                 )
             )
 
