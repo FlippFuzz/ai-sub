@@ -1,5 +1,18 @@
 # AI Sub Release Notes
 
+## v0.0.3
+
+This release focuses on improving the robustness of subtitle generation by enhancing error handling for invalid AI model responses.
+
+**New Features & Improvements:**
+
+*   **Enhanced Error Logging:** Detailed error messages are now logged for invalid JSON responses received from the Gemini model, providing better insights into issues during subtitle generation.
+*   **Robust JSON Handling:** The `json-repair` dependency has been removed. The system will now retry when Gemini returns an invalid response, ensuring data integrity and preventing the use of potentially incomplete or corrupted subtitle data.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v0.0.2...v0.0.3
+
+---
+
 ## v0.0.2
 
 This release includes changes to the default AI model, improvements in subtitle generation, and an expanded showcase.
@@ -15,6 +28,10 @@ This release includes changes to the default AI model, improvements in subtitle 
 **Other Changes:**
 
 *   The `RELEASE_NOTES.md` file has been added to the project for future release documentation.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v0.0.1...v0.0.2
+
+---
 
 ## v0.0.1
 
