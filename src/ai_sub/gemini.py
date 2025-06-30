@@ -517,6 +517,7 @@ class Gemini:
                 GenerateSubtitleResponse(**gemini_response.model_dump()).get_ssafile()
             except json.JSONDecodeError as e:
                 logger.error(f"    Invalid JSON received from Gemini: {e}")
+                logger.error(f"    Invalid JSON: {response.text}")
                 raise  # Re-raise to trigger retry
 
             return GenerateSubtitleResponse(**gemini_response.model_dump())
