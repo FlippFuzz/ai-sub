@@ -12,7 +12,6 @@ dependencies = [
     "google-genai",
     "static-ffmpeg",
     "pymediainfo",
-    "json-repair",
     "pydantic",
     "retrying",
 ]

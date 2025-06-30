@@ -1,8 +1,8 @@
+import json
 import logging
 from pathlib import Path
 
 import google.genai.types as genai_types
-import json_repair
 import pysubs2
 from pydantic import BaseModel
 from pysubs2 import SSAFile
@@ -115,7 +115,7 @@ class GenerateSubtitleResponse(GeminiResponse):
         if self.response.text is None:
             raise ValueError("response.text is None")
 
-        parsed_json = json_repair.loads(self.response.text)
+        parsed_json = json.loads(self.response.text)
         if not isinstance(parsed_json, dict):
             raise ValueError("parsed_json is not a dictionary")
 

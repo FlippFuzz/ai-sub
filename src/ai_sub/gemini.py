@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -506,6 +507,17 @@ class Gemini:
                 raise Exception(
                     f"    Error: response.text is None. Retrying...response.prompt_feedback: {response.prompt_feedback}"
                 )
+
+            # Explicitly validate JSON by attempting to parse it
+            # If there is an error with the JSON, the @retry decorator will catch it
+            # and retry the request.
+            try:
+                # This will trigger the json.loads() call in GenerateSubtitleResponse.get_ssafile()
+                # and raise JSONDecodeError if the JSON is invalid.
+                GenerateSubtitleResponse(**gemini_response.model_dump()).get_ssafile()
+            except json.JSONDecodeError as e:
+                logger.error(f"    Invalid JSON received from Gemini: {e}")
+                raise  # Re-raise to trigger retry
 
             return GenerateSubtitleResponse(**gemini_response.model_dump())
         except Exception:
