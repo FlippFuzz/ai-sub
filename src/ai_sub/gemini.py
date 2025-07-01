@@ -503,24 +503,47 @@ class Gemini:
             logger.info(f"    Duration: {gemini_response.time_with_ratelimit} seconds")
             response = gemini_response.response
 
-            if response.text is None:
-                raise Exception(
-                    f"    Error: response.text is None. Retrying...response.prompt_feedback: {response.prompt_feedback}"
-                )
+            # Validate responses
+            # If there is an error the @retry decorator will catch it and retry the request.
 
-            # Explicitly validate JSON by attempting to parse it
-            # If there is an error with the JSON, the @retry decorator will catch it
-            # and retry the request.
+            # Response Check 01 - Response text is None
+            if response.text is None:
+                logger.error(gemini_response.model_dump_json())
+                raise ValueError("Response Check 01 - Response text is None.")
+
+            # Response Check 02 - Invalid JSON returned
             try:
                 # This will trigger the json.loads() call in GenerateSubtitleResponse.get_ssafile()
                 # and raise JSONDecodeError if the JSON is invalid.
-                GenerateSubtitleResponse(**gemini_response.model_dump()).get_ssafile()
-            except json.JSONDecodeError as e:
-                logger.error(f"    Invalid JSON received from Gemini: {e}")
-                logger.error(f"    Invalid JSON: {response.text}")
-                raise  # Re-raise to trigger retry
+                subtitles_response = GenerateSubtitleResponse(
+                    **gemini_response.model_dump()
+                )
+            except json.JSONDecodeError:
+                logger.error(gemini_response.model_dump_json())
+                raise ValueError("Response Check 02 - Invalid JSON returned.")
 
-            return GenerateSubtitleResponse(**gemini_response.model_dump())
+            # Response Check 03 - Invalid chronological order of timestamps
+            ssa_file = subtitles_response.get_ssafile()
+
+            last_end_time_ms = 0
+            for event in ssa_file.events:
+                if event.start > event.end:
+                    logger.error(gemini_response.model_dump_json())
+                    raise ValueError(
+                        "Response Check 03 - Invalid chronological order of timestamps."
+                        f"Start time ({event.start}ms) is after end time ({event.end}ms)."
+                    )
+
+                if event.start < last_end_time_ms:
+                    logger.error(gemini_response.model_dump_json())
+                    raise ValueError(
+                        "Response Check 03 - Invalid chronological order of timestamps."
+                        f"Current start time ({event.start}ms) is before previous end time ({last_end_time_ms}ms)."
+                    )
+
+                last_end_time_ms = event.end
+
+            return subtitles_response
         except Exception:
             logger.exception("  Error generating subtitles")
             raise
