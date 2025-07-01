@@ -10,10 +10,6 @@ This release focuses on ensuring chronological timestamps in subtitle generation
 *   **Enhanced Error Messages:** Error messages for response checks have been improved to clearly indicate when retries are occurring, providing better debugging information.
 *   **Showcase Expansion:** The project showcase has been updated with new video entries and corresponding SRT files.
 
-**Other Changes:**
-
-*   The project version has been bumped to `0.0.4` in [`pyproject.toml`](pyproject.toml).
-
 **Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v0.0.3...v0.0.4
 
 ---
