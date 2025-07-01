@@ -1,5 +1,23 @@
 # AI Sub Release Notes
 
+## v0.0.4
+
+This release focuses on ensuring chronological timestamps in subtitle generation, enhancing error messages, and expanding the project showcase.
+
+**New Features & Improvements:**
+
+*   **Chronological Timestamps:** Implemented a mechanism to ensure that timestamps returned by `generate_subtitles` are always chronological, improving subtitle accuracy.
+*   **Enhanced Error Messages:** Error messages for response checks have been improved to clearly indicate when retries are occurring, providing better debugging information.
+*   **Showcase Expansion:** The project showcase has been updated with new video entries and corresponding SRT files.
+
+**Other Changes:**
+
+*   The project version has been bumped to `0.0.4` in [`pyproject.toml`](pyproject.toml).
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v0.0.3...v0.0.4
+
+---
+
 ## v0.0.3
 
 This release focuses on improving the robustness of subtitle generation by enhancing error handling for invalid AI model responses.
