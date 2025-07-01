@@ -17,3 +17,4 @@ The `.png` files are screenshots taken from the respective videos, often showing
 | `cVT_yB1qpYY` | https://www.youtube.com/watch?v=cVT_yB1qpYY | `cVT_yB1qpYY.srt` | N/A |
 | `28P_1Y0WbrM` | https://www.youtube.com/watch?v=28P_1Y0WbrM | `28P_1Y0WbrM.srt` | N/A |
 | `aPaQ13pE3pk` | https://www.youtube.com/watch?v=aPaQ13pE3pk | `aPaQ13pE3pk.srt` | N/A |
+| `gdQ4eN9wzZg` | https://www.youtube.com/watch?v=gdQ4eN9wzZg | `gdQ4eN9wzZg.srt` | N/A |
