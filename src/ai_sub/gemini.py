@@ -509,7 +509,9 @@ class Gemini:
             # Response Check 01 - Response text is None
             if response.text is None:
                 logger.error(gemini_response.model_dump_json())
-                raise ValueError("Response Check 01 - Response text is None.")
+                raise ValueError(
+                    "Response Check 01 - Response text is None. Retrying..."
+                )
 
             # Response Check 02 - Invalid JSON returned
             try:
@@ -520,7 +522,9 @@ class Gemini:
                 )
             except json.JSONDecodeError:
                 logger.error(gemini_response.model_dump_json())
-                raise ValueError("Response Check 02 - Invalid JSON returned.")
+                raise ValueError(
+                    "Response Check 02 - Invalid JSON returned. Retrying..."
+                )
 
             # Response Check 03 - Invalid chronological order of timestamps
             ssa_file = subtitles_response.get_ssafile()
@@ -530,14 +534,14 @@ class Gemini:
                 if event.start > event.end:
                     logger.error(gemini_response.model_dump_json())
                     raise ValueError(
-                        "Response Check 03 - Invalid chronological order of timestamps."
+                        "Response Check 03 - Invalid chronological order of timestamps. Retrying..."
                         f"Start time ({event.start}ms) is after end time ({event.end}ms)."
                     )
 
                 if event.start < last_end_time_ms:
                     logger.error(gemini_response.model_dump_json())
                     raise ValueError(
-                        "Response Check 03 - Invalid chronological order of timestamps."
+                        "Response Check 03 - Invalid chronological order of timestamps. Retrying..."
                         f"Current start time ({event.start}ms) is before previous end time ({last_end_time_ms}ms)."
                     )
 
