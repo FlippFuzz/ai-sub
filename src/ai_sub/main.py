@@ -128,6 +128,7 @@ def main():
     ## Combine all the partial SRTs into a final one
     all_subtitles = SSAFile()
     all_duration_ms = 0
+    unprocessed_segments = []
 
     for video_path in all_video_paths:
         _, output_state_path = generate_output_paths(video_path, args)
@@ -136,6 +137,7 @@ def main():
         if state.generateSubtitleResponse is not None:
             current_subtitles = state.generateSubtitleResponse.get_ssafile()
         else:
+            unprocessed_segments.append(video_path.name)
             current_subtitles = SSAFile()
             current_subtitles.append(
                 SSAEvent(
@@ -177,6 +179,13 @@ def main():
     output_file_path = args.output_dir / f"{args.input_file.stem}.srt"
     all_subtitles.save(str(output_file_path))
     logging.info(f"Subtitles saved to {output_file_path}")
+
+    if unprocessed_segments:
+        logger.error("=" * 70)
+        logger.error("The following video segments could not be processed:")
+        for segment in unprocessed_segments:
+            logger.error(f"  - {segment}")
+        logger.error("Re-run the script to retry processing these segments.")
 
 
 if __name__ == "__main__":
