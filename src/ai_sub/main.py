@@ -180,7 +180,7 @@ def main():
     all_subtitles.save(str(output_file_path))
     logging.info(f"Subtitles saved to {output_file_path}")
 
-    if unprocessed_segments:
+    if len(unprocessed_segments) > 0:
         logger.error("=" * 70)
         logger.error("The following video segments could not be processed:")
         for segment in unprocessed_segments:
