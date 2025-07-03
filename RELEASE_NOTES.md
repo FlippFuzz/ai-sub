@@ -1,5 +1,19 @@
 # AI Sub Release Notes
 
+## v0.0.5
+
+This release includes updates to the Gemini API configuration, improved error handling, and minor showcase additions.
+
+**New Features & Improvements:**
+
+*   **Gemini API Configuration:** Updated the default thinking budget for the Gemini API to 32768, aligning with the maximum for Gemini 2.5 Pro.
+*   **Error Handling:** List the video segments that cannot be processed at the end of execution.
+*   **Showcase Additions:** Added new subtitles to the project showcase.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v0.0.4...v0.0.5
+
+---
+
 ## v0.0.4
 
 This release focuses on ensuring chronological timestamps in subtitle generation, enhancing error messages, and expanding the project showcase.
