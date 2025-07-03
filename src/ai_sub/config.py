@@ -82,8 +82,8 @@ def parse_arguments() -> Namespace:
     api_group.add_argument(
         "--thinking_budget",
         type=int,
-        default=24576,
-        help="Thinking budget for Gemini API (default: 24576).",
+        default=32768,
+        help="Thinking budget for Gemini API (default: 32768).",
     )
 
     file_group = parser.add_argument_group("File and Directory Options")
