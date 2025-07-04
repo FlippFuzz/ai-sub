@@ -102,8 +102,8 @@ def parse_arguments() -> Namespace:
     processing_group.add_argument(
         "--max_subtitle_chars",
         type=int,
-        default=60,
-        help="Maximum character length for each subtitle entry (default: 60).",
+        default=50,
+        help="Maximum character length for each subtitle entry (default: 50).",
     )
     processing_group.add_argument(
         "--num_processing_threads",
