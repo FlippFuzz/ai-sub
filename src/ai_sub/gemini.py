@@ -29,6 +29,8 @@ from ai_sub.models import (
     GenerateSubtitleResponse,
 )
 
+# Technical details about how Gemini handle videos
+# https://ai.google.dev/gemini-api/docs/video-understanding#technical-details-video
 PROMPT_GENERATE_SUBTITLE_TEMPLATE = dedent(
     """
     You are an expert subtitling and transcription AI. Your primary task is to generate precise, contextually rich English and Japanese subtitles for the provided video content.
@@ -38,7 +40,7 @@ PROMPT_GENERATE_SUBTITLE_TEMPLATE = dedent(
     1.  **TIMING ACCURACY (ABSOLUTE HIGHEST PRIORITY):**
         *   **Ensure the `start` and `end` timestamps for each subtitle entry are meticulously accurate.** Both must align perfectly with the *actual beginning and end of the spoken words* for that specific segment.
         *   **CRITICAL: The `end` timestamp is frequently inaccurate and requires special attention.** It must precisely mark the *exact conclusion* of the spoken content for that subtitle entry.
-        *   Timestamps must always be in `mm:ss` (minutes:seconds).
+        *   Timestamps must always be in `MM:SS` (minutes:seconds).
 
     2.  **CRITICAL: Holistic Translation, Contextual Understanding & Comprehensive Analysis:**
         *   **You ABSOLUTELY MUST watch the entire video thoroughly** to understand the visual context, speaker actions, and overall narrative.
@@ -64,7 +66,7 @@ PROMPT_GENERATE_SUBTITLE_TEMPLATE = dedent(
 
     ** Output Format **
     * Your entire response must be a single JSON object.
-    * Timestamps must always be in `mm:ss` (minutes:seconds).
+    * Timestamps must always be in `MM:SS` (minutes:seconds).
 
     ** Example Output **
 
