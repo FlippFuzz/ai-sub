@@ -1,5 +1,18 @@
 # AI Sub Release Notes
 
+## v0.0.6
+
+This release focuses on minor bug fixes and improvements to the subtitle generation process and project showcase.
+
+**New Features & Improvements:**
+
+*   **Prompt Template Update:** The prompt template used for subtitle generation has been updated for improved accuracy.
+*   **Showcase Updates:** The showcase directory now includes version numbers for SRT files, and a new v0.0.6 SRT file has been added for `42h4ydJS3zk`.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v0.0.5...v0.0.6
+
+---
+
 ## v0.0.5
 
 This release includes updates to the Gemini API configuration, improved error handling, and minor showcase additions.
