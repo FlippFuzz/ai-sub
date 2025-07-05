@@ -123,6 +123,12 @@ def parse_arguments() -> Namespace:
         default=180,
         help="Duration in seconds to split the video into segments (default: 180s).",
     )
+    processing_group.add_argument(
+        "--start_offset_min",
+        type=int,
+        default=0,
+        help="Number of minutes to offset the start of video processing (default: 0).",
+    )
 
     logging_group = parser.add_argument_group("Logging Options")
     logging_group.add_argument(

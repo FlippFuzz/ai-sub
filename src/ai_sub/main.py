@@ -97,19 +97,30 @@ def main():
     logger.info(f"Splitting input into {args.split_seconds}s segments")
     all_video_paths = split_video(args.input_file, args.temp_dir, args.split_seconds)
 
-    # We only need to work on videos parts that haven't been worked on
-    video_paths = []
-    for video_path in all_video_paths:
+    # Calculate how many segments to skip based on start_offset_min
+    segments_to_skip = int((args.start_offset_min * 60) / args.split_seconds)
+
+    if segments_to_skip > 0:
+        logger.info(
+            f"Offsetting video processing by {segments_to_skip} segments ({args.start_offset_min} minutes)."
+        )
+
+    # Determine which video segments actually need processing
+    video_paths_to_process = []
+    for i, video_path in enumerate(all_video_paths):
+        if i < segments_to_skip:
+            continue  # Do not add to video_paths_to_process
+
         _, output_state_path = generate_output_paths(video_path, args)
         state = State.load_or_return_new(output_state_path)
         if state.generateSubtitleResponse is None:
-            video_paths.append(video_path)
+            video_paths_to_process.append(video_path)
         else:
-            logger.info(f"  Skipping previously processed part: {video_path.name}")
+            logger.info(f"  Re-using previously processed part: {video_path.name}")
 
     # Upload videos to Gemini
     logger.info("Uploading files")
-    video_files = gemini.upload_files(video_paths)
+    video_files = gemini.upload_files(video_paths_to_process)
 
     start_time = datetime.now()
     logger.info(
@@ -130,7 +141,12 @@ def main():
     all_duration_ms = 0
     unprocessed_segments = []
 
-    for video_path in all_video_paths:
+    for i, video_path in enumerate(all_video_paths):  # Iterate through all segments
+        if i < segments_to_skip:
+            # For skipped segments, just increment the total duration, do not add subtitles
+            all_duration_ms += get_video_duration_ms(video_path)
+            continue
+
         _, output_state_path = generate_output_paths(video_path, args)
         state = State.load_or_return_new(output_state_path)
 
