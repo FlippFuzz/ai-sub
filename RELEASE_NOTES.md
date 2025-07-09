@@ -1,5 +1,18 @@
 # AI Sub Release Notes
 
+## v0.0.7
+
+This release introduces a new offset feature for video processing and significant enhancements to subtitle generation prompt instructions.
+
+**New Features & Improvements:**
+
+*   **Video Processing Offset:** Added a new `--start_offset_min` argument to allow users to skip a specified number of minutes from the beginning of a video, enabling more flexible processing of long videos.
+*   **Enhanced Subtitle Prompt Instructions:** The prompt template for subtitle generation has been significantly updated to improve timing precision, enforce strict chronological order, enhance translation accuracy and nuance, and ensure better readability and formatting.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v0.0.6...v0.0.7
+
+---
+
 ## v0.0.6
 
 This release focuses on minor bug fixes and improvements to the subtitle generation process and project showcase.
