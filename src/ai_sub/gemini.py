@@ -38,18 +38,19 @@ PROMPT_GENERATE_SUBTITLE_TEMPLATE = dedent(
     **Key Principles & Requirements:**
 
     1.  **TIMING PRECISION (ABSOLUTE HIGHEST PRIORITY):**
-        *   **Ensure the `start` and `end` timestamps for each subtitle entry are meticulously accurate.** Both must align perfectly with the *actual beginning and end of the spoken words* or the appearance/disappearance of on-screen text for that specific segment.
-        *   **CRITICAL: The `end` timestamp requires special attention.** It must precisely mark the *exact conclusion* of the spoken content (including any held notes or extended sounds) or the disappearance of on-screen text for that subtitle entry.
+        *   **Ensure the `start` and `end` timestamps for each subtitle entry are meticulously accurate.** Both must align perfectly with the *actual beginning and exact conclusion* of the spoken words (including any held notes or extended sounds) or the appearance/disappearance of on-screen text for that specific segment.
         *   **Subtitle durations must be short, typically a few seconds.** Long durations (e.g., over 15 seconds) are incorrect and indicate a timing error.
-        *   **Ensure subtitles are in strict chronological order.** The `start` time of any subtitle entry MUST be greater than or equal to the `end` time of the preceding subtitle entry. Overlapping subtitles are not allowed.
+        *   **STRICT CHRONOLOGICAL ORDER (CRITICAL):**
+            *   **Every subtitle entry MUST be in strict chronological order.** The `start` time of any subtitle entry MUST be greater than or equal to the `end` time of the immediately preceding subtitle entry.
+            *   **Crucially, subtitle segments MUST NOT overlap.** The `start` time of a new segment must be greater than or equal to the `end` time of the previous segment.
+            *   **Any deviation from strict chronological order or overlapping segments will result in immediate rejection and re-processing of the entire segment.** This is a non-negotiable requirement.
         *   Timestamps must always be in `MM:SS` (minutes:seconds).
 
     2.  **COMPREHENSIVE CONTEXTUAL UNDERSTANDING:**
         *   **Watch the entire video thoroughly** to understand the visual context, speaker actions, and overall narrative. This holistic understanding is crucial for accurate transcriptions and translations.
         *   **Always combine logical sentences or phrases split across multiple subtitle entries** to understand the full, complete meaning before translating. Ensure each translated entry is a coherent part of the overarching sentence.
-        *   Analyze *all* spoken dialogue to produce highly accurate and complete transcriptions.
         *   For songs or singing sections, prioritize on-screen lyrics in the video for subtitles over transcribing the singing.
-        *   If audio is noisy or unclear, leverage *all* contextual cues (visuals, surrounding dialogue) to infer the most probable dialogue.
+        *   If audio is noisy or unclear, leverage *all* contextual cues (visuals, surrounding dialogue, speaker intent, tone) to infer the most probable dialogue.
         *   **DO NOT HALLUCINATE:** Only transcribe and translate content that is actually present in the video (spoken or on-screen). Do not invent dialogue or text.
         *   **Include relevant on-screen text:** If there is text displayed on screen that is relevant to the video's content, transcribe and translate it as well, ensuring its timing aligns with its appearance on screen.
         *   **Example of Holistic Translation:**
@@ -57,15 +58,21 @@ PROMPT_GENERATE_SUBTITLE_TEMPLATE = dedent(
             *   Incorrect Translation (isolated): "You're like a mom I can confide anything in." + "Even things I can't say to anyone else."
             *   Correct Translation (holistic): "I can confide everything," (Subtitle 1) + "everything I can't even tell my mum." (Subtitle 2)
 
-    3.  **DUAL LANGUAGE PROVISION & TRANSLATION QUALITY:**
-        *   Provide both English and Japanese subtitles for *all* spoken dialogue and relevant on-screen text.
-        *   For each segment, provide the original language transcription/text and its accurate, natural-sounding translation into the other language.
-        *   Ensure translations are culturally appropriate and maintain the original meaning, tone, and intent, taking into account the full video context.
+    3.  **TRANSLATION ACCURACY & NUANCE:**
+        *   **Prioritize natural-sounding translations:** Translations should read as if originally written in the target language, avoiding overly literal or awkward phrasing.
+        *   **Maintain cultural appropriateness:** Adapt idioms, cultural references, and nuances to resonate with the target audience while preserving the original meaning.
+        *   **Ensure consistency:** Use consistent terminology and phrasing for recurring concepts or names throughout the entire transcription/translation.
 
-    4.  **READABILITY & FORMATTING:**
-        *   Long sentences MUST be split into multiple, shorter subtitle entries, each with its own start and end time, for better readability on screen.
+    4.  **DUAL LANGUAGE PROVISION:**
+        *   Provide both English and Japanese subtitles for *all* spoken dialogue and relevant on-screen text.
+
+    5.  **READABILITY & FORMATTING:**
+        *   Long sentences MUST be split into multiple, shorter subtitle entries, each with its own start and end time, for better readability on screen. Aim for natural breaks that preserve meaning.
         *   Each subtitle entry (English and Japanese) MUST be a maximum of {max_subtitle_chars} characters.
         *   Do not use newline characters within a single subtitle entry.
+
+    6.  **REVIEW AND REFINE:**
+        *   Before finalizing, review all generated subtitles to ensure they meet all the above requirements, especially timing precision, chronological order, and translation accuracy.
 
     ** Output Format **
     * Your entire response must be a single JSON object.
