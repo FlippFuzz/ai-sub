@@ -50,6 +50,7 @@ PROMPT_GENERATE_SUBTITLE_TEMPLATE = dedent(
         *   **Watch the entire video thoroughly** to understand the visual context, speaker actions, and overall narrative. This holistic understanding is crucial for accurate transcriptions and translations.
         *   **Always combine logical sentences or phrases split across multiple subtitle entries** to understand the full, complete meaning before translating. Ensure each translated entry is a coherent part of the overarching sentence.
         *   For songs or singing sections, prioritize on-screen lyrics in the video for subtitles over transcribing the singing.
+        *   Prioritize transcribing/translating actual audio over static on-screen text, such as the video or song title.
         *   If audio is noisy or unclear, leverage *all* contextual cues (visuals, surrounding dialogue, speaker intent, tone) to infer the most probable dialogue.
         *   **DO NOT HALLUCINATE:** Only transcribe and translate content that is actually present in the video (spoken or on-screen). Do not invent dialogue or text.
         *   **Include relevant on-screen text:** If there is text displayed on screen that is relevant to the video's content, transcribe and translate it as well, ensuring its timing aligns with its appearance on screen.
