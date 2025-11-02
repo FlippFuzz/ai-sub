@@ -1,5 +1,19 @@
 # AI Sub Release Notes
 
+## v0.0.8
+
+
+This release improves subtitle transcription guidance and updates the project's default settings in response to changes in Google's Gemini free tier.
+
+**New Features & Improvements:**
+
+*   **Gemini API limits:** Reduced default API settings to match Google's lowered free-tier rate limits and prevent rate-limit errors for users on the free tier.
+*   **Improved transcription guidance:** Enhanced subtitle-generation guidance to prioritize audio transcription (when available) over static on-screen text, improving accuracy for spoken content.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v0.0.7...v0.0.8
+
+---
+
 ## v0.0.7
 
 This release introduces a new offset feature for video processing and significant enhancements to subtitle generation prompt instructions.
