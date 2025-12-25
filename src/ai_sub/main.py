@@ -110,13 +110,6 @@ def subtitle_job(
 
             with logfire.span(f"Working on {job.name}"):
                 job.response = agent.run(PROMPT, job.file, job.video_duration_ms)
-
-                # Save the completed job state to a JSON file for persistence.
-                job.save(settings.dir.tmp / f"{job.name}.json")
-                # Also generate a subtitle file for this job for the user to view.
-                job.response.get_ssafile().save(
-                    str(settings.dir.tmp / f"{job.name}.srt")
-                )
                 logfire.info(f"{job.name} done")
 
         except IndexError:
@@ -138,6 +131,15 @@ def subtitle_job(
                         # Insert at the front of the queue for immediate reprocessing.
                         sleep(settings.retry.delay)
                         jobs_queue.insert(0, job)
+        finally:
+            if job is not None:
+                # Save the completed job state to a JSON file for persistence.
+                job.save(settings.dir.tmp / f"{job.name}.json")
+                if job.response is not None:
+                    # Also generate a subtitle file for this job for the user to view.
+                    job.response.get_ssafile().save(
+                        str(settings.dir.tmp / f"{job.name}.srt")
+                    )
 
 
 def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -> None:
