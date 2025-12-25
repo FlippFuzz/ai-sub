@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Optional
 
 from google.genai.types import File
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, NonNegativeInt, PositiveInt, field_validator
 from pysubs2 import SSAEvent, SSAFile
 
 
@@ -103,8 +103,8 @@ class UploadFileJob(BaseModel):
     """Represents a job to upload a file to the AI provider."""
 
     python_file: Path
-    video_duration_ms: int
-    run_num_retries: int = 0
+    video_duration_ms: PositiveInt
+    run_num_retries: NonNegativeInt = 0
 
 
 class SubtitleJob(BaseModel):
@@ -112,9 +112,9 @@ class SubtitleJob(BaseModel):
 
     name: str
     file: File | Path
-    video_duration_ms: int
-    run_num_retries: int = 0
-    total_num_retries: int = 0
+    video_duration_ms: PositiveInt
+    run_num_retries: NonNegativeInt = 0
+    total_num_retries: NonNegativeInt = 0
     response: Optional[AiResponse] = None
 
     def save(self, filename: Path):
