@@ -1,7 +1,9 @@
 pysubs2
-google-genai
 static-ffmpeg
 pymediainfo
 pydantic
-retrying
+pydantic-ai-slim[google, logfire]
+pydantic-settings
+pyrate-limiter
+json_repair
 black

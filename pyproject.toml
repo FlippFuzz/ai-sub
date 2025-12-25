@@ -1,6 +1,6 @@
 [project]
 name = "ai-sub"
-version = "0.0.8"
+version = "1.0.0"
 authors = [
   { name="FlippFuzz" },
 ]
@@ -9,11 +9,13 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "pysubs2",
-    "google-genai",
     "static-ffmpeg",
     "pymediainfo",
     "pydantic",
-    "retrying",
+    "pydantic-ai-slim[google, logfire]",
+    "pydantic-settings",
+    "json_repair",
+    "pyrate-limiter"
 ]
 
 [project.urls]

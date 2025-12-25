@@ -1,229 +1,250 @@
-import logging
 import os
-from argparse import ArgumentParser, ArgumentTypeError, Namespace
 from pathlib import Path
-from typing import Tuple
+from typing import Optional
 
-from google.genai.types import File
-
-
-def check_file_exists(filepath_str: str) -> Path:
-    """Checks if a given file path string corresponds to an existing file.
-
-    Args:
-        filepath_str (str): The string representation of the file path.
-
-    Returns:
-        Path: A resolved Path object if the file exists.
-
-    Raises:
-        ArgumentTypeError: If the file does not exist or is not a file.
-    """
-    # Resolve the path to get an absolute, normalized path, resolving symlinks
-    file_path = Path(filepath_str).resolve()
-
-    # Check if the path points to an actual file
-    if not file_path.is_file():
-        raise ArgumentTypeError(
-            f"Input file '{filepath_str}' does not exist or is not a file."
-        )
-
-    return file_path
+from logfire import LevelName
+from pydantic import (
+    Field,
+    FilePath,
+    HttpUrl,
+    NonNegativeInt,
+    PositiveInt,
+    SecretStr,
+    model_validator,
+)
+from pydantic_settings import BaseSettings, CliPositionalArg, SettingsConfigDict
 
 
-def parse_arguments() -> Namespace:
-    """Parses command-line arguments for the Gemini TL application.
-
-    This function sets up an ArgumentParser with various options for API
-    configuration, file and directory handling, processing parameters, and
-    logging. It also performs validation for the API key and sets default
-    values for temporary and output directories if not provided.
-
-    Returns:
-        Namespace: An argparse Namespace object containing the parsed arguments.
-
-    Raises:
-        ArgumentTypeError: If the input file does not exist.
-        SystemExit: If no Gemini API key is provided.
-    """
-    parser = ArgumentParser(
-        description="AI-Powered Subtitle Generation with Translation.",
-        prog="ai-sub",
-    )
-    parser.add_argument(
-        "input_file", type=check_file_exists, help="Path to the input video file."
+class GoogleAiSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_AI_GOOGLE_",
     )
 
-    api_group = parser.add_argument_group("API Options")
-    api_group.add_argument(
-        "--api_key",
-        type=str,
-        default=os.environ.get("GOOGLE_API_KEY"),
-        help="Your Gemini API key (or set GOOGLE_API_KEY environment variable).",
+    file_cache_ttl: PositiveInt = Field(
+        description="The time-to-live (TTL) in seconds for the Gemini file list cache. This cache helps avoid frequent API calls to list uploaded files.",
+        default=10,
     )
-    api_group.add_argument(
-        "--rpm",
-        type=int,
-        default=2,
-        help="Requests per minute for Gemini API (default: 2).",
+    key: Optional[SecretStr] = Field(
+        description="The API key for Google's generative language models. If not provided, it will fall back to the GOOGLE_API_KEY or GEMINI_API_KEY environment variables.",
+        # We handle default loading from env in the validator
+        default=None,
     )
-    api_group.add_argument(
-        "--tpm",
-        type=int,
-        default=125000,
-        help="Tokens per minute for Gemini API (default: 125000).",
+    use_files_api: bool = Field(
+        description="Whether to use the Gemini Files API.", default=True
     )
-    api_group.add_argument(
-        "--model",
-        type=str,
-        default="gemini-2.5-pro",
-        help="Gemini model to use (default: gemini-2.5-pro).",
-    )
-    api_group.add_argument(
-        "--thinking_budget",
-        type=int,
-        default=32768,
-        help="Thinking budget for Gemini API (default: 32768).",
+    base_url: Optional[HttpUrl] = Field(
+        description="The base URL for the Google AI API. This can be used to override the default endpoint, for instance, to use a proxy. If not provided, Google's default URL will be used.",
+        default=None,
     )
 
-    file_group = parser.add_argument_group("File and Directory Options")
-    file_group.add_argument(
-        "--output_dir",
-        type=Path,
-        help="Directory to save output files (default: input_file's parent directory).",
-    )
-    file_group.add_argument(
-        "--temp_dir",
-        type=Path,
-        help="Directory to store temporary files (default: tmp_<input_file_name>}).",
+    @model_validator(mode="before")
+    @classmethod
+    def load_api_key_from_env(cls, values):
+        """
+        Load the API key from environment variables if it's not provided directly.
+        Pydantic-settings handles the prefixed env var (AISUB_AI_GOOGLE_KEY),
+        but we also want to check for GOOGLE_API_KEY and GEMINI_API_KEY.
+        """
+        # If 'key' is not provided directly, try to load it from standard env vars.
+        if values.get("key") is None:
+            key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+            if key:
+                values["key"] = key
+
+        return values
+
+
+class AiSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_AI_",
     )
 
-    processing_group = parser.add_argument_group("Processing Options")
-    processing_group.add_argument(
-        "--max_subtitle_chars",
-        type=int,
-        default=50,
-        help="Maximum character length for each subtitle entry (default: 50).",
+    model: str = Field(
+        description="The AI model for subtitle generation. Use 'google-gla:<model>' for Google models, 'openai:<model>' for OpenAI, or 'custom:<url>' for a custom endpoint.",
+        default="google-gla:gemini-3-flash-preview",
     )
-    processing_group.add_argument(
-        "--num_processing_threads",
-        type=int,
+    rpm: PositiveInt = Field(
+        description="Maximum requests per minute for the AI model.", default=4
+    )
+    tpm: PositiveInt = Field(
+        description="Maximum tokens per minute for the AI model.", default=250000
+    )
+    google: GoogleAiSettings = Field(
+        description="Settings that only apply to the Google AI model.",
+        default_factory=GoogleAiSettings,
+    )
+
+    @model_validator(mode="after")
+    def validate_google_key(self):
+        """
+        Validates that a Google AI API key is provided if a Google model is selected.
+        """
+        if self.model.lower().startswith("google-gla") and self.google.key is None:
+            raise ValueError(
+                "A Google AI API key must be provided either via the 'key' field, GOOGLE_API_KEY, GEMINI_API_KEY or AISUB_AI_GOOGLE_KEY environment variables."
+            )
+        return self
+
+
+class ReEncodeSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_SPLIT_RE_ENCODE_",
+    )
+
+    enabled: bool = Field(
+        description="Re-encode the video chunks to save bandwidth.",
+        default=False,
+    )
+    fps: PositiveInt = Field(
+        description="The framerate to re-encode the video to.",
+        default=1,
+    )
+    height: PositiveInt = Field(
+        description="The height (resolution) to re-encode the video to. Width is scaled automatically.",
+        default=360,
+    )
+    bitrate_kb: PositiveInt = Field(
+        description="The bitrate in KB/s (Kilobytes per second) to re-encode the video to.",
+        default=30,
+    )
+
+
+class SplittingSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_SPLIT_",
+    )
+
+    max_seconds: PositiveInt = Field(
+        description="The maximum duration in seconds for each video chunk. The input video will be split into these smaller segments for processing.",
+        default=60 * 5,
+    )
+    max_bytes: PositiveInt = Field(
+        description="The maximum size in bytes for each video chunk. The input video will be split into these smaller segments for processing.",
+        default=10 * 1000 * 1000 * 1000,
+    )
+    re_encode: ReEncodeSettings = Field(
+        description="Settings for re-encoding video chunks.",
+        default_factory=ReEncodeSettings,
+    )
+
+
+class DirectorySettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_DIR_",
+    )
+
+    tmp: Path = Field(
+        description="Temporary directory for intermediate files (e.g., video segments). Defaults to a 'tmp_<video_name>' folder in the output directory.",
+        default=Path("tmp_input_video_file"),
+    )
+    out: Path = Field(
+        description="Output directory for the final subtitle files. Defaults to the same directory as the input video file.",
+        default=Path("directory_of_input_file"),
+    )
+
+
+class ThreadSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_THREAD_",
+    )
+
+    uploads: PositiveInt = Field(
+        description="The number of concurrent threads for uploading video segments. This is only used for Gemini (google-gla) models.",
         default=4,
-        help="Number of threads to use for parallel subtitle processing (default: 4).",
     )
-    processing_group.add_argument(
-        "--num_upload_threads",
-        type=int,
+    subtitles: PositiveInt = Field(
+        description="The number of concurrent threads to use for generating subtitles.",
         default=4,
-        help="Number of threads to use for parallel file uploads (default: 4).",
-    )
-    processing_group.add_argument(
-        "--split_seconds",
-        type=int,
-        default=180,
-        help="Duration in seconds to split the video into segments (default: 180s).",
-    )
-    processing_group.add_argument(
-        "--start_offset_min",
-        type=int,
-        default=0,
-        help="Number of minutes to offset the start of video processing (default: 0).",
     )
 
-    logging_group = parser.add_argument_group("Logging Options")
-    logging_group.add_argument(
-        "--log_level",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Set the logging level (default: INFO).",
+
+class RetrySettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_RETRY_",
     )
 
-    args = parser.parse_args()
-
-    if args.api_key is None:
-        parser.error(
-            "No Gemini API key provided. Use --api_key or set the GOOGLE_API_KEY "
-            "environment variable."
-        )
-
-    # Set default temp_dir if not provided
-    if args.temp_dir is None:
-        args.temp_dir = args.input_file.parent / f"tmp_{args.input_file.stem}"
-    args.temp_dir.mkdir(parents=True, exist_ok=True)
-
-    # Set default output_dir if not provided
-    if args.output_dir is None:
-        args.output_dir = args.input_file.parent
-
-    return args
+    run: NonNegativeInt = Field(
+        description="The maximum number of times to retry a failed job in this run of the program.",
+        default=3,
+    )
+    max: NonNegativeInt = Field(
+        description="The absolute maximum number of times a job can be retried in total.",
+        default=9,
+    )
+    delay: NonNegativeInt = Field(
+        description="The number of seconds to wait between retries.",
+        default=30,
+    )
 
 
-def configure_logging(log_level: str):
-    """Configures the logging for the application.
+class LoggingSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_LOG_",
+    )
 
-    This function sets up a stream handler for logging, defines the log format,
-    and sets the overall logging level. It also suppresses noisy INFO level
-    logs from specific external libraries like 'httpx' and 'google_genai.models'.
-
-    Args:
-        log_level (str): The desired logging level (e.g., "INFO", "DEBUG").
-    """
-    # Remove all existing handlers from the root logger to ensure a clean slate
-    for handler in logging.root.handlers[:]:
-        logging.root.removeHandler(handler)
-        handler.close()
-
-    # Create a formatter with the desired format (no date)
-    formatter = logging.Formatter("%(threadName)s %(levelname)s %(message)s")
-
-    # Create a stream handler and set the formatter
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-
-    # Get the root logger and add the new handler
-    root_logger = logging.getLogger()
-    root_logger.addHandler(stream_handler)
-    root_logger.setLevel(log_level)
-
-    # Suppress INFO level logs from 'httpx' to reduce noise from HTTP request/response logging.
-    # Example noisy log: "INFO HTTP Request: GET https://generativelanguage.googleapis.com/v1beta/files?pageSize=100 'HTTP/1.1 200 OK'"
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    # Suppress INFO level logs from 'google.genai.models' to reduce noise from internal model operations.
-    # Example noisy log: "INFO AFC is enabled with max remote calls: 10."
-    # https://github.com/googleapis/python-genai/issues/278
-    logging.getLogger("google_genai.models").setLevel(logging.WARNING)
+    level: LevelName = Field(
+        description="The minimum log level to display.", default="info"
+    )
+    timestamps: bool = Field(
+        description="Whether to include timestamps in the console output.",
+        default=False,
+    )
 
 
-def generate_output_paths(
-    video_file: Path | File, args: Namespace
-) -> Tuple[Path, Path]:
-    """Generates the output paths for subtitle and state files.
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        nested_model_default_partial_update=True,
+        cli_parse_args=True,
+        cli_avoid_json=True,
+        cli_kebab_case=True,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_prefix="AISUB_",
+    )
 
-    Based on the input video file (either a local Path or a Gemini File object)
-    and the provided arguments, this function constructs the full paths for
-    where the generated subtitle file (.srt) and the processing state file (.json)
-    should be saved.
+    ai: AiSettings = Field(
+        description="Settings related to the AI model.", default_factory=AiSettings
+    )
+    split: SplittingSettings = Field(
+        description="Settings for splitting the input video into chunks.",
+        default_factory=SplittingSettings,
+    )
+    dir: DirectorySettings = Field(
+        description="Settings for temporary and output directories.",
+        default_factory=DirectorySettings,
+    )
+    thread: ThreadSettings = Field(
+        description="Settings for controlling concurrency.",
+        default_factory=ThreadSettings,
+    )
+    retry: RetrySettings = Field(
+        description="Settings for retrying failed jobs.", default_factory=RetrySettings
+    )
+    log: LoggingSettings = Field(
+        description="Settings related to logging.", default_factory=LoggingSettings
+    )
 
-    Args:
-        video_file (Path | File): The input video file, which can be a pathlib.Path
-                                  object for local files or a google.genai.types.File
-                                  object for uploaded files.
-        args (Namespace): An argparse Namespace object containing command-line arguments,
-                          specifically `temp_dir` for the temporary directory.
+    # Position Argument - input file is always the last
+    input_video_file: CliPositionalArg[FilePath] = Field(
+        description="The path to the video file for which to generate subtitles."
+    )
 
-    Returns:
-        Tuple[Path, Path]: A tuple containing two Path objects:
-                           - The full path for the output subtitle file (.srt).
-                           - The full path for the output state file (.json).
-    """
-    stem = ""
-    if isinstance(video_file, Path):
-        stem = video_file.stem
-    elif isinstance(video_file, File):
-        stem = Path(str(video_file.display_name)).stem
+    @model_validator(mode="after")
+    def setup_file_locations(self):
+        """
+        Validator that sets up default file locations for output and temporary directories
+        if they are not explicitly provided by the user. It also creates the temporary directory.
+        """
 
-    output_subtitle_path = args.temp_dir / f"{stem}.srt"
-    output_state_path = args.temp_dir / f"{stem}.json"
+        # If the user didn't set out_dir, set it automatically
+        if self.dir.out == Path("directory_of_input_file"):
+            self.dir.out = self.input_video_file.parent
 
-    return output_subtitle_path, output_state_path
+        # If the user didn't set tmp_dir, set it automatically
+        if self.dir.tmp == Path("tmp_input_video_file"):
+            self.dir.tmp = self.dir.out / f"tmp_{self.input_video_file.stem}"
+
+        # Create the tmp directory (works for both user-provided and default paths)
+        self.dir.tmp.mkdir(parents=True, exist_ok=True)
+
+        return self
