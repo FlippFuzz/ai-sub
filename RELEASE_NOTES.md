@@ -1,5 +1,22 @@
 # AI Sub Release Notes
 
+## v1.0.1
+
+This release includes bug fixes for logging configuration and job state persistence, as well as improvements to data validation.
+
+**Bug Fixes:**
+
+- **Logfire Configuration:** Fixed an issue where Logfire was not optional.
+- **Job State Persistence:** Fixed a bug where the job state was not saved after a failure.
+
+**Code Improvements:**
+
+- **Data Validation:** Refactored data models to use Pydantic's `NonNegativeInt` and `PositiveInt` for better validation.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.0.0...v1.0.1
+
+---
+
 ## v1.0.0
 
 This major release marks a complete re-write of the application architecture to improve flexibility and extensibility.
