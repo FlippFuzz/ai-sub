@@ -80,30 +80,52 @@ class GeminiCliWrapper:
             with open(prompt_file, "w", encoding="utf-8") as f:
                 f.write(prompt)
 
-            # Run gemini-cli via subprocess.run and parse it's response
+            # Run gemini-cli via subprocess.Popen and parse its response.
+            # We use Popen instead of run because on Windows with shell=True, the timeout
+            # only kills the shell, leaving the child process running and holding pipes open.
+            # As a result, this Python program will just hang waiting forever for the pipes to close.
+            # This allows us to manually kill the process tree on timeout.
+            cmd = [
+                "gemini",
+                "-p",
+                f"@{video.name}",
+                "--model",
+                self.model_name,
+                "--output-format",
+                "json",
+            ]
             try:
-                raw_result = subprocess.run(
-                    [
-                        "gemini",
-                        "-p",
-                        f"@{video.name}",
-                        "--model",
-                        self.model_name,
-                        "--output-format",
-                        "json",
-                    ],
+                with subprocess.Popen(
+                    cmd,
                     cwd=video_directory,
                     env=os.environ | {"GEMINI_SYSTEM_MD": "prompt.md"},
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
                     encoding="utf-8",
                     # On Windows, shell=True is required to execute batch files/scripts (like npm binaries).
                     # On Linux, shell=True with a list of args causes the args to be passed to the shell itself,
                     # effectively stripping them from the command, so we must use shell=False.
                     shell=sys.platform == "win32",
-                    timeout=self.timeout,
-                    check=True,
-                )
+                ) as process:
+                    try:
+                        stdout, stderr = process.communicate(timeout=self.timeout)
+                    except subprocess.TimeoutExpired:
+                        if sys.platform == "win32":
+                            # Kill the entire process tree
+                            subprocess.run(
+                                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                                capture_output=True,
+                            )
+                        process.kill()
+                        process.communicate()
+                        raise
+
+                    if process.returncode != 0:
+                        raise subprocess.CalledProcessError(
+                            process.returncode, cmd, output=stdout, stderr=stderr
+                        )
+
             except subprocess.TimeoutExpired as e:
                 logfire.error(
                     f"Gemini CLI timed out.\nStdout: {e.stdout}\nStderr: {e.stderr}"
@@ -116,11 +138,9 @@ class GeminiCliWrapper:
                 raise
 
             try:
-                cli_response = GeminiCliResponse.model_validate_json(raw_result.stdout)
+                cli_response = GeminiCliResponse.model_validate_json(stdout)
             except ValidationError:
-                logfire.error(
-                    f"Failed to validate Gemini CLI output: {raw_result.stdout}"
-                )
+                logfire.error(f"Failed to validate Gemini CLI output: {stdout}")
                 raise
             if cli_response.response is not None:
                 try:
