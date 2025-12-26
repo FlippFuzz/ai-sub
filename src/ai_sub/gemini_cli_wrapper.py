@@ -133,6 +133,9 @@ class GeminiCliWrapper:
                     logfire.error(f"Failed to validate JSON: {json_str}")
                     raise
                 ai_response.model_name = self.model_name
+                logfire.debug(
+                    f"GeminiCliResponse: {cli_response}\nAiResponse: {ai_response}"
+                )
                 return ai_response
             else:
                 return None
