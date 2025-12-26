@@ -1,5 +1,21 @@
 # AI Sub Release Notes
 
+## v1.0.2
+
+This release introduces hardware acceleration for video encoding and fixes issues with video splitting.
+
+**New Features & Improvements:**
+
+- **Hardware Acceleration:** Added support for hardware acceleration during video encoding to improve processing speed.
+
+**Bug Fixes:**
+
+- **Video Splitting:** Fixed an issue where videos were not correctly split at 20MB intervals. The `--split.max_bytes` argument has been removed.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.0.1...v1.0.2
+
+---
+
 ## v1.0.1
 
 This release includes bug fixes for logging configuration and job state persistence, as well as improvements to data validation.
