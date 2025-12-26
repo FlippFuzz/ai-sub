@@ -1,5 +1,17 @@
 # AI Sub Release Notes
 
+## v1.2.1
+
+This release addresses a compatibility issue with the Gemini CLI wrapper on Linux systems.
+
+**Bug Fixes:**
+
+- **Linux Compatibility:** Fixed an issue where the Gemini CLI wrapper failed to execute correctly on Linux environments.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.2.0...v1.2.1
+
+---
+
 ## v1.2.0
 
 This release introduces a new logging configuration to control data scrubbing and improves debugging for Gemini CLI integration.
