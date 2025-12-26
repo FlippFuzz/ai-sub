@@ -1,5 +1,21 @@
 # AI Sub Release Notes
 
+## v1.2.0
+
+This release introduces a new logging configuration to control data scrubbing and improves debugging for Gemini CLI integration.
+
+**New Features & Improvements:**
+
+- **Log Scrubbing Control:** Added a new flag `--log.scrub` to enable or disable the scrubbing of sensitive data from logs.
+
+**Bug Fixes:**
+
+- **Gemini CLI Debugging:** Improved error handling to log the original response output when the Gemini CLI output cannot be successfully parsed.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.1.0...v1.2.0
+
+---
+
 ## v1.1.0
 
 This release adds a configurable timeout for Gemini CLI operations.
