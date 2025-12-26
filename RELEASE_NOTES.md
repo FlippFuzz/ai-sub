@@ -1,5 +1,17 @@
 # AI Sub Release Notes
 
+## v1.1.0
+
+This release adds a configurable timeout for Gemini CLI operations.
+
+**New Features & Improvements:**
+
+- **Gemini CLI Timeout:** Added a new configuration option `--ai.gemini-cli.timeout` to specify the timeout in seconds for Gemini CLI operations.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.0.2...v1.1.0
+
+---
+
 ## v1.0.2
 
 This release introduces hardware acceleration for video encoding and fixes issues with video splitting.
