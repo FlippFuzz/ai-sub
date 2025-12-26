@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -96,7 +97,10 @@ class GeminiCliWrapper:
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
-                    shell=True,
+                    # On Windows, shell=True is required to execute batch files/scripts (like npm binaries).
+                    # On Linux, shell=True with a list of args causes the args to be passed to the shell itself,
+                    # effectively stripping them from the command, so we must use shell=False.
+                    shell=sys.platform == "win32",
                     timeout=self.timeout,
                     check=True,
                 )
