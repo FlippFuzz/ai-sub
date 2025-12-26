@@ -3,7 +3,6 @@ from pathlib import Path
 
 import logfire
 import static_ffmpeg
-from pymediainfo import MediaInfo
 
 
 def get_video_duration_ms(video_path: Path) -> int:
@@ -15,13 +14,24 @@ def get_video_duration_ms(video_path: Path) -> int:
     Returns:
         int: The duration of the video in milliseconds. Returns 0 if duration cannot be determined.
     """
-    # Parse media information from the video file
-    media_info = MediaInfo.parse(video_path)
-    # Assuming the first track is the video track and contains duration
-    for track in media_info.tracks:
-        if track.track_type == "Video":
-            return int(float(track.duration))
-    return 0
+    static_ffmpeg.add_paths(weak=True)
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ]
+        result = subprocess.run(
+            cmd, check=True, capture_output=True, text=True, encoding="utf-8"
+        )
+        return int(float(result.stdout) * 1000)
+    except (subprocess.CalledProcessError, ValueError):
+        return 0
 
 
 def get_working_encoder() -> str:

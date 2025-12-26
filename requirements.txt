@@ -1,6 +1,5 @@
 pysubs2
 static-ffmpeg
-pymediainfo
 pydantic
 pydantic-ai-slim[google, logfire]
 pydantic-settings
