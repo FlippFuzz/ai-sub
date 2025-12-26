@@ -84,7 +84,7 @@ You can use AI Sub with either a Google AI Studio API Key or the Gemini CLI.
 2.  **Run the application:**
 
     ```bash
-    ai-sub --ai.model=gemini-cli:gemini-3-pro-preview --split.max-bytes=19500000 --split.re-encode.enabled=True --thread.subtitles=1 "path/to/your/video.mp4"
+    ai-sub --ai.model=gemini-cli:gemini-3-pro-preview --split.re-encode.enabled=True --thread.subtitles=1 "path/to/your/video.mp4"
     ```
 
     **Important Notes for CLI Mode:**
