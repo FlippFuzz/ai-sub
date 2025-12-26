@@ -1,5 +1,24 @@
 # AI Sub Release Notes
 
+## v1.2.2
+
+This release focuses on improving video processing accuracy, fixing Windows-specific issues with the Gemini CLI, and refining the AI prompt.
+
+**New Features & Improvements:**
+
+- **Prompt Refinement:** Updated the system prompt to improve subtitle generation quality.
+- **Enhanced Logging:** Added debug logging for Gemini CLI responses and parsed AI responses to aid in troubleshooting.
+- **Dependency Cleanup:** Removed `pymediainfo` from the project dependencies.
+
+**Bug Fixes:**
+
+- **Video Splitting Accuracy:** Fixed timing inaccuracies by splitting the video before re-encoding, preventing drift.
+- **Windows Timeout Fix:** Fixed an issue where the Gemini CLI timeout was not functioning correctly on Windows systems.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.2.1...v1.2.2
+
+---
+
 ## v1.2.1
 
 This release addresses a compatibility issue with the Gemini CLI wrapper on Linux systems.
