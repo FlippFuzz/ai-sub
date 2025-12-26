@@ -54,9 +54,11 @@ class GeminiCliWrapper:
     """
 
     model_name: str
+    timeout: int
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, timeout: int = 600):
         self.model_name = model_name
+        self.timeout = timeout
 
     def run_sync(self, prompt: str, video: Path) -> AiResponse | None:
         """
@@ -78,23 +80,36 @@ class GeminiCliWrapper:
                 f.write(prompt)
 
             # Run gemini-cli via subprocess.run and parse it's response
-            raw_result = subprocess.run(
-                [
-                    "gemini",
-                    "-p",
-                    f"@{video.name}",
-                    "--model",
-                    self.model_name,
-                    "--output-format",
-                    "json",
-                ],
-                cwd=video_directory,
-                env=os.environ | {"GEMINI_SYSTEM_MD": "prompt.md"},
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                shell=True,
-            )
+            try:
+                raw_result = subprocess.run(
+                    [
+                        "gemini",
+                        "-p",
+                        f"@{video.name}",
+                        "--model",
+                        self.model_name,
+                        "--output-format",
+                        "json",
+                    ],
+                    cwd=video_directory,
+                    env=os.environ | {"GEMINI_SYSTEM_MD": "prompt.md"},
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    shell=True,
+                    timeout=self.timeout,
+                    check=True,
+                )
+            except subprocess.TimeoutExpired as e:
+                logfire.error(
+                    f"Gemini CLI timed out.\nStdout: {e.stdout}\nStderr: {e.stderr}"
+                )
+                raise
+            except subprocess.CalledProcessError as e:
+                logfire.error(
+                    f"Gemini CLI failed with exit code {e.returncode}.\nStdout: {e.stdout}\nStderr: {e.stderr}"
+                )
+                raise
 
             cli_response = GeminiCliResponse.model_validate_json(raw_result.stdout)
             logfire.debug(f"GeminiCliResponse: {cli_response}")

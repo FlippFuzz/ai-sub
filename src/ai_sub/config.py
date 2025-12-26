@@ -15,6 +15,16 @@ from pydantic import (
 from pydantic_settings import BaseSettings, CliPositionalArg, SettingsConfigDict
 
 
+class GeminiCliSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_AI_GEMINI_CLI_",
+    )
+
+    timeout: PositiveInt = Field(
+        description="The timeout in seconds for Gemini CLI operations.", default=600
+    )
+
+
 class GoogleAiSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="AISUB_AI_GOOGLE_",
@@ -72,6 +82,10 @@ class AiSettings(BaseSettings):
     google: GoogleAiSettings = Field(
         description="Settings that only apply to the Google AI model.",
         default_factory=GoogleAiSettings,
+    )
+    gemini_cli: GeminiCliSettings = Field(
+        description="Settings that only apply to the Gemini CLI.",
+        default_factory=GeminiCliSettings,
     )
 
     @model_validator(mode="after")
