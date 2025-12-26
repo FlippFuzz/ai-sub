@@ -111,97 +111,141 @@ def split_video(
         subprocess.CalledProcessError: If the FFmpeg command fails.
     """
     ext = input_video.suffix  # Includes the dot, e.g., ".mp4"
-    if reencode:
-        ext = ".mp4"
+    final_ext = ".mov" if reencode else ext
 
     # TODO: Work on better logic to determine whether or not video has already been split
-    expected_first_segment_path = output_dir / f"part_000{ext}"
+    expected_first_segment_path = output_dir / f"part_000{final_ext}"
     if expected_first_segment_path.exists():
         logfire.info(
-            f"Assuming video has already been split because part_000{ext} already exists"
+            f"Assuming video has already been split because part_000{final_ext} already exists"
         )
+        return list(sorted(output_dir.glob(f"part_*{final_ext}")))
     else:
         static_ffmpeg.add_paths(weak=True)
 
         if reencode:
-            encoder = get_working_encoder()
-            with logfire.span(
-                f"Re-encoding video to {reencode_fps}fps, {reencode_height}p using {encoder}"
-            ):
-                video_bytes_per_sec = reencode_bitrate_kb * 1024
+            # TODO: In the future, have re-encoding jobs just like gemini upload jobs
+            # This will allow us to re-encode while starting the subtitle generation
 
-                cmd = [
+            # Strategy: Split the original video first (copy mode) to preserve exact timing,
+            # then re-encode the chunks. This prevents drift caused by re-encoding the whole file first.
+            encoder = get_working_encoder()
+            video_bytes_per_sec = reencode_bitrate_kb * 1024
+
+            # 1. Split original video into temporary chunks
+            temp_pattern = str(output_dir / f"temp_%03d{ext}")
+            with logfire.span("Splitting original video (copy mode)"):
+                cmd_split = [
                     "ffmpeg",
-                    "-y",
                     "-i",
                     str(input_video),
-                    "-vf",
-                    f"fps={reencode_fps},scale=-2:{reencode_height}",  # Set to specified FPS and height
-                    "-c:v",
-                    encoder,
-                    "-g",
-                    str(reencode_fps * 10),  # Force a keyframe every 10 seconds
-                    "-b:v",
-                    str(video_bytes_per_sec * 8),  # ffmpeg expects bits per second
-                    "-maxrate",
-                    str(video_bytes_per_sec * 8),
-                    "-bufsize",
-                    str(video_bytes_per_sec * 8 * 2),
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "128k",
-                    str(output_dir / "reencoded.mp4"),
+                    "-c",
+                    "copy",
+                    "-map",
+                    "0",
+                    "-f",
+                    "segment",
+                    "-segment_time",
+                    str(split_duration_s),
+                    "-reset_timestamps",
+                    "1",
+                    temp_pattern,
                 ]
-
                 try:
                     subprocess.run(
-                        cmd,
+                        cmd_split,
                         check=True,
                         capture_output=True,
                         text=True,
                         encoding="utf-8",
                     )
-                    # Change the input video to point to the reencoded video because we are going to split it
-                    input_video = output_dir / "reencoded.mp4"
                 except subprocess.CalledProcessError as e:
                     logfire.error(
-                        f"FFmpeg command failed. Stdout: {e.stdout}, Stderr: {e.stderr}"
+                        f"FFmpeg split failed. Stdout: {e.stdout}, Stderr: {e.stderr}"
                     )
-                    raise  # Re-raise the exception after logging/printing
+                    raise
 
-        # Split the video here
-        # Construct the output file pattern for ffmpeg
-        output_pattern_filename = f"part_%03d{ext}"
-        output_pattern = str(output_dir / output_pattern_filename)
+            # 2. Re-encode each chunk
+            temp_files = sorted(output_dir.glob(f"temp_*{ext}"))
+            with logfire.span(
+                f"Re-encoding {len(temp_files)} segments to {reencode_fps}fps, {reencode_height}p"
+            ):
+                for temp_file in temp_files:
+                    # Map temp_001.mp4 -> part_001.mov
+                    part_num = temp_file.stem.split("_")[-1]
+                    output_file = output_dir / f"part_{part_num}{final_ext}"
 
-        cmd = [
-            "ffmpeg",  # This is a string from static_ffmpeg
-            "-i",
-            str(input_video),  # Convert Path to string for subprocess
-            "-c",
-            "copy",
-            "-map",
-            "0",
-            "-f",
-            "segment",
-            "-segment_time",
-            str(split_duration_s),
-            "-reset_timestamps",
-            "1",
-            str(output_pattern),
-        ]
+                    cmd_encode = [
+                        "ffmpeg",
+                        "-y",
+                        "-i",
+                        str(temp_file),
+                        "-vf",
+                        f"fps={reencode_fps},scale=-2:{reencode_height}",
+                        "-c:v",
+                        encoder,
+                        "-g",
+                        str(reencode_fps * 10),
+                        "-b:v",
+                        str(video_bytes_per_sec * 8),
+                        "-maxrate",
+                        str(video_bytes_per_sec * 8),
+                        "-bufsize",
+                        str(video_bytes_per_sec * 8 * 2),
+                        "-c:a",
+                        "pcm_u8",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        str(output_file),
+                    ]
 
-        try:
-            subprocess.run(
-                cmd, check=True, capture_output=True, text=True, encoding="utf-8"
-            )
-        except subprocess.CalledProcessError as e:
-            logfire.error(
-                f"FFmpeg command failed. Stdout: {e.stdout}, Stderr: {e.stderr}"
-            )
-            raise  # Re-raise the exception after logging/printing
+                    try:
+                        subprocess.run(
+                            cmd_encode,
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                        )
+                        temp_file.unlink()  # Remove temp file
+                    except subprocess.CalledProcessError as e:
+                        logfire.error(
+                            f"FFmpeg re-encode failed for {temp_file.name}. Stdout: {e.stdout}, Stderr: {e.stderr}"
+                        )
+                        raise
 
-    result = list(sorted(output_dir.glob(f"part_*{ext}")))
+        else:
+            # Split the video directly without re-encoding
+            output_pattern = str(output_dir / f"part_%03d{ext}")
+            cmd = [
+                "ffmpeg",
+                "-i",
+                str(input_video),
+                "-c",
+                "copy",
+                "-map",
+                "0",
+                "-f",
+                "segment",
+                "-segment_time",
+                str(split_duration_s),
+                "-reset_timestamps",
+                "1",
+                output_pattern,
+            ]
+
+            try:
+                subprocess.run(
+                    cmd, check=True, capture_output=True, text=True, encoding="utf-8"
+                )
+            except subprocess.CalledProcessError as e:
+                logfire.error(
+                    f"FFmpeg command failed. Stdout: {e.stdout}, Stderr: {e.stderr}"
+                )
+                raise
+
+    result = list(sorted(output_dir.glob(f"part_*{final_ext}")))
     logfire.info(f"Split into {len(result)} segments")
     return result
