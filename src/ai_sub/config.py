@@ -199,6 +199,10 @@ class LoggingSettings(BaseSettings):
         description="Whether to include timestamps in the console output.",
         default=False,
     )
+    scrub: bool = Field(
+        description="Whether to scrub sensitive data from logs.",
+        default=True,
+    )
 
 
 class Settings(BaseSettings):

@@ -247,11 +247,15 @@ def main():
         service_name=socket.gethostname(),
         service_version=version("ai-sub"),
         send_to_logfire="if-token-present",
+        # Logfire scrubs by default (None). We pass False to disable it if configured.
+        scrubbing=None if settings.log.scrub else False,
     )
     no_console_logfire = logfire.configure(
         local=True,
         console=False,
         send_to_logfire="if-token-present",
+        # Logfire scrubs by default (None). We pass False to disable it if configured.
+        scrubbing=None if settings.log.scrub else False,
     )
     no_console_logfire.instrument_pydantic_ai()
     no_console_logfire.instrument_httpx(capture_all=True)
