@@ -267,7 +267,6 @@ def main():
             settings.input_video_file,
             settings.dir.tmp,
             settings.split.max_seconds,
-            settings.split.max_bytes,
             settings.split.re_encode.enabled,
             settings.split.re_encode.fps,
             settings.split.re_encode.height,

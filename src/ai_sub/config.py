@@ -105,7 +105,7 @@ class ReEncodeSettings(BaseSettings):
     )
     bitrate_kb: PositiveInt = Field(
         description="The bitrate in KB/s (Kilobytes per second) to re-encode the video to.",
-        default=30,
+        default=35,
     )
 
 
@@ -117,10 +117,6 @@ class SplittingSettings(BaseSettings):
     max_seconds: PositiveInt = Field(
         description="The maximum duration in seconds for each video chunk. The input video will be split into these smaller segments for processing.",
         default=60 * 5,
-    )
-    max_bytes: PositiveInt = Field(
-        description="The maximum size in bytes for each video chunk. The input video will be split into these smaller segments for processing.",
-        default=10 * 1000 * 1000 * 1000,
     )
     re_encode: ReEncodeSettings = Field(
         description="Settings for re-encoding video chunks.",
