@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 
 import logfire
 from json_repair import repair_json
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from ai_sub.data_models import AiResponse
 from ai_sub.prompt import PROMPT
@@ -111,16 +111,24 @@ class GeminiCliWrapper:
                 )
                 raise
 
-            cli_response = GeminiCliResponse.model_validate_json(raw_result.stdout)
-            logfire.debug(f"GeminiCliResponse: {cli_response}")
-            if cli_response.response is not None:
-                # There is usually leading and trailing ''' characters.
-                # repair_json will take care of it
-                ai_response = AiResponse.model_validate_json(
-                    repair_json(cli_response.response)
+            try:
+                cli_response = GeminiCliResponse.model_validate_json(raw_result.stdout)
+            except ValidationError:
+                logfire.error(
+                    f"Failed to validate Gemini CLI output: {raw_result.stdout}"
                 )
+                raise
+            if cli_response.response is not None:
+                try:
+                    # There is usually leading and trailing ''' characters.
+                    # repair_json will take care of it
+                    json_str = repair_json(cli_response.response)
+                    ai_response = AiResponse.model_validate_json(json_str)
+                except ValidationError:
+                    logfire.debug(f"GeminiCliResponse: {cli_response}")
+                    logfire.error(f"Failed to validate JSON: {json_str}")
+                    raise
                 ai_response.model_name = self.model_name
-                # logfire.debug(f"AiResponse: {result}")
                 return ai_response
             else:
                 return None
