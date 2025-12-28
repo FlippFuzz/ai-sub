@@ -13,6 +13,8 @@ class Subtitles(BaseModel):
     end: str
     english: str
     japanese: str
+    alignment_source: str
+    type: str
 
 
 class AiResponse(BaseModel):

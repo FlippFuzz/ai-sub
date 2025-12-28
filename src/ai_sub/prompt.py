@@ -18,6 +18,7 @@ PROMPT = dedent(
     *   **Drift Prevention:** Treat every subtitle entry as a **discrete event**.
         *   Do not calculate a `start` time based on a previous `end` time *unless* the speech is continuous (see Priority 3).
         *   Reset your internal clock for every new sentence.
+        *   **CRITICAL:** Do NOT estimate timestamps based on text length. Do NOT linearize time.
     *   **Format:** `MM:SS.mmm` (e.g., `09:30.125`). Precision is paramount.
 
     **PRIORITY 2: CONTENT SOURCE & TRANSLATION LOGIC**
@@ -62,7 +63,7 @@ PROMPT = dedent(
     1.  **Audio Detection:** Scan audio. Is there **Vocal Energy**? (Ignore music/SFX for this check).
     2.  **Context Analysis:** Check visuals (who/where), surrounding dialogue, and **reconstruct the full sentence** if it spans multiple segments.
     3.  **Anchor Identification:** Identify the **First Word** and **Last Word** of the specific phrase segment.
-    4.  **Timestamp Extraction:** Locate the native audio timestamps for these anchors.
+    4.  **Timestamp Extraction:** Locate the native audio timestamps for these anchors. **Verify against audio tokens.**
     5.  **Translation/Transcription:** Apply language directionality and **Semantic Continuity** rules.
     6.  **Length & Split Check:** 
         *   Is text > 50 chars? -> Split. 
@@ -75,6 +76,8 @@ PROMPT = dedent(
     ### OUTPUT FORMAT
     *   Return **ONLY** a valid, parseable JSON object.
     *   **NO Markdown, NO Commentary, NO HTML Entities.**
+    *   **alignment_source:** State the source used for timestamp alignment (`audio_tokens`, `visual_inference`, or `gap_calculation`).
+    *   **type:** Classify as `dialogue` or `on_screen_text`.
 
     **JSON Schema:**
     {
@@ -83,7 +86,9 @@ PROMPT = dedent(
         "start": "MM:SS.mmm",
         "end": "MM:SS.mmm",
         "english": "String",
-        "japanese": "String"
+        "japanese": "String",
+        "alignment_source": "String",
+        "type": "String"
         }
     ]
     }
