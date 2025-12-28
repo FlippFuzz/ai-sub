@@ -101,22 +101,24 @@ class AiResponse(BaseModel):
         return subtitles
 
 
-class UploadFileJob(BaseModel):
+class Job(BaseModel):
+    run_num_retries: NonNegativeInt = 0
+    total_num_retries: NonNegativeInt = 0
+
+
+class UploadFileJob(Job):
     """Represents a job to upload a file to the AI provider."""
 
     python_file: Path
     video_duration_ms: PositiveInt
-    run_num_retries: NonNegativeInt = 0
 
 
-class SubtitleJob(BaseModel):
+class SubtitleJob(Job):
     """Represents a job to generate subtitles for a specific file."""
 
     name: str
     file: File | Path
     video_duration_ms: PositiveInt
-    run_num_retries: NonNegativeInt = 0
-    total_num_retries: NonNegativeInt = 0
     response: Optional[AiResponse] = None
 
     def save(self, filename: Path):
