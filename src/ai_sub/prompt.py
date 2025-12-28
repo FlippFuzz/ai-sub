@@ -38,6 +38,10 @@ PROMPT = dedent(
     *   **Handling Unclear Audio:**
         *   **Multimodal Inference:** If audio is mumbled/unclear, use Visuals and Context to infer the text.
         *   **Sync Requirement:** Even if the text is inferred, the **timestamps must map to the actual mumbled audio event.**
+    *   **Overlapping Speech:**
+        *   **Strategy:** Generate **separate** subtitle objects for each speaker.
+        *   **Timestamps:** Overlapping `start`/`end` times are explicitly **PERMITTED** for simultaneous speech.
+        *   **No Merging:** Do NOT combine multiple speakers into one line (e.g., "- Hi - Hello").
     *   **Language Directionality:**
         *   **Audio = ENGLISH:** `english` = Verbatim; `japanese` = Translation.
         *   **Audio = JAPANESE:** `japanese` = Verbatim; `english` = Translation.
@@ -69,7 +73,7 @@ PROMPT = dedent(
         *   Is text > 50 chars? -> Split. 
         *   Is there a pause in the middle? -> Split there first.
         *   *Refine Timestamps:* If split, re-align start/end for the new sub-segments.
-    7.  **Final Verification:** Ensure no overlap between non-contiguous sentences.
+    7.  **Final Verification:** Ensure no overlap between non-contiguous sentences (unless distinct speakers are overlapping).
 
     ---
 
