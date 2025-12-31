@@ -1,5 +1,17 @@
 # AI Sub Release Notes
 
+## v1.3.1
+
+This release fixes an issue where videos containing non-UTF-8 data could cause the application to crash.
+
+**Bug Fixes:**
+
+- **UTF-8 Handling:** Improved handling of video files containing non-UTF-8 data to prevent processing failures.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.3.0...v1.3.1
+
+---
+
 ## v1.3.0
 
 This release introduces parallel encoding jobs to improve performance and updates the AI prompt to better handle overlapping speech.
