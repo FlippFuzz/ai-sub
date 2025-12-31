@@ -15,6 +15,8 @@ from google.genai.types import (
 )
 from pydantic_ai.providers.google import GoogleProvider
 
+from ai_sub.config import Settings
+
 
 def calculate_sha256(filename: Path):
     """
@@ -53,17 +55,28 @@ class GeminiFileUploader:
     _list_cache_ttl_seconds: int
     _lock: Lock
 
-    def __init__(self, provider: GoogleProvider, cache_ttl_seconds: int = 1) -> None:
+    def __init__(self, settings: Settings) -> None:
         """
         Initializes the GeminiFileUploader.
 
         Args:
-            provider (GoogleProvider): The GoogleProvider instance for API access.
-            cache_ttl_seconds (int): The time-to-live in seconds for the file list cache.
+            settings (Settings): The application configuration settings.
         """
-        self._provider = provider
+        self._provider = GoogleProvider(
+            api_key=(
+                settings.ai.google.key.get_secret_value()
+                if settings.ai.google.key
+                else None
+            ),
+            http_client=None,
+            base_url=(
+                str(settings.ai.google.base_url)
+                if settings.ai.google.base_url
+                else None
+            ),
+        )
+        self._list_cache_ttl_seconds = settings.ai.google.file_cache_ttl
         self._state = {}
-        self._list_cache_ttl_seconds = cache_ttl_seconds
         self._lock = Lock()
 
     def _update_file_list(self) -> None:

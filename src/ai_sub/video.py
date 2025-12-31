@@ -83,10 +83,7 @@ def split_video(
     input_video: Path,
     output_dir: Path,
     split_duration_s: int,
-    reencode: bool = False,
-    reencode_fps: int = 1,
-    reencode_height: int = 360,
-    reencode_bitrate_kb: int = 30,
+    output_pattern: str = "part_%03d",
 ) -> list[Path]:
     """Splits a video file into segments of a specified duration using FFmpeg.
 
@@ -99,10 +96,7 @@ def split_video(
         input_video (Path): The path to the input video file.
         output_dir (Path): The directory where the video segments will be saved.
         split_duration_s (int): The target duration of each video segment in seconds.
-        reencode (bool): If True, re-encodes the video to 1fps 360p. Defaults to False.
-        reencode_fps (int): The framerate to re-encode the video to. Defaults to 1.
-        reencode_height (int): The height (resolution) to re-encode the video to. Defaults to 360.
-        reencode_bitrate_kb (int): The bitrate in KB/s to re-encode the video to. Defaults to 30.
+        output_pattern (str): The filename pattern for the output segments. Defaults to "part_%03d".
 
     Returns:
         list[Path]: A sorted list of Path objects, each pointing to a generated video segment.
@@ -111,141 +105,121 @@ def split_video(
         subprocess.CalledProcessError: If the FFmpeg command fails.
     """
     ext = input_video.suffix  # Includes the dot, e.g., ".mp4"
-    final_ext = ".mov" if reencode else ext
 
-    # TODO: Work on better logic to determine whether or not video has already been split
-    expected_first_segment_path = output_dir / f"part_000{final_ext}"
+    # Check if we have files matching the pattern
+    glob_pattern = output_pattern.replace("%03d", "*") + ext
+
+    # Check for the first file to see if we can skip
+    first_file_name = output_pattern % 0 + ext
+    expected_first_segment_path = output_dir / first_file_name
+
     if expected_first_segment_path.exists():
         logfire.info(
-            f"Assuming video has already been split because part_000{final_ext} already exists"
+            f"Assuming video has already been split because {first_file_name} already exists"
         )
-        return list(sorted(output_dir.glob(f"part_*{final_ext}")))
+        return list(sorted(output_dir.glob(glob_pattern)))
     else:
         static_ffmpeg.add_paths(weak=True)
 
-        if reencode:
-            # TODO: In the future, have re-encoding jobs just like gemini upload jobs
-            # This will allow us to re-encode while starting the subtitle generation
+        full_output_pattern = str(output_dir / f"{output_pattern}{ext}")
+        cmd = [
+            "ffmpeg",
+            "-i",
+            str(input_video),
+            "-c",
+            "copy",
+            "-map",
+            "0",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(split_duration_s),
+            "-reset_timestamps",
+            "1",
+            full_output_pattern,
+        ]
 
-            # Strategy: Split the original video first (copy mode) to preserve exact timing,
-            # then re-encode the chunks. This prevents drift caused by re-encoding the whole file first.
-            encoder = get_working_encoder()
-            video_bytes_per_sec = reencode_bitrate_kb * 1024
+        try:
+            subprocess.run(
+                cmd, check=True, capture_output=True, text=True, encoding="utf-8"
+            )
+        except subprocess.CalledProcessError as e:
+            logfire.error(
+                f"FFmpeg command failed. Stdout: {e.stdout}, Stderr: {e.stderr}"
+            )
+            raise
 
-            # 1. Split original video into temporary chunks
-            temp_pattern = str(output_dir / f"temp_%03d{ext}")
-            with logfire.span("Splitting original video (copy mode)"):
-                cmd_split = [
-                    "ffmpeg",
-                    "-i",
-                    str(input_video),
-                    "-c",
-                    "copy",
-                    "-map",
-                    "0",
-                    "-f",
-                    "segment",
-                    "-segment_time",
-                    str(split_duration_s),
-                    "-reset_timestamps",
-                    "1",
-                    temp_pattern,
-                ]
-                try:
-                    subprocess.run(
-                        cmd_split,
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                    )
-                except subprocess.CalledProcessError as e:
-                    logfire.error(
-                        f"FFmpeg split failed. Stdout: {e.stdout}, Stderr: {e.stderr}"
-                    )
-                    raise
-
-            # 2. Re-encode each chunk
-            temp_files = sorted(output_dir.glob(f"temp_*{ext}"))
-            with logfire.span(
-                f"Re-encoding {len(temp_files)} segments to {reencode_fps}fps, {reencode_height}p"
-            ):
-                for temp_file in temp_files:
-                    # Map temp_001.mp4 -> part_001.mov
-                    part_num = temp_file.stem.split("_")[-1]
-                    output_file = output_dir / f"part_{part_num}{final_ext}"
-
-                    cmd_encode = [
-                        "ffmpeg",
-                        "-y",
-                        "-i",
-                        str(temp_file),
-                        "-vf",
-                        f"fps={reencode_fps},scale=-2:{reencode_height}",
-                        "-c:v",
-                        encoder,
-                        "-g",
-                        str(reencode_fps * 10),
-                        "-b:v",
-                        str(video_bytes_per_sec * 8),
-                        "-maxrate",
-                        str(video_bytes_per_sec * 8),
-                        "-bufsize",
-                        str(video_bytes_per_sec * 8 * 2),
-                        "-c:a",
-                        "pcm_u8",
-                        "-ac",
-                        "1",
-                        "-ar",
-                        "16000",
-                        str(output_file),
-                    ]
-
-                    try:
-                        subprocess.run(
-                            cmd_encode,
-                            check=True,
-                            capture_output=True,
-                            text=True,
-                            encoding="utf-8",
-                        )
-                        temp_file.unlink()  # Remove temp file
-                    except subprocess.CalledProcessError as e:
-                        logfire.error(
-                            f"FFmpeg re-encode failed for {temp_file.name}. Stdout: {e.stdout}, Stderr: {e.stderr}"
-                        )
-                        raise
-
-        else:
-            # Split the video directly without re-encoding
-            output_pattern = str(output_dir / f"part_%03d{ext}")
-            cmd = [
-                "ffmpeg",
-                "-i",
-                str(input_video),
-                "-c",
-                "copy",
-                "-map",
-                "0",
-                "-f",
-                "segment",
-                "-segment_time",
-                str(split_duration_s),
-                "-reset_timestamps",
-                "1",
-                output_pattern,
-            ]
-
-            try:
-                subprocess.run(
-                    cmd, check=True, capture_output=True, text=True, encoding="utf-8"
-                )
-            except subprocess.CalledProcessError as e:
-                logfire.error(
-                    f"FFmpeg command failed. Stdout: {e.stdout}, Stderr: {e.stderr}"
-                )
-                raise
-
-    result = list(sorted(output_dir.glob(f"part_*{final_ext}")))
+    result = list(sorted(output_dir.glob(glob_pattern)))
     logfire.info(f"Split into {len(result)} segments")
     return result
+
+
+def reencode_video(
+    input_path: Path,
+    output_path: Path,
+    fps: int,
+    height: int,
+    bitrate_kb: int,
+) -> None:
+    """Re-encodes a video file to a specific format.
+
+    If the output file already exists, re-encoding is skipped.
+
+    Args:
+        input_path (Path): The path to the input video file.
+        output_path (Path): The path where the re-encoded video will be saved.
+        fps (int): The target framerate.
+        height (int): The target height (resolution).
+        bitrate_kb (int): The target bitrate in KB/s.
+    """
+
+    # If output file already exists, we can just skip the re-encode
+    if output_path.exists():
+        logfire.info(
+            f"Skipping re-encode for {input_path.name} as {output_path.name} already exists."
+        )
+        return
+
+    static_ffmpeg.add_paths(weak=True)
+    encoder = get_working_encoder()
+    video_bytes_per_sec = bitrate_kb * 1024
+
+    cmd_encode = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vf",
+        f"fps={fps},scale=-2:{height}",
+        "-c:v",
+        encoder,
+        "-g",
+        str(fps * 10),
+        "-b:v",
+        str(video_bytes_per_sec * 8),
+        "-maxrate",
+        str(video_bytes_per_sec * 8),
+        "-bufsize",
+        str(video_bytes_per_sec * 8 * 2),
+        "-c:a",
+        "pcm_u8",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(output_path),
+    ]
+
+    try:
+        subprocess.run(
+            cmd_encode,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+    except subprocess.CalledProcessError as e:
+        logfire.error(
+            f"FFmpeg re-encode failed for {input_path.name}. Stdout: {e.stdout}, Stderr: {e.stderr}"
+        )
+        raise

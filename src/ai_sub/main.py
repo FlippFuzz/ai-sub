@@ -3,22 +3,74 @@ from collections import deque
 from importlib.metadata import version
 from pathlib import Path
 from threading import Event
+from typing import Any, Callable
 
 import logfire
 from pydantic import ValidationError
-from pydantic_ai.providers.google import GoogleProvider
 from pysubs2 import SSAEvent, SSAFile
 
 from ai_sub.agent_wrapper import RateLimitedAgentWrapper
 from ai_sub.config import Settings
-from ai_sub.data_models import SubtitleJob, UploadFileJob
+from ai_sub.data_models import ReEncodingJob, SubtitleJob, UploadFileJob
 from ai_sub.gemini_file_uploader import GeminiFileUploader
 from ai_sub.job_runner import JobRunner
 from ai_sub.prompt import PROMPT
-from ai_sub.video import get_video_duration_ms, split_video
+from ai_sub.video import get_video_duration_ms, reencode_video, split_video
+
+
+class ReEncodeJobRunner(JobRunner[ReEncodingJob]):
+    """
+    Worker that re-encodes video segments to a lower quality/different format.
+
+    This is typically done to reduce file size before uploading to an API,
+    saving bandwidth and potentially processing time.
+    """
+
+    def __init__(
+        self,
+        queue: deque[ReEncodingJob],
+        settings: Settings,
+        max_workers: int,
+        next_queue: deque[Any],
+        next_job_factory: Callable[[Path, int], Any],
+        stop_events: list[Event] = [],
+        name: str = "ReEncode",
+    ):
+        super().__init__(queue, settings, max_workers, stop_events, name)
+        self.next_queue = next_queue
+        self.next_job_factory = next_job_factory
+
+    def process(self, job: ReEncodingJob) -> None:
+        """
+        Re-encodes the video file specified in the job.
+
+        After re-encoding, it calculates the new duration, creates the next job
+        (either an UploadJob or a SubtitleJob) using the factory, and adds it
+        to the next queue.
+        """
+        with logfire.span(f"Re-encoding {job.input_file.name}"):
+            reencode_video(
+                job.input_file,
+                job.output_file,
+                job.fps,
+                job.height,
+                job.bitrate_kb,
+            )
+
+            duration = get_video_duration_ms(job.output_file)
+            next_job = self.next_job_factory(job.output_file, duration)
+            self.next_queue.append(next_job)
+            logfire.info(f"{job.input_file.name} re-encoded to {job.output_file.name}")
 
 
 class UploadJobRunner(JobRunner[UploadFileJob]):
+    """
+    Worker that uploads video files to the Gemini Files API.
+
+    This runner is used when the AI model requires the file to be hosted
+    on Google's servers (e.g., for Gemini models).
+    """
+
     def __init__(
         self,
         queue: deque[UploadFileJob],
@@ -36,6 +88,9 @@ class UploadJobRunner(JobRunner[UploadFileJob]):
     def process(self, job: UploadFileJob) -> None:
         """
         Uploads the specified file using the `GeminiFileUploader`.
+
+        Upon successful upload, it creates a `SubtitleJob` with the uploaded file handle
+        and adds it to the subtitle jobs queue.
         """
         with logfire.span(f"Uploading {job.python_file.name}"):
             # Perform the file upload. This is a blocking operation.
@@ -52,6 +107,10 @@ class UploadJobRunner(JobRunner[UploadFileJob]):
 
 
 class SubtitleJobRunner(JobRunner[SubtitleJob]):
+    """
+    Worker that executes the AI agent to generate subtitles for a video segment.
+    """
+
     def __init__(
         self,
         queue: deque[SubtitleJob],
@@ -70,11 +129,14 @@ class SubtitleJobRunner(JobRunner[SubtitleJob]):
         """
         with logfire.span(f"Subtitling {job.name}"):
             job.response = self.agent.run(PROMPT, job.file, job.video_duration_ms)
-            logfire.info(f"{job.name} done")
+            logfire.info(f"{job.name} subtitled")
 
     def post_process(self, job: SubtitleJob) -> None:
         """
         Saves the result (or partial state) to disk.
+
+        This ensures that if the process is interrupted, completed segments
+        don't need to be re-processed.
         """
         # Save the completed job state to a JSON file for persistence.
         job.save(self.settings.dir.tmp / f"{job.name}.json")
@@ -88,6 +150,10 @@ class SubtitleJobRunner(JobRunner[SubtitleJob]):
 def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -> None:
     """
     Assembles the final subtitle file from processed segments.
+
+    It iterates through the expected video segments, loads the corresponding
+    processed subtitle jobs, and concatenates them. Timestamps are shifted
+    appropriately to match the original video's timeline.
 
     Args:
         video_splits: A list of tuples containing the path and duration of each video segment.
@@ -209,15 +275,13 @@ def main():
 
     # Start the main application logic within a Logfire span for better tracing.
     with logfire.span(f"Generating subtitles for {settings.input_video_file.name}"):
-        # Step 1: Split the input video into smaller segments based on the configured duration.
-        video_splits_paths: list[Path] = split_video(
+
+        # Step 1: Split the input video into smaller segments.
+        video_splits_paths = split_video(
             settings.input_video_file,
             settings.dir.tmp,
             settings.split.max_seconds,
-            settings.split.re_encode.enabled,
-            settings.split.re_encode.fps,
-            settings.split.re_encode.height,
-            settings.split.re_encode.bitrate_kb,
+            output_pattern="part_%03d",
         )
         video_splits: list[tuple[Path, int]] = [
             (path, get_video_duration_ms(path)) for path in video_splits_paths
@@ -239,80 +303,134 @@ def main():
 
         # Step 3: Initialize data structures for concurrent processing.
         # Deques are used as thread-safe queues for managing jobs.
+        reencode_jobs_queue: deque[ReEncodingJob] = deque()
         gemini_upload_jobs_queue: deque[UploadFileJob] = deque()
         subtitle_jobs_queue: deque[SubtitleJob] = deque()
-        gemini_upload_complete_event = Event()
-        upload_runner: UploadJobRunner | None = None
 
-        # Step 4: Populate the initial job queues.
-        # If using a Google model, video parts must be uploaded first. These jobs
-        # are added to a dedicated upload queue.
-        if agent.is_google() and settings.ai.google.use_files_api:
-            gemini_upload_jobs_queue.extend(
-                UploadFileJob(python_file=path, video_duration_ms=duration)
-                for path, duration in videos_to_work_on
+        reencode_complete_event = Event()
+        gemini_upload_complete_event = Event()
+
+        reencode_runner: ReEncodeJobRunner | None = None
+        upload_runner: UploadJobRunner | None = None
+        subtitle_runner: SubtitleJobRunner | None = None
+
+        use_reencode = settings.split.re_encode.enabled
+        use_upload = agent.is_google() and settings.ai.google.use_files_api
+
+        # Setup reencode_runner
+        if use_reencode:
+            if use_upload:
+                next_queue = gemini_upload_jobs_queue
+
+                def create_upload_job(p: Path, d: int):
+                    return UploadFileJob(python_file=p, video_duration_ms=d)
+
+                next_factory = create_upload_job
+            else:
+                next_queue = subtitle_jobs_queue
+
+                def create_subtitle_job(p: Path, d: int):
+                    return SubtitleJob(name=p.stem, file=p, video_duration_ms=d)
+
+                next_factory = create_subtitle_job
+
+            reencode_runner = ReEncodeJobRunner(
+                reencode_jobs_queue,
+                settings,
+                settings.thread.re_encode,
+                next_queue=next_queue,
+                next_job_factory=next_factory,
             )
-            googleProvider = GoogleProvider(
-                api_key=(
-                    settings.ai.google.key.get_secret_value()
-                    if settings.ai.google.key
-                    else None
-                ),
-                http_client=None,
-                base_url=(
-                    str(settings.ai.google.base_url)
-                    if settings.ai.google.base_url
-                    else None
-                ),
-            )
-            uploader = GeminiFileUploader(
-                googleProvider, cache_ttl_seconds=settings.ai.google.file_cache_ttl
-            )
+
+        # Setup upload_runner
+        if use_upload:
+            stop_events = [reencode_complete_event] if use_reencode else []
             upload_runner = UploadJobRunner(
                 gemini_upload_jobs_queue,
                 settings,
                 settings.thread.uploads,
-                uploader=uploader,
+                uploader=GeminiFileUploader(settings),
                 jobs_queue=subtitle_jobs_queue,
+                stop_events=stop_events,
             )
-            upload_runner.start()
+
+        # Setup subtitle_runner
+        subtitle_stop_events = []
+        if use_upload:
+            subtitle_stop_events.append(gemini_upload_complete_event)
+        elif use_reencode:
+            subtitle_stop_events.append(reencode_complete_event)
+
+        subtitle_runner = SubtitleJobRunner(
+            subtitle_jobs_queue,
+            settings,
+            settings.thread.subtitles,
+            agent,
+            stop_events=subtitle_stop_events,
+        )
+
+        # Step 4: Populate the initial job queues.
+        if use_reencode:
+            # Create a directory for re-encoded files to avoid name collisions
+            # and preserve the file stem for stitching.
+            reencode_dir = settings.dir.tmp / "reencoded"
+            reencode_dir.mkdir(exist_ok=True)
+
+            for input_file, _ in videos_to_work_on:
+                # We want to keep the same stem (e.g. "part_000") so that the
+                # SubtitleJob is named correctly for stitching later.
+                output_file = reencode_dir / input_file.with_suffix(".mov").name
+
+                reencode_jobs_queue.append(
+                    ReEncodingJob(
+                        input_file=input_file,
+                        output_file=output_file,
+                        fps=settings.split.re_encode.fps,
+                        height=settings.split.re_encode.height,
+                        bitrate_kb=settings.split.re_encode.bitrate_kb,
+                    )
+                )
+        elif use_upload:
+            # We start with the gemini file upload tasks
+            gemini_upload_jobs_queue.extend(
+                UploadFileJob(python_file=path, video_duration_ms=duration)
+                for path, duration in videos_to_work_on
+            )
         else:
-            # For other models (e.g., OpenAI, custom), files are handled locally or
-            # as binary data, so we can directly populate the subtitle jobs queue.
+            # We start with the subtitle generation tasks
             subtitle_jobs_queue.extend(
                 SubtitleJob(name=path.stem, file=path, video_duration_ms=duration)
                 for path, duration in videos_to_work_on
             )
 
-        # Step 5: Start the subtitle generation workers.
-        # A thread pool is created to process subtitle jobs concurrently.
-        max_workers = settings.thread.subtitles
-        subtitle_runner = SubtitleJobRunner(
-            subtitle_jobs_queue,
-            settings,
-            max_workers,
-            agent,
-            stop_events=[gemini_upload_complete_event],
-        )
+        # Step 5: Start all runners and wait for them to complete
+        # Start runners
+        if reencode_runner:
+            reencode_runner.start()
+        if upload_runner:
+            upload_runner.start()
         subtitle_runner.start()
 
-        # Step 6: Wait for all jobs to complete.
-        # First, wait for all file upload jobs (if any) to finish.
+        # Wait for runners to complete and signal as needed
+        if reencode_runner:
+            reencode_runner.wait()
+            reencode_complete_event.set()
+
         if upload_runner:
             upload_runner.wait()
-        # Signal that no more upload jobs will be added. This tells the subtitle
-        # workers they can exit once their queue is empty.
-        gemini_upload_complete_event.set()
+            gemini_upload_complete_event.set()
 
-        # Then, wait for all the subtitle generation jobs to finish.
         subtitle_runner.wait()
 
-        # Shutdown executors
+        # Shutdown runners when all done
+        if reencode_runner:
+            reencode_runner.shutdown()
         if upload_runner:
             upload_runner.shutdown()
         subtitle_runner.shutdown()
 
-        # Step 7: Assemble the final subtitle file.
+        # Step 6: Assemble the final subtitle file.
+        # Recalculate durations as they might have changed or were unknown during re-encoding
         stitch_subtitles(video_splits, settings)
 
         logfire.info("Done")

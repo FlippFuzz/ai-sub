@@ -106,6 +106,16 @@ class Job(BaseModel):
     total_num_retries: NonNegativeInt = 0
 
 
+class ReEncodingJob(Job):
+    """Represents a job to re-encode a video file."""
+
+    input_file: Path
+    output_file: Path
+    fps: PositiveInt
+    height: PositiveInt
+    bitrate_kb: PositiveInt
+
+
 class UploadFileJob(Job):
     """Represents a job to upload a file to the AI provider."""
 

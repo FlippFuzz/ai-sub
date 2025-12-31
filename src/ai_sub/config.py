@@ -162,6 +162,10 @@ class ThreadSettings(BaseSettings):
         description="The number of concurrent threads for uploading video segments. This is only used for Gemini (google-gla) models.",
         default=4,
     )
+    re_encode: PositiveInt = Field(
+        description="The number of concurrent threads for re-encoding video chunks.",
+        default=2,
+    )
     subtitles: PositiveInt = Field(
         description="The number of concurrent threads to use for generating subtitles.",
         default=4,
