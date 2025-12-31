@@ -27,7 +27,12 @@ def get_video_duration_ms(video_path: Path) -> int:
             str(video_path),
         ]
         result = subprocess.run(
-            cmd, check=True, capture_output=True, text=True, encoding="utf-8"
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         return int(float(result.stdout) * 1000)
     except (subprocess.CalledProcessError, ValueError):
@@ -64,6 +69,7 @@ def get_working_encoder() -> str:
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
+                errors="replace",
             )
             return encoder
         except subprocess.CalledProcessError as e:
@@ -141,7 +147,12 @@ def split_video(
 
         try:
             subprocess.run(
-                cmd, check=True, capture_output=True, text=True, encoding="utf-8"
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except subprocess.CalledProcessError as e:
             logfire.error(
@@ -217,6 +228,7 @@ def reencode_video(
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
         )
     except subprocess.CalledProcessError as e:
         logfire.error(
