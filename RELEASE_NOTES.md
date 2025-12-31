@@ -1,5 +1,18 @@
 # AI Sub Release Notes
 
+## v1.3.0
+
+This release introduces parallel encoding jobs to improve performance and updates the AI prompt to better handle overlapping speech.
+
+**New Features & Improvements:**
+
+- **Parallel Encoding:** Implemented encoding jobs to parallelize video encoding alongside subtitle generation, significantly reducing overall processing time.
+- **Prompt Update:** Updated the system prompt to better handle overlapping speech and improve general subtitle quality.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.2.2...v1.3.0
+
+---
+
 ## v1.2.2
 
 This release focuses on improving video processing accuracy, fixing Windows-specific issues with the Gemini CLI, and refining the AI prompt.
