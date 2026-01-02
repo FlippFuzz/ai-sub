@@ -3,25 +3,36 @@ from pathlib import Path
 from typing import Optional
 
 from google.genai.types import File
-from pydantic import BaseModel, NonNegativeInt, PositiveInt, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    PositiveInt,
+    field_validator,
+)
 from pysubs2 import SSAEvent, SSAFile
 
 
 class Subtitles(BaseModel):
     """Represents a single subtitle entry with start/end times and text."""
 
-    start: str
-    end: str
-    english: str
-    original: str
-    alignment_source: str
-    type: str
+    model_config = ConfigDict(populate_by_name=True)
+
+    start: str = Field(alias="s")
+    end: str = Field(alias="e")
+    english: str = Field(alias="en")
+    original: str = Field(alias="og")
+    alignment_source: str = Field(alias="src")
+    type: str = Field(alias="t")
 
 
 class AiResponse(BaseModel):
     """Represents the structured response from the AI model containing a list of subtitles."""
 
-    subtitles: list[Subtitles]
+    model_config = ConfigDict(populate_by_name=True)
+
+    subtitles: list[Subtitles] = Field(alias="subs")
     model_name: Optional[str] = None
 
     @field_validator("subtitles")
