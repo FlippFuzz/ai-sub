@@ -121,6 +121,18 @@ class ReEncodeSettings(BaseSettings):
         description="The bitrate in KB/s (Kilobytes per second) to re-encode the video to.",
         default=35,
     )
+    encoder: Optional[str] = Field(
+        description="The specific encoder to use (e.g., 'h264_nvenc', 'libx264'). If not provided, it will be automatically detected.",
+        default=None,
+    )
+
+    @model_validator(mode="after")
+    def detect_encoder(self):
+        if self.enabled and not self.encoder:
+            from ai_sub.video import get_working_encoder
+
+            self.encoder = get_working_encoder()
+        return self
 
 
 class SplittingSettings(BaseSettings):

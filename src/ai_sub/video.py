@@ -44,6 +44,7 @@ def get_working_encoder() -> str:
     Checks for available hardware acceleration for H.264 encoding.
     Returns the name of the encoder to use (e.g., 'h264_nvenc', 'libx264').
     """
+    static_ffmpeg.add_paths(weak=True)
     # List of hardware encoders to check in order of preference
     candidates = ["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox", "h264_mf"]
 
@@ -171,6 +172,7 @@ def reencode_video(
     fps: int,
     height: int,
     bitrate_kb: int,
+    encoder: str,
 ) -> None:
     """Re-encodes a video file to a specific format.
 
@@ -182,6 +184,7 @@ def reencode_video(
         fps (int): The target framerate.
         height (int): The target height (resolution).
         bitrate_kb (int): The target bitrate in KB/s.
+        encoder (str): The encoder to use.
     """
 
     # If output file already exists, we can just skip the re-encode
@@ -192,7 +195,6 @@ def reencode_video(
         return
 
     static_ffmpeg.add_paths(weak=True)
-    encoder = get_working_encoder()
     video_bytes_per_sec = bitrate_kb * 1024
 
     cmd_encode = [

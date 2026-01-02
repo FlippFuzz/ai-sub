@@ -55,6 +55,7 @@ class ReEncodeJobRunner(JobRunner[ReEncodingJob]):
                 job.fps,
                 job.height,
                 job.bitrate_kb,
+                self.settings.split.re_encode.encoder or "libx264",
             )
 
             duration = get_video_duration_ms(job.output_file)
