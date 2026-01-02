@@ -12,7 +12,7 @@ class Subtitles(BaseModel):
     start: str
     end: str
     english: str
-    japanese: str
+    original: str
     alignment_source: str
     type: str
 
@@ -77,7 +77,7 @@ class AiResponse(BaseModel):
     def get_ssafile(self) -> SSAFile:
         """
         Converts the AiResponse's subtitles into an SSAFile object.
-        Handles timestamp parsing and combines English and Japanese text.
+        Handles timestamp parsing and combines English and Original text.
 
         Returns:
             SSAFile: An SSAFile object containing the parsed subtitles.
@@ -88,13 +88,13 @@ class AiResponse(BaseModel):
             start = AiResponse._parse_timestamp_string_ms(subtitle.start)
             end = AiResponse._parse_timestamp_string_ms(subtitle.end)
             english_text = subtitle.english.strip()
-            japanese_text = subtitle.japanese.strip()
+            original_text = subtitle.original.strip()
 
-            # If Gemini returns the same text for En and Jp, just use the Jp
-            if english_text.lower() == japanese_text.lower():
-                text = japanese_text
+            # If Gemini returns the same text for En and Original, just use the Original
+            if english_text.lower() == original_text.lower():
+                text = original_text
             else:
-                text = f"{japanese_text}\n{english_text}"
+                text = f"{original_text}\n{english_text}"
 
             subtitles.append(SSAEvent(start=start, end=end, text=text))
 
