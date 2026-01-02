@@ -17,7 +17,7 @@ from pysubs2 import SSAEvent, SSAFile
 class Subtitles(BaseModel):
     """Represents a single subtitle entry with start/end times and text."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
     start: str = Field(alias="s")
     end: str = Field(alias="e")
@@ -30,7 +30,7 @@ class Subtitles(BaseModel):
 class AiResponse(BaseModel):
     """Represents the structured response from the AI model containing a list of subtitles."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
     subtitles: list[Subtitles] = Field(alias="subs")
     model_name: Optional[str] = None
