@@ -38,10 +38,22 @@ class AiResponse(BaseModel):
     @field_validator("subtitles")
     @classmethod
     def validate_timestamps(cls, v: list[Subtitles]) -> list[Subtitles]:
+        """
+        Validates the timestamps for all subtitles.
+
+        Checks:
+        1. Format: Timestamps must be parseable (e.g., "MM:SS.mmm").
+        2. Logic: Start time must be strictly before end time.
+        """
         for subtitle in v:
             try:
-                cls._parse_timestamp_string_ms(subtitle.start)
-                cls._parse_timestamp_string_ms(subtitle.end)
+                start_ms = cls._parse_timestamp_string_ms(subtitle.start)
+                end_ms = cls._parse_timestamp_string_ms(subtitle.end)
+
+                if start_ms >= end_ms:
+                    raise ValueError(
+                        f"Start time ({subtitle.start}) must be strictly before end time ({subtitle.end})"
+                    )
             except ValueError as e:
                 raise ValueError(f"Invalid timestamp in subtitle: {subtitle}. {e}")
         return v
