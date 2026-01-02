@@ -1,3 +1,4 @@
+import string
 from pathlib import Path
 from typing import Optional
 
@@ -84,14 +85,19 @@ class AiResponse(BaseModel):
         """
         subtitles = SSAFile()
 
+        translator = str.maketrans("", "", string.punctuation)
+
         for subtitle in self.subtitles:
             start = AiResponse._parse_timestamp_string_ms(subtitle.start)
             end = AiResponse._parse_timestamp_string_ms(subtitle.end)
             english_text = subtitle.english.strip()
             original_text = subtitle.original.strip()
 
-            # If Gemini returns the same text for En and Original, just use the Original
-            if english_text.lower() == original_text.lower():
+            english_norm = english_text.casefold().translate(translator)
+            original_norm = original_text.casefold().translate(translator)
+
+            # If Gemini returns the similar text for En and Original, just use the Original
+            if english_norm == original_norm:
                 text = original_text
             else:
                 text = f"{original_text}\n{english_text}"
