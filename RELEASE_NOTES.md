@@ -1,5 +1,27 @@
 # AI Sub Release Notes
 
+## v1.4.0
+
+This release optimizes token usage, expands language support, and improves subtitle quality through Chain of Thought processing.
+
+**New Features & Improvements:**
+
+- **Universal Language Support:** Updated the prompt to support all input languages, removing the restriction to Japanese.
+- **Chain of Thought:** The prompt now requests scene descriptions to trigger Chain of Thought processing, improving subtitle context and accuracy.
+- **Token Optimization:** Shortened JSON keys (e.g., `start` to `s`, `end` to `e`) to save output tokens.
+- **Smart Display:** Logic added to display only the original subtitle when the English translation is substantially similar.
+- **Timestamp Validation:** Enhanced validation logic for subtitle timestamps.
+- **Encoder Option:** Added an encoder option to `ReEncodeSettings`.
+- **Error Status:** Added "Max Retries Exceeded" status to generated subtitles.
+
+**Bug Fixes:**
+
+- **Pydantic Deprecation:** Switched to `validate_by_name` and `validate_by_alias` to avoid `populate_by_name` deprecation warnings in Pydantic v3.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.3.1...v1.4.0
+
+---
+
 ## v1.3.1
 
 This release fixes an issue where videos containing non-UTF-8 data could cause the application to crash.
