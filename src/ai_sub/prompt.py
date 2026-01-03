@@ -1,7 +1,8 @@
 from textwrap import dedent
 
 # Notes:
-# * Forcing the AI to state the alignment_source to hopefully make sure that it correctly aligns the audio.
+# * The 'src' and 't' fields are added to trigger "Chain of Thought" processing, ensuring the AI verifies timestamps and categorizes text. These fields are not used by the application logic.
+# * The 'scenes' field is added to trigger "Chain of Thought" processing. By forcing the AI to describe the scene first, we improve the context for the subsequent subtitles. This field is not used by the application logic.
 
 PROMPT = dedent(
     """
@@ -67,7 +68,7 @@ PROMPT = dedent(
 
     ### INTERNAL CHAIN-OF-THOUGHT (STEP-BY-STEP PROCESS)
     1.  **Audio Detection:** Scan audio for **ANY** human speech. Be aggressive in detecting faint voices or speech mixed with music/SFX. Do not dismiss audio as 'noise' if there is a chance it contains speech.
-    2.  **Context Analysis:** Check visuals (who/where), surrounding dialogue, and **reconstruct the full sentence** if it spans multiple segments.
+    2.  **Context Analysis:** Check visuals (who/where). Identify the sequence of scenes (e.g. MC, Song). Note song names and singers if present. Reconstruct full sentences if split.
     3.  **Anchor Identification:** Identify the **First Word** and **Last Word** of the specific phrase segment.
     4.  **Timestamp Extraction:** Locate the native audio timestamps for these anchors. **Verify against audio tokens.** Ensure the `e` timestamp captures the full sound decay.
     5.  **Translation/Transcription:** Apply language directionality and **Semantic Continuity** rules.
@@ -87,12 +88,20 @@ PROMPT = dedent(
     *Output:*
     ```json
     {
+      "scenes": [
+        {
+          "s": "00:00.000",
+          "e": "00:05.000",
+          "d": "A person speaking directly to the camera.",
+          "spk": ["Speaker A"]
+        }
+      ],
       "subs": [
         {
           "s": "00:01.200",
           "e": "00:03.500",
-          "en": "Hello, how are you doing today?",
           "og": "Hello, how are you doing today?",
+          "en": "Hello, how are you doing today?",
           "src": "audio_tokens",
           "t": "dialogue"
         }
@@ -105,20 +114,69 @@ PROMPT = dedent(
     *Output:*
     ```json
     {
+      "scenes": [
+        {
+          "s": "00:00.000",
+          "e": "00:15.000",
+          "d": "A person pausing while thinking about food.",
+          "spk": ["Speaker A"]
+        }
+      ],
       "subs": [
         {
           "s": "00:10.200",
           "e": "00:11.100",
-          "en": "I...",
           "og": "私は...",
+          "en": "I...",
           "src": "audio_tokens",
           "t": "dialogue"
         },
         {
           "s": "00:12.500",
           "e": "00:14.000",
-          "en": "...like sushi.",
           "og": "...寿司が好きです。",
+          "en": "...like sushi.",
+          "src": "audio_tokens",
+          "t": "dialogue"
+        }
+      ]
+    }
+    ```
+
+    **Example 3: Multiple Scenes (Song to MC Transition)**
+    *Input Audio:* (Singing) "La la la..." (Applause) "Thank you everyone!"
+    *Output:*
+    ```json
+    {
+      "scenes": [
+        {
+          "s": "00:00.000",
+          "e": "00:10.000",
+          "d": "Performance of the song 'Starlight'.",
+          "song": "Starlight",
+          "spk": ["Singer A"]
+        },
+        {
+          "s": "00:10.000",
+          "e": "00:20.000",
+          "d": "MC section after the song, thanking the audience.",
+          "spk": ["Singer A"]
+        }
+      ],
+      "subs": [
+        {
+          "s": "00:05.000",
+          "e": "00:08.000",
+          "og": "La la la...",
+          "en": "La la la...",
+          "src": "audio_tokens",
+          "t": "dialogue"
+        },
+        {
+          "s": "00:12.000",
+          "e": "00:14.000",
+          "og": "Thank you everyone!",
+          "en": "Thank you everyone!",
           "src": "audio_tokens",
           "t": "dialogue"
         }
@@ -129,17 +187,32 @@ PROMPT = dedent(
     ### OUTPUT FORMAT
     *   Return **ONLY** a valid, parseable JSON object.
     *   **NO Markdown, NO Commentary, NO HTML Entities.**
+    *   **scenes:** An array of objects describing the distinct scenes in the video (e.g., MC section, Song performance).
+        *   **s:** Start time of the scene (`MM:SS.mmm`).
+        *   **e:** End time of the scene (`MM:SS.mmm`).
+        *   **d:** Description of the scene.
+        *   **song:** Name of the song (if applicable).
+        *   **spk:** List of active speakers or singers.
     *   **src:** State the source used for timestamp alignment (`audio_tokens`, `visual_inference`, or `gap_calculation`).
     *   **t:** Classify as `dialogue` or `on_screen_text`.
 
     **JSON Schema:**
     {
+    "scenes": [
+        {
+        "s": "MM:SS.mmm",
+        "e": "MM:SS.mmm",
+        "d": "String",
+        "song": "String (Optional)",
+        "spk": ["String"]
+        }
+    ],
     "subs": [
         {
         "s": "MM:SS.mmm",
         "e": "MM:SS.mmm",
-        "en": "String",
         "og": "String",
+        "en": "String",
         "src": "String",
         "t": "String"
         }

@@ -21,10 +21,22 @@ class Subtitles(BaseModel):
 
     start: str = Field(alias="s")
     end: str = Field(alias="e")
-    english: str = Field(alias="en")
     original: str = Field(alias="og")
+    english: str = Field(alias="en")
     alignment_source: str = Field(alias="src")
     type: str = Field(alias="t")
+
+
+class Scene(BaseModel):
+    """Represents a visual or audio scene within the video segment."""
+
+    model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
+
+    start: str = Field(alias="s")
+    end: str = Field(alias="e")
+    description: str = Field(alias="d")
+    song_name: Optional[str] = Field(default=None, alias="song")
+    speakers: list[str] = Field(default_factory=list, alias="spk")
 
 
 class AiResponse(BaseModel):
@@ -32,6 +44,7 @@ class AiResponse(BaseModel):
 
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
+    scenes: list[Scene] = Field(default_factory=list)
     subtitles: list[Subtitles] = Field(alias="subs")
     model_name: Optional[str] = None
 
