@@ -283,6 +283,7 @@ def ai_sub(settings: Settings) -> None:
     if settings.split.re_encode.enabled and not settings.split.re_encode.encoder:
         with logfire.span("Detecting hardware encoder"):
             settings.split.re_encode.encoder = get_working_encoder()
+            logfire.info(f"Using encoder: {settings.split.re_encode.encoder}")
 
     # Initialize the AI Agent.
     # A custom wrapper is used to make handling rate limits and differences in models more cleanly
