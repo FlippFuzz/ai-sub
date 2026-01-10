@@ -225,6 +225,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         nested_model_default_partial_update=True,
         cli_avoid_json=True,
+        cli_kebab_case=True,
         env_file=".env",
         env_file_encoding="utf-8",
         env_prefix="AISUB_",
