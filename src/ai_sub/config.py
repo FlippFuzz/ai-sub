@@ -126,14 +126,6 @@ class ReEncodeSettings(BaseSettings):
         default=None,
     )
 
-    @model_validator(mode="after")
-    def detect_encoder(self):
-        if self.enabled and not self.encoder:
-            from ai_sub.video import get_working_encoder
-
-            self.encoder = get_working_encoder()
-        return self
-
 
 class SplittingSettings(BaseSettings):
     model_config = SettingsConfigDict(

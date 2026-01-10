@@ -20,7 +20,12 @@ from ai_sub.data_models import (
 from ai_sub.gemini_file_uploader import GeminiFileUploader
 from ai_sub.job_runner import JobRunner
 from ai_sub.prompt import SUBTITLES_PROMPT, SUBTITLES_PROMPT_VERSION
-from ai_sub.video import get_video_duration_ms, reencode_video, split_video
+from ai_sub.video import (
+    get_video_duration_ms,
+    get_working_encoder,
+    reencode_video,
+    split_video,
+)
 
 
 class ReEncodeJobRunner(JobRunner[ReEncodingJob]):
@@ -274,6 +279,10 @@ def ai_sub(settings: Settings) -> None:
     )
     no_console_logfire.instrument_pydantic_ai()
     no_console_logfire.instrument_httpx(capture_all=True)
+
+    if settings.split.re_encode.enabled and not settings.split.re_encode.encoder:
+        with logfire.span("Detecting hardware encoder"):
+            settings.split.re_encode.encoder = get_working_encoder()
 
     # Initialize the AI Agent.
     # A custom wrapper is used to make handling rate limits and differences in models more cleanly
