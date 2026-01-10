@@ -13,6 +13,8 @@ from pydantic import (
 )
 from pysubs2 import SSAEvent, SSAFile
 
+from ai_sub.config import Settings
+
 
 class Subtitles(BaseModel):
     """Represents a single subtitle entry with start/end times and text."""
@@ -141,6 +143,16 @@ class AiResponse(BaseModel):
             subtitles.append(SSAEvent(start=start, end=end, text=text))
 
         return subtitles
+
+
+class SubtitleGenerationState(BaseModel):
+    """Represents the state of the subtitle generation process."""
+
+    ai_sub_version: str
+    subtitles_prompt_version: int
+    complete: bool = True
+    max_retries_exceeded: bool = False
+    settings: Settings
 
 
 class Job(BaseModel):

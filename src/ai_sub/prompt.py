@@ -1,10 +1,13 @@
 from textwrap import dedent
 
+# Version number is incremented whenever SUBTITLES_PROMPT is updated
+SUBTITLES_PROMPT_VERSION = 1
+
 # Notes:
 # * The 'src' and 't' fields are added to trigger "Chain of Thought" processing, ensuring the AI verifies timestamps and categorizes text. These fields are not used by the application logic.
 # * The 'scenes' field is added to trigger "Chain of Thought" processing. By forcing the AI to describe the scene first, we improve the context for the subsequent subtitles. This field is not used by the application logic.
 
-PROMPT = dedent(
+SUBTITLES_PROMPT = dedent(
     """
     You are an advanced AI expert in audio-visual translation and subtitling. Your specialty is generating **audio-synchronized**, contextually rich subtitles from multimodal inputs using native audio tokenization.
 
