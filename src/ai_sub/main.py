@@ -6,7 +6,7 @@ from threading import Event
 from typing import Any, Callable
 
 import logfire
-from pydantic import ValidationError
+from pydantic_settings import CliApp
 from pysubs2 import SSAEvent, SSAFile
 
 from ai_sub.agent_wrapper import RateLimitedAgentWrapper
@@ -227,14 +227,9 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
         )
 
 
-def main():
+def run(settings: Settings) -> None:
     """
-    Main function to generate subtitles for a video file.
-
-    This function orchestrates the entire subtitling process. It starts by parsing
-    command-line arguments and environment variables to configure the application settings.
-    It then sets up logging and initializes the appropriate AI agent based on the
-    selected model.
+    Runs the subtitle generation process.
 
     The core workflow is as follows:
     1.  The input video is split into smaller, manageable segments.
@@ -245,13 +240,6 @@ def main():
     6.  Finally, it stitches together the subtitles from all segments, adjusting
         timestamps to create a single, synchronized subtitle file for the original video.
     """
-    # Parse settings from CLI arguments, environment variables, and .env file.
-    try:
-        settings = Settings()  # pyright: ignore
-    except ValidationError as ve:
-        print(ve)
-        exit(-1)
-
     # Configure Logfire for observability. This setup includes a console logger
     # and another configuration to instrument libraries like Pydantic AI and HTTPX
     # without sending their logs to the console.
@@ -441,6 +429,16 @@ def main():
         stitch_subtitles(video_splits, settings)
 
         logfire.info("Done")
+
+
+def main():
+    """
+    Main function to generate subtitles for a video file via CLI.
+    """
+    # Parse settings from CLI arguments, environment variables, and .env file.
+    settings = CliApp.run(Settings)
+
+    run(settings)
 
 
 if __name__ == "__main__":
