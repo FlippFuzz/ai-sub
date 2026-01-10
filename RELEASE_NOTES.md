@@ -1,5 +1,22 @@
 # AI Sub Release Notes
 
+## v1.5.0
+
+This release introduces a Python API for programmatic usage and adds versioning for subtitle prompts.
+
+**New Features & Improvements:**
+
+- **Python API:** Users can now invoke ai-sub directly within Python scripts, enabling seamless integration into custom workflows.
+- **Prompt Versioning:** Added `SUBTITLES_PROMPT_VERSION` to track and manage changes to the subtitle generation prompt.
+
+**Bug Fixes:**
+
+- **Logfire Configuration:** Fixed a `LogfireNotConfiguredWarning` by moving hardware encoder detection logic to run after Logfire initialization.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.4.0...v1.5.0
+
+---
+
 ## v1.4.0
 
 This release optimizes token usage, expands language support, and improves subtitle quality through Chain of Thought processing.
