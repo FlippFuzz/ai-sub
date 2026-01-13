@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -98,6 +99,13 @@ class AiSettings(BaseSettings):
                 "A Google AI API key must be provided either via the 'key' field, GOOGLE_API_KEY, GEMINI_API_KEY or AISUB_AI_GOOGLE_KEY environment variables."
             )
         return self
+
+    def get_sanitized_model_name(self) -> str:
+        """
+        Sanitizes the model name to be safe for filenames.
+        Removes all non-alphanumeric characters.
+        """
+        return re.sub(r"[^a-zA-Z0-9]", "", self.model)
 
 
 class ReEncodeSettings(BaseSettings):

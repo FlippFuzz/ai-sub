@@ -152,11 +152,12 @@ class SubtitleJobRunner(JobRunner[SubtitleJob]):
         don't need to be re-processed.
         """
         # Save the completed job state to a JSON file for persistence.
-        job.save(self.settings.dir.tmp / f"{job.name}.json")
+        sanitized_model = self.settings.ai.get_sanitized_model_name()
+        job.save(self.settings.dir.tmp / f"{job.name}.{sanitized_model}.json")
         if job.response is not None:
             # Also generate a subtitle file for this job for the user to view.
             job.response.get_ssafile().save(
-                str(self.settings.dir.tmp / f"{job.name}.srt")
+                str(self.settings.dir.tmp / f"{job.name}.{sanitized_model}.srt")
             )
 
 
@@ -182,10 +183,12 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
             settings=settings,
         )
 
+        sanitized_model = settings.ai.get_sanitized_model_name()
+
         for video_path, video_duration_ms in video_splits:
             # Load the job result from the temporary JSON file.
             job = SubtitleJob.load_or_return_new(
-                settings.dir.tmp / f"{video_path.stem}.json",
+                settings.dir.tmp / f"{video_path.stem}.{sanitized_model}.json",
                 video_path.stem,
                 video_path,
                 video_duration_ms,
@@ -239,7 +242,10 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
             all_subtitles[1].start = 1
 
         all_subtitles.save(
-            str(settings.dir.out / f"{settings.input_video_file.stem}.srt")
+            str(
+                settings.dir.out
+                / f"{settings.input_video_file.stem}.{sanitized_model}.srt"
+            )
         )
 
 
@@ -308,9 +314,10 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> None:
         # This allows the process to be resumed. It checks for the existence of a
         # .json file which indicates a completed (or failed) job.
         videos_to_work_on: list[tuple[Path, int]] = []
+        sanitized_model = settings.ai.get_sanitized_model_name()
         for split, video_duration_ms in video_splits:
             possibleJob = SubtitleJob.load_or_return_new(
-                settings.dir.tmp / f"{split.stem}.json",
+                settings.dir.tmp / f"{split.stem}.{sanitized_model}.json",
                 split.stem,
                 split,
                 video_duration_ms,
