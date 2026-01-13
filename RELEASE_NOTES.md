@@ -1,5 +1,18 @@
 # AI Sub Release Notes
 
+## v1.6.0
+
+This release adds support for disabling default logging configuration and includes the model name in output filenames to prevent collisions.
+
+**New Features & Improvements:**
+
+- **Flexible Logging:** Added an optional `configure_logging` parameter to `ai_sub` (defaulting to `True`). This allows external applications to use `ai_sub` without conflicting with their own logging or `logfire` configuration.
+- **Model-Specific Output Files:** Intermediate and final output filenames now include the sanitized AI model name. This prevents file collisions when testing different models on the same video.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.5.0...v1.6.0
+
+---
+
 ## v1.5.0
 
 This release introduces a Python API for programmatic usage and adds versioning for subtitle prompts.
