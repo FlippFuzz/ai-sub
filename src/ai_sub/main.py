@@ -243,7 +243,7 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
         )
 
 
-def ai_sub(settings: Settings) -> None:
+def ai_sub(settings: Settings, configure_logging: bool = True) -> None:
     """
     Runs the subtitle generation process.
 
@@ -256,29 +256,30 @@ def ai_sub(settings: Settings) -> None:
     6.  Finally, it stitches together the subtitles from all segments, adjusting
         timestamps to create a single, synchronized subtitle file for the original video.
     """
-    # Configure Logfire for observability. This setup includes a console logger
-    # and another configuration to instrument libraries like Pydantic AI and HTTPX
-    # without sending their logs to the console.
-    logfire.configure(
-        console=logfire.ConsoleOptions(
-            min_log_level=settings.log.level,
-            include_timestamps=settings.log.timestamps,
-        ),
-        service_name=socket.gethostname(),
-        service_version=version("ai-sub"),
-        send_to_logfire="if-token-present",
-        # Logfire scrubs by default (None). We pass False to disable it if configured.
-        scrubbing=None if settings.log.scrub else False,
-    )
-    no_console_logfire = logfire.configure(
-        local=True,
-        console=False,
-        send_to_logfire="if-token-present",
-        # Logfire scrubs by default (None). We pass False to disable it if configured.
-        scrubbing=None if settings.log.scrub else False,
-    )
-    no_console_logfire.instrument_pydantic_ai()
-    no_console_logfire.instrument_httpx(capture_all=True)
+    if configure_logging:
+        # Configure Logfire for observability. This setup includes a console logger
+        # and another configuration to instrument libraries like Pydantic AI and HTTPX
+        # without sending their logs to the console.
+        logfire.configure(
+            console=logfire.ConsoleOptions(
+                min_log_level=settings.log.level,
+                include_timestamps=settings.log.timestamps,
+            ),
+            service_name=socket.gethostname(),
+            service_version=version("ai-sub"),
+            send_to_logfire="if-token-present",
+            # Logfire scrubs by default (None). We pass False to disable it if configured.
+            scrubbing=None if settings.log.scrub else False,
+        )
+        no_console_logfire = logfire.configure(
+            local=True,
+            console=False,
+            send_to_logfire="if-token-present",
+            # Logfire scrubs by default (None). We pass False to disable it if configured.
+            scrubbing=None if settings.log.scrub else False,
+        )
+        no_console_logfire.instrument_pydantic_ai()
+        no_console_logfire.instrument_httpx(capture_all=True)
 
     if settings.split.re_encode.enabled and not settings.split.re_encode.encoder:
         with logfire.span("Detecting hardware encoder"):
