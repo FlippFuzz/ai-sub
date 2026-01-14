@@ -1,5 +1,17 @@
 # AI Sub Release Notes
 
+## v1.6.1
+
+This release fixes an issue where the provider prefix was included in the sanitized model name used for filenames.
+
+**Bug Fixes:**
+
+- **Model Name Sanitization:** Updated `get_sanitized_model_name` to strip the provider prefix (e.g., `gemini-cli:`) from the model string, ensuring cleaner filenames (e.g., `gemini3propreview` instead of `geminicligemini3propreview`).
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.6.0...v1.6.1
+
+---
+
 ## v1.6.0
 
 This release adds support for disabling default logging configuration and includes the model name in output filenames to prevent collisions.
