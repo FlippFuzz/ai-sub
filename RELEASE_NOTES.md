@@ -1,5 +1,17 @@
 # AI Sub Release Notes
 
+## v1.6.2
+
+This release fixes an issue where sub-settings classes were not exported from the package root.
+
+**Bug Fixes:**
+
+- **Export Settings Classes:** Updated `__init__.py` to explicitly export all settings models defined in `config.py` (such as `GeminiCliSettings` and `GoogleAiSettings`). Previously, only the main `Settings` class was exported, requiring users to import from the internal `config` module for specific sub-settings.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.6.1...v1.6.2
+
+---
+
 ## v1.6.1
 
 This release fixes an issue where the provider prefix was included in the sanitized model name used for filenames.
