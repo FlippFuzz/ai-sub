@@ -1,5 +1,29 @@
-from .config import Settings
+from .config import (
+    AiSettings,
+    DirectorySettings,
+    GeminiCliSettings,
+    GoogleAiSettings,
+    LoggingSettings,
+    ReEncodeSettings,
+    RetrySettings,
+    Settings,
+    SplittingSettings,
+    ThreadSettings,
+)
 from .main import ai_sub
 from .prompt import SUBTITLES_PROMPT_VERSION
 
-__all__ = ["Settings", "ai_sub", "SUBTITLES_PROMPT_VERSION"]
+__all__ = [
+    "AiSettings",
+    "DirectorySettings",
+    "GeminiCliSettings",
+    "GoogleAiSettings",
+    "LoggingSettings",
+    "ReEncodeSettings",
+    "RetrySettings",
+    "Settings",
+    "SplittingSettings",
+    "ThreadSettings",
+    "ai_sub",
+    "SUBTITLES_PROMPT_VERSION",
+]
