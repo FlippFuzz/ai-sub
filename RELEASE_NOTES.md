@@ -1,5 +1,24 @@
 # AI Sub Release Notes
 
+## v1.7.0
+
+This release implements standardized return codes for the application and refactors the main entry point.
+
+**New Features & Improvements:**
+
+- **Exit Codes:** The application now returns specific exit codes to indicate the result of the operation: `0` (COMPLETE), `-1` (INCOMPLETE), and `-2` (MAX_RETRIES_EXHAUSTED).
+
+**Code Improvements:**
+
+- **Type Definitions:** Added `AiSubResult` IntEnum in `data_models.py` to formally define execution states.
+- **Exports:** Exposed `AiSubResult` in `__init__.py` for easier import.
+- **Cleanup:** Removed the `main()` wrapper function in `main.py` and moved execution logic to the `__main__` block.
+- **Documentation:** Added missing docstrings to `AiSubResult` and `Job` classes.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.6.2...v1.7.0
+
+---
+
 ## v1.6.2
 
 This release fixes an issue where sub-settings classes were not exported from the package root.
