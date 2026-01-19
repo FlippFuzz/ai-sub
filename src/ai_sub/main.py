@@ -1,4 +1,5 @@
 import socket
+import sys
 from collections import deque
 from importlib.metadata import version
 from pathlib import Path
@@ -12,6 +13,7 @@ from pysubs2 import SSAEvent, SSAFile
 from ai_sub.agent_wrapper import RateLimitedAgentWrapper
 from ai_sub.config import Settings
 from ai_sub.data_models import (
+    AiSubResult,
     ReEncodingJob,
     SubtitleGenerationState,
     SubtitleJob,
@@ -161,7 +163,9 @@ class SubtitleJobRunner(JobRunner[SubtitleJob]):
             )
 
 
-def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -> None:
+def stitch_subtitles(
+    video_splits: list[tuple[Path, int]], settings: Settings
+) -> SubtitleGenerationState:
     """
     Assembles the final subtitle file from processed segments.
 
@@ -172,6 +176,9 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
     Args:
         video_splits: A list of tuples containing the path and duration of each video segment.
         settings: The application's configuration settings.
+
+    Returns:
+        SubtitleGenerationState: The final state of the subtitle generation process.
     """
     with logfire.span("Producing final SRT file"):
         all_subtitles = SSAFile()
@@ -247,9 +254,10 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
                 / f"{settings.input_video_file.stem}.{sanitized_model}.srt"
             )
         )
+        return state
 
 
-def ai_sub(settings: Settings, configure_logging: bool = True) -> None:
+def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
     """
     Runs the subtitle generation process.
 
@@ -261,6 +269,9 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> None:
     5.  The application waits for all processing to complete.
     6.  Finally, it stitches together the subtitles from all segments, adjusting
         timestamps to create a single, synchronized subtitle file for the original video.
+
+    Returns:
+        AiSubResult: The result code indicating the success or failure state of the operation.
     """
     if configure_logging:
         # Configure Logfire for observability. This setup includes a console logger
@@ -455,20 +466,21 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> None:
 
         # Step 6: Assemble the final subtitle file.
         # Recalculate durations as they might have changed or were unknown during re-encoding
-        stitch_subtitles(video_splits, settings)
+        state = stitch_subtitles(video_splits, settings)
 
-        logfire.info("Done")
+        # Return the final result
+        result = AiSubResult.COMPLETE
+        if state.max_retries_exceeded:
+            result = AiSubResult.MAX_RETRIES_EXHAUSTED
+        elif not state.complete:
+            result = AiSubResult.INCOMPLETE
 
-
-def main():
-    """
-    Main function to generate subtitles for a video file via CLI.
-    """
-    # Parse settings from CLI arguments, environment variables, and .env file.
-    settings = CliApp.run(Settings)
-
-    ai_sub(settings)
+        logfire.info(f"Done - {result}")
+        return result
 
 
 if __name__ == "__main__":
-    main()
+    # Parse settings from CLI arguments, environment variables, and .env file.
+    settings = CliApp.run(Settings)
+
+    sys.exit(ai_sub(settings).value)

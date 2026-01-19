@@ -1,4 +1,5 @@
 import string
+from enum import IntEnum
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +15,14 @@ from pydantic import (
 from pysubs2 import SSAEvent, SSAFile
 
 from ai_sub.config import Settings
+
+
+class AiSubResult(IntEnum):
+    """Result codes for the AI subtitle generation process."""
+
+    COMPLETE = 0
+    INCOMPLETE = -1
+    MAX_RETRIES_EXHAUSTED = -2
 
 
 class Subtitles(BaseModel):
@@ -156,6 +165,8 @@ class SubtitleGenerationState(BaseModel):
 
 
 class Job(BaseModel):
+    """Base class for all job types in the processing pipeline."""
+
     run_num_retries: NonNegativeInt = 0
     total_num_retries: NonNegativeInt = 0
 
