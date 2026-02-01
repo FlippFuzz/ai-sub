@@ -1,5 +1,23 @@
 # AI Sub Release Notes
 
+## v1.9.0
+
+This release refines the subtitle generation prompt to improve Japanese transcription quality, noise handling, and JSON formatting.
+
+**New Features & Improvements:**
+
+- **Prompt Refinement:** Updated `SUBTITLES_PROMPT` to improve noise handling by explicitly excluding non-speech sounds like applause and laughter. Additionally, on-screen text logic is now more generous, ensuring important context is captured.
+- **JSON Formatting:** Added explicit instructions to escape double quotes within JSON strings to ensure valid parsing.
+
+**Bug Fixes:**
+
+- **Japanese Transcription:** Updated the prompt to strictly enforce native script (Kanji/Kana) for the `og` field when transcribing Japanese audio, explicitly forbidding Romaji.
+- **Prompt Version:** Incremented `SUBTITLES_PROMPT_VERSION` to 2.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.8.0...v1.9.0
+
+---
+
 ## v1.8.0
 
 This release improves the readability of output filenames by refining how AI model names are sanitized.
