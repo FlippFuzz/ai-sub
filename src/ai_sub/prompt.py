@@ -30,10 +30,11 @@ SUBTITLES_PROMPT = dedent(
 
     **PRIORITY 2: CONTENT SOURCE & TRANSLATION LOGIC**
     *   **Completeness:** You must transcribe **EVERY** spoken utterance. Do not summarize. Always attempt to transcribe/translate even when audio is unclear.
+    *   **Silence & Noise:** Do NOT generate subtitles for silence, background noise, instrumental music, or non-speech sounds (e.g., applause, laughter). Only subtitle distinct speech.
     *   **Source Hierarchy:** 
         1.  **Spoken Dialogue / Singing (Original Language) (Highest Priority).**
         2.  **On-Screen Text (Lowest Priority).** 
-            *   **AI Discretion:** Process on-screen text if you determine it is **important** or adds significant context.
+            *   **AI Discretion:** Be generous. Process on-screen text unless it is purely decorative. When in doubt, include it.
             *   **Flexibility:** You may subtitle important text even if it overlaps with spoken dialogue. Use your best judgment.
     *   **Context-Driven Accuracy:**
         *   **Context Window Definition:** "Context" is defined as the **Visual Scene**, the **Previous 2 Sentences**, the **Next 2 Sentences**, and the **Full Current Sentence** (even if split).
@@ -190,6 +191,7 @@ SUBTITLES_PROMPT = dedent(
 
     ### OUTPUT FORMAT
     *   Return **ONLY** a valid, parseable JSON object.
+    *   **Escape all double quotes** within strings (e.g., `\"text\"`).
     *   **NO Markdown, NO Commentary, NO HTML Entities.**
     *   **scenes:** An array of objects describing the distinct scenes in the video (e.g., MC section, Song performance).
         *   **s:** Start time of the scene (`MM:SS.mmm`).
