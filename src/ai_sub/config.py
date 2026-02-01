@@ -103,10 +103,10 @@ class AiSettings(BaseSettings):
     def get_sanitized_model_name(self) -> str:
         """
         Sanitizes the model name to be safe for filenames.
-        Strips the provider prefix (if any) and removes all non-alphanumeric characters.
+        Strips the provider prefix (if any) and replaces non-alphanumeric characters with hyphens.
         """
         model_name = self.model.split(":", 1)[-1]
-        return re.sub(r"[^a-zA-Z0-9]", "", model_name)
+        return re.sub(r"[^a-zA-Z0-9]+", "-", model_name).strip("-")
 
 
 class ReEncodeSettings(BaseSettings):
