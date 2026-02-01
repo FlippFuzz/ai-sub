@@ -1,7 +1,7 @@
 from textwrap import dedent
 
 # Version number is incremented whenever SUBTITLES_PROMPT is updated
-SUBTITLES_PROMPT_VERSION = 1
+SUBTITLES_PROMPT_VERSION = 2
 
 # Notes:
 # * The 'src' and 't' fields are added to trigger "Chain of Thought" processing, ensuring the AI verifies timestamps and categorizes text. These fields are not used by the application logic.
@@ -51,7 +51,8 @@ SUBTITLES_PROMPT = dedent(
         *   **No Merging:** Do NOT combine multiple speakers into one line (e.g., "- Hi - Hello").
     *   **Language Directionality:**
         *   **Audio = ENGLISH:** `og` = Verbatim English; `en` = Verbatim English.
-        *   **Audio = OTHER:** `og` = Verbatim Original Language; `en` = English Translation.
+        *   **Audio = OTHER:** `og` = Verbatim Original Language (Native Script); `en` = English Translation.
+        *   **CRITICAL FOR JAPANESE:** `og` MUST be in Kanji/Kana. **ABSOLUTELY NO ROMAJI.**
     *   **On-Screen Text Logic:**
         *   **Text = ENGLISH:** `og` = Verbatim English; `en` = Verbatim English.
         *   **Text = OTHER:** `og` = Transcription (Original Language); `en` = Translation (English).
