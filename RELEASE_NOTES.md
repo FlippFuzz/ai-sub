@@ -1,5 +1,15 @@
 # AI Sub Release Notes
 
+## v1.8.0
+
+This release improves the readability of output filenames by refining how AI model names are sanitized.
+
+**New Features & Improvements:**
+
+- **Model Name Sanitization:** Updated `get_sanitized_model_name` to replace non-alphanumeric characters with hyphens (`-`) instead of removing them entirely. This results in more readable filenames (e.g., `gemini-3-pro-preview` instead of `gemini3propreview`). Leading or trailing hyphens are now stripped from the resulting string.
+
+---
+
 ## v1.7.0
 
 This release implements standardized return codes for the application and refactors the main entry point.
