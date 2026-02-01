@@ -1,5 +1,17 @@
 # AI Sub Release Notes
 
+## v1.9.1
+
+This release fixes a compatibility issue with `pyrate-limiter` v4+.
+
+**Bug Fixes:**
+
+- **Pyrate Limiter Compatibility:** Removed the `raise_when_fail` argument from the `Limiter` constructor in `RateLimitedAgentWrapper`. This argument was removed in `pyrate-limiter` version 4.0.0.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.9.0...v1.9.1
+
+---
+
 ## v1.9.0
 
 This release refines the subtitle generation prompt to improve Japanese transcription quality, noise handling, and JSON formatting.
