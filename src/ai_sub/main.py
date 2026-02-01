@@ -475,7 +475,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         elif not state.complete:
             result = AiSubResult.INCOMPLETE
 
-        logfire.info(f"Done - {result}")
+        logfire.info(f"Done - {result.name}")
         return result
 
 
