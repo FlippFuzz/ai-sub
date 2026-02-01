@@ -57,12 +57,8 @@ class RateLimitedAgentWrapper:
         """
         self.settings = settings
 
-        self.request_limiter = Limiter(
-            Rate(self.settings.ai.rpm, Duration.MINUTE), raise_when_fail=False
-        )
-        self.token_limiter = Limiter(
-            Rate(self.settings.ai.tpm, Duration.MINUTE), raise_when_fail=False
-        )
+        self.request_limiter = Limiter(Rate(self.settings.ai.rpm, Duration.MINUTE))
+        self.token_limiter = Limiter(Rate(self.settings.ai.tpm, Duration.MINUTE))
 
         if self.is_gemini_cli():
             model_str = settings.ai.model.split(":", 1)[1]
