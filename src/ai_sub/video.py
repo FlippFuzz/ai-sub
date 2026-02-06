@@ -128,7 +128,11 @@ def split_video(
     else:
         static_ffmpeg.add_paths(weak=True)
 
-        full_output_pattern = str(output_dir / f"{output_pattern}{ext}")
+        # Escape '%' in the directory path by doubling it ('%%').
+        # This is required because the segment muxer interprets '%' as a format specifier.
+        escaped_dir = str(output_dir).replace("%", "%%")
+        full_output_pattern = str(Path(escaped_dir) / f"{output_pattern}{ext}")
+
         cmd = [
             "ffmpeg",
             "-i",
