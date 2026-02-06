@@ -1,5 +1,17 @@
 # AI Sub Release Notes
 
+## v1.9.2
+
+This release fixes an issue where video segmentation failed if the output directory path contained a percent sign (`%`).
+
+**Bug Fixes:**
+
+- **FFmpeg Path Escaping:** Fixed a bug where FFmpeg's segment muxer would fail or incorrectly interpret paths containing `%` characters (e.g., "Video 100%"). The application now properly escapes these characters in the output directory path, ensuring correct file generation.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.9.1...v1.9.2
+
+---
+
 ## v1.9.1
 
 This release fixes a compatibility issue with `pyrate-limiter` v4+.
