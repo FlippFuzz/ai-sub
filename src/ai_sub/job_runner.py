@@ -2,7 +2,7 @@ import concurrent.futures
 from collections import deque
 from threading import Event
 from time import sleep
-from typing import Generic, TypeVar
+from typing import Any, Callable, Generic, TypeVar
 
 import logfire
 
@@ -23,12 +23,14 @@ class JobRunner(Generic[TJob]):
         queue: deque[TJob],
         settings: Settings,
         max_workers: int,
+        on_complete: Callable[[TJob, Any], None] | None = None,
         stop_events: list[Event] = [],
         name: str = "JobRunner",
     ):
         self.queue = queue
         self.settings = settings
         self.max_workers = max_workers
+        self.on_complete = on_complete
         self.stop_events = stop_events
         self.name = name
         self.executor: concurrent.futures.ThreadPoolExecutor | None = None
@@ -65,7 +67,9 @@ class JobRunner(Generic[TJob]):
                 job.run_num_retries += 1
                 job.total_num_retries += 1
 
-                self.process(job)
+                result = self.process(job)
+                if self.on_complete:
+                    self.on_complete(job, result)
 
             except IndexError:
                 # The queue is empty.
@@ -95,7 +99,7 @@ class JobRunner(Generic[TJob]):
                             f"Exception in post_process for {self.name} job"
                         )
 
-    def process(self, job: TJob) -> None:
+    def process(self, job: TJob) -> Any:
         raise NotImplementedError
 
     def post_process(self, job: TJob) -> None:

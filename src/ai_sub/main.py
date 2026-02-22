@@ -43,22 +43,17 @@ class ReEncodeJobRunner(JobRunner[ReEncodingJob]):
         queue: deque[ReEncodingJob],
         settings: Settings,
         max_workers: int,
-        next_queue: deque[Any],
-        next_job_factory: Callable[[Path, int], Any],
+        on_complete: Callable[[ReEncodingJob, Any], None],
         stop_events: list[Event] = [],
         name: str = "ReEncode",
     ):
-        super().__init__(queue, settings, max_workers, stop_events, name)
-        self.next_queue = next_queue
-        self.next_job_factory = next_job_factory
+        super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
 
     def process(self, job: ReEncodingJob) -> None:
         """
         Re-encodes the video file specified in the job.
 
-        After re-encoding, it calculates the new duration, creates the next job
-        (either an UploadJob or a SubtitleJob) using the factory, and adds it
-        to the next queue.
+        After re-encoding, it returns None, triggering the on_complete callback in the runner.
         """
         with logfire.span(f"Re-encoding {job.input_file.name}"):
             reencode_video(
@@ -70,9 +65,6 @@ class ReEncodeJobRunner(JobRunner[ReEncodingJob]):
                 self.settings.split.re_encode.encoder or "libx264",
             )
 
-            duration = get_video_duration_ms(job.output_file)
-            next_job = self.next_job_factory(job.output_file, duration)
-            self.next_queue.append(next_job)
             logfire.info(f"{job.input_file.name} re-encoded to {job.output_file.name}")
 
 
@@ -90,33 +82,24 @@ class UploadJobRunner(JobRunner[UploadFileJob]):
         settings: Settings,
         max_workers: int,
         uploader: GeminiFileUploader,
-        jobs_queue: deque[SubtitleJob],
+        on_complete: Callable[[UploadFileJob, Any], None],
         stop_events: list[Event] = [],
         name: str = "Upload",
     ):
-        super().__init__(queue, settings, max_workers, stop_events, name)
+        super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
         self.uploader = uploader
-        self.jobs_queue = jobs_queue
 
-    def process(self, job: UploadFileJob) -> None:
+    def process(self, job: UploadFileJob) -> Any:
         """
         Uploads the specified file using the `GeminiFileUploader`.
 
-        Upon successful upload, it creates a `SubtitleJob` with the uploaded file handle
-        and adds it to the subtitle jobs queue.
+        Upon successful upload, it returns the file object, triggering the on_complete callback.
         """
         with logfire.span(f"Uploading {job.python_file.name}"):
             # Perform the file upload. This is a blocking operation.
             file = self.uploader.upload_file(job.python_file)
-            # On success, create a SubtitleJob and add it to the next queue.
-            self.jobs_queue.append(
-                SubtitleJob(
-                    name=job.python_file.stem,
-                    file=file,
-                    video_duration_ms=job.video_duration_ms,
-                )
-            )
             logfire.info(f"{job.python_file.name} uploaded")
+            return file
 
 
 class SubtitleJobRunner(JobRunner[SubtitleJob]):
@@ -133,7 +116,7 @@ class SubtitleJobRunner(JobRunner[SubtitleJob]):
         stop_events: list[Event] = [],
         name: str = "Subtitle",
     ):
-        super().__init__(queue, settings, max_workers, stop_events, name)
+        super().__init__(queue, settings, max_workers, None, stop_events, name)
         self.agent = agent
 
     def process(self, job: SubtitleJob) -> None:
@@ -352,29 +335,40 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         use_reencode = settings.split.re_encode.enabled
         use_upload = agent.is_google() and settings.ai.google.use_files_api
 
+        # Define callbacks
+        def on_reencode_complete(job: ReEncodingJob, _: Any) -> None:
+            duration = get_video_duration_ms(job.output_file)
+            if use_upload:
+                gemini_upload_jobs_queue.append(
+                    UploadFileJob(
+                        python_file=job.output_file, video_duration_ms=duration
+                    )
+                )
+            else:
+                subtitle_jobs_queue.append(
+                    SubtitleJob(
+                        name=job.output_file.stem,
+                        file=job.output_file,
+                        video_duration_ms=duration,
+                    )
+                )
+
+        def on_upload_complete(job: UploadFileJob, file: Any) -> None:
+            subtitle_jobs_queue.append(
+                SubtitleJob(
+                    name=job.python_file.stem,
+                    file=file,
+                    video_duration_ms=job.video_duration_ms,
+                )
+            )
+
         # Setup reencode_runner
         if use_reencode:
-            if use_upload:
-                next_queue = gemini_upload_jobs_queue
-
-                def create_upload_job(p: Path, d: int):
-                    return UploadFileJob(python_file=p, video_duration_ms=d)
-
-                next_factory = create_upload_job
-            else:
-                next_queue = subtitle_jobs_queue
-
-                def create_subtitle_job(p: Path, d: int):
-                    return SubtitleJob(name=p.stem, file=p, video_duration_ms=d)
-
-                next_factory = create_subtitle_job
-
             reencode_runner = ReEncodeJobRunner(
                 reencode_jobs_queue,
                 settings,
                 settings.thread.re_encode,
-                next_queue=next_queue,
-                next_job_factory=next_factory,
+                on_complete=on_reencode_complete,
             )
 
         # Setup upload_runner
@@ -385,7 +379,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 settings,
                 settings.thread.uploads,
                 uploader=GeminiFileUploader(settings),
-                jobs_queue=subtitle_jobs_queue,
+                on_complete=on_upload_complete,
                 stop_events=stop_events,
             )
 
