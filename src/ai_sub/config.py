@@ -130,6 +130,10 @@ class ReEncodeSettings(BaseSettings):
         description="The bitrate in KB/s (Kilobytes per second) to re-encode the video to.",
         default=35,
     )
+    threshold_mb: NonNegativeInt = Field(
+        description="The threshold in MB for re-encoding. Files smaller than this will not be re-encoded. Set to 0 to re-encode everything.",
+        default=20,
+    )
     encoder: Optional[str] = Field(
         description="The specific encoder to use (e.g., 'h264_nvenc', 'libx264'). If not provided, it will be automatically detected.",
         default=None,

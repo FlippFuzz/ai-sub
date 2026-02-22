@@ -405,20 +405,46 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             reencode_dir = settings.dir.tmp / "reencoded"
             reencode_dir.mkdir(exist_ok=True)
 
-            for input_file, _ in videos_to_work_on:
-                # We want to keep the same stem (e.g. "part_000") so that the
-                # SubtitleJob is named correctly for stitching later.
-                output_file = reencode_dir / input_file.with_suffix(".mov").name
+            for input_file, duration in videos_to_work_on:
+                should_reencode = True
+                if settings.split.re_encode.threshold_mb > 0:
+                    file_size_mb = input_file.stat().st_size / (1024 * 1024)
+                    if file_size_mb < settings.split.re_encode.threshold_mb:
+                        should_reencode = False
+                        logfire.info(
+                            f"Skipping re-encode for {input_file.name} "
+                            f"({file_size_mb:.2f}MB < {settings.split.re_encode.threshold_mb}MB)"
+                        )
 
-                reencode_jobs_queue.append(
-                    ReEncodingJob(
-                        input_file=input_file,
-                        output_file=output_file,
-                        fps=settings.split.re_encode.fps,
-                        height=settings.split.re_encode.height,
-                        bitrate_kb=settings.split.re_encode.bitrate_kb,
+                if should_reencode:
+                    # We want to keep the same stem (e.g. "part_000") so that the
+                    # SubtitleJob is named correctly for stitching later.
+                    output_file = reencode_dir / input_file.with_suffix(".mov").name
+
+                    reencode_jobs_queue.append(
+                        ReEncodingJob(
+                            input_file=input_file,
+                            output_file=output_file,
+                            fps=settings.split.re_encode.fps,
+                            height=settings.split.re_encode.height,
+                            bitrate_kb=settings.split.re_encode.bitrate_kb,
+                        )
                     )
-                )
+                else:
+                    if use_upload:
+                        gemini_upload_jobs_queue.append(
+                            UploadFileJob(
+                                python_file=input_file, video_duration_ms=duration
+                            )
+                        )
+                    else:
+                        subtitle_jobs_queue.append(
+                            SubtitleJob(
+                                name=input_file.stem,
+                                file=input_file,
+                                video_duration_ms=duration,
+                            )
+                        )
         elif use_upload:
             # We start with the gemini file upload tasks
             gemini_upload_jobs_queue.extend(
