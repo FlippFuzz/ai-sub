@@ -44,7 +44,7 @@ class ReEncodeJobRunner(JobRunner[ReEncodingJob]):
         settings: Settings,
         max_workers: int,
         on_complete: Callable[[ReEncodingJob, Any], None],
-        stop_events: list[Event] = [],
+        stop_events: list[Event] | None = None,
         name: str = "ReEncode",
     ):
         super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
@@ -83,7 +83,7 @@ class UploadJobRunner(JobRunner[UploadFileJob]):
         max_workers: int,
         uploader: GeminiFileUploader,
         on_complete: Callable[[UploadFileJob, Any], None],
-        stop_events: list[Event] = [],
+        stop_events: list[Event] | None = None,
         name: str = "Upload",
     ):
         super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
@@ -113,7 +113,7 @@ class SubtitleJobRunner(JobRunner[SubtitleJob]):
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
-        stop_events: list[Event] = [],
+        stop_events: list[Event] | None = None,
         name: str = "Subtitle",
     ):
         super().__init__(queue, settings, max_workers, None, stop_events, name)

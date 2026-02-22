@@ -24,14 +24,14 @@ class JobRunner(Generic[TJob]):
         settings: Settings,
         max_workers: int,
         on_complete: Callable[[TJob, Any], None] | None = None,
-        stop_events: list[Event] = [],
+        stop_events: list[Event] | None = None,
         name: str = "JobRunner",
     ):
         self.queue = queue
         self.settings = settings
         self.max_workers = max_workers
         self.on_complete = on_complete
-        self.stop_events = stop_events
+        self.stop_events = stop_events or []
         self.name = name
         self.executor: concurrent.futures.ThreadPoolExecutor | None = None
         self.futures: list[concurrent.futures.Future] = []
