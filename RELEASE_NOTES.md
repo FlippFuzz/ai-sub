@@ -1,5 +1,22 @@
 # AI Sub Release Notes
 
+## v1.10.0
+
+This release introduces a re-encoding threshold to optimize processing time and includes significant refactoring of the job runner architecture.
+
+**New Features & Improvements:**
+
+- **Re-encoding threshold:** Introduced a `threshold_mb` setting (default: 20MB) to `ReEncodeSettings`. Video segments smaller than this threshold will now skip the re-encoding step, as re-encoding small files often provides minimal size reduction while incurring processing overhead. To re-encode all segments regardless of size, set this threshold to `0`.
+
+**Code Improvements:**
+
+- **JobRunner Refactor:** Refactored `JobRunner` and its subclasses to use `on_complete` callbacks. This decouples job execution from the pipeline flow, moving the logic for creating subsequent jobs into the main application logic.
+- **Mutable Defaults:** Fixed a potential issue with mutable default arguments in `JobRunner` constructors. `stop_events` now defaults to `None` instead of `[]`, preventing the sharing of list instances across multiple class instances.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.9.2...v1.10.0
+
+---
+
 ## v1.9.2
 
 This release fixes an issue where video segmentation failed if the output directory path contained a percent sign (`%`).
