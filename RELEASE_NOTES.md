@@ -1,5 +1,17 @@
 # AI Sub Release Notes
 
+## v1.10.1
+
+This release fixes a critical issue preventing the application from starting when installed via pip.
+
+**Bug Fixes:**
+
+- **Script Entry Point:** Encapsulated the application startup logic within a `main()` function in `ai_sub.main`. This resolves an `ImportError` where the `ai-sub` command (defined in `pyproject.toml` as `ai_sub.main:main`) failed to find the `main` function because the logic was previously contained solely within an `if __name__ == "__main__":` block.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.10.0...v1.10.1
+
+---
+
 ## v1.10.0
 
 This release introduces a re-encoding threshold to optimize processing time and includes significant refactoring of the job runner architecture.

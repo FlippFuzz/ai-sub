@@ -1,6 +1,6 @@
 [project]
 name = "ai-sub"
-version = "1.10.0"
+version = "1.10.1"
 authors = [
   { name="FlippFuzz" },
 ]
