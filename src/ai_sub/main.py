@@ -499,8 +499,12 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         return result
 
 
-if __name__ == "__main__":
+def main() -> None:
     # Parse settings from CLI arguments, environment variables, and .env file.
     settings = CliApp.run(Settings)
 
     sys.exit(ai_sub(settings).value)
+
+
+if __name__ == "__main__":
+    main()
