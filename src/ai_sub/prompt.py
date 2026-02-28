@@ -1,7 +1,7 @@
 from textwrap import dedent
 
 # Version number is incremented whenever SUBTITLES_PROMPT is updated
-SUBTITLES_PROMPT_VERSION = 2
+SUBTITLES_PROMPT_VERSION = 3
 
 # Notes:
 # * The 'src' and 't' fields are added to trigger "Chain of Thought" processing, ensuring the AI verifies timestamps and categorizes text. These fields are not used by the application logic.
@@ -22,11 +22,10 @@ SUBTITLES_PROMPT = dedent(
     *   **Token-to-Time Mapping:** You must align timestamps to the precise **Audio Tokens**.
         *   `s`: The exact moment the first phoneme of the **First Anchor Word** becomes audible.
         *   `e`: The exact moment the last phoneme of the **Last Anchor Word** fades or transitions to the next sound. **CRITICAL: Do not cut off the end of the word.** Include the full decay.
-    *   **Drift Prevention:** Treat every subtitle entry as a **discrete event**.
-        *   Do not calculate a `s` time based on a previous `e` time.
-        *   Reset your internal clock for every new sentence.
-        *   **CRITICAL:** Do NOT estimate timestamps based on text length. Do NOT linearize time.
-    *   **Format:** `MM:SS.mmm` (e.g., `09:30.125`). Precision is paramount.
+    *   **CRITICAL ANTI-BIAS RULE (IGNORE READABILITY):** You likely possess a training bias to keep text on-screen for a minimum duration so humans can read it (e.g., 1-2 seconds). **COMPLETELY DISABLE THIS BIAS.** Audio duration dictates subtitle duration, always. Group words into logical phrases normally, but do NOT artificially extend the `e` time or delay the `s` time. If an entire sentence is spoken rapidly in 800 milliseconds, your subtitle block for that entire sentence MUST last exactly 800ms.
+    *   **Drift Prevention (Zero Latency):** Treat every subtitle entry as a **discrete, isolated event**. 
+        *   Never calculate a starting time based on the previous line's ending time.
+        *   Whether dealing with rapid-fire dialogue, overlapping arguments, or fast music, never let timestamps "lag" or "buffer" behind the audio.
 
     **PRIORITY 2: CONTENT SOURCE & TRANSLATION LOGIC**
     *   **Completeness:** You must transcribe **EVERY** spoken utterance. Do not summarize. Always attempt to transcribe/translate even when audio is unclear.
@@ -59,37 +58,34 @@ SUBTITLES_PROMPT = dedent(
         *   **Text = OTHER:** `og` = Transcription (Original Language); `en` = Translation (English).
 
     **PRIORITY 3: INTELLIGENT SEGMENTATION & SPLITTING**
-    *   **Max Length:** 50 characters per line.
+    *   **Max Length:** 50 characters per line. Group phrases logically; do NOT output single words unless spoken in isolation.
     *   **The "Breath Group" Rule:** Prefer splitting at natural pauses (commas, breaths) even if the line is under 50 chars. This improves timing accuracy.
     *   **The Split Protocol (If splitting is required):**
         *   **Scenario A: Distinct Gap (Pause/Breath):** 
             *   Part 1 `e`: When sound fully stops (include decay).
             *   Part 2 `s`: When sound resumes. (There is a time gap).
-        *   **Scenario B: Continuous Flow (Fast Speech):**
-            *   If the speaker does not pause between words, utilize **Contiguous Timestamping**.
-            *   Part 1 `e` MUST EQUAL Part 2 `s` (e.g., `00:05.500`). Do not invent a gap where none exists.
+        *   **Scenario B: Continuous Flow (Rapid Speech / Fast-Paced Audio):**
+            *   If the speaker/singer rapidly transitions between phrases without pausing, utilize **Contiguous Timestamping**.
+            *   Part 1 `e` MUST EQUAL Part 2 `s` (e.g., `00:05.500`). Do not invent a gap where none exists. DO NOT artificially extend Part 1. Snap instantly to Part 2 based strictly on the audio token.
 
     ---
 
     ### INTERNAL CHAIN-OF-THOUGHT (STEP-BY-STEP PROCESS)
-    1.  **Audio Detection:** Scan audio for **ANY** human speech. Be aggressive in detecting faint voices or speech mixed with music/SFX. Do not dismiss audio as 'noise' if there is a chance it contains speech.
-    2.  **Context Analysis:** Check visuals (who/where). Identify the sequence of scenes (e.g. MC, Song). Note song names and singers if present. Reconstruct full sentences if split.
-    3.  **Anchor Identification:** Identify the **First Word** and **Last Word** of the specific phrase segment.
-    4.  **Timestamp Extraction:** Locate the native audio timestamps for these anchors. **Verify against audio tokens.** Ensure the `e` timestamp captures the full sound decay.
+    1.  **Audio Detection:** Scan audio for **ANY** human speech. Be aggressive in detecting faint voices or speech mixed with music/SFX.
+    2.  **Context Analysis:** Check visuals. Identify the sequence of scenes. Reconstruct full sentences if split.
+    3.  **Anchor Identification:** Identify the **First Word** and **Last Word** of the phrase segment. Group words logically; do not over-segment.
+    4.  **Timestamp Extraction (Zero-Bias):** Locate the native audio timestamps for these anchors. Ensure `s` and `e` are perfectly pinned to the actual audio tokens. **Verify you are not extending durations for human readability.**
     5.  **Translation/Transcription:** Apply language directionality and **Semantic Continuity** rules.
-    6.  **Length & Split Check:** 
-        *   Is text > 50 chars? -> Split. 
-        *   Is there a pause in the middle? -> Split there first.
-        *   *Refine Timestamps:* If split, re-align start/end for the new sub-segments.
+    6.  **Length & Split Check:** Split if over 50 chars or at natural pauses.
     7.  **Coverage Check:** Did I skip any audio segments? If yes, go back and add them.
-    8.  **Final Verification:** Ensure no overlap between non-contiguous sentences (unless distinct speakers are overlapping).
+    8.  **Final Verification:** Ensure no cumulative lag has occurred. Are fast words and lyrics synchronized precisely to the millisecond they are vocalized?
 
     ---
 
     ### EXAMPLES
 
-    **Example 1: Simple Dialogue**
-    *Input Audio:* "Hello, how are you doing today?"
+    **Example 1: Simple Dialogue (Japanese to English)**
+    *Input Audio:* "こんにちは、今日の調子はどうですか？"
     *Output:*
     ```json
     {
@@ -105,7 +101,7 @@ SUBTITLES_PROMPT = dedent(
         {
           "s": "00:01.200",
           "e": "00:03.500",
-          "og": "Hello, how are you doing today?",
+          "og": "こんにちは、今日の調子はどうですか？",
           "en": "Hello, how are you doing today?",
           "src": "audio_tokens",
           "t": "dialogue"
@@ -114,7 +110,7 @@ SUBTITLES_PROMPT = dedent(
     }
     ```
 
-    **Example 2: Split Sentence (Japanese to English)**
+    **Example 2: Split Sentence with Pause (Semantic Continuity)**
     *Input Audio:* "私は..." (pause) "...寿司が好きです。"
     *Output:*
     ```json
@@ -148,8 +144,8 @@ SUBTITLES_PROMPT = dedent(
     }
     ```
 
-    **Example 3: Multiple Scenes (Song to MC Transition)**
-    *Input Audio:* (Singing) "La la la..." (Applause) "Thank you everyone!"
+    **Example 3: Rapid Speech / Fast-Paced Audio (Zero Latency)**
+    *Input Audio:* Panicked, extremely fast rapid-fire speech with no pauses: "やばい！遅刻する！急げ！" (Spoken continuously over ~1.2 seconds).
     *Output:*
     ```json
     {
@@ -157,31 +153,32 @@ SUBTITLES_PROMPT = dedent(
         {
           "s": "00:00.000",
           "e": "00:10.000",
-          "d": "Performance of the song 'Starlight'.",
-          "song": "Starlight",
-          "spk": ["Singer A"]
-        },
-        {
-          "s": "00:10.000",
-          "e": "00:20.000",
-          "d": "MC section after the song, thanking the audience.",
-          "spk": ["Singer A"]
+          "d": "A panicked character running and speaking extremely fast.",
+          "spk": ["Speaker A"]
         }
       ],
       "subs": [
         {
-          "s": "00:05.000",
-          "e": "00:08.000",
-          "og": "La la la...",
-          "en": "La la la...",
+          "s": "00:08.100",
+          "e": "00:08.400",
+          "og": "やばい！",
+          "en": "Oh no!",
           "src": "audio_tokens",
           "t": "dialogue"
         },
         {
-          "s": "00:12.000",
-          "e": "00:14.000",
-          "og": "Thank you everyone!",
-          "en": "Thank you everyone!",
+          "s": "00:08.400",
+          "e": "00:08.900",
+          "og": "遅刻する！",
+          "en": "I'm gonna be late!",
+          "src": "audio_tokens",
+          "t": "dialogue"
+        },
+        {
+          "s": "00:08.900",
+          "e": "00:09.300",
+          "og": "急げ！",
+          "en": "Hurry!",
           "src": "audio_tokens",
           "t": "dialogue"
         }
