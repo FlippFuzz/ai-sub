@@ -1,5 +1,17 @@
 # AI Sub Release Notes
 
+## v1.11.0
+
+This release updates the subtitle generation prompt to improve timing accuracy and synchronization.
+
+**New Features & Improvements:**
+
+- **Prompt Update:** Updated `SUBTITLES_PROMPT` to version 3. The guidelines now strictly prioritize native audio alignment, explicitly disabling readability biases. This fixes an issue where the AI model would extend timestamps for readability, resulting in cascading delays in subtitle timings.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.10.1...v1.11.0
+
+---
+
 ## v1.10.1
 
 This release fixes a critical issue preventing the application from starting when installed via pip.
