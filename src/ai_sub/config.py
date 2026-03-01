@@ -157,6 +157,10 @@ class SplittingSettings(BaseSettings):
         description="Settings for re-encoding video chunks.",
         default_factory=ReEncodeSettings,
     )
+    start_offset_min: NonNegativeInt = Field(
+        description="The number of minutes to skip from the beginning of the video.",
+        default=0,
+    )
 
 
 class DirectorySettings(BaseSettings):

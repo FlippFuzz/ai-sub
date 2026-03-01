@@ -165,7 +165,11 @@ def stitch_subtitles(
     """
     with logfire.span("Producing final SRT file"):
         all_subtitles = SSAFile()
-        offset_ms = 0
+
+        chunks_to_skip = int(
+            (settings.split.start_offset_min * 60) / settings.split.max_seconds
+        )
+        offset_ms = sum(duration for _, duration in video_splits[:chunks_to_skip])
 
         state = SubtitleGenerationState(
             ai_sub_version=version("ai-sub"),
@@ -175,7 +179,7 @@ def stitch_subtitles(
 
         sanitized_model = settings.ai.get_sanitized_model_name()
 
-        for video_path, video_duration_ms in video_splits:
+        for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
             # Load the job result from the temporary JSON file.
             job = SubtitleJob.load_or_return_new(
                 settings.dir.tmp / f"{video_path.stem}.{sanitized_model}.json",
@@ -304,12 +308,25 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             (path, get_video_duration_ms(path)) for path in video_splits_paths
         ]
 
+        chunks_to_skip = int(
+            (settings.split.start_offset_min * 60) / settings.split.max_seconds
+        )
+        splits_to_process = video_splits
+        if chunks_to_skip > 0:
+            skipped_splits = video_splits[:chunks_to_skip]
+            initial_offset_ms = sum(duration for _, duration in skipped_splits)
+            splits_to_process = video_splits[chunks_to_skip:]
+            logfire.info(
+                f"Skipping first {chunks_to_skip} chunks ({len(skipped_splits)} segments, "
+                f"{initial_offset_ms}ms) due to start_offset_min={settings.split.start_offset_min}"
+            )
+
         # Step 2: Filter out segments that have already been processed.
         # This allows the process to be resumed. It checks for the existence of a
         # .json file which indicates a completed (or failed) job.
         videos_to_work_on: list[tuple[Path, int]] = []
         sanitized_model = settings.ai.get_sanitized_model_name()
-        for split, video_duration_ms in video_splits:
+        for split, video_duration_ms in splits_to_process:
             possibleJob = SubtitleJob.load_or_return_new(
                 settings.dir.tmp / f"{split.stem}.{sanitized_model}.json",
                 split.stem,
