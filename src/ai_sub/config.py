@@ -24,6 +24,10 @@ class GeminiCliSettings(BaseSettings):
     timeout: PositiveInt = Field(
         description="The timeout in seconds for Gemini CLI operations.", default=600
     )
+    overwrite_system_prompt: bool = Field(
+        description="Whether to overwrite the system prompt using GEMINI_SYSTEM_MD. If False, the prompt is passed as a regular file argument.",
+        default=False,
+    )
 
 
 class GoogleAiSettings(BaseSettings):

@@ -63,7 +63,8 @@ class RateLimitedAgentWrapper:
         if self.is_gemini_cli():
             model_str = settings.ai.model.split(":", 1)[1]
             self.cli_wrapper = GeminiCliWrapper(
-                model_str, settings.ai.gemini_cli.timeout
+                model_str,
+                settings.ai.gemini_cli,
             )
         elif self.is_google():
             model_str = settings.ai.model.split(":", 1)[1]

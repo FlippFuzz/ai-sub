@@ -8,6 +8,7 @@ import logfire
 from json_repair import repair_json
 from pydantic import BaseModel, ValidationError
 
+from ai_sub.config import GeminiCliSettings
 from ai_sub.data_models import AiResponse
 
 
@@ -54,11 +55,11 @@ class GeminiCliWrapper:
     """
 
     model_name: str
-    timeout: int
+    settings: GeminiCliSettings
 
-    def __init__(self, model_name: str, timeout: int = 600):
+    def __init__(self, model_name: str, settings: GeminiCliSettings):
         self.model_name = model_name
-        self.timeout = timeout
+        self.settings = settings
 
     def run_sync(self, prompt: str, video: Path) -> AiResponse | None:
         """
@@ -84,10 +85,17 @@ class GeminiCliWrapper:
             # only kills the shell, leaving the child process running and holding pipes open.
             # As a result, this Python program will just hang waiting forever for the pipes to close.
             # This allows us to manually kill the process tree on timeout.
+            if self.settings.overwrite_system_prompt:
+                prompt_arg = f"@{video.name}"
+                env = os.environ | {"GEMINI_SYSTEM_MD": "prompt.md"}
+            else:
+                prompt_arg = f"@prompt.md @{video.name}"
+                env = os.environ
+
             cmd = [
                 "gemini",
                 "-p",
-                f"@{video.name}",
+                prompt_arg,
                 "--model",
                 self.model_name,
                 "--output-format",
@@ -97,7 +105,7 @@ class GeminiCliWrapper:
                 with subprocess.Popen(
                     cmd,
                     cwd=video_directory,
-                    env=os.environ | {"GEMINI_SYSTEM_MD": "prompt.md"},
+                    env=env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -108,7 +116,9 @@ class GeminiCliWrapper:
                     shell=sys.platform == "win32",
                 ) as process:
                     try:
-                        stdout, stderr = process.communicate(timeout=self.timeout)
+                        stdout, stderr = process.communicate(
+                            timeout=self.settings.timeout
+                        )
                     except subprocess.TimeoutExpired:
                         if sys.platform == "win32":
                             # Kill the entire process tree
