@@ -9,7 +9,6 @@ from json_repair import repair_json
 from pydantic import BaseModel, ValidationError
 
 from ai_sub.data_models import AiResponse
-from ai_sub.prompt import SUBTITLES_PROMPT
 
 
 class GeminiCliResponseModelStats(BaseModel):
@@ -159,17 +158,3 @@ class GeminiCliWrapper:
                 return ai_response
             else:
                 return None
-
-
-# TODO: Delete later - Just for testing
-if __name__ == "__main__":
-    logfire.configure()
-
-    wrapper = GeminiCliWrapper("gemini-3-flash-preview")
-    result = wrapper.run_sync(
-        SUBTITLES_PROMPT,
-        Path(
-            "C:\\Tools\\tmp_【MV】ジェヘナ (Gehenna) 【IRyS x Mumei Cover】 [9qkkPOD85YE]\\part_000.webm"
-        ),
-    )
-    print(result)
