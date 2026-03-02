@@ -1,5 +1,22 @@
 # AI Sub Release Notes
 
+## v1.12.0
+
+This release adds functionality to skip initial video segments and improves prompt handling for the Gemini CLI.
+
+**New Features & Improvements:**
+
+- **Start Offset:** Added `start_offset_min` to `SplittingSettings`. This allows users to skip the first _X_ minutes of the input video (e.g., to bypass waiting screens) by setting `--split.start_offset_min`.
+- **Gemini CLI Configuration:** Added `overwrite_system_prompt` to `GeminiCliSettings`. This setting determines whether to overwrite the system prompt using `GEMINI_SYSTEM_MD` or pass the prompt as a regular file argument.
+
+**Code Improvements:**
+
+- **GeminiCliWrapper Refactor:** Refactored `GeminiCliWrapper` to accept the full `GeminiCliSettings` object and removed unused imports and testing code.
+
+**Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v1.11.0...v1.12.0
+
+---
+
 ## v1.11.0
 
 This release updates the subtitle generation prompt to improve timing accuracy and synchronization.
