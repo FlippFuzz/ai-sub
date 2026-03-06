@@ -16,12 +16,17 @@ from ai_sub.data_models import (
     AiSubResult,
     ReEncodingJob,
     SubtitleGenerationState,
-    SubtitleJob,
+    SubtitlePass1Job,
+    SubtitlePass2Job,
     UploadFileJob,
 )
 from ai_sub.gemini_file_uploader import GeminiFileUploader
 from ai_sub.job_runner import JobRunner
-from ai_sub.prompt import SUBTITLES_PROMPT, SUBTITLES_PROMPT_VERSION
+from ai_sub.prompt import (
+    SUBTITLES_PASS_1_PROMPT,
+    SUBTITLES_PASS_2_PROMPT,
+    SUBTITLES_PROMPT_VERSION,
+)
 from ai_sub.video import (
     get_video_duration_ms,
     get_working_encoder,
@@ -102,34 +107,34 @@ class UploadJobRunner(JobRunner[UploadFileJob]):
             return file
 
 
-class SubtitleJobRunner(JobRunner[SubtitleJob]):
+class SubtitlePass1JobRunner(JobRunner[SubtitlePass1Job]):
     """
-    Worker that executes the AI agent to generate subtitles for a video segment.
+    Worker that executes the AI agent to generate the first pass of subtitles.
     """
 
     def __init__(
         self,
-        queue: deque[SubtitleJob],
+        queue: deque[SubtitlePass1Job],
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
+        on_complete: Callable[[SubtitlePass1Job, Any], None],
         stop_events: list[Event] | None = None,
-        name: str = "Subtitle",
+        name: str = "SubtitlePass1JobRunner",
     ):
-        super().__init__(queue, settings, max_workers, None, stop_events, name)
+        super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
         self.agent = agent
 
-    def process(self, job: SubtitleJob) -> None:
+    def process(self, job: SubtitlePass1Job) -> None:
         """
         Invokes the AI agent to generate subtitles.
         """
-        with logfire.span(f"Subtitling {job.name}"):
+        with logfire.span(f"Subtitling Pass 1 {job.name}"):
             job.response = self.agent.run(
-                SUBTITLES_PROMPT, job.file, job.video_duration_ms
+                SUBTITLES_PASS_1_PROMPT, job.file, job.video_duration_ms
             )
-            logfire.info(f"{job.name} subtitled")
 
-    def post_process(self, job: SubtitleJob) -> None:
+    def post_process(self, job: SubtitlePass1Job) -> None:
         """
         Saves the result (or partial state) to disk.
 
@@ -137,12 +142,64 @@ class SubtitleJobRunner(JobRunner[SubtitleJob]):
         don't need to be re-processed.
         """
         # Save the completed job state to a JSON file for persistence.
-        sanitized_model = self.settings.ai.get_sanitized_model_name()
-        job.save(self.settings.dir.tmp / f"{job.name}.{sanitized_model}.json")
+        sanitized_model = self.settings.ai.get_sanitized_model_name(
+            self.settings.ai.pass1_model
+        )
+        job.save(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-pass1.json")
+
+        # Also generate a subtitle file for this job for the user to view.
+        if job.response is not None:
+            job.response.get_ssafile().save(
+                str(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-pass1.srt")
+            )
+
+
+class SubtitlePass2JobRunner(JobRunner[SubtitlePass2Job]):
+    """
+    Worker that executes the AI agent to generate the second pass of subtitles (QA & Refinement).
+    """
+
+    def __init__(
+        self,
+        queue: deque[SubtitlePass2Job],
+        settings: Settings,
+        max_workers: int,
+        agent: RateLimitedAgentWrapper,
+        stop_events: list[Event] | None = None,
+        name: str = "SubtitlePass2JobRunner",
+    ):
+        super().__init__(queue, settings, max_workers, None, stop_events, name)
+        self.agent = agent
+
+    def process(self, job: SubtitlePass2Job) -> None:
+        """
+        Invokes the AI agent to generate subtitles.
+        """
+        with logfire.span(f"Subtitling Pass 2 {job.name}"):
+            draft_json = job.draft.model_dump_json(indent=2)
+            prompt = f"{SUBTITLES_PASS_2_PROMPT}{draft_json}\n```"
+
+            job.response = self.agent.run(prompt, job.file, job.video_duration_ms)
+            logfire.info(f"{job.name} subtitled")
+
+    def post_process(self, job: SubtitlePass2Job) -> None:
+        """
+        Saves the result (or partial state) to disk.
+
+        This ensures that if the process is interrupted, completed segments
+        don't need to be re-processed.
+        """
+        # Save the completed job state to a JSON file for persistence.
+        sanitized_model = self.settings.ai.get_sanitized_model_name(
+            self.settings.ai.pass2_model
+        )
+
+        job.save(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-pass2.json")
+
         if job.response is not None:
             # Also generate a subtitle file for this job for the user to view.
             job.response.get_ssafile().save(
-                str(self.settings.dir.tmp / f"{job.name}.{sanitized_model}.srt")
+                str(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-pass2.srt")
             )
 
 
@@ -177,17 +234,16 @@ def stitch_subtitles(
             settings=settings,
         )
 
-        sanitized_model = settings.ai.get_sanitized_model_name()
+        sanitized_model = settings.ai.get_sanitized_model_name(settings.ai.pass2_model)
 
         for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
             # Load the job result from the temporary JSON file.
-            job = SubtitleJob.load_or_return_new(
-                settings.dir.tmp / f"{video_path.stem}.{sanitized_model}.json",
-                video_path.stem,
-                video_path,
-                video_duration_ms,
+            # We look for the final pass 2 output
+            job = SubtitlePass2Job.load(
+                settings.dir.tmp / f"{video_path.stem}.{sanitized_model}-pass2.json"
             )
-            if job.response is not None:
+
+            if job and job.response is not None:
                 current_subtitles = job.response.get_ssafile()
                 # Shift the timestamps of the current subtitle segment by the
                 # cumulative duration of all previous segments.
@@ -209,7 +265,7 @@ def stitch_subtitles(
             offset_ms += video_duration_ms
 
             # Sort out max retries exceeded
-            if job.total_num_retries >= settings.retry.max:
+            if job and job.total_num_retries >= settings.retry.max:
                 state.max_retries_exceeded = True
 
         # Insert version and config, as a single SSAEvent at the beginning (0-1ms)
@@ -246,19 +302,36 @@ def stitch_subtitles(
 
 def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
     """
-    Runs the subtitle generation process.
+    Runs the main subtitle generation pipeline.
 
-    The core workflow is as follows:
-    1.  The input video is split into smaller, manageable segments.
-    2.  Jobs are created for each segment that hasn't been processed previously.
-    3.  If using a Gemini model, video segments are uploaded concurrently.
-    4.  Subtitle generation is performed concurrently for all segments.
-    5.  The application waits for all processing to complete.
-    6.  Finally, it stitches together the subtitles from all segments, adjusting
-        timestamps to create a single, synchronized subtitle file for the original video.
+    This function orchestrates the entire process, from video preparation to
+    final subtitle file generation. The workflow is as follows:
+
+    1.  **Video Splitting:** The input video is divided into smaller, manageable
+        segments based on the configured duration.
+    2.  **Job Queueing:** For each segment, the application checks if results
+        from previous runs exist. If not, it creates a chain of jobs:
+        - (Optional) Re-encoding to a smaller size.
+        - (Optional) Uploading the video file to a cloud service (e.g., Gemini Files API).
+        - Pass 1: Generating an initial subtitle draft (transcription).
+        - Pass 2: Refining and quality-checking the draft.
+    3.  **Concurrent Processing:** Jobs are processed concurrently by dedicated
+        `JobRunner` instances, each with its own thread pool. Callbacks are
+        used to chain dependent jobs (e.g., an upload job triggers a subtitle job).
+    4.  **Stitching:** Once all segments are processed, the individual subtitle
+        files are stitched together. Timestamps are adjusted to align with the
+        original, full-length video.
+    5.  **Final Output:** A single `.srt` file is created, along with a state
+        summary embedded in the first subtitle entry.
+
+    Args:
+        settings (Settings): The application configuration.
+        configure_logging (bool): If True, configures Logfire for observability.
+                                  Set to False if the calling application
+                                  manages its own logging.
 
     Returns:
-        AiSubResult: The result code indicating the success or failure state of the operation.
+        AiSubResult: An enum indicating the final status (COMPLETE, INCOMPLETE, etc.).
     """
     if configure_logging:
         # Configure Logfire for observability. This setup includes a console logger
@@ -292,7 +365,8 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
 
     # Initialize the AI Agent.
     # A custom wrapper is used to make handling rate limits and differences in models more cleanly
-    agent = RateLimitedAgentWrapper(settings)
+    agent1 = RateLimitedAgentWrapper(settings, settings.ai.pass1_model)
+    agent2 = RateLimitedAgentWrapper(settings, settings.ai.pass2_model)
 
     # Start the main application logic within a Logfire span for better tracing.
     with logfire.span(f"Generating subtitles for {settings.input_video_file.name}"):
@@ -324,33 +398,28 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         # Step 2: Filter out segments that have already been processed.
         # This allows the process to be resumed. It checks for the existence of a
         # .json file which indicates a completed (or failed) job.
-        videos_to_work_on: list[tuple[Path, int]] = []
-        sanitized_model = settings.ai.get_sanitized_model_name()
-        for split, video_duration_ms in splits_to_process:
-            possibleJob = SubtitleJob.load_or_return_new(
-                settings.dir.tmp / f"{split.stem}.{sanitized_model}.json",
-                split.stem,
-                split,
-                video_duration_ms,
-            )
-            if possibleJob.response is None:
-                videos_to_work_on.append((split, video_duration_ms))
 
-        # Step 3: Initialize data structures for concurrent processing.
+        # Initialize data structures for concurrent processing.
         # Deques are used as thread-safe queues for managing jobs.
         reencode_jobs_queue: deque[ReEncodingJob] = deque()
         gemini_upload_jobs_queue: deque[UploadFileJob] = deque()
-        subtitle_jobs_queue: deque[SubtitleJob] = deque()
+        subtitle_pass1_jobs_queue: deque[SubtitlePass1Job] = deque()
+        subtitle_pass2_jobs_queue: deque[SubtitlePass2Job] = deque()
+
+        sanitized_model1 = settings.ai.get_sanitized_model_name(settings.ai.pass1_model)
+        sanitized_model2 = settings.ai.get_sanitized_model_name(settings.ai.pass2_model)
+
+        use_reencode = settings.split.re_encode.enabled
+        use_upload = agent1.is_google() and settings.ai.google.use_files_api
 
         reencode_complete_event = Event()
         gemini_upload_complete_event = Event()
+        subtitle1_complete_event = Event()
 
         reencode_runner: ReEncodeJobRunner | None = None
         upload_runner: UploadJobRunner | None = None
-        subtitle_runner: SubtitleJobRunner | None = None
-
-        use_reencode = settings.split.re_encode.enabled
-        use_upload = agent.is_google() and settings.ai.google.use_files_api
+        subtitle_pass1_runner: SubtitlePass1JobRunner | None = None
+        subtitle_pass2_runner: SubtitlePass2JobRunner | None = None
 
         # Define callbacks
         def on_reencode_complete(job: ReEncodingJob, _: Any) -> None:
@@ -362,8 +431,8 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                     )
                 )
             else:
-                subtitle_jobs_queue.append(
-                    SubtitleJob(
+                subtitle_pass1_jobs_queue.append(
+                    SubtitlePass1Job(
                         name=job.output_file.stem,
                         file=job.output_file,
                         video_duration_ms=duration,
@@ -371,13 +440,24 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 )
 
         def on_upload_complete(job: UploadFileJob, file: Any) -> None:
-            subtitle_jobs_queue.append(
-                SubtitleJob(
+            subtitle_pass1_jobs_queue.append(
+                SubtitlePass1Job(
                     name=job.python_file.stem,
                     file=file,
                     video_duration_ms=job.video_duration_ms,
                 )
             )
+
+        def on_subtitle1_complete(job: SubtitlePass1Job, _: Any) -> None:
+            if job.response:
+                subtitle_pass2_jobs_queue.append(
+                    SubtitlePass2Job(
+                        name=job.name,
+                        file=job.file,
+                        video_duration_ms=job.video_duration_ms,
+                        draft=job.response,
+                    )
+                )
 
         # Setup reencode_runner
         if use_reencode:
@@ -400,29 +480,68 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 stop_events=stop_events,
             )
 
-        # Setup subtitle_runner
-        subtitle_stop_events = []
+        # Setup subtitle_pass1_runner
+        subtitle1_stop_events = []
         if use_upload:
-            subtitle_stop_events.append(gemini_upload_complete_event)
+            subtitle1_stop_events.append(gemini_upload_complete_event)
         elif use_reencode:
-            subtitle_stop_events.append(reencode_complete_event)
+            subtitle1_stop_events.append(reencode_complete_event)
 
-        subtitle_runner = SubtitleJobRunner(
-            subtitle_jobs_queue,
+        subtitle_pass1_runner = SubtitlePass1JobRunner(
+            subtitle_pass1_jobs_queue,
             settings,
-            settings.thread.subtitles,
-            agent,
-            stop_events=subtitle_stop_events,
+            settings.thread.subtitles1,
+            agent1,
+            on_complete=on_subtitle1_complete,
+            stop_events=subtitle1_stop_events,
+        )
+
+        # Setup subtitle_pass2_runner
+        subtitle_pass2_runner = SubtitlePass2JobRunner(
+            subtitle_pass2_jobs_queue,
+            settings,
+            settings.thread.subtitles2,
+            agent2,
+            stop_events=[subtitle1_complete_event],
         )
 
         # Step 4: Populate the initial job queues.
+
+        # Create a directory for re-encoded files to avoid name collisions
+        # and preserve the file stem for stitching.
+        reencode_dir = settings.dir.tmp / "reencoded"
         if use_reencode:
-            # Create a directory for re-encoded files to avoid name collisions
-            # and preserve the file stem for stitching.
-            reencode_dir = settings.dir.tmp / "reencoded"
             reencode_dir.mkdir(exist_ok=True)
 
-            for input_file, duration in videos_to_work_on:
+        for split, duration in splits_to_process:
+            # 1. Check Pass 2 Done
+            pass2_job = SubtitlePass2Job.load(
+                settings.dir.tmp / f"{split.stem}.{sanitized_model2}-pass2.json"
+            )
+            if pass2_job and pass2_job.response is not None:
+                continue
+
+            # 2. Check Pass 1 Done
+            pass1_job = SubtitlePass1Job.load_or_return_new(
+                settings.dir.tmp / f"{split.stem}.{sanitized_model1}-pass1.json",
+                split.stem,
+                split,
+                duration,
+            )
+            if pass1_job.response is not None:
+                subtitle_pass2_jobs_queue.append(
+                    SubtitlePass2Job(
+                        name=pass1_job.name,
+                        file=pass1_job.file,
+                        video_duration_ms=pass1_job.video_duration_ms,
+                        draft=pass1_job.response,
+                    )
+                )
+                continue
+
+            # 3. Start from scratch (Re-encode/Upload/Pass1)
+            input_file = split
+            if use_reencode:
                 should_reencode = True
                 if settings.split.re_encode.threshold_mb > 0:
                     file_size_mb = input_file.stat().st_size / (1024 * 1024)
@@ -455,25 +574,25 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                             )
                         )
                     else:
-                        subtitle_jobs_queue.append(
-                            SubtitleJob(
+                        subtitle_pass1_jobs_queue.append(
+                            SubtitlePass1Job(
                                 name=input_file.stem,
                                 file=input_file,
                                 video_duration_ms=duration,
                             )
                         )
-        elif use_upload:
-            # We start with the gemini file upload tasks
-            gemini_upload_jobs_queue.extend(
-                UploadFileJob(python_file=path, video_duration_ms=duration)
-                for path, duration in videos_to_work_on
-            )
-        else:
-            # We start with the subtitle generation tasks
-            subtitle_jobs_queue.extend(
-                SubtitleJob(name=path.stem, file=path, video_duration_ms=duration)
-                for path, duration in videos_to_work_on
-            )
+            elif use_upload:
+                gemini_upload_jobs_queue.append(
+                    UploadFileJob(python_file=input_file, video_duration_ms=duration)
+                )
+            else:
+                subtitle_pass1_jobs_queue.append(
+                    SubtitlePass1Job(
+                        name=input_file.stem,
+                        file=input_file,
+                        video_duration_ms=duration,
+                    )
+                )
 
         # Step 5: Start all runners and wait for them to complete
         # Start runners
@@ -481,7 +600,8 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             reencode_runner.start()
         if upload_runner:
             upload_runner.start()
-        subtitle_runner.start()
+        subtitle_pass1_runner.start()
+        subtitle_pass2_runner.start()
 
         # Wait for runners to complete and signal as needed
         if reencode_runner:
@@ -492,14 +612,18 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             upload_runner.wait()
             gemini_upload_complete_event.set()
 
-        subtitle_runner.wait()
+        subtitle_pass1_runner.wait()
+        subtitle1_complete_event.set()
+
+        subtitle_pass2_runner.wait()
 
         # Shutdown runners when all done
         if reencode_runner:
             reencode_runner.shutdown()
         if upload_runner:
             upload_runner.shutdown()
-        subtitle_runner.shutdown()
+        subtitle_pass1_runner.shutdown()
+        subtitle_pass2_runner.shutdown()
 
         # Step 6: Assemble the final subtitle file.
         # Recalculate durations as they might have changed or were unknown during re-encoding
@@ -517,6 +641,14 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
 
 
 def main() -> None:
+    """
+    Parses CLI arguments and runs the main `ai_sub` function.
+
+    This is the primary entry point for the command-line application. It uses
+    `pydantic-settings.CliApp` to build a `Settings` object from command-line
+    arguments, environment variables, and .env files, then executes the main
+    pipeline and exits with the appropriate status code.
+    """
     # Parse settings from CLI arguments, environment variables, and .env file.
     settings = CliApp.run(Settings)
 

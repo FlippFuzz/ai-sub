@@ -74,8 +74,16 @@ class AiSettings(BaseSettings):
         env_prefix="AISUB_AI_",
     )
 
-    model: str = Field(
-        description="The AI model for subtitle generation. Use 'google-gla:<model>' for Google models, 'openai:<model>' for OpenAI, or 'custom:<url>' for a custom endpoint.",
+    model: Optional[str] = Field(
+        default=None,
+        description="A shorthand to set both pass1_model and pass2_model to the same value. If provided, this will override the other two settings.",
+    )
+    pass1_model: str = Field(
+        description="The AI model for the first pass of subtitle generation. Use 'google-gla:<model>' for Google models, 'openai:<model>' for OpenAI, or 'custom:<url>' for a custom endpoint.",
+        default="google-gla:gemini-3-flash-preview",
+    )
+    pass2_model: str = Field(
+        description="The AI model for the second pass of subtitle generation (QA & Refinement).",
         default="google-gla:gemini-3-flash-preview",
     )
     rpm: PositiveInt = Field(
@@ -94,22 +102,33 @@ class AiSettings(BaseSettings):
     )
 
     @model_validator(mode="after")
-    def validate_google_key(self):
+    def validate_models(self):
         """
-        Validates that a Google AI API key is provided if a Google model is selected.
+        - If the 'model' field is set, it overrides both 'pass1_model' and 'pass2_model'.
+        - Validates that a Google AI API key is provided if a Google model is selected.
         """
-        if self.model.lower().startswith("google-gla") and self.google.key is None:
+        if self.model:
+            self.pass1_model = self.model
+            self.pass2_model = self.model
+
+        is_google_1 = self.pass1_model.lower().startswith("google-gla")
+        is_google_2 = self.pass2_model.lower().startswith("google-gla")
+
+        if (is_google_1 or is_google_2) and self.google.key is None:
             raise ValueError(
                 "A Google AI API key must be provided either via the 'key' field, GOOGLE_API_KEY, GEMINI_API_KEY or AISUB_AI_GOOGLE_KEY environment variables."
             )
         return self
 
-    def get_sanitized_model_name(self) -> str:
+    def get_sanitized_model_name(self, model_name: str) -> str:
         """
         Sanitizes the model name to be safe for filenames.
         Strips the provider prefix (if any) and replaces non-alphanumeric characters with hyphens.
+
+        Args:
+            model_name (str): The full model string (e.g. "google-gla:gemini-1.5-pro")
         """
-        model_name = self.model.split(":", 1)[-1]
+        model_name = model_name.split(":", 1)[-1]
         return re.sub(r"[^a-zA-Z0-9]+", "-", model_name).strip("-")
 
 
@@ -191,8 +210,12 @@ class ThreadSettings(BaseSettings):
         description="The number of concurrent threads for re-encoding video chunks.",
         default=2,
     )
-    subtitles: PositiveInt = Field(
-        description="The number of concurrent threads to use for generating subtitles.",
+    subtitles1: PositiveInt = Field(
+        description="The number of concurrent threads to use for Pass 1 (Transcription).",
+        default=4,
+    )
+    subtitles2: PositiveInt = Field(
+        description="The number of concurrent threads to use for Pass 2 (QA).",
         default=4,
     )
 

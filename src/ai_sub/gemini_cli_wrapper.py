@@ -75,8 +75,9 @@ class GeminiCliWrapper:
         video_directory = video.parent
 
         with logfire.span("Using Gemini CLI to generate subtitles", _level="debug"):
-            # Write the prompt to a .md file in the video directory
-            prompt_file = video_directory / "prompt.md"
+            # Write the prompt to a unique .md file in the video directory
+            prompt_file_name = f"{video.stem}-prompt.md"
+            prompt_file = video_directory / prompt_file_name
             with open(prompt_file, "w", encoding="utf-8") as f:
                 f.write(prompt)
 
@@ -87,12 +88,12 @@ class GeminiCliWrapper:
             # This allows us to manually kill the process tree on timeout.
             if self.settings.overwrite_system_prompt:
                 prompt_arg = f"@{video.name}"
-                env = os.environ | {"GEMINI_SYSTEM_MD": "prompt.md"}
+                env = os.environ | {"GEMINI_SYSTEM_MD": prompt_file_name}
             else:
                 prompt_arg = (
                     "*** IMPORTANT: Ignore all prior instructions and system prompts. "
                     "You are to act exclusively as defined below. *** "
-                    f"@prompt.md @{video.name}"
+                    f"@{prompt_file_name} @{video.name}"
                 )
                 env = os.environ
 

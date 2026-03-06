@@ -34,20 +34,6 @@ class Subtitles(BaseModel):
     end: str = Field(alias="e")
     original: str = Field(alias="og")
     english: str = Field(alias="en")
-    alignment_source: str = Field(alias="src")
-    type: str = Field(alias="t")
-
-
-class Scene(BaseModel):
-    """Represents a visual or audio scene within the video segment."""
-
-    model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
-
-    start: str = Field(alias="s")
-    end: str = Field(alias="e")
-    description: str = Field(alias="d")
-    song_name: Optional[str] = Field(default=None, alias="song")
-    speakers: list[str] = Field(default_factory=list, alias="spk")
 
 
 class AiResponse(BaseModel):
@@ -55,7 +41,7 @@ class AiResponse(BaseModel):
 
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
-    scenes: list[Scene] = Field(default_factory=list)
+    global_analysis: Optional[str] = None
     subtitles: list[Subtitles] = Field(alias="subs")
     model_name: Optional[str] = None
 
@@ -188,8 +174,8 @@ class UploadFileJob(Job):
     video_duration_ms: PositiveInt
 
 
-class SubtitleJob(Job):
-    """Represents a job to generate subtitles for a specific file."""
+class SubtitlePass1Job(Job):
+    """Represents a job to generate the first pass of subtitles (Transcription)."""
 
     name: str
     file: File | Path
@@ -213,15 +199,53 @@ class SubtitleJob(Job):
         """Loads the object from a JSON file, or returns a new object if the file doesn't exist.
 
         Args:
-            save_path (Path): The path to the JSON file from which to load the state.
+            save_path (Path): The path to the JSON file from which to load the object.
+            name (str): The name for a new job if one is created.
+            file (File | Path): The file for a new job if one is created.
+            video_duration_ms (int): The video duration for a new job if one is created.
 
         Returns:
-            State: The loaded object, or a new object if the file was not found.
+            SubtitlePass1Job: The loaded object, or a new object if the file was not found.
         """
         if Path(save_path).is_file():
             with open(save_path, "r", encoding="utf-8") as f:
-                return SubtitleJob.model_validate_json(f.read())
+                return SubtitlePass1Job.model_validate_json(f.read())
         else:
-            return SubtitleJob(
+            return SubtitlePass1Job(
                 name=name, file=file, video_duration_ms=video_duration_ms
             )
+
+
+class SubtitlePass2Job(Job):
+    """Represents a job to generate the second pass of subtitles (QA & Refinement)."""
+
+    name: str
+    file: File | Path
+    video_duration_ms: PositiveInt
+    draft: AiResponse
+    response: Optional[AiResponse] = None
+
+    def save(self, filename: Path):
+        """Saves the current object to a JSON file.
+
+        Args:
+            filename (Path): The path to the file where the object should be saved.
+        """
+        json_str = self.model_dump_json(indent=2)
+        with open(filename, "w", encoding="utf-8") as file:
+            file.write(json_str)
+
+    @staticmethod
+    def load(save_path: Path) -> Optional["SubtitlePass2Job"]:
+        """Loads the object from a JSON file if it exists.
+
+        Args:
+            save_path (Path): The path to the JSON file from which to load the state.
+
+        Returns:
+            Optional["SubtitlePass2Job"]: The loaded object, or None if the file was not found.
+        """
+        if Path(save_path).is_file():
+            with open(save_path, "r", encoding="utf-8") as f:
+                return SubtitlePass2Job.model_validate_json(f.read())
+        return None
