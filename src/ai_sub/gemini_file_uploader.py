@@ -81,8 +81,11 @@ class GeminiFileUploader:
 
     def _update_file_list(self) -> None:
         """
-        Updates the local file list cache from the server, but only if the
-        cache is older than the TTL and the rate limit allows it.
+        Updates the local file list cache from the server if the cache is stale.
+
+        The cache is considered stale if the time since the last update is
+        greater than the configured `_list_cache_ttl_seconds`. This mechanism
+        serves as a simple rate limit to avoid excessive `files.list` API calls.
         """
         now = time()
         with self._lock:
