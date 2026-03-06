@@ -64,15 +64,15 @@ class RateLimitedAgentWrapper:
         self.token_limiter = Limiter(Rate(self.settings.ai.tpm, Duration.MINUTE))
 
         if self.is_gemini_cli():
-            model_str = self.model_name.split(":", 1)[1]
+            model_str = self.model_name.split(":", 1)[-1]
             self.cli_wrapper = GeminiCliWrapper(
                 model_str,
                 settings.ai.gemini_cli,
             )
         elif self.is_google():
-            model_str = self.model_name.split(":", 1)[1]
-
-            # Configure Max thinking possible
+            model_str = self.model_name.split(":", 1)[
+                -1
+            ]  # Configure Max thinking possible
             # https://ai.google.dev/gemini-api/docs/thinking
             thinking_config: ThinkingConfigDict
             if model_str.lower().startswith("gemini-3"):
