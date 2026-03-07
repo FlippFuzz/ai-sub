@@ -1,5 +1,32 @@
 # AI Sub Release Notes
 
+## v2.0.0
+
+This major release introduces a two-pass subtitle generation workflow to significantly improve subtitle quality, accuracy, and refinement.
+
+**New Features & Improvements:**
+
+- **Two-Pass Subtitle Generation:** The core subtitle generation process has been re-architected into a two-pass system:
+  - **Pass 1 (Draft Generation):** The first pass generates an initial draft of the subtitles. This is handled by the new `SubtitlePass1JobRunner` and configured with `ai.pass1_model` and `thread.subtitles1`.
+  - **Pass 2 (QA & Refinement):** The second pass takes the JSON output from Pass 1 as a draft and performs quality assurance, correction, and refinement using a separate, specialized prompt. This is handled by the new `SubtitlePass2JobRunner` and configured with `ai.pass2_model` and `thread.subtitles2`.
+- **Improved Modularity:** This new architecture allows for using different AI models for each pass (e.g., a faster model for the initial draft and a more powerful model for refinement).
+
+**Breaking Changes & Refactoring:**
+
+- **Configuration (`config.py`):**
+  - The `ai.model` setting has been replaced by `ai.pass1_model` and `ai.pass2_model`. An optional `ai.model` shorthand is available to set both to the same value.
+  - The `thread.subtitles` setting has been split into `thread.subtitles1` and `thread.subtitles2` to configure concurrency for each pass independently.
+- **Main Pipeline (`main.py`):**
+  - The main application logic has been significantly updated to orchestrate the new two-pass workflow, managing separate job queues and runners for each pass.
+  - Job resumption logic now checks for the state of both passes to correctly resume interrupted sessions.
+- **Data Models (`data_models.py`):**
+  - `SubtitleJob` has been renamed to `SubtitlePass1Job`.
+  - A new `SubtitlePass2Job` has been introduced to manage the state and data for the refinement pass.
+- **Agent Wrapper (`agent_wrapper.py`):**
+  - The `RateLimitedAgentWrapper` is now initialized with a specific model name, enabling the use of different models for each generation pass.
+
+---
+
 ## v1.12.0
 
 This release adds functionality to skip initial video segments and improves prompt handling for the Gemini CLI.
