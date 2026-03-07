@@ -31,6 +31,7 @@ class RateLimitedAgentWrapper:
     agent: Agent
     cli_wrapper: GeminiCliWrapper | None = None
     settings: Settings
+    model_name: str
 
     def is_google(self) -> bool:
         """Checks if the model is a Google model.
@@ -38,7 +39,7 @@ class RateLimitedAgentWrapper:
         Returns:
             bool: True if the model is a Google model, False otherwise.
         """
-        return self.settings.ai.model.lower().startswith("google-gla")
+        return self.model_name.lower().startswith("google-gla")
 
     def is_gemini_cli(self) -> bool:
         """Checks if the model is a Gemini CLI model.
@@ -46,30 +47,32 @@ class RateLimitedAgentWrapper:
         Returns:
             bool: True if the model is a Gemini CLI model, False otherwise.
         """
-        return self.settings.ai.model.lower().startswith("gemini-cli")
+        return self.model_name.lower().startswith("gemini-cli")
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, model_name: str):
         """
         Initializes the agent wrapper with settings.
 
         Args:
             settings (Settings): The application configuration settings.
+            model_name (str): The name of the model to use.
         """
         self.settings = settings
+        self.model_name = model_name
 
         self.request_limiter = Limiter(Rate(self.settings.ai.rpm, Duration.MINUTE))
         self.token_limiter = Limiter(Rate(self.settings.ai.tpm, Duration.MINUTE))
 
         if self.is_gemini_cli():
-            model_str = settings.ai.model.split(":", 1)[1]
+            model_str = self.model_name.split(":", 1)[-1]
             self.cli_wrapper = GeminiCliWrapper(
                 model_str,
                 settings.ai.gemini_cli,
             )
         elif self.is_google():
-            model_str = settings.ai.model.split(":", 1)[1]
-
-            # Configure Max thinking possible
+            model_str = self.model_name.split(":", 1)[
+                -1
+            ]  # Configure Max thinking possible
             # https://ai.google.dev/gemini-api/docs/thinking
             thinking_config: ThinkingConfigDict
             if model_str.lower().startswith("gemini-3"):
@@ -129,7 +132,7 @@ class RateLimitedAgentWrapper:
         else:
             # TODO: Do we need to enable thinking, etc for other models?
             # For now, this is only tested to work against Google
-            self.agent = Agent(model=settings.ai.model)
+            self.agent = Agent(model=self.model_name)
 
     def run(
         self, prompt: str, video: genai.types.File | Path, video_duration_ms: int
@@ -199,9 +202,21 @@ class RateLimitedAgentWrapper:
 
     def _calculate_tokens(self, text: str, video_duration_ms: int) -> int:
         """
-        Roughly calculates the number of tokens.
-        - Text: 1 token per character.
-        - Video: 300 tokens per second.
+        Estimates the number of tokens for a given text and video duration.
+
+        This is a rough estimation used for rate limiting purposes. The actual
+        token count may vary depending on the model and tokenizer.
+
+        The estimation is based on:
+        - Text: A simple character count.
+        - Video: A fixed rate of tokens per second of video.
+
+        Args:
+            text (str): The text prompt.
+            video_duration_ms (int): The duration of the video in milliseconds.
+
+        Returns:
+            int: The estimated number of tokens.
         """
         # TODO: Make this more accurate. This is just a rough estimation
         return int(len(text) + (video_duration_ms / 1000) * 300)

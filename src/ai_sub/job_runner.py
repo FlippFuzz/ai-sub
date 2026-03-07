@@ -14,8 +14,14 @@ TJob = TypeVar("TJob", bound=Job)
 
 class JobRunner(Generic[TJob]):
     """
-    Abstracts the logic for running jobs from a queue with retries and optional
-    stop events.
+    A generic, concurrent job processor.
+
+    This class provides a framework for processing jobs from a deque in a
+    thread-safe manner using a `ThreadPoolExecutor`. It handles job acquisition,
+    retries on failure, and graceful shutdown.
+
+    Subclasses must implement the `process` method to define the actual work
+    for a job. The `on_complete` callback can be used to chain dependent jobs.
     """
 
     def __init__(
