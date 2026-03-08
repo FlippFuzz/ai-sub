@@ -322,3 +322,31 @@ class SubtitlePass2Job(Job):
             with open(save_path, "r", encoding="utf-8") as f:
                 return SubtitlePass2Job.model_validate_json(f.read())
         return None
+
+
+class VideoPartState(BaseModel):
+    """Represents the consolidated state of a video part processing."""
+
+    name: str
+    file: File | Path
+    video_duration_ms: int
+
+    scene_job: Optional[LyricsSceneJob] = None
+    pass1_job: Optional[SubtitlePass1Job] = None
+    pass2_job: Optional[SubtitlePass2Job] = None
+
+    def save(self, filename: Path):
+        """Saves the current object to a JSON file."""
+        json_str = self.model_dump_json(indent=2)
+        with open(filename, "w", encoding="utf-8") as file:
+            file.write(json_str)
+
+    @staticmethod
+    def load_or_create(
+        save_path: Path, name: str, file: File | Path, video_duration_ms: int
+    ) -> "VideoPartState":
+        """Loads the object from a JSON file, or returns a new object if the file doesn't exist."""
+        if save_path.is_file():
+            with open(save_path, "r", encoding="utf-8") as f:
+                return VideoPartState.model_validate_json(f.read())
+        return VideoPartState(name=name, file=file, video_duration_ms=video_duration_ms)
