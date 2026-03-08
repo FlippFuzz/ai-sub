@@ -3,7 +3,7 @@ from textwrap import dedent
 
 from ai_sub.data_models import SceneResponse, SubtitlePass1Response
 
-SUBTITLES_PROMPT_VERSION = 7
+SUBTITLES_PROMPT_VERSION = 8
 
 # ==========================================
 # SCENE DETECTION & LYRICS RESEARCH
@@ -15,7 +15,8 @@ _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
     ### INSTRUCTIONS
     1.  **Analyze the Audio/Video:** Watch and listen to the entire input. Divide the media into distinct scenes based on audio/visual shifts (e.g., dialogue transitioning into a music video, or a change of song).
     2.  **Identify Vocal Songs:** If a scene contains a song **with vocals**, identify the track name and artist using audio/visual clues (lyrics, on-screen text, context). **Ignore background music (BGM) or instrumental-only tracks.**
-    3.  **Web Search (CRITICAL):** Use your Google Search Tool to look up the official lyrics for the identified song. You must try to find both the **Original Language** lyrics and the **English Translation**.
+    3.  **Web Search (CRITICAL):** Use your Google Search Tool to look up the **FULL official lyrics** for the identified song. You must try to find both the **Original Language** lyrics and the **English Translation**.
+        *   **Completeness Mandate:** Ensure you retrieve the lyrics for the **entire song** (all verses, choruses, bridges, and outros). Do not stop at the first verse.
     4.  **No Hallucination:** If a scene is just dialogue **or instrumental BGM**, leave the song info and lyrics empty. If you cannot confidently find the lyrics online, provide what you can or leave it null. Do NOT make up lyrics.
 
     ### OUTPUT FORMAT
@@ -57,9 +58,10 @@ _SUBTITLES_PASS1_PROMPT_TEMPLATE = dedent(
     ### INPUT CONSTRAINTS (CRITICAL)
     1.  **Audio (High-Res):** This is your **SOLE, ABSOLUTE SOURCE OF TRUTH** for audio timestamps. You must map speech text precisely to the audio waveform and phonemes.
     2.  **Visuals (1fps):** Visuals are provided at 1 Frame Per Second. Use visuals for context, decoding unclear audio, and extracting relevant On-Screen Text.
-    3.  **Scene & Lyrics Reference JSON:** This is **ONLY A REFERENCE**. It may be **missing**, **incomplete** (missing verses), or for the **wrong song entirely**.
+    3.  **Scene & Lyrics Reference JSON:** This is **ONLY A REFERENCE**. It may be **missing**, **incomplete** (missing verses), **have extra lines**, or be for the **wrong song entirely**.
         *   **If it matches:** Use it to resolve unclear vocals.
         *   **If it mismatches, is missing, or has gaps:** **IGNORE THE REFERENCE FOR THAT SECTION.** Transcribe the vocals exactly as heard in the audio. **DO NOT** force the audio to fit an incorrect lyric sheet and **DO NOT** skip lines just because they are missing from the reference.
+        *   **If it has EXTRA lines:** If the reference contains verses/lines that are NOT sung in the audio (e.g., extended album version vs. TV edit), **IGNORE THEM**. Do not hallucinate subtitles for lines that are not audibly present.
 
     ### PRIORITY 1: PRECISION TIMESTAMPS & FORMATTING
     You must eradicate all common AI subtitling biases. Treat every subtitle entry as a discrete, isolated event tied exclusively to the audio waveform.
@@ -187,7 +189,8 @@ _SUBTITLES_PASS2_PROMPT_TEMPLATE = dedent(
     1.  **Audio is the Absolute Source of Truth (CRITICAL):** The high-res audio waveform dictates EXACTLY when a subtitle starts and ends. Pass 1 may contain timestamp drift. You must correct it.
     2.  **Visuals (1fps) for Context Only:** Use the 1 FPS visual feed to understand *who* is speaking, *what* is happening, and *what* on-screen text exists. Do not use visuals for micro-timestamping. Use them to fix pronoun errors, tone mismatches, or translation ambiguities in Pass 1.
     3.  **Holistic Context Integration:** Synthesize the video's narrative, the reference lyrics (if singing), the visual cues, and the audio.
-        *   **Lyrics Reference Warning:** The reference lyrics might be **incomplete** or for the **wrong song**. If the audio contains lines not in the reference, or if the reference contradicts the audio, **TRUST THE AUDIO**. Verify that Pass 1 didn't blindly copy incorrect reference lyrics or omit lines missing from the reference.
+        *   **Lyrics Reference Warning:** The reference lyrics might be **incomplete**, have **extra lines**, or be for the **wrong song**. If the audio contains lines not in the reference, or if the reference contradicts the audio, **TRUST THE AUDIO**. Verify that Pass 1 didn't blindly copy incorrect reference lyrics or omit lines missing from the reference.
+        *   **Extra Lines Protocol:** If the reference has lines that are NOT in the audio, ensure Pass 1 did NOT include them. If it did, **DELETE THEM**.
         *   If Pass 1 misunderstood a lyric, hallucinated during a silent/instrumental part, or lost semantic continuity between sentences, you must rewrite it.
 
     ### QA PRIORITY 1: FLAWLESS TIMESTAMPS (THE AUDIO MANDATE)
