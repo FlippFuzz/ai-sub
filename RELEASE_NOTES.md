@@ -1,5 +1,28 @@
 # AI Sub Release Notes
 
+## v2.1.0b1
+
+This release introduces a new "Scene Detection & Lyrics Research" pass to the pipeline, further enhancing contextual accuracy, especially for videos containing music.
+
+**New Features & Improvements:**
+
+- **Scene Detection & Lyrics Research Pass:** A new initial pass has been added to the processing pipeline.
+  - It analyzes the video to identify distinct scenes (e.g., dialogue vs. music).
+  - For scenes containing music, it uses the AI's web search capabilities to find official original and translated lyrics.
+- **Context-Aware Subtitle Generation:** The data from the new scene/lyrics pass is fed into both Pass 1 (Drafting) and Pass 2 (Refinement). This provides the AI with crucial context, improving the accuracy of lyric transcription and translation.
+- **New Configuration:**
+  - `ai.lyrics_model`: A new setting to specify the model for the scene detection pass.
+  - `thread.lyrics`: A new setting to control concurrency for this pass.
+- **Updated Pipeline Flow:** The processing pipeline is now: Lyrics and Scene Detection -> Subtitle Pass 1 -> Subtitle Pass 2.
+
+**Code Improvements:**
+
+- **Pipeline Orchestration (`main.py`):** The main pipeline logic has been updated to incorporate the new scene detection job runner and manage the new data flow.
+- **Data Models (`data_models.py`):** Introduced `LyricsSceneJob`, `Scene`, and `SceneResponse` models to handle the data from the new pass. `SubtitlePass1Job` and `SubtitlePass2Job` now include an optional `scene_response`.
+- **Prompt Engineering (`prompt.py`):** Prompts for Pass 1 and Pass 2 have been updated to consume and utilize the new scene and lyrics reference data.
+
+---
+
 ## v2.0.0
 
 This major release introduces a two-pass subtitle generation workflow to significantly improve subtitle quality, accuracy, and refinement.

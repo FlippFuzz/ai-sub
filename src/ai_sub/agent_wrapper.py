@@ -1,7 +1,7 @@
 from __future__ import annotations as _annotations
 
 from pathlib import Path
-from typing import cast
+from typing import TypeVar, cast
 
 from google import genai as genai
 from google.genai.types import (
@@ -9,6 +9,7 @@ from google.genai.types import (
     HarmCategory,
     ThinkingConfigDict,
 )
+from pydantic import BaseModel
 from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.messages import DocumentUrl
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
@@ -18,6 +19,8 @@ from pyrate_limiter import Duration, Limiter, Rate
 from ai_sub.config import Settings
 from ai_sub.data_models import AiResponse
 from ai_sub.gemini_cli_wrapper import GeminiCliWrapper
+
+T = TypeVar("T", bound=BaseModel)
 
 
 class RateLimitedAgentWrapper:
@@ -135,8 +138,12 @@ class RateLimitedAgentWrapper:
             self.agent = Agent(model=self.model_name)
 
     def run(
-        self, prompt: str, video: genai.types.File | Path, video_duration_ms: int
-    ) -> AiResponse:
+        self,
+        prompt: str,
+        video: genai.types.File | Path,
+        video_duration_ms: int,
+        response_type: type[T] = AiResponse,  # type: ignore[assignment]
+    ) -> T:
         """
         Runs the AI agent to generate subtitles for the given video.
 
@@ -144,9 +151,10 @@ class RateLimitedAgentWrapper:
             prompt (str): The system prompt to guide the AI.
             video (genai.types.File | Path): The video file (either a Google File object or a local Path).
             video_duration_ms (int): The duration of the video in milliseconds (used for token estimation).
+            response_type (type[T]): The expected Pydantic model for the response. Defaults to AiResponse.
 
         Returns:
-            AiResponse: The structured response containing subtitles.
+            T: The structured response containing subtitles or scene data.
         """
         # Handle Rate limits
         self.request_limiter.try_acquire("rpm")
@@ -157,7 +165,7 @@ class RateLimitedAgentWrapper:
         if self.is_gemini_cli():
             if isinstance(video, Path):
                 assert self.cli_wrapper
-                result = self.cli_wrapper.run_sync(prompt, video)
+                result = self.cli_wrapper.run_sync(prompt, video, response_type)
                 if result:
                     return result
                 raise RuntimeError("Gemini CLI failed to generate response")
@@ -196,8 +204,11 @@ class RateLimitedAgentWrapper:
             ]
 
         # Execute the AI agent to generate subtitles and get a structured response.
-        result = self.agent.run_sync(user_prompt=user_prompt, output_type=AiResponse)
-        result.output.model_name = result.response.model_name
+        result = self.agent.run_sync(user_prompt=user_prompt, output_type=response_type)
+
+        if isinstance(result.output, AiResponse):
+            result.output.model_name = result.response.model_name
+
         return result.output
 
     def _calculate_tokens(self, text: str, video_duration_ms: int) -> int:

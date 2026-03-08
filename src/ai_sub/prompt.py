@@ -1,20 +1,66 @@
+import json
 from textwrap import dedent
 
-SUBTITLES_PROMPT_VERSION = 4
+from ai_sub.data_models import AiResponse, SceneResponse
 
-SUBTITLES_PASS_1_PROMPT = dedent(
+SUBTITLES_PROMPT_VERSION = 5
+
+# ==========================================
+# SCENE DETECTION & LYRICS RESEARCH
+# ==========================================
+_LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
+    """
+    You are an AI Music and Audio Scene Analyzer. Your job is to analyze a video, break it down into chronological scenes, detect if a song is playing, and use your Web Search Tool to find the official lyrics.
+
+    ### INSTRUCTIONS
+    1.  **Analyze the Audio/Video:** Watch and listen to the entire input. Divide the media into distinct scenes based on audio/visual shifts (e.g., dialogue transitioning into a music video, or a change of song).
+    2.  **Identify Songs:** If a scene contains a song, identify the track name and artist using audio/visual clues (lyrics, on-screen text, context).
+    3.  **Web Search (CRITICAL):** Use your Google Search Tool to look up the official lyrics for the identified song. You must try to find both the **Original Language** lyrics and the **English Translation**.
+    4.  **No Hallucination:** If a scene is just dialogue, leave the song info and lyrics empty. If you cannot confidently find the lyrics online, provide what you can or leave it null. Do NOT make up lyrics.
+
+    ### OUTPUT FORMAT
+    Return ONLY a valid, parseable JSON object. No markdown wrapping outside the JSON.
+
+    **JSON Schema:**
+    {
+      "global_summary": "Brief summary of the video structure (e.g., '1 minute of dialogue followed by a 3-minute Japanese pop song').",
+      "scenes": [
+        {
+          "start": "MM:SS.mmm",
+          "end": "MM:SS.mmm",
+          "description": "Brief description of the audio/visual content",
+          "contains_song": true,
+          "song_title": "Found Title or null",
+          "reference_lyrics_og": "Raw original lyrics from web search. Separate lines with \\n. Put null if not found/applicable.",
+          "reference_lyrics_en": "Raw English translation from web search. Separate lines with \\n. Put null if not found/applicable."
+        }
+      ]
+    }
+    """
+).strip()
+
+
+def get_lyrics_scenes_prompt() -> str:
+    """Returns the prompt for scene detection and lyrics research."""
+    return _LYRICS_SCENES_PROMPT_TEMPLATE
+
+
+# ==========================================
+# DRAFTING (WITH LYRIC REFERENCE)
+# ==========================================
+_SUBTITLES_PASS1_PROMPT_TEMPLATE = dedent(
     """
     You are an advanced AI expert in audio-visual translation and subtitling. Your specialty is generating **audio-synchronized**, contextually rich subtitles from multimodal inputs using native audio tokenization.
 
-    **Task:** Generate precise, contextually accurate subtitles. Transcribe the spoken audio in its **Original Language** and provide an **English Translation**.
+    **Task:** Generate precise subtitles. Your Primary Priority is transcribing/translating spoken audio/vocals. Your Secondary Priority is transcribing/translating relevant on-screen text. Output both original language (`og`) and English translation (`en`).
     
     ### INPUT CONSTRAINTS (CRITICAL)
-    1.  **Audio (High-Res):** This is your **SOLE, ABSOLUTE SOURCE OF TRUTH** for timestamps. You must map text precisely to the audio waveform and phonemes.
-    2.  **Visuals (1fps):** Visuals are provided at only 1 Frame Per Second. **DO NOT ATTEMPT VISUAL LIP-SYNC.** Use visuals STRICTLY for context (understanding who is speaking), OCR (reading on-screen text/lyrics), and deciphering unclear audio.
+    1.  **Audio (High-Res):** This is your **SOLE, ABSOLUTE SOURCE OF TRUTH** for audio timestamps. You must map speech text precisely to the audio waveform and phonemes.
+    2.  **Visuals (1fps):** Visuals are provided at 1 Frame Per Second. Use visuals for context, decoding unclear audio, and extracting relevant On-Screen Text.
+    3.  **Scene & Lyrics Reference JSON:** This is **ONLY A REFERENCE** and may contain incorrect, mismatched, or incomplete lyrics. Use it as a helpful guide, but **FOLLOW THE AUDIO** if the singer deviates, skips a verse, or if the reference is simply wrong.
 
     ### PRIORITY 1: PRECISION TIMESTAMPS & FORMATTING
     You must eradicate all common AI subtitling biases. Treat every subtitle entry as a discrete, isolated event tied exclusively to the audio waveform.
-    
     *   **Timecode Format:** MUST strictly adhere to `MM:SS.mmm` (e.g., `01:05.300`). Always pad with zeros. Never use `M:SS.ms` or `HH:MM:SS.mmm`.
     *   **The Zero-Padding Rule:** Disable your bias to keep text on screen for readability. If a 10-word sentence is spoken rapidly in 900ms, the subtitle `s` and `e` MUST reflect exactly that 900ms duration. Do not add artificial padding.
     *   **Anti-Clipping Rule:** `s` is the exact millisecond the first phoneme begins. `e` is the exact millisecond the final phoneme's sound fully decays. 
@@ -26,8 +72,10 @@ SUBTITLES_PASS_1_PROMPT = dedent(
         *   **Scenario A: Distinct Gap (Pause/Breath):** Part 1 `e` captures the vocal decay. Part 2 `s` begins when sound resumes. 
         *   **Scenario B: Continuous Flow (Over 50 chars, no pauses):** Utilize **Contiguous Timestamping**. Split at a natural conjunction. Part 1 `e` MUST EXACTLY EQUAL Part 2 `s` (e.g., `00:05.500`). Do not invent an audio gap.
 
-    ### PRIORITY 3: TRANSCRIPTION, TRANSLATION & ANTI-HALLUCINATION
-    *   **Speech ONLY (No CC Tags):** Do NOT transcribe sound effects, background noise, music, or applause. ABSOLUTELY NO tags like `[applause]`, `(sighs)`, or `♪`. 
+    ### PRIORITY 3: HOLISTIC CONTEXT, TRANSCRIPTION & VISUAL TEXT
+    *   **Holistic Context for Accuracy:** Do not process audio in a vacuum. To ensure flawless transcription and translation, you MUST synthesize all available context: **the lyrics reference, the visual narrative, the on-screen text, and the overarching theme of the entire video**. Use this combined context to decipher mumbled/unclear audio, assign correct pronouns, and maintain semantic continuity. NEVER translate lines in isolation.
+    *   **Primary (Audio):** Transcribe human speech and vocals. Do NOT transcribe sound effects, music, or applause. NO CC tags like `[applause]`, `(sighs)`, or `♪`. 
+    *   **Secondary (On-Screen Text):** Transcribe/translate prominent, relevant visual text (titles, signs, phone screens). **Exclude:** Meaningless background text, UI elements, or burnt-in subtitles that merely duplicate the spoken audio.
     *   **Anti-Hallucination Protocol:** During long stretches of silence or instrumental music, AI models often hallucinate text or repeat the previous line. YOU MUST REMAIN SILENT. Output nothing if there is no human speech.
     *   **Context-Aware Translation (NO ISOLATION):** NEVER translate lines in isolation. Always analyze the **Previous 2 Sentences**, the **Next 2 Sentences**, and the **Full Current Sentence**. Use this context to determine pronouns, tense, and tone.
     *   **Semantic Continuity:** If splitting a sentence, ensure the translation of "Part 1" grammatically anticipates "Part 2" (e.g., using open-ended connective forms). Do not close a sentence prematurely.
@@ -103,61 +151,96 @@ SUBTITLES_PASS_1_PROMPT = dedent(
         }
       ]
     }
+
+    ### SCENE & LYRICS REFERENCE JSON INPUT:
+    ```json
     """
 ).strip()
 
-SUBTITLES_PASS_2_PROMPT = dedent(
+
+def get_subtitle_pass1_prompt(scene_response: SceneResponse | None) -> str:
     """
-    You are a strict Quality Assurance Auditor and Audio-Timing Expert for subtitling. 
-    
-    **Inputs Provided:**
-    1. A Video file (High-res Audio, 1fps Video).
-    2. A "Draft" JSON file containing subtitles generated by an earlier AI pass.
+    Generates the prompt for the first pass of subtitle generation.
 
-    **Your Task:** Audit and perfect the Draft JSON. You must return a final, flawless JSON object using the exact same schema.
-    
-    ### AUDIT PROTOCOL (EXECUTE IN ORDER):
+    Args:
+        scene_response (SceneResponse | None): The scene detection data.
 
-    **1. Timestamp Verification & Formatting (CRITICAL):**
-    *   **Format Check:** Ensure every single timestamp strictly follows `MM:SS.mmm` (e.g., `00:05.200`, NOT `0:5.2`).
-    *   **Check for Padding:** Did the draft add 500ms+ of silence to the end of a line? Remove it. `e` must perfectly match the vocal decay.
-    *   **Check for Clipping:** Fix `s` times to catch the very first phoneme if the draft started late.
-    *   **Check for Drift:** Ensure fast-paced dialogue or singing hasn't drifted off the audio beat.
+    Returns:
+        str: The full prompt string.
+    """
+    scene_json = scene_response.model_dump_json(indent=2) if scene_response else ""
+    return f"{_SUBTITLES_PASS1_PROMPT_TEMPLATE}{scene_json}\n```"
 
-    **2. Segmentation & Length Check (Max 50 Chars):**
-    *   Did the draft output any lines exceeding 50 characters? If yes, split them logically.
-    *   **Crucial:** If splitting a continuous flow of speech, you MUST use **Contiguous Timestamps** (Part 1 `e` exactly equals Part 2 `s`). Do not invent an audio gap.
 
-    **3. Anti-Hallucination & Clean-up:**
-    *   **Strip Non-Speech Tags:** Remove ANY descriptions of sound effects, music, laughter, or applause (`[applause]`, `(sighs)`, `♪`). 
-    *   **Eradicate Hallucinations:** Check long gaps of silence or music in the audio. If the draft hallucinated text or repeated a previous line during these gaps, DELETE that subtitle entry entirely.
-    *   Ensure transcription matches on-screen lyrics if present. Correct spelling/Kanji.
+# ==========================================
+# QA/REFINEMENT
+# ==========================================
+_SUBTITLES_PASS2_PROMPT_TEMPLATE = dedent(
+    """
+    You are an Elite AI Subtitle QA Editor and Audio-Visual Context Analyst. Your job is to meticulously review, refine, and perfect a "Pass 1" subtitle draft. 
 
-    **4. Translation & Cohesion Polish:**
-    *   **Context Check:** Do the translations flow logically from one sentence to the next?
-    *   **Fix Isolated Fragments:** Ensure broken sentences grammatical bridge smoothly across entries. Ensure pronouns and tenses are consistent.
+    You have access to the original high-resolution audio, the 1 FPS visual track, the Scene & Lyrics Reference, and the Pass 1 Subtitles draft. Your ultimate goal is absolute perfection in both synchronization and contextual translation.
 
-    ### CRITICAL OUTPUT RULE: NO TRUNCATION
-    You MUST output the ENTIRE corrected JSON. Do not omit any subtitles. Do not use placeholders like "// ... rest of the subtitles". **Output every single array item from start to finish.**
+    ### INPUT CONSTRAINTS & CONTEXT RULES
+    1.  **Audio is the Absolute Source of Truth (CRITICAL):** The high-res audio waveform dictates EXACTLY when a subtitle starts and ends. Pass 1 may contain timestamp drift. You must correct it.
+    2.  **Visuals (1fps) for Context Only:** Use the 1 FPS visual feed to understand *who* is speaking, *what* is happening, and *what* on-screen text exists. Do not use visuals for micro-timestamping. Use them to fix pronoun errors, tone mismatches, or translation ambiguities in Pass 1.
+    3.  **Holistic Context Integration:** Synthesize the video's narrative, the reference lyrics (if singing), the visual cues, and the audio. If Pass 1 misunderstood a lyric, hallucinated during a silent/instrumental part, or lost semantic continuity between sentences, you must rewrite it.
+
+    ### QA PRIORITY 1: FLAWLESS TIMESTAMPS (THE AUDIO MANDATE)
+    *   **The Anti-Padding/Zero-Padding Mandate (CRITICAL):** You have a strong underlying AI bias to pad subtitle durations to ensure human readability. **DISABLE THIS BIAS.** Do NOT "fix" fast subtitles. If Pass 1 correctly timed a rapid 10-word sentence to a mere 900ms audio burst, you must leave it at 900ms. `s` and `e` MUST tightly hug the actual audio waveform. Never extend an `e` timestamp into silence just to keep text on screen.
+    *   **Micro-Alignment:** Adjust `s` (start) and `e` (end) to perfectly encapsulate the exact phoneme start and phonetic decay of the spoken words. 
+    *   **Strict Format:** `MM:SS.mmm` (e.g., `01:05.300`). Must be zero-padded.
+    *   **Contiguous Timestamps for Continuous Speech:** If a long, uninterrupted sentence is split across multiple subtitles, ensure the `e` of part 1 exactly matches the `s` of part 2 (e.g., `e: "00:05.500"`, `s: "00:05.500"`). Do NOT introduce artificial millisecond gaps in the middle of a continuous breath.
+    *   **Silence the Hallucinations:** If Pass 1 created subtitles during pure instrumental music, long pauses, or sound effects, **DELETE THEM**. Only human speech, vocals, or critical on-screen text get subtitles.
+
+    ### QA PRIORITY 2: TRANSCRIPTION & TRANSLATION REFINEMENT
+    *   **Correct Audio Mismatches:** Listen closely. Did Pass 1 mishear a word? Fix the `og` (original language) transcription and update the `en` (English) translation accordingly.
+    *   **Contextual Translation Corrections:** Did Pass 1 translate a sentence in isolation? Look at the previous/next lines and the visuals. Fix grammatical tense, pronouns (he/she/it/they), and tone (formal/informal) to match the actual scene.
+    *   **On-Screen Text Check:** Ensure any critical on-screen text translated by Pass 1 is actually relevant and not just background clutter. If Pass 1 missed an important visual title card, add it.
+    *   **Constraint Verification:** Ensure NO subtitle exceeds 50 characters per line. Ensure NO closed captioning tags (like `[music]`, `(sighs)`, `♪`) survived Pass 1.
 
     ### OUTPUT FORMAT
-    Return **ONLY** a valid, parseable JSON object. Do not explain your changes outside of the JSON. 
+    Return **ONLY** a valid, parseable JSON object. No markdown wrapping outside the JSON.
+    You MUST output `qa_analysis` FIRST to explain your corrections.
 
     **JSON Schema:**
     {
-      "global_analysis": "Briefly state exactly what formatting, timing, hallucination, or cohesion errors you found in the draft and fixed in this pass.",
+      "qa_analysis": "A brief paragraph detailing the specific fixes you made to Pass 1. Explicitly mention if you had to strip away artificial padding, remove hallucinations, or fix contextual translations based on visuals.",
       "subs": [
         {
           "s": "MM:SS.mmm",
           "e": "MM:SS.mmm",
-          "og": "Corrected Original Transcription",
-          "en": "Corrected English Translation"
+          "og": "Refined Original Language Transcription",
+          "en": "Refined English Translation"
         }
       ]
     }
 
-
-    ### DRAFT JSON INPUT:
+    ### PASS 1 SUBTITLES & LYRICS REFERENCE INPUT:
     ```json
     """
 ).strip()
+
+
+def get_subtitle_pass2_prompt(
+    scene_response: SceneResponse | None, pass1_subs: AiResponse
+) -> str:
+    """
+    Generates the prompt for the second pass of subtitle generation (QA).
+
+    Args:
+        scene_response (SceneResponse | None): The scene detection data.
+        pass1_subs (AiResponse): The subtitles generated in pass 1.
+
+    Returns:
+        str: The full prompt string.
+    """
+    combined_input = {
+        "scene_data": (
+            scene_response.model_dump(mode="json") if scene_response else None
+        ),
+        "pass1_subs": pass1_subs.model_dump(mode="json"),
+    }
+    return (
+        f"{_SUBTITLES_PASS2_PROMPT_TEMPLATE}{json.dumps(combined_input, indent=2)}\n```"
+    )

@@ -2,7 +2,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TypeVar
 
 import logfire
 from json_repair import repair_json
@@ -10,6 +10,8 @@ from pydantic import BaseModel, ValidationError
 
 from ai_sub.config import GeminiCliSettings
 from ai_sub.data_models import AiResponse
+
+T = TypeVar("T", bound=BaseModel)
 
 
 class GeminiCliResponseModelStats(BaseModel):
@@ -61,16 +63,19 @@ class GeminiCliWrapper:
         self.model_name = model_name
         self.settings = settings
 
-    def run_sync(self, prompt: str, video: Path) -> AiResponse | None:
+    def run_sync(
+        self, prompt: str, video: Path, response_type: type[T] = AiResponse  # type: ignore[assignment]
+    ) -> T | None:
         """
         Runs the Gemini CLI synchronously.
 
         Args:
             prompt (str): The prompt text.
             video (Path): The path to the video file.
+            response_type (type[T]): The expected Pydantic model for the response.
 
         Returns:
-            AiResponse | None: The parsed response or None if execution failed.
+            T | None: The parsed response or None if execution failed.
         """
         video_directory = video.parent
 
@@ -161,15 +166,18 @@ class GeminiCliWrapper:
                     # There is usually leading and trailing ''' characters.
                     # repair_json will take care of it
                     json_str = repair_json(cli_response.response)
-                    ai_response = AiResponse.model_validate_json(json_str)
+                    response_obj = response_type.model_validate_json(json_str)
                 except ValidationError:
                     logfire.debug(f"GeminiCliResponse: {cli_response}")
                     logfire.error(f"Failed to validate JSON: {json_str}")
                     raise
-                ai_response.model_name = self.model_name
+
+                if isinstance(response_obj, AiResponse):
+                    response_obj.model_name = self.model_name
+
                 logfire.debug(
-                    f"GeminiCliResponse: {cli_response}\nAiResponse: {ai_response}"
+                    f"GeminiCliResponse: {cli_response}\nResponse: {response_obj}"
                 )
-                return ai_response
+                return response_obj
             else:
                 return None

@@ -150,6 +150,25 @@ class SubtitleGenerationState(BaseModel):
     settings: Settings
 
 
+class Scene(BaseModel):
+    """Represents a detected scene in the video."""
+
+    start: str
+    end: str
+    description: str
+    contains_song: bool
+    song_title: Optional[str] = None
+    reference_lyrics_og: Optional[str] = None
+    reference_lyrics_en: Optional[str] = None
+
+
+class SceneResponse(BaseModel):
+    """Represents the structured response from the Scene Detection pass."""
+
+    global_summary: str
+    scenes: list[Scene]
+
+
 class Job(BaseModel):
     """Base class for all job types in the processing pipeline."""
 
@@ -174,12 +193,44 @@ class UploadFileJob(Job):
     video_duration_ms: PositiveInt
 
 
-class SubtitlePass1Job(Job):
-    """Represents a job to generate the first pass of subtitles (Transcription)."""
+class LyricsSceneJob(Job):
+    """Represents a job to detect lyrics and scenes in a video segment."""
 
     name: str
     file: File | Path
     video_duration_ms: PositiveInt
+    response: Optional[SceneResponse] = None
+
+    def save(self, filename: Path):
+        """Saves the current object to a JSON file."""
+        json_str = self.model_dump_json(indent=2)
+        with open(filename, "w", encoding="utf-8") as file:
+            file.write(json_str)
+
+    @staticmethod
+    def load_or_return_new(
+        save_path: Path, name: str, file: File | Path, video_duration_ms: int
+    ):
+        """Loads the object from a JSON file, or returns a new object if the file doesn't exist."""
+        if Path(save_path).is_file():
+            with open(save_path, "r", encoding="utf-8") as f:
+                return LyricsSceneJob.model_validate_json(f.read())
+        else:
+            return LyricsSceneJob(
+                name=name, file=file, video_duration_ms=video_duration_ms
+            )
+
+
+class SubtitlePass1Job(Job):
+    """
+    Represents a job to generate the first pass of subtitles (Transcription),
+    using scene/lyrics data from a `SceneResponse` as a reference.
+    """
+
+    name: str
+    file: File | Path
+    video_duration_ms: PositiveInt
+    scene_response: Optional[SceneResponse] = None
     response: Optional[AiResponse] = None
 
     def save(self, filename: Path):
@@ -217,11 +268,15 @@ class SubtitlePass1Job(Job):
 
 
 class SubtitlePass2Job(Job):
-    """Represents a job to generate the second pass of subtitles (QA & Refinement)."""
+    """
+    Represents a job to generate the second pass of subtitles (QA & Refinement),
+    using the Pass 1 `draft` and scene/lyrics data from a `SceneResponse` as a reference.
+    """
 
     name: str
     file: File | Path
     video_duration_ms: PositiveInt
+    scene_response: Optional[SceneResponse] = None
     draft: AiResponse
     response: Optional[AiResponse] = None
 

@@ -14,7 +14,9 @@ from ai_sub.agent_wrapper import RateLimitedAgentWrapper
 from ai_sub.config import Settings
 from ai_sub.data_models import (
     AiSubResult,
+    LyricsSceneJob,
     ReEncodingJob,
+    SceneResponse,
     SubtitleGenerationState,
     SubtitlePass1Job,
     SubtitlePass2Job,
@@ -23,9 +25,10 @@ from ai_sub.data_models import (
 from ai_sub.gemini_file_uploader import GeminiFileUploader
 from ai_sub.job_runner import JobRunner
 from ai_sub.prompt import (
-    SUBTITLES_PASS_1_PROMPT,
-    SUBTITLES_PASS_2_PROMPT,
     SUBTITLES_PROMPT_VERSION,
+    get_lyrics_scenes_prompt,
+    get_subtitle_pass1_prompt,
+    get_subtitle_pass2_prompt,
 )
 from ai_sub.video import (
     get_video_duration_ms,
@@ -107,6 +110,44 @@ class UploadJobRunner(JobRunner[UploadFileJob]):
             return file
 
 
+class LyricsSceneJobRunner(JobRunner[LyricsSceneJob]):
+    """
+    Worker that executes the AI agent to detect lyrics and scenes.
+    """
+
+    def __init__(
+        self,
+        queue: deque[LyricsSceneJob],
+        settings: Settings,
+        max_workers: int,
+        agent: RateLimitedAgentWrapper,
+        on_complete: Callable[[LyricsSceneJob, Any], None],
+        stop_events: list[Event] | None = None,
+        name: str = "LyricsSceneJobRunner",
+    ):
+        super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
+        self.agent = agent
+
+    def process(self, job: LyricsSceneJob) -> None:
+        """
+        Invokes the AI agent to detect scenes.
+        """
+        with logfire.span(f"Scene Detection {job.name}"):
+            job.response = self.agent.run(
+                get_lyrics_scenes_prompt(),
+                job.file,
+                job.video_duration_ms,
+                response_type=SceneResponse,
+            )
+
+    def post_process(self, job: LyricsSceneJob) -> None:
+        """Saves the result to disk."""
+        sanitized_model = self.settings.ai.get_sanitized_model_name(
+            self.settings.ai.lyrics_model
+        )
+        job.save(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-scene.json")
+
+
 class SubtitlePass1JobRunner(JobRunner[SubtitlePass1Job]):
     """
     Worker that executes the AI agent to generate the first pass of subtitles.
@@ -130,9 +171,8 @@ class SubtitlePass1JobRunner(JobRunner[SubtitlePass1Job]):
         Invokes the AI agent to generate subtitles.
         """
         with logfire.span(f"Subtitling Pass 1 {job.name}"):
-            job.response = self.agent.run(
-                SUBTITLES_PASS_1_PROMPT, job.file, job.video_duration_ms
-            )
+            prompt = get_subtitle_pass1_prompt(job.scene_response)
+            job.response = self.agent.run(prompt, job.file, job.video_duration_ms)
 
     def post_process(self, job: SubtitlePass1Job) -> None:
         """
@@ -176,9 +216,7 @@ class SubtitlePass2JobRunner(JobRunner[SubtitlePass2Job]):
         Invokes the AI agent to generate subtitles.
         """
         with logfire.span(f"Subtitling Pass 2 {job.name}"):
-            draft_json = job.draft.model_dump_json(indent=2)
-            prompt = f"{SUBTITLES_PASS_2_PROMPT}{draft_json}\n```"
-
+            prompt = get_subtitle_pass2_prompt(job.scene_response, job.draft)
             job.response = self.agent.run(prompt, job.file, job.video_duration_ms)
             logfire.info(f"{job.name} subtitled")
 
@@ -307,22 +345,22 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
     This function orchestrates the entire process, from video preparation to
     final subtitle file generation. The workflow is as follows:
 
-    1.  **Video Splitting:** The input video is divided into smaller, manageable
-        segments based on the configured duration.
-    2.  **Job Queueing:** For each segment, the application checks if results
-        from previous runs exist. If not, it creates a chain of jobs:
-        - (Optional) Re-encoding to a smaller size.
-        - (Optional) Uploading the video file to a cloud service (e.g., Gemini Files API).
-        - Pass 1: Generating an initial subtitle draft (transcription).
-        - Pass 2: Refining and quality-checking the draft.
-    3.  **Concurrent Processing:** Jobs are processed concurrently by dedicated
-        `JobRunner` instances, each with its own thread pool. Callbacks are
-        used to chain dependent jobs (e.g., an upload job triggers a subtitle job).
-    4.  **Stitching:** Once all segments are processed, the individual subtitle
-        files are stitched together. Timestamps are adjusted to align with the
-        original, full-length video.
-    5.  **Final Output:** A single `.srt` file is created, along with a state
-        summary embedded in the first subtitle entry.
+    1.  **Video Splitting:** The input video is divided into smaller, manageable segments.
+    2.  **Job Queueing:** For each segment, the application checks for cached results from
+        previous runs. If a step is not complete, it creates a chain of jobs:
+        - (Optional) **Re-encoding:** The video segment is re-encoded to a smaller size.
+        - (Optional) **Uploading:** The file is uploaded to a cloud service (e.g., Gemini Files API).
+        - **Scene Detection:** The video is analyzed for scene changes and lyrics for any detected songs are researched.
+        - **Pass 1 (Drafting):** An initial subtitle draft is generated, using the scene/lyrics data as a reference.
+        - **Pass 2 (Refinement):** The draft is refined and quality-checked, also using the scene/lyrics data.
+    3.  **Concurrent Processing:** Jobs for each stage are processed concurrently by
+        dedicated `JobRunner` instances. Callbacks are used to chain dependent jobs
+        (e.g., an upload job triggers a scene detection job, which in turn triggers a
+        subtitle job).
+    4.  **Stitching:** Once all segments are processed, the individual subtitle results
+        are stitched together, with timestamps adjusted to align with the original video.
+    5.  **Final Output:** A single `.srt` file is created, containing the final subtitles
+        and a state summary.
 
     Args:
         settings (Settings): The application configuration.
@@ -366,6 +404,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
     # Initialize the AI Agent.
     # A custom wrapper is used to make handling rate limits and differences in models more cleanly
     agent1 = RateLimitedAgentWrapper(settings, settings.ai.pass1_model)
+    agent_scene = RateLimitedAgentWrapper(settings, settings.ai.lyrics_model)
     agent2 = RateLimitedAgentWrapper(settings, settings.ai.pass2_model)
 
     # Start the main application logic within a Logfire span for better tracing.
@@ -403,10 +442,14 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         # Deques are used as thread-safe queues for managing jobs.
         reencode_jobs_queue: deque[ReEncodingJob] = deque()
         gemini_upload_jobs_queue: deque[UploadFileJob] = deque()
+        scene_detection_jobs_queue: deque[LyricsSceneJob] = deque()
         subtitle_pass1_jobs_queue: deque[SubtitlePass1Job] = deque()
         subtitle_pass2_jobs_queue: deque[SubtitlePass2Job] = deque()
 
         sanitized_model1 = settings.ai.get_sanitized_model_name(settings.ai.pass1_model)
+        sanitized_model_scene = settings.ai.get_sanitized_model_name(
+            settings.ai.lyrics_model
+        )
         sanitized_model2 = settings.ai.get_sanitized_model_name(settings.ai.pass2_model)
 
         use_reencode = settings.split.re_encode.enabled
@@ -414,10 +457,12 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
 
         reencode_complete_event = Event()
         gemini_upload_complete_event = Event()
+        scene_detection_complete_event = Event()
         subtitle1_complete_event = Event()
 
         reencode_runner: ReEncodeJobRunner | None = None
         upload_runner: UploadJobRunner | None = None
+        scene_detection_runner: LyricsSceneJobRunner | None = None
         subtitle_pass1_runner: SubtitlePass1JobRunner | None = None
         subtitle_pass2_runner: SubtitlePass2JobRunner | None = None
 
@@ -431,8 +476,8 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                     )
                 )
             else:
-                subtitle_pass1_jobs_queue.append(
-                    SubtitlePass1Job(
+                scene_detection_jobs_queue.append(
+                    LyricsSceneJob(
                         name=job.output_file.stem,
                         file=job.output_file,
                         video_duration_ms=duration,
@@ -440,13 +485,24 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 )
 
         def on_upload_complete(job: UploadFileJob, file: Any) -> None:
-            subtitle_pass1_jobs_queue.append(
-                SubtitlePass1Job(
+            scene_detection_jobs_queue.append(
+                LyricsSceneJob(
                     name=job.python_file.stem,
                     file=file,
                     video_duration_ms=job.video_duration_ms,
                 )
             )
+
+        def on_scene_detection_complete(job: LyricsSceneJob, _: Any) -> None:
+            if job.response:
+                subtitle_pass1_jobs_queue.append(
+                    SubtitlePass1Job(
+                        name=job.name,
+                        file=job.file,
+                        video_duration_ms=job.video_duration_ms,
+                        scene_response=job.response,
+                    )
+                )
 
         def on_subtitle1_complete(job: SubtitlePass1Job, _: Any) -> None:
             if job.response:
@@ -455,6 +511,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                         name=job.name,
                         file=job.file,
                         video_duration_ms=job.video_duration_ms,
+                        scene_response=job.scene_response,
                         draft=job.response,
                     )
                 )
@@ -480,12 +537,25 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 stop_events=stop_events,
             )
 
-        # Setup subtitle_pass1_runner
-        subtitle1_stop_events = []
+        # Setup scene_detection_runner
+        scene_stop_events = []
         if use_upload:
-            subtitle1_stop_events.append(gemini_upload_complete_event)
+            scene_stop_events.append(gemini_upload_complete_event)
         elif use_reencode:
-            subtitle1_stop_events.append(reencode_complete_event)
+            scene_stop_events.append(reencode_complete_event)
+
+        scene_detection_runner = LyricsSceneJobRunner(
+            scene_detection_jobs_queue,
+            settings,
+            settings.thread.lyrics,
+            agent_scene,
+            on_complete=on_scene_detection_complete,
+            stop_events=scene_stop_events,
+        )
+
+        # Setup subtitle_pass1_runner
+        # Pass 1 now depends on Scene Detection
+        subtitle1_stop_events = [scene_detection_complete_event]
 
         subtitle_pass1_runner = SubtitlePass1JobRunner(
             subtitle_pass1_jobs_queue,
@@ -529,17 +599,34 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 duration,
             )
             if pass1_job.response is not None:
+                # We need scene response for Pass 2. If Pass 1 was loaded from disk,
+                # it might have scene_response if it was run with the new version.
+                # If not, we might be missing it.
+                # For now, we assume if Pass 1 is done, we can proceed to Pass 2.
+                # If scene_response is missing, Pass 2 prompt will just have null for scene_data.
                 subtitle_pass2_jobs_queue.append(
                     SubtitlePass2Job(
                         name=pass1_job.name,
                         file=pass1_job.file,
                         video_duration_ms=pass1_job.video_duration_ms,
+                        scene_response=pass1_job.scene_response,
                         draft=pass1_job.response,
                     )
                 )
                 continue
 
-            # 3. Start from scratch (Re-encode/Upload/Pass1)
+            # 3. Check Scene Detection Done
+            scene_job = LyricsSceneJob.load_or_return_new(
+                settings.dir.tmp / f"{split.stem}.{sanitized_model_scene}-scene.json",
+                split.stem,
+                split,
+                duration,
+            )
+            if scene_job.response is not None:
+                on_scene_detection_complete(scene_job, None)
+                continue
+
+            # 4. Start from scratch (Re-encode/Upload/Scene)
             input_file = split
             if use_reencode:
                 should_reencode = True
@@ -574,8 +661,8 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                             )
                         )
                     else:
-                        subtitle_pass1_jobs_queue.append(
-                            SubtitlePass1Job(
+                        scene_detection_jobs_queue.append(
+                            LyricsSceneJob(
                                 name=input_file.stem,
                                 file=input_file,
                                 video_duration_ms=duration,
@@ -586,8 +673,8 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                     UploadFileJob(python_file=input_file, video_duration_ms=duration)
                 )
             else:
-                subtitle_pass1_jobs_queue.append(
-                    SubtitlePass1Job(
+                scene_detection_jobs_queue.append(
+                    LyricsSceneJob(
                         name=input_file.stem,
                         file=input_file,
                         video_duration_ms=duration,
@@ -600,6 +687,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             reencode_runner.start()
         if upload_runner:
             upload_runner.start()
+        scene_detection_runner.start()
         subtitle_pass1_runner.start()
         subtitle_pass2_runner.start()
 
@@ -612,6 +700,9 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             upload_runner.wait()
             gemini_upload_complete_event.set()
 
+        scene_detection_runner.wait()
+        scene_detection_complete_event.set()
+
         subtitle_pass1_runner.wait()
         subtitle1_complete_event.set()
 
@@ -622,6 +713,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             reencode_runner.shutdown()
         if upload_runner:
             upload_runner.shutdown()
+        scene_detection_runner.shutdown()
         subtitle_pass1_runner.shutdown()
         subtitle_pass2_runner.shutdown()
 
