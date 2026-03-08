@@ -3,7 +3,7 @@ from textwrap import dedent
 
 from ai_sub.data_models import SceneResponse, SubtitlePass1Response
 
-SUBTITLES_PROMPT_VERSION = 6
+SUBTITLES_PROMPT_VERSION = 7
 
 # ==========================================
 # SCENE DETECTION & LYRICS RESEARCH
@@ -57,7 +57,9 @@ _SUBTITLES_PASS1_PROMPT_TEMPLATE = dedent(
     ### INPUT CONSTRAINTS (CRITICAL)
     1.  **Audio (High-Res):** This is your **SOLE, ABSOLUTE SOURCE OF TRUTH** for audio timestamps. You must map speech text precisely to the audio waveform and phonemes.
     2.  **Visuals (1fps):** Visuals are provided at 1 Frame Per Second. Use visuals for context, decoding unclear audio, and extracting relevant On-Screen Text.
-    3.  **Scene & Lyrics Reference JSON:** This is **ONLY A REFERENCE** and may contain incorrect, mismatched, or incomplete lyrics. Use it as a helpful guide, but **FOLLOW THE AUDIO** if the singer deviates, skips a verse, or if the reference is simply wrong.
+    3.  **Scene & Lyrics Reference JSON:** This is **ONLY A REFERENCE**. It may be **missing**, **incomplete** (missing verses), or for the **wrong song entirely**.
+        *   **If it matches:** Use it to resolve unclear vocals.
+        *   **If it mismatches, is missing, or has gaps:** **IGNORE THE REFERENCE FOR THAT SECTION.** Transcribe the vocals exactly as heard in the audio. **DO NOT** force the audio to fit an incorrect lyric sheet and **DO NOT** skip lines just because they are missing from the reference.
 
     ### PRIORITY 1: PRECISION TIMESTAMPS & FORMATTING
     You must eradicate all common AI subtitling biases. Treat every subtitle entry as a discrete, isolated event tied exclusively to the audio waveform.
@@ -184,7 +186,9 @@ _SUBTITLES_PASS2_PROMPT_TEMPLATE = dedent(
     ### INPUT CONSTRAINTS & CONTEXT RULES
     1.  **Audio is the Absolute Source of Truth (CRITICAL):** The high-res audio waveform dictates EXACTLY when a subtitle starts and ends. Pass 1 may contain timestamp drift. You must correct it.
     2.  **Visuals (1fps) for Context Only:** Use the 1 FPS visual feed to understand *who* is speaking, *what* is happening, and *what* on-screen text exists. Do not use visuals for micro-timestamping. Use them to fix pronoun errors, tone mismatches, or translation ambiguities in Pass 1.
-    3.  **Holistic Context Integration:** Synthesize the video's narrative, the reference lyrics (if singing), the visual cues, and the audio. If Pass 1 misunderstood a lyric, hallucinated during a silent/instrumental part, or lost semantic continuity between sentences, you must rewrite it.
+    3.  **Holistic Context Integration:** Synthesize the video's narrative, the reference lyrics (if singing), the visual cues, and the audio.
+        *   **Lyrics Reference Warning:** The reference lyrics might be **incomplete** or for the **wrong song**. If the audio contains lines not in the reference, or if the reference contradicts the audio, **TRUST THE AUDIO**. Verify that Pass 1 didn't blindly copy incorrect reference lyrics or omit lines missing from the reference.
+        *   If Pass 1 misunderstood a lyric, hallucinated during a silent/instrumental part, or lost semantic continuity between sentences, you must rewrite it.
 
     ### QA PRIORITY 1: FLAWLESS TIMESTAMPS (THE AUDIO MANDATE)
     *   **The Anti-Padding/Zero-Padding Mandate (CRITICAL):** You have a strong underlying AI bias to pad subtitle durations to ensure human readability. **DISABLE THIS BIAS.** Do NOT "fix" fast subtitles. If Pass 1 correctly timed a rapid 10-word sentence to a mere 900ms audio burst, you must leave it at 900ms. `s` and `e` MUST tightly hug the actual audio waveform. Never extend an `e` timestamp into silence just to keep text on screen.

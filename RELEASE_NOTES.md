@@ -1,5 +1,17 @@
 # AI Sub Release Notes
 
+## v2.1.0b3
+
+This release improves the robustness of subtitle generation when the lyrics reference is inaccurate or missing.
+
+**Improvements:**
+
+- **Prompt Engineering:**
+  - Updated `SUBTITLES_PROMPT_VERSION` to 7.
+  - Refined Pass 1 and Pass 2 prompts to handle cases where the lyrics reference is missing, incomplete, or incorrect. The AI is now explicitly instructed to prioritize the audio source of truth over the reference JSON if discrepancies exist, preventing it from forcing audio to fit an incorrect lyric sheet.
+
+---
+
 ## v2.1.0b2
 
 This release refines the scene detection pass to reduce false positives for lyrics research by ignoring instrumental background music.
