@@ -297,10 +297,10 @@ def stitch_subtitles(
         for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
             # Load the job result from the temporary JSON file.
             state_path = settings.dir.tmp / f"{video_path.stem}.json"
-            state = VideoPartState.load_or_create(
+            part_state = VideoPartState.load_or_create(
                 state_path, video_path.stem, video_path, video_duration_ms
             )
-            job = state.pass2_job
+            job = part_state.pass2_job
 
             if job and job.response is not None:
                 current_subtitles = job.response.get_ssafile()
