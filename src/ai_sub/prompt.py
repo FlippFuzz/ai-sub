@@ -1,7 +1,7 @@
 import json
 from textwrap import dedent
 
-from ai_sub.data_models import AiResponse, SceneResponse
+from ai_sub.data_models import SceneResponse, SubtitlePass1Response
 
 SUBTITLES_PROMPT_VERSION = 5
 
@@ -223,14 +223,14 @@ _SUBTITLES_PASS2_PROMPT_TEMPLATE = dedent(
 
 
 def get_subtitle_pass2_prompt(
-    scene_response: SceneResponse | None, pass1_subs: AiResponse
+    scene_response: SceneResponse | None, pass1_subs: SubtitlePass1Response
 ) -> str:
     """
     Generates the prompt for the second pass of subtitle generation (QA).
 
     Args:
         scene_response (SceneResponse | None): The scene detection data.
-        pass1_subs (AiResponse): The subtitles generated in pass 1.
+        pass1_subs (SubtitlePass1Response): The subtitles generated in pass 1.
 
     Returns:
         str: The full prompt string.

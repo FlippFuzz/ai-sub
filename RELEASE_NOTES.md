@@ -19,6 +19,7 @@ This release introduces a new "Scene Detection & Lyrics Research" pass to the pi
 
 - **Pipeline Orchestration (`main.py`):** The main pipeline logic has been updated to incorporate the new scene detection job runner and manage the new data flow.
 - **Data Models (`data_models.py`):** Introduced `LyricsSceneJob`, `Scene`, and `SceneResponse` models to handle the data from the new pass. `SubtitlePass1Job` and `SubtitlePass2Job` now include an optional `scene_response`.
+- **Response Models (`data_models.py`):** Split the generic `AiResponse` into specific `SubtitlePass1Response` and `SubtitlePass2Response` models. This ensures that the output from each pass strictly adheres to its expected schema (e.g., `global_analysis` for Pass 1, `qa_analysis` for Pass 2).
 - **Prompt Engineering (`prompt.py`):** Prompts for Pass 1 and Pass 2 have been updated to consume and utilize the new scene and lyrics reference data.
 
 ---

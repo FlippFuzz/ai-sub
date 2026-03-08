@@ -9,7 +9,7 @@ from json_repair import repair_json
 from pydantic import BaseModel, ValidationError
 
 from ai_sub.config import GeminiCliSettings
-from ai_sub.data_models import AiResponse
+from ai_sub.data_models import AiResponse, SubtitleResponse
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -172,7 +172,7 @@ class GeminiCliWrapper:
                     logfire.error(f"Failed to validate JSON: {json_str}")
                     raise
 
-                if isinstance(response_obj, AiResponse):
+                if isinstance(response_obj, SubtitleResponse):
                     response_obj.model_name = self.model_name
 
                 logfire.debug(

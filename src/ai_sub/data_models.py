@@ -36,12 +36,11 @@ class Subtitles(BaseModel):
     english: str = Field(alias="en")
 
 
-class AiResponse(BaseModel):
-    """Represents the structured response from the AI model containing a list of subtitles."""
+class SubtitleResponse(BaseModel):
+    """Base class for the structured response from the AI model containing a list of subtitles."""
 
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
-    global_analysis: Optional[str] = None
     subtitles: list[Subtitles] = Field(alias="subs")
     model_name: Optional[str] = None
 
@@ -110,7 +109,7 @@ class AiResponse(BaseModel):
 
     def get_ssafile(self) -> SSAFile:
         """
-        Converts the AiResponse's subtitles into an SSAFile object.
+        Converts the response's subtitles into an SSAFile object.
         Handles timestamp parsing and combines English and Original text.
 
         Returns:
@@ -121,8 +120,8 @@ class AiResponse(BaseModel):
         translator = str.maketrans("", "", string.punctuation)
 
         for subtitle in self.subtitles:
-            start = AiResponse._parse_timestamp_string_ms(subtitle.start)
-            end = AiResponse._parse_timestamp_string_ms(subtitle.end)
+            start = SubtitleResponse._parse_timestamp_string_ms(subtitle.start)
+            end = SubtitleResponse._parse_timestamp_string_ms(subtitle.end)
             english_text = subtitle.english.strip()
             original_text = subtitle.original.strip()
 
@@ -138,6 +137,25 @@ class AiResponse(BaseModel):
             subtitles.append(SSAEvent(start=start, end=end, text=text))
 
         return subtitles
+
+
+class AiResponse(SubtitleResponse):
+    """Represents the structured response from the AI model containing a list of subtitles."""
+
+    qa_analysis: Optional[str] = None
+    global_analysis: Optional[str] = None
+
+
+class SubtitlePass1Response(SubtitleResponse):
+    """Response model for the first pass of subtitle generation."""
+
+    global_analysis: str
+
+
+class SubtitlePass2Response(SubtitleResponse):
+    """Response model for the second pass of subtitle generation."""
+
+    qa_analysis: str
 
 
 class SubtitleGenerationState(BaseModel):
@@ -231,7 +249,7 @@ class SubtitlePass1Job(Job):
     file: File | Path
     video_duration_ms: PositiveInt
     scene_response: Optional[SceneResponse] = None
-    response: Optional[AiResponse] = None
+    response: Optional[SubtitlePass1Response] = None
 
     def save(self, filename: Path):
         """Saves the current object to a JSON file.
@@ -277,8 +295,8 @@ class SubtitlePass2Job(Job):
     file: File | Path
     video_duration_ms: PositiveInt
     scene_response: Optional[SceneResponse] = None
-    draft: AiResponse
-    response: Optional[AiResponse] = None
+    draft: SubtitlePass1Response
+    response: Optional[SubtitlePass2Response] = None
 
     def save(self, filename: Path):
         """Saves the current object to a JSON file.

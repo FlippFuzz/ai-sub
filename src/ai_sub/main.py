@@ -19,7 +19,9 @@ from ai_sub.data_models import (
     SceneResponse,
     SubtitleGenerationState,
     SubtitlePass1Job,
+    SubtitlePass1Response,
     SubtitlePass2Job,
+    SubtitlePass2Response,
     UploadFileJob,
 )
 from ai_sub.gemini_file_uploader import GeminiFileUploader
@@ -172,7 +174,12 @@ class SubtitlePass1JobRunner(JobRunner[SubtitlePass1Job]):
         """
         with logfire.span(f"Subtitling Pass 1 {job.name}"):
             prompt = get_subtitle_pass1_prompt(job.scene_response)
-            job.response = self.agent.run(prompt, job.file, job.video_duration_ms)
+            job.response = self.agent.run(
+                prompt,
+                job.file,
+                job.video_duration_ms,
+                response_type=SubtitlePass1Response,
+            )
 
     def post_process(self, job: SubtitlePass1Job) -> None:
         """
@@ -217,7 +224,12 @@ class SubtitlePass2JobRunner(JobRunner[SubtitlePass2Job]):
         """
         with logfire.span(f"Subtitling Pass 2 {job.name}"):
             prompt = get_subtitle_pass2_prompt(job.scene_response, job.draft)
-            job.response = self.agent.run(prompt, job.file, job.video_duration_ms)
+            job.response = self.agent.run(
+                prompt,
+                job.file,
+                job.video_duration_ms,
+                response_type=SubtitlePass2Response,
+            )
             logfire.info(f"{job.name} subtitled")
 
     def post_process(self, job: SubtitlePass2Job) -> None:
