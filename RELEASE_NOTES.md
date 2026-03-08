@@ -1,5 +1,19 @@
 # AI Sub Release Notes
 
+## v2.1.0b2
+
+This release refines the scene detection pass to reduce false positives for lyrics research by ignoring instrumental background music.
+
+**Improvements:**
+
+- **Scene Detection:**
+  - Renamed the `contains_song` field to `contains_vocal_music` to explicitly target songs with vocals.
+  - Updated the scene detection prompt to instruct the AI to ignore instrumental-only tracks and background music (BGM). This prevents unnecessary web searches for lyrics when no vocals are present.
+- **Prompt Versioning:**
+  - Incremented `SUBTITLES_PROMPT_VERSION` to 6.
+
+---
+
 ## v2.1.0b1
 
 This release introduces a new "Scene Detection & Lyrics Research" pass to the pipeline, further enhancing contextual accuracy, especially for videos containing music.

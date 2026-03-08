@@ -3,7 +3,7 @@ from textwrap import dedent
 
 from ai_sub.data_models import SceneResponse, SubtitlePass1Response
 
-SUBTITLES_PROMPT_VERSION = 5
+SUBTITLES_PROMPT_VERSION = 6
 
 # ==========================================
 # SCENE DETECTION & LYRICS RESEARCH
@@ -14,9 +14,9 @@ _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
 
     ### INSTRUCTIONS
     1.  **Analyze the Audio/Video:** Watch and listen to the entire input. Divide the media into distinct scenes based on audio/visual shifts (e.g., dialogue transitioning into a music video, or a change of song).
-    2.  **Identify Songs:** If a scene contains a song, identify the track name and artist using audio/visual clues (lyrics, on-screen text, context).
+    2.  **Identify Vocal Songs:** If a scene contains a song **with vocals**, identify the track name and artist using audio/visual clues (lyrics, on-screen text, context). **Ignore background music (BGM) or instrumental-only tracks.**
     3.  **Web Search (CRITICAL):** Use your Google Search Tool to look up the official lyrics for the identified song. You must try to find both the **Original Language** lyrics and the **English Translation**.
-    4.  **No Hallucination:** If a scene is just dialogue, leave the song info and lyrics empty. If you cannot confidently find the lyrics online, provide what you can or leave it null. Do NOT make up lyrics.
+    4.  **No Hallucination:** If a scene is just dialogue **or instrumental BGM**, leave the song info and lyrics empty. If you cannot confidently find the lyrics online, provide what you can or leave it null. Do NOT make up lyrics.
 
     ### OUTPUT FORMAT
     Return ONLY a valid, parseable JSON object. No markdown wrapping outside the JSON.
@@ -29,7 +29,7 @@ _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
           "start": "MM:SS.mmm",
           "end": "MM:SS.mmm",
           "description": "Brief description of the audio/visual content",
-          "contains_song": true,
+          "contains_vocal_music": true,
           "song_title": "Found Title or null",
           "reference_lyrics_og": "Raw original lyrics from web search. Separate lines with \\n. Put null if not found/applicable.",
           "reference_lyrics_en": "Raw English translation from web search. Separate lines with \\n. Put null if not found/applicable."

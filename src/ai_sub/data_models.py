@@ -174,7 +174,7 @@ class Scene(BaseModel):
     start: str
     end: str
     description: str
-    contains_song: bool
+    contains_vocal_music: bool
     song_title: Optional[str] = None
     reference_lyrics_og: Optional[str] = None
     reference_lyrics_en: Optional[str] = None
