@@ -23,7 +23,6 @@ from ai_sub.data_models import (
     SubtitlePass2Job,
     SubtitlePass2Response,
     UploadFileJob,
-    VideoPartState,
 )
 from ai_sub.gemini_file_uploader import GeminiFileUploader
 from ai_sub.job_runner import JobRunner
@@ -145,12 +144,10 @@ class LyricsSceneJobRunner(JobRunner[LyricsSceneJob]):
 
     def post_process(self, job: LyricsSceneJob) -> None:
         """Saves the result to disk."""
-        state_path = self.settings.dir.tmp / f"{job.name}.json"
-        state = VideoPartState.load_or_create(
-            state_path, job.name, job.file, job.video_duration_ms
+        sanitized_model = self.settings.ai.get_sanitized_model_name(
+            self.settings.ai.lyrics_model
         )
-        state.scene_job = job
-        state.save(state_path)
+        job.save(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-scene.json")
 
 
 class SubtitlePass1JobRunner(JobRunner[SubtitlePass1Job]):
@@ -191,16 +188,12 @@ class SubtitlePass1JobRunner(JobRunner[SubtitlePass1Job]):
         This ensures that if the process is interrupted, completed segments
         don't need to be re-processed.
         """
-        state_path = self.settings.dir.tmp / f"{job.name}.json"
-        state = VideoPartState.load_or_create(
-            state_path, job.name, job.file, job.video_duration_ms
-        )
-        state.pass1_job = job
-        state.save(state_path)
-
+        # Save the completed job state to a JSON file for persistence.
         sanitized_model = self.settings.ai.get_sanitized_model_name(
             self.settings.ai.pass1_model
         )
+        job.save(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-pass1.json")
+
         # Also generate a subtitle file for this job for the user to view.
         if job.response is not None:
             job.response.get_ssafile().save(
@@ -246,16 +239,13 @@ class SubtitlePass2JobRunner(JobRunner[SubtitlePass2Job]):
         This ensures that if the process is interrupted, completed segments
         don't need to be re-processed.
         """
-        state_path = self.settings.dir.tmp / f"{job.name}.json"
-        state = VideoPartState.load_or_create(
-            state_path, job.name, job.file, job.video_duration_ms
-        )
-        state.pass2_job = job
-        state.save(state_path)
-
+        # Save the completed job state to a JSON file for persistence.
         sanitized_model = self.settings.ai.get_sanitized_model_name(
             self.settings.ai.pass2_model
         )
+
+        job.save(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-pass2.json")
+
         if job.response is not None:
             # Also generate a subtitle file for this job for the user to view.
             job.response.get_ssafile().save(
@@ -294,13 +284,14 @@ def stitch_subtitles(
             settings=settings,
         )
 
+        sanitized_model = settings.ai.get_sanitized_model_name(settings.ai.pass2_model)
+
         for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
             # Load the job result from the temporary JSON file.
-            state_path = settings.dir.tmp / f"{video_path.stem}.json"
-            state = VideoPartState.load_or_create(
-                state_path, video_path.stem, video_path, video_duration_ms
+            # We look for the final pass 2 output
+            job = SubtitlePass2Job.load(
+                settings.dir.tmp / f"{video_path.stem}.{sanitized_model}-pass2.json"
             )
-            job = state.pass2_job
 
             if job and job.response is not None:
                 current_subtitles = job.response.get_ssafile()
@@ -350,7 +341,6 @@ def stitch_subtitles(
         if len(all_subtitles) > 1 and all_subtitles[1].start < 1:
             all_subtitles[1].start = 1
 
-        sanitized_model = settings.ai.get_sanitized_model_name(settings.ai.pass2_model)
         all_subtitles.save(
             str(
                 settings.dir.out
@@ -467,6 +457,12 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         scene_detection_jobs_queue: deque[LyricsSceneJob] = deque()
         subtitle_pass1_jobs_queue: deque[SubtitlePass1Job] = deque()
         subtitle_pass2_jobs_queue: deque[SubtitlePass2Job] = deque()
+
+        sanitized_model1 = settings.ai.get_sanitized_model_name(settings.ai.pass1_model)
+        sanitized_model_scene = settings.ai.get_sanitized_model_name(
+            settings.ai.lyrics_model
+        )
+        sanitized_model2 = settings.ai.get_sanitized_model_name(settings.ai.pass2_model)
 
         use_reencode = settings.split.re_encode.enabled
         use_upload = agent1.is_google() and settings.ai.google.use_files_api
@@ -600,19 +596,21 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             reencode_dir.mkdir(exist_ok=True)
 
         for split, duration in splits_to_process:
-            state_path = settings.dir.tmp / f"{split.stem}.json"
-            state = VideoPartState.load_or_create(
-                state_path, split.stem, split, duration
-            )
-
             # 1. Check Pass 2 Done
-            pass2_job = state.pass2_job
+            pass2_job = SubtitlePass2Job.load(
+                settings.dir.tmp / f"{split.stem}.{sanitized_model2}-pass2.json"
+            )
             if pass2_job and pass2_job.response is not None:
                 continue
 
             # 2. Check Pass 1 Done
-            pass1_job = state.pass1_job
-            if pass1_job and pass1_job.response is not None:
+            pass1_job = SubtitlePass1Job.load_or_return_new(
+                settings.dir.tmp / f"{split.stem}.{sanitized_model1}-pass1.json",
+                split.stem,
+                split,
+                duration,
+            )
+            if pass1_job.response is not None:
                 # We need scene response for Pass 2. If Pass 1 was loaded from disk,
                 # it might have scene_response if it was run with the new version.
                 # If not, we might be missing it.
@@ -630,8 +628,13 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 continue
 
             # 3. Check Scene Detection Done
-            scene_job = state.scene_job
-            if scene_job and scene_job.response is not None:
+            scene_job = LyricsSceneJob.load_or_return_new(
+                settings.dir.tmp / f"{split.stem}.{sanitized_model_scene}-scene.json",
+                split.stem,
+                split,
+                duration,
+            )
+            if scene_job.response is not None:
                 on_scene_detection_complete(scene_job, None)
                 continue
 
