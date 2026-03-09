@@ -216,16 +216,16 @@ class ThreadSettings(BaseSettings):
         description="The number of concurrent threads for re-encoding video chunks.",
         default=2,
     )
-    lyrics: NonNegativeInt = Field(
-        description="The number of concurrent threads to use for Lyrics/Scene Detection. Set to 0 to disable.",
+    lyrics: PositiveInt = Field(
+        description="The number of concurrent threads to use for Lyrics/Scene Detection.",
         default=2,
     )
     subtitles1: PositiveInt = Field(
         description="The number of concurrent threads to use for Pass 1 (Transcription).",
         default=2,
     )
-    subtitles2: NonNegativeInt = Field(
-        description="The number of concurrent threads to use for Pass 2 (QA). Set to 0 to disable Pass 2.",
+    subtitles2: PositiveInt = Field(
+        description="The number of concurrent threads to use for Pass 2 (QA).",
         default=2,
     )
 
