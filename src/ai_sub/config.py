@@ -218,15 +218,15 @@ class ThreadSettings(BaseSettings):
     )
     lyrics: PositiveInt = Field(
         description="The number of concurrent threads to use for Lyrics/Scene Detection.",
-        default=4,
+        default=2,
     )
     subtitles1: PositiveInt = Field(
         description="The number of concurrent threads to use for Pass 1 (Transcription).",
-        default=4,
+        default=2,
     )
     subtitles2: PositiveInt = Field(
         description="The number of concurrent threads to use for Pass 2 (QA).",
-        default=4,
+        default=2,
     )
 
 
