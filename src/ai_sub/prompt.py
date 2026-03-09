@@ -3,7 +3,7 @@ from textwrap import dedent
 
 from ai_sub.data_models import SceneResponse, SubtitlePass1Response
 
-SUBTITLES_PROMPT_VERSION = 8
+SUBTITLES_PROMPT_VERSION = 9
 
 # ==========================================
 # SCENE DETECTION & LYRICS RESEARCH
@@ -181,38 +181,38 @@ def get_subtitle_pass1_prompt(scene_response: SceneResponse | None) -> str:
 # ==========================================
 _SUBTITLES_PASS2_PROMPT_TEMPLATE = dedent(
     """
-    You are an Elite AI Subtitle QA Editor and Audio-Visual Context Analyst. Your job is to meticulously review, refine, and perfect a "Pass 1" subtitle draft. 
+    You are an Elite AI Subtitle Sync Auditor and QA Editor. Your primary job is to hunt down and fix TIMING DESYNCS (where Pass 1 placed text at the wrong time) and translation mistakes, while strictly enforcing professional subtitling constraints.
 
-    You have access to the original high-resolution audio, the 1 FPS visual track, the Scene & Lyrics Reference, and the Pass 1 Subtitles draft. Your ultimate goal is absolute perfection in both synchronization and contextual translation.
+    You have access to the original high-resolution audio, the 1 FPS visual track, the Scene & Lyrics Reference, and the Pass 1 Subtitles draft. 
 
-    ### INPUT CONSTRAINTS & CONTEXT RULES
-    1.  **Audio is the Absolute Source of Truth (CRITICAL):** The high-res audio waveform dictates EXACTLY when a subtitle starts and ends. Pass 1 may contain timestamp drift. You must correct it.
-    2.  **Visuals (1fps) for Context Only:** Use the 1 FPS visual feed to understand *who* is speaking, *what* is happening, and *what* on-screen text exists. Do not use visuals for micro-timestamping. Use them to fix pronoun errors, tone mismatches, or translation ambiguities in Pass 1.
-    3.  **Holistic Context Integration:** Synthesize the video's narrative, the reference lyrics (if singing), the visual cues, and the audio.
-        *   **Lyrics Reference Warning:** The reference lyrics might be **incomplete**, have **extra lines**, or be for the **wrong song**. If the audio contains lines not in the reference, or if the reference contradicts the audio, **TRUST THE AUDIO**. Verify that Pass 1 didn't blindly copy incorrect reference lyrics or omit lines missing from the reference.
-        *   **Extra Lines Protocol:** If the reference has lines that are NOT in the audio, ensure Pass 1 did NOT include them. If it did, **DELETE THEM**.
-        *   If Pass 1 misunderstood a lyric, hallucinated during a silent/instrumental part, or lost semantic continuity between sentences, you must rewrite it.
+    ### QA PRIORITY 1: THE SYNC AUDIT (FIXING TIMING ERRORS)
+    Pass 1 often suffers from "Timestamp Drift" (placing subtitles seconds earlier or later than the actual audio) or hallucinates text during silence. You must verify and fix these.
+    1.  **Listen and Verify:** For every subtitle, check the audio at the `s` (start) time. Does the spoken audio actually match the text?
+    2.  **Re-Anchoring:** If the audio does NOT match, you must scan the timeline, find exactly where the words are actually spoken, and rewrite the `s` and `e` timestamps.
+    3.  **Purging Ghost Subtitles:** If Pass 1 generated text during pure silence, instrumental background music, or sound effects, DELETE the subtitle object entirely.
 
-    ### QA PRIORITY 1: FLAWLESS TIMESTAMPS (THE AUDIO MANDATE)
-    *   **The Anti-Padding/Zero-Padding Mandate (CRITICAL):** You have a strong underlying AI bias to pad subtitle durations to ensure human readability. **DISABLE THIS BIAS.** Do NOT "fix" fast subtitles. If Pass 1 correctly timed a rapid 10-word sentence to a mere 900ms audio burst, you must leave it at 900ms. `s` and `e` MUST tightly hug the actual audio waveform. Never extend an `e` timestamp into silence just to keep text on screen.
-    *   **Micro-Alignment:** Adjust `s` (start) and `e` (end) to perfectly encapsulate the exact phoneme start and phonetic decay of the spoken words. 
-    *   **Strict Format:** `MM:SS.mmm` (e.g., `01:05.300`). Must be zero-padded.
-    *   **Contiguous Timestamps for Continuous Speech:** If a long, uninterrupted sentence is split across multiple subtitles, ensure the `e` of part 1 exactly matches the `s` of part 2 (e.g., `e: "00:05.500"`, `s: "00:05.500"`). Do NOT introduce artificial millisecond gaps in the middle of a continuous breath.
-    *   **Silence the Hallucinations:** If Pass 1 created subtitles during pure instrumental music, long pauses, or sound effects, **DELETE THEM**. Only human speech, vocals, or critical on-screen text get subtitles.
+    ### QA PRIORITY 2: STRICT TIMING CONSTRAINTS (THE ANTI-PADDING RULE)
+    When you verify or fix a timestamp, you MUST adhere to strict audio-waveform boundaries.
+    *   **The Anti-Padding Mandate:** Disable your AI bias to keep text on screen for readability. If a fast speaker says a full sentence in exactly 800ms, the subtitle duration MUST be exactly 800ms. Do not extend the `e` (end) timestamp into silence.
+    *   **Contiguous Timestamping:** If an uninterrupted, continuous sentence is split across multiple subtitle blocks (to stay under 50 characters), the `e` of Part 1 MUST EXACTLY EQUAL the `s` of Part 2 (e.g., Part 1 `e`: "00:05.500", Part 2 `s`: "00:05.500"). Do not insert artificial millisecond gaps during continuous speech.
+    *   **Strict Format:** Timestamps must be exactly `MM:SS.mmm` (e.g., `01:05.300`). Always zero-pad.
 
-    ### QA PRIORITY 2: TRANSCRIPTION & TRANSLATION REFINEMENT
-    *   **Correct Audio Mismatches:** Listen closely. Did Pass 1 mishear a word? Fix the `og` (original language) transcription and update the `en` (English) translation accordingly.
-    *   **Contextual Translation Corrections:** Did Pass 1 translate a sentence in isolation? Look at the previous/next lines and the visuals. Fix grammatical tense, pronouns (he/she/it/they), and tone (formal/informal) to match the actual scene.
-    *   **On-Screen Text Check:** Ensure any critical on-screen text translated by Pass 1 is actually relevant and not just background clutter. If Pass 1 missed an important visual title card, add it.
-    *   **Constraint Verification:** Ensure NO subtitle exceeds 50 characters per line. Ensure NO closed captioning tags (like `[music]`, `(sighs)`, `♪`) survived Pass 1.
+    ### QA PRIORITY 3: CONTEXTUAL TRANSLATION & THE HIERARCHY OF TRUTH
+    *   **The Hierarchy of Truth (On-Screen Lyrics > JSON Reference):** If the 1 FPS visual track shows burnt-in subtitles or on-screen lyrics, treat them as the ULTIMATE GUIDE for the `og` (original language) transcription. They strictly override the external Scene & Lyrics Reference JSON.
+    *   **Lyrics Reference Warning (CRITICAL):** The Scene & Lyrics Reference JSON is a highly fallible web search. It might be **incomplete (missing verses)**, have **extra lines**, or be for the **wrong song entirely**. 
+        *   **If Missing Lines:** If the audio contains vocals/verses that are NOT in the reference, ensure Pass 1 didn't skip them. If Pass 1 missed them, you MUST transcribe and translate them by ear (or by using on-screen text).
+        *   **If Extra Lines:** If the reference contains lyrics that are NOT sung in the audio, ensure Pass 1 did NOT include them. If it did, DELETE them.
+        *   **If Wrong Song / Conflict:** If the reference lyrics contradict what is actually being sung or what is written on-screen, IGNORE THE REFERENCE ENTIRELY. Fix Pass 1 so it matches the actual audio and visuals.
+    *   **Visual Context:** Use the visuals to determine speaker gender, number of people, and relationships. Fix pronouns (he/she/they), tense, and tone.
+    *   **Formatting Check:** Ensure NO subtitle exceeds 50 characters per line. Remove any closed captioning tags (like `[music]`, `(sighs)`) if Pass 1 included them.
 
     ### OUTPUT FORMAT
     Return **ONLY** a valid, parseable JSON object. No markdown wrapping outside the JSON.
-    You MUST output `qa_analysis` FIRST to explain your corrections.
+    You MUST output `qa_analysis` FIRST. This acts as your scratchpad to plan your sync corrections.
 
     **JSON Schema:**
     {
-      "qa_analysis": "A brief paragraph detailing the specific fixes you made to Pass 1. Explicitly mention if you had to strip away artificial padding, remove hallucinations, or fix contextual translations based on visuals.",
+      "qa_analysis": "Detail your sync audit. EXPLICITLY state your fixes (e.g., 'Pass 1 skipped a verse at 01:10, transcribed using on-screen lyrics', 'Shifted line X to 00:48', 'Deleted hallucinated text at 01:20', 'Ignored JSON reference because it conflicted with on-screen text.').",
       "subs": [
         {
           "s": "MM:SS.mmm",
