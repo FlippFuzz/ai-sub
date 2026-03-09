@@ -1,25 +1,5 @@
 # AI Sub Release Notes
 
-## v2.1.0
-
-This release marks the stable version of the 2.1.x series, introducing a consolidated state management system and further refinements to lyrics handling.
-
-**New Features & Improvements:**
-
-- **Lyrics Handling:**
-  - **Full Lyrics Retrieval:** Updated the scene detection prompt to explicitly request full lyrics (verses, choruses, bridges) to prevent incomplete retrievals during the research phase.
-  - **TV Size vs. Full Size:** Updated Pass 1 and Pass 2 prompts to handle discrepancies where the reference lyrics contain extra lines not present in the audio (e.g., a full song vs. a TV edit). The AI is now explicitly instructed to ignore these extra lines and trust the audio as the source of truth.
-  - **Prompt Version:** Incremented `SUBTITLES_PROMPT_VERSION` to 8.
-
-**Code Improvements:**
-
-- **State Consolidation:**
-  - **Unified JSON State:** Refactored the intermediate file storage to consolidate `LyricsSceneJob`, `SubtitlePass1Job`, and `SubtitlePass2Job` data into a single `part_XXX.json` file per video segment using the new `VideoPartState` model.
-  - **Reduced Clutter:** This change replaces multiple model-specific JSON files (e.g., `*.scene.json`, `*.pass1.json`) with a unified file, reducing clutter in the temporary directory.
-  - **Simplified Logic:** The main execution loop and stitching logic now load job status and results from this consolidated state, simplifying the logic for checking job completion and resuming interrupted runs.
-
----
-
 ## v2.1.0b3
 
 This release improves the robustness of subtitle generation when the lyrics reference is inaccurate or missing.
