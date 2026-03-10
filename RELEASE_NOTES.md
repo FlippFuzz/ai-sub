@@ -1,5 +1,36 @@
 # AI Sub Release Notes
 
+## v2.2.0b1
+
+This release introduces a major refactoring of the job processing pipeline to be more flexible and robust, improves state persistence, and refines the QA prompt to better handle timing errors.
+
+**BREAKING CHANGE:**
+
+- The persistence format for intermediate job states has changed from multiple files per segment to a single `part_XXX.json` file. In-progress jobs from previous versions are not compatible. **You must delete temporary directories (e.g., `tmp_<video_name>`) from previous runs before using this version.**
+
+**New Features & Improvements:**
+
+- **Pipeline Rearchitecture & Multi-Model Reruns:**
+  - The pipeline now uses a central `JobState` object that stores results for each stage (`lyrics`, `pass1`, `pass2`) in a dictionary keyed by the model name.
+  - This enables re-running a specific stage with a different model (e.g., using a more powerful model for Pass 2) without reprocessing the entire pipeline.
+- **Robust State Persistence & Resumption:**
+  - **Unified Persistence:** The state for each video segment is now saved to a single `part_XXX.json` file, making state management and job resumption more reliable.
+  - **Intelligent Resumption:** The processing loop now intelligently inspects the state file to determine which stage to execute next based on the models configured for the current run.
+  - **File Existence Validation:** The resumption logic now verifies that the video files for completed stages still exist, preventing errors if intermediate files are deleted.
+- **Prompt Engineering:**
+  - Updated `SUBTITLES_PROMPT_VERSION` to 9.
+  - The Pass 2 (QA) prompt has been significantly updated to prioritize fixing timestamp desynchronization ("Timestamp Drift"), instructing the AI to re-anchor subtitles to the correct audio position.
+
+**Bug Fixes:**
+
+- **Video Duration Calculation:** Fixed an issue where a failure to get a video's duration would result in a silent error and a value of `0`. This led to corrupted timestamp offsets in the final subtitle file. The function now raises a `RuntimeError` to fail fast.
+
+**Code Improvements:**
+
+- **Data Model Refactoring:** The `SubtitlePass1Job` and `SubtitlePass2Job` models have been simplified. The job runners now retrieve prerequisite data (like scene information and Pass 1 drafts) directly from the central `JobState` object, creating a cleaner and more efficient data flow.
+
+---
+
 ## v2.1.0b3
 
 This release improves the robustness of subtitle generation when the lyrics reference is inaccurate or missing.
