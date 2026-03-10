@@ -810,7 +810,6 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         subtitle_pass2_runner.shutdown()
 
         # Step 6: Assemble the final subtitle file.
-        # Recalculate durations as they might have changed or were unknown during re-encoding
         state = stitch_subtitles(video_splits, settings)
 
         # Return the final result

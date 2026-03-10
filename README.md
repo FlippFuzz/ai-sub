@@ -189,8 +189,6 @@ Intermediate files are stored in a temporary directory (default: `tmp_<input_fil
 
 To re-process a specific segment:
 
-1.  Navigate to the temporary directory.
-2.  Locate and delete the corresponding `part_XXX.model_name.json` file.
-3.  Re-run the script. It will automatically detect missing files and re-process only those segments.
-4.  Locate and delete the corresponding `part_XXX.json` file.
-5.  Re-run the script. It will automatically detect missing files and re-process only those segments.
+1.  Navigate to the temporary directory (default: `tmp_<input_file_name>`).
+2.  Locate and delete the corresponding `part_XXX.json` state file for the segment you want to re-process.
+3.  Re-run the script. It will automatically detect the missing state file and re-process only that segment from the beginning.
