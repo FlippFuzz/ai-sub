@@ -12,7 +12,10 @@ def get_video_duration_ms(video_path: Path) -> int:
         video_path (Path): The path to the video file.
 
     Returns:
-        int: The duration of the video in milliseconds. Returns 0 if duration cannot be determined.
+        int: The duration of the video in milliseconds.
+
+    Raises:
+        RuntimeError: If the duration cannot be determined.
     """
     static_ffmpeg.add_paths(weak=True)
     try:
@@ -35,8 +38,11 @@ def get_video_duration_ms(video_path: Path) -> int:
             errors="replace",
         )
         return int(float(result.stdout) * 1000)
-    except (subprocess.CalledProcessError, ValueError):
-        return 0
+    except (subprocess.CalledProcessError, ValueError) as e:
+        logfire.error(f"Could not determine duration for {video_path.name}: {e}")
+        raise RuntimeError(
+            f"Could not determine duration for video file: {video_path.name}"
+        ) from e
 
 
 def get_working_encoder() -> str:
