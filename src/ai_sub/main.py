@@ -14,6 +14,7 @@ from ai_sub.agent_wrapper import RateLimitedAgentWrapper
 from ai_sub.config import Settings
 from ai_sub.data_models import (
     AiSubResult,
+    JobState,
     LyricsSceneJob,
     ReEncodingJob,
     SceneResponse,
@@ -40,7 +41,28 @@ from ai_sub.video import (
 )
 
 
-class ReEncodeJobRunner(JobRunner[ReEncodingJob]):
+def _job_file_exists(
+    job: LyricsSceneJob | SubtitlePass1Job | SubtitlePass2Job | None,
+) -> bool:
+    """
+    Checks if the file associated with a job exists on the local filesystem.
+    For cloud files, it assumes they exist.
+    """
+    if not job:
+        return False
+    # If the job's file is a local path, check if it actually exists.
+    if isinstance(job.file, Path):
+        if not job.file.exists():
+            logfire.warning(
+                f"File {job.file} for completed job '{job.name}' is missing. Will re-process."
+            )
+            return False
+    # For google.genai.types.File objects, we assume they exist.
+    # The API call will fail later if the URI is invalid, which is handled by the retry logic.
+    return True
+
+
+class ReEncodeJobRunner(JobRunner):
     """
     Worker that re-encodes video segments to a lower quality/different format.
 
@@ -50,35 +72,39 @@ class ReEncodeJobRunner(JobRunner[ReEncodingJob]):
 
     def __init__(
         self,
-        queue: deque[ReEncodingJob],
+        queue: deque[JobState],
         settings: Settings,
         max_workers: int,
-        on_complete: Callable[[ReEncodingJob, Any], None],
+        on_complete: Callable[[JobState, Any], None],
         stop_events: list[Event] | None = None,
         name: str = "ReEncode",
     ):
         super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
 
-    def process(self, job: ReEncodingJob) -> None:
+    def process(self, job: JobState) -> None:
         """
         Re-encodes the video file specified in the job.
 
         After re-encoding, it returns None, triggering the on_complete callback in the runner.
         """
-        with logfire.span(f"Re-encoding {job.input_file.name}"):
+        reencode_job = job.reencode
+        assert reencode_job is not None
+        with logfire.span(f"Re-encoding {reencode_job.input_file.name}"):
             reencode_video(
-                job.input_file,
-                job.output_file,
-                job.fps,
-                job.height,
-                job.bitrate_kb,
+                reencode_job.input_file,
+                reencode_job.output_file,
+                reencode_job.fps,
+                reencode_job.height,
+                reencode_job.bitrate_kb,
                 self.settings.split.re_encode.encoder or "libx264",
             )
 
-            logfire.info(f"{job.input_file.name} re-encoded to {job.output_file.name}")
+            logfire.info(
+                f"{reencode_job.input_file.name} re-encoded to {reencode_job.output_file.name}"
+            )
 
 
-class UploadJobRunner(JobRunner[UploadFileJob]):
+class UploadJobRunner(JobRunner):
     """
     Worker that uploads video files to the Gemini Files API.
 
@@ -88,100 +114,112 @@ class UploadJobRunner(JobRunner[UploadFileJob]):
 
     def __init__(
         self,
-        queue: deque[UploadFileJob],
+        queue: deque[JobState],
         settings: Settings,
         max_workers: int,
         uploader: GeminiFileUploader,
-        on_complete: Callable[[UploadFileJob, Any], None],
+        on_complete: Callable[[JobState, Any], None],
         stop_events: list[Event] | None = None,
         name: str = "Upload",
     ):
         super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
         self.uploader = uploader
 
-    def process(self, job: UploadFileJob) -> Any:
+    def process(self, job: JobState) -> Any:
         """
         Uploads the specified file using the `GeminiFileUploader`.
 
         Upon successful upload, it returns the file object, triggering the on_complete callback.
         """
-        with logfire.span(f"Uploading {job.python_file.name}"):
+        upload_job = job.upload
+        assert upload_job is not None
+        with logfire.span(f"Uploading {upload_job.python_file.name}"):
             # Perform the file upload. This is a blocking operation.
-            file = self.uploader.upload_file(job.python_file)
-            logfire.info(f"{job.python_file.name} uploaded")
+            file = self.uploader.upload_file(upload_job.python_file)
+            logfire.info(f"{upload_job.python_file.name} uploaded")
             return file
 
 
-class LyricsSceneJobRunner(JobRunner[LyricsSceneJob]):
+class LyricsSceneJobRunner(JobRunner):
     """
     Worker that executes the AI agent to detect lyrics and scenes.
     """
 
     def __init__(
         self,
-        queue: deque[LyricsSceneJob],
+        queue: deque[JobState],
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
-        on_complete: Callable[[LyricsSceneJob, Any], None],
+        on_complete: Callable[[JobState, Any], None],
         stop_events: list[Event] | None = None,
         name: str = "LyricsSceneJobRunner",
     ):
         super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
         self.agent = agent
+        self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(
+            self.agent.model_name
+        )
 
-    def process(self, job: LyricsSceneJob) -> None:
+    def process(self, job: JobState) -> None:
         """
         Invokes the AI agent to detect scenes.
         """
-        with logfire.span(f"Scene Detection {job.name}"):
-            job.response = self.agent.run(
+        lyrics_job = job.lyrics[self.sanitized_model_name]
+        assert lyrics_job is not None
+        with logfire.span(f"Scene Detection {lyrics_job.name}"):
+            lyrics_job.response = self.agent.run(
                 get_lyrics_scenes_prompt(),
-                job.file,
-                job.video_duration_ms,
+                lyrics_job.file,
+                lyrics_job.video_duration_ms,
                 response_type=SceneResponse,
             )
 
-    def post_process(self, job: LyricsSceneJob) -> None:
+    def post_process(self, job: JobState) -> None:
         """Saves the result to disk."""
-        sanitized_model = self.settings.ai.get_sanitized_model_name(
-            self.settings.ai.lyrics_model
-        )
-        job.save(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-scene.json")
+        lyrics_job = job.lyrics[self.sanitized_model_name]
+        assert lyrics_job is not None
+        job_state_path = self.settings.dir.tmp / f"{lyrics_job.name}.json"
+        job.save(job_state_path)
 
 
-class SubtitlePass1JobRunner(JobRunner[SubtitlePass1Job]):
+class SubtitlePass1JobRunner(JobRunner):
     """
     Worker that executes the AI agent to generate the first pass of subtitles.
     """
 
     def __init__(
         self,
-        queue: deque[SubtitlePass1Job],
+        queue: deque[JobState],
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
-        on_complete: Callable[[SubtitlePass1Job, Any], None],
+        on_complete: Callable[[JobState, Any], None],
         stop_events: list[Event] | None = None,
         name: str = "SubtitlePass1JobRunner",
     ):
         super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
         self.agent = agent
+        self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(
+            self.agent.model_name
+        )
 
-    def process(self, job: SubtitlePass1Job) -> None:
+    def process(self, job: JobState) -> None:
         """
         Invokes the AI agent to generate subtitles.
         """
-        with logfire.span(f"Subtitling Pass 1 {job.name}"):
-            prompt = get_subtitle_pass1_prompt(job.scene_response)
-            job.response = self.agent.run(
+        pass1_job = job.pass1[self.sanitized_model_name]
+        assert pass1_job is not None
+        with logfire.span(f"Subtitling Pass 1 {pass1_job.name}"):
+            prompt = get_subtitle_pass1_prompt(pass1_job.scene_response)
+            pass1_job.response = self.agent.run(
                 prompt,
-                job.file,
-                job.video_duration_ms,
+                pass1_job.file,
+                pass1_job.video_duration_ms,
                 response_type=SubtitlePass1Response,
             )
 
-    def post_process(self, job: SubtitlePass1Job) -> None:
+    def post_process(self, job: JobState) -> None:
         """
         Saves the result (or partial state) to disk.
 
@@ -189,50 +227,64 @@ class SubtitlePass1JobRunner(JobRunner[SubtitlePass1Job]):
         don't need to be re-processed.
         """
         # Save the completed job state to a JSON file for persistence.
-        sanitized_model = self.settings.ai.get_sanitized_model_name(
-            self.settings.ai.pass1_model
-        )
-        job.save(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-pass1.json")
+        pass1_job = job.pass1[self.sanitized_model_name]
+        assert pass1_job is not None
+        job_state_path = self.settings.dir.tmp / f"{pass1_job.name}.json"
+        job.save(job_state_path)
 
         # Also generate a subtitle file for this job for the user to view.
-        if job.response is not None:
-            job.response.get_ssafile().save(
-                str(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-pass1.srt")
+        if pass1_job.response is not None:
+            sanitized_model = self.settings.ai.get_sanitized_model_name(
+                self.settings.ai.pass1_model
+            )
+            pass1_job.response.get_ssafile().save(
+                str(
+                    self.settings.dir.tmp
+                    / f"{pass1_job.name}.{sanitized_model}-pass1.srt"
+                )
             )
 
 
-class SubtitlePass2JobRunner(JobRunner[SubtitlePass2Job]):
+class SubtitlePass2JobRunner(JobRunner):
     """
     Worker that executes the AI agent to generate the second pass of subtitles (QA & Refinement).
     """
 
     def __init__(
         self,
-        queue: deque[SubtitlePass2Job],
+        queue: deque[JobState],
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
+        on_complete: Callable[[JobState, Any], None] | None = None,
         stop_events: list[Event] | None = None,
         name: str = "SubtitlePass2JobRunner",
     ):
-        super().__init__(queue, settings, max_workers, None, stop_events, name)
+        super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
         self.agent = agent
+        self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(
+            self.agent.model_name
+        )
 
-    def process(self, job: SubtitlePass2Job) -> None:
+    def process(self, job: JobState) -> None:
         """
         Invokes the AI agent to generate subtitles.
         """
-        with logfire.span(f"Subtitling Pass 2 {job.name}"):
-            prompt = get_subtitle_pass2_prompt(job.scene_response, job.draft)
-            job.response = self.agent.run(
+        pass2_job = job.pass2[self.sanitized_model_name]
+        assert pass2_job is not None
+        with logfire.span(f"Subtitling Pass 2 {pass2_job.name}"):
+            prompt = get_subtitle_pass2_prompt(
+                pass2_job.scene_response, pass2_job.draft
+            )
+            pass2_job.response = self.agent.run(
                 prompt,
-                job.file,
-                job.video_duration_ms,
+                pass2_job.file,
+                pass2_job.video_duration_ms,
                 response_type=SubtitlePass2Response,
             )
-            logfire.info(f"{job.name} subtitled")
+            logfire.info(f"{pass2_job.name} subtitled")
 
-    def post_process(self, job: SubtitlePass2Job) -> None:
+    def post_process(self, job: JobState) -> None:
         """
         Saves the result (or partial state) to disk.
 
@@ -240,16 +292,21 @@ class SubtitlePass2JobRunner(JobRunner[SubtitlePass2Job]):
         don't need to be re-processed.
         """
         # Save the completed job state to a JSON file for persistence.
-        sanitized_model = self.settings.ai.get_sanitized_model_name(
-            self.settings.ai.pass2_model
-        )
+        pass2_job = job.pass2[self.sanitized_model_name]
+        assert pass2_job is not None
+        job_state_path = self.settings.dir.tmp / f"{pass2_job.name}.json"
+        job.save(job_state_path)
 
-        job.save(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-pass2.json")
-
-        if job.response is not None:
+        if pass2_job.response is not None:
             # Also generate a subtitle file for this job for the user to view.
-            job.response.get_ssafile().save(
-                str(self.settings.dir.tmp / f"{job.name}.{sanitized_model}-pass2.srt")
+            sanitized_model = self.settings.ai.get_sanitized_model_name(
+                self.settings.ai.pass2_model
+            )
+            pass2_job.response.get_ssafile().save(
+                str(
+                    self.settings.dir.tmp
+                    / f"{pass2_job.name}.{sanitized_model}-pass2.srt"
+                )
             )
 
 
@@ -272,6 +329,7 @@ def stitch_subtitles(
     """
     with logfire.span("Producing final SRT file"):
         all_subtitles = SSAFile()
+        sanitized_model = settings.ai.get_sanitized_model_name(settings.ai.pass2_model)
 
         chunks_to_skip = int(
             (settings.split.start_offset_min * 60) / settings.split.max_seconds
@@ -284,16 +342,12 @@ def stitch_subtitles(
             settings=settings,
         )
 
-        sanitized_model = settings.ai.get_sanitized_model_name(settings.ai.pass2_model)
-
         for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
             # Load the job result from the temporary JSON file.
             # We look for the final pass 2 output
-            job = SubtitlePass2Job.load(
-                settings.dir.tmp / f"{video_path.stem}.{sanitized_model}-pass2.json"
-            )
-
-            if job and job.response is not None:
+            job_state = JobState.load(settings.dir.tmp / f"{video_path.stem}.json")
+            job = job_state.pass2.get(sanitized_model) if job_state else None
+            if job and job.response:
                 current_subtitles = job.response.get_ssafile()
                 # Shift the timestamps of the current subtitle segment by the
                 # cumulative duration of all previous segments.
@@ -315,7 +369,7 @@ def stitch_subtitles(
             offset_ms += video_duration_ms
 
             # Sort out max retries exceeded
-            if job and job.total_num_retries >= settings.retry.max:
+            if job_state and job_state.total_num_retries >= settings.retry.max:
                 state.max_retries_exceeded = True
 
         # Insert version and config, as a single SSAEvent at the beginning (0-1ms)
@@ -419,6 +473,16 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
     agent_scene = RateLimitedAgentWrapper(settings, settings.ai.lyrics_model)
     agent2 = RateLimitedAgentWrapper(settings, settings.ai.pass2_model)
 
+    sanitized_lyrics_model = settings.ai.get_sanitized_model_name(
+        settings.ai.lyrics_model
+    )
+    sanitized_pass1_model = settings.ai.get_sanitized_model_name(
+        settings.ai.pass1_model
+    )
+    sanitized_pass2_model = settings.ai.get_sanitized_model_name(
+        settings.ai.pass2_model
+    )
+
     # Start the main application logic within a Logfire span for better tracing.
     with logfire.span(f"Generating subtitles for {settings.input_video_file.name}"):
 
@@ -452,17 +516,11 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
 
         # Initialize data structures for concurrent processing.
         # Deques are used as thread-safe queues for managing jobs.
-        reencode_jobs_queue: deque[ReEncodingJob] = deque()
-        gemini_upload_jobs_queue: deque[UploadFileJob] = deque()
-        scene_detection_jobs_queue: deque[LyricsSceneJob] = deque()
-        subtitle_pass1_jobs_queue: deque[SubtitlePass1Job] = deque()
-        subtitle_pass2_jobs_queue: deque[SubtitlePass2Job] = deque()
-
-        sanitized_model1 = settings.ai.get_sanitized_model_name(settings.ai.pass1_model)
-        sanitized_model_scene = settings.ai.get_sanitized_model_name(
-            settings.ai.lyrics_model
-        )
-        sanitized_model2 = settings.ai.get_sanitized_model_name(settings.ai.pass2_model)
+        reencode_jobs_queue: deque[JobState] = deque()
+        gemini_upload_jobs_queue: deque[JobState] = deque()
+        scene_detection_jobs_queue: deque[JobState] = deque()
+        subtitle_pass1_jobs_queue: deque[JobState] = deque()
+        subtitle_pass2_jobs_queue: deque[JobState] = deque()
 
         use_reencode = settings.split.re_encode.enabled
         use_upload = agent1.is_google() and settings.ai.google.use_files_api
@@ -479,54 +537,57 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         subtitle_pass2_runner: SubtitlePass2JobRunner | None = None
 
         # Define callbacks
-        def on_reencode_complete(job: ReEncodingJob, _: Any) -> None:
-            duration = get_video_duration_ms(job.output_file)
+        def on_reencode_complete(job: JobState, _: Any) -> None:
+            reencode_job = job.reencode
+            assert reencode_job is not None
+            duration = get_video_duration_ms(reencode_job.output_file)
             if use_upload:
-                gemini_upload_jobs_queue.append(
-                    UploadFileJob(
-                        python_file=job.output_file, video_duration_ms=duration
-                    )
+                job.upload = UploadFileJob(
+                    python_file=reencode_job.output_file, video_duration_ms=duration
                 )
+                gemini_upload_jobs_queue.append(job)
             else:
-                scene_detection_jobs_queue.append(
-                    LyricsSceneJob(
-                        name=job.output_file.stem,
-                        file=job.output_file,
-                        video_duration_ms=duration,
-                    )
+                job.lyrics[sanitized_lyrics_model] = LyricsSceneJob(
+                    name=reencode_job.output_file.stem,
+                    file=reencode_job.output_file,
+                    video_duration_ms=duration,
                 )
+                scene_detection_jobs_queue.append(job)
 
-        def on_upload_complete(job: UploadFileJob, file: Any) -> None:
-            scene_detection_jobs_queue.append(
-                LyricsSceneJob(
-                    name=job.python_file.stem,
-                    file=file,
-                    video_duration_ms=job.video_duration_ms,
-                )
+        def on_upload_complete(job: JobState, file: Any) -> None:
+            upload_job = job.upload
+            assert upload_job is not None
+            job.lyrics[sanitized_lyrics_model] = LyricsSceneJob(
+                name=upload_job.python_file.stem,
+                file=file,
+                video_duration_ms=upload_job.video_duration_ms,
             )
+            scene_detection_jobs_queue.append(job)
 
-        def on_scene_detection_complete(job: LyricsSceneJob, _: Any) -> None:
-            if job.response:
-                subtitle_pass1_jobs_queue.append(
-                    SubtitlePass1Job(
-                        name=job.name,
-                        file=job.file,
-                        video_duration_ms=job.video_duration_ms,
-                        scene_response=job.response,
-                    )
+        def on_scene_detection_complete(job: JobState, _: Any) -> None:
+            lyrics_job = job.lyrics[sanitized_lyrics_model]
+            assert lyrics_job is not None
+            if lyrics_job.response:
+                job.pass1[sanitized_pass1_model] = SubtitlePass1Job(
+                    name=lyrics_job.name,
+                    file=lyrics_job.file,
+                    video_duration_ms=lyrics_job.video_duration_ms,
+                    scene_response=lyrics_job.response,
                 )
+                subtitle_pass1_jobs_queue.append(job)
 
-        def on_subtitle1_complete(job: SubtitlePass1Job, _: Any) -> None:
-            if job.response:
-                subtitle_pass2_jobs_queue.append(
-                    SubtitlePass2Job(
-                        name=job.name,
-                        file=job.file,
-                        video_duration_ms=job.video_duration_ms,
-                        scene_response=job.scene_response,
-                        draft=job.response,
-                    )
+        def on_subtitle1_complete(job: JobState, _: Any) -> None:
+            pass1_job = job.pass1[sanitized_pass1_model]
+            assert pass1_job is not None
+            if pass1_job.response:
+                job.pass2[sanitized_pass2_model] = SubtitlePass2Job(
+                    name=pass1_job.name,
+                    file=pass1_job.file,
+                    video_duration_ms=pass1_job.video_duration_ms,
+                    scene_response=pass1_job.scene_response,
+                    draft=pass1_job.response,
                 )
+                subtitle_pass2_jobs_queue.append(job)
 
         # Setup reencode_runner
         if use_reencode:
@@ -584,6 +645,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             settings,
             settings.thread.subtitles2,
             agent2,
+            on_complete=None,
             stop_events=[subtitle1_complete_event],
         )
 
@@ -596,102 +658,102 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             reencode_dir.mkdir(exist_ok=True)
 
         for split, duration in splits_to_process:
+            job_state_path = settings.dir.tmp / f"{split.stem}.json"
+            job_state = JobState.load(job_state_path)
+
+            if not job_state:
+                job_state = JobState()
+
             # 1. Check Pass 2 Done
-            pass2_job = SubtitlePass2Job.load(
-                settings.dir.tmp / f"{split.stem}.{sanitized_model2}-pass2.json"
-            )
-            if pass2_job and pass2_job.response is not None:
+            # Check if the final stage (Pass 2) has already been completed for the target model.
+            # If a response exists, we can skip this entire segment.
+            pass2_job = job_state.pass2.get(sanitized_pass2_model)
+            if pass2_job and pass2_job.response and _job_file_exists(pass2_job):
                 continue
 
             # 2. Check Pass 1 Done
-            pass1_job = SubtitlePass1Job.load_or_return_new(
-                settings.dir.tmp / f"{split.stem}.{sanitized_model1}-pass1.json",
-                split.stem,
-                split,
-                duration,
-            )
-            if pass1_job.response is not None:
-                # We need scene response for Pass 2. If Pass 1 was loaded from disk,
-                # it might have scene_response if it was run with the new version.
-                # If not, we might be missing it.
-                # For now, we assume if Pass 1 is done, we can proceed to Pass 2.
-                # If scene_response is missing, Pass 2 prompt will just have null for scene_data.
-                subtitle_pass2_jobs_queue.append(
-                    SubtitlePass2Job(
+            # If Pass 2 is not done, check if Pass 1 is complete for its target model.
+            # If it is, we can create and queue a job for Pass 2.
+            pass1_job = job_state.pass1.get(sanitized_pass1_model)
+            if pass1_job and pass1_job.response and _job_file_exists(pass1_job):
+                # Create a Pass 2 job if it doesn't already exist for the target model.
+                if not job_state.pass2.get(sanitized_pass2_model):
+                    job_state.pass2[sanitized_pass2_model] = SubtitlePass2Job(
                         name=pass1_job.name,
                         file=pass1_job.file,
                         video_duration_ms=pass1_job.video_duration_ms,
                         scene_response=pass1_job.scene_response,
                         draft=pass1_job.response,
                     )
-                )
+                subtitle_pass2_jobs_queue.append(job_state)
                 continue
 
             # 3. Check Scene Detection Done
-            scene_job = LyricsSceneJob.load_or_return_new(
-                settings.dir.tmp / f"{split.stem}.{sanitized_model_scene}-scene.json",
-                split.stem,
-                split,
-                duration,
-            )
-            if scene_job.response is not None:
-                on_scene_detection_complete(scene_job, None)
+            # If Pass 1 is not done, check if the lyrics/scene detection is complete.
+            # If it is, we can create and queue a job for Pass 1.
+            lyrics_job = job_state.lyrics.get(sanitized_lyrics_model)
+            if lyrics_job and lyrics_job.response and _job_file_exists(lyrics_job):
+                # Create a Pass 1 job if it doesn't already exist for the target model.
+                if not job_state.pass1.get(sanitized_pass1_model):
+                    job_state.pass1[sanitized_pass1_model] = SubtitlePass1Job(
+                        name=lyrics_job.name,
+                        file=lyrics_job.file,
+                        video_duration_ms=lyrics_job.video_duration_ms,
+                        scene_response=lyrics_job.response,
+                    )
+                subtitle_pass1_jobs_queue.append(job_state)
                 continue
 
             # 4. Start from scratch (Re-encode/Upload/Scene)
+            # If none of the AI-driven stages are complete for the specified models,
+            # we start the processing chain from the beginning for this segment.
+            # This involves potentially re-encoding or uploading the video segment
+            # before queueing the first AI job (lyrics/scene detection).
             input_file = split
+
+            should_reencode = False
             if use_reencode:
-                should_reencode = True
-                if settings.split.re_encode.threshold_mb > 0:
+                if settings.split.re_encode.threshold_mb == 0:
+                    should_reencode = True
+                else:
                     file_size_mb = input_file.stat().st_size / (1024 * 1024)
-                    if file_size_mb < settings.split.re_encode.threshold_mb:
-                        should_reencode = False
+                    if file_size_mb >= settings.split.re_encode.threshold_mb:
+                        should_reencode = True
+                    else:
                         logfire.info(
                             f"Skipping re-encode for {input_file.name} "
                             f"({file_size_mb:.2f}MB < {settings.split.re_encode.threshold_mb}MB)"
                         )
 
-                if should_reencode:
-                    # We want to keep the same stem (e.g. "part_000") so that the
-                    # SubtitleJob is named correctly for stitching later.
-                    output_file = reencode_dir / input_file.with_suffix(".mov").name
-
-                    reencode_jobs_queue.append(
-                        ReEncodingJob(
-                            input_file=input_file,
-                            output_file=output_file,
-                            fps=settings.split.re_encode.fps,
-                            height=settings.split.re_encode.height,
-                            bitrate_kb=settings.split.re_encode.bitrate_kb,
-                        )
-                    )
-                else:
-                    if use_upload:
-                        gemini_upload_jobs_queue.append(
-                            UploadFileJob(
-                                python_file=input_file, video_duration_ms=duration
-                            )
-                        )
-                    else:
-                        scene_detection_jobs_queue.append(
-                            LyricsSceneJob(
-                                name=input_file.stem,
-                                file=input_file,
-                                video_duration_ms=duration,
-                            )
-                        )
-            elif use_upload:
-                gemini_upload_jobs_queue.append(
-                    UploadFileJob(python_file=input_file, video_duration_ms=duration)
+            if should_reencode:
+                output_file = reencode_dir / input_file.with_suffix(".mov").name
+                # Always create/update the re-encode job and queue it.
+                # The runner is idempotent and will skip if the output file already exists.
+                job_state.reencode = ReEncodingJob(
+                    input_file=input_file,
+                    output_file=output_file,
+                    fps=settings.split.re_encode.fps,
+                    height=settings.split.re_encode.height,
+                    bitrate_kb=settings.split.re_encode.bitrate_kb,
                 )
+                reencode_jobs_queue.append(job_state)
+            elif use_upload:
+                # Always create/update the upload job and queue it.
+                # The uploader is idempotent and will check for existing files on the server.
+                job_state.upload = UploadFileJob(
+                    python_file=input_file, video_duration_ms=duration
+                )
+                gemini_upload_jobs_queue.append(job_state)
             else:
-                scene_detection_jobs_queue.append(
-                    LyricsSceneJob(
+                # If no re-encode or upload, queue the lyrics job directly.
+                # Create the job if it doesn't exist for the target model.
+                if not job_state.lyrics.get(sanitized_lyrics_model):
+                    job_state.lyrics[sanitized_lyrics_model] = LyricsSceneJob(
                         name=input_file.stem,
                         file=input_file,
                         video_duration_ms=duration,
                     )
-                )
+                scene_detection_jobs_queue.append(job_state)
 
         # Step 5: Start all runners and wait for them to complete
         # Start runners

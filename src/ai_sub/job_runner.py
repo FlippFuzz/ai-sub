@@ -2,17 +2,15 @@ import concurrent.futures
 from collections import deque
 from threading import Event
 from time import sleep
-from typing import Any, Callable, Generic, TypeVar
+from typing import Any, Callable
 
 import logfire
 
 from ai_sub.config import Settings
-from ai_sub.data_models import Job
-
-TJob = TypeVar("TJob", bound=Job)
+from ai_sub.data_models import JobState
 
 
-class JobRunner(Generic[TJob]):
+class JobRunner:
     """
     A generic, concurrent job processor.
 
@@ -26,10 +24,10 @@ class JobRunner(Generic[TJob]):
 
     def __init__(
         self,
-        queue: deque[TJob],
+        queue: deque[JobState],
         settings: Settings,
         max_workers: int,
-        on_complete: Callable[[TJob, Any], None] | None = None,
+        on_complete: Callable[[JobState, Any], None] | None = None,
         stop_events: list[Event] | None = None,
         name: str = "JobRunner",
     ):
@@ -64,7 +62,7 @@ class JobRunner(Generic[TJob]):
         Worker function that processes jobs from the queue.
         """
         while True:
-            job: TJob | None = None
+            job: JobState | None = None
             try:
                 # Attempt to get a job from the left of the queue.
                 job = self.queue.popleft()
@@ -105,13 +103,13 @@ class JobRunner(Generic[TJob]):
                             f"Exception in post_process for {self.name} job"
                         )
 
-    def process(self, job: TJob) -> Any:
+    def process(self, job: JobState) -> Any:
         raise NotImplementedError
 
-    def post_process(self, job: TJob) -> None:
+    def post_process(self, job: JobState) -> None:
         pass
 
-    def _handle_retry(self, job: TJob) -> None:
+    def _handle_retry(self, job: JobState) -> None:
         """Handles re-queuing the job if retry limits are not exceeded."""
         can_retry_run = job.run_num_retries < self.settings.retry.run
         can_retry_total = job.total_num_retries < self.settings.retry.max

@@ -219,25 +219,6 @@ class LyricsSceneJob(Job):
     video_duration_ms: PositiveInt
     response: Optional[SceneResponse] = None
 
-    def save(self, filename: Path):
-        """Saves the current object to a JSON file."""
-        json_str = self.model_dump_json(indent=2)
-        with open(filename, "w", encoding="utf-8") as file:
-            file.write(json_str)
-
-    @staticmethod
-    def load_or_return_new(
-        save_path: Path, name: str, file: File | Path, video_duration_ms: int
-    ):
-        """Loads the object from a JSON file, or returns a new object if the file doesn't exist."""
-        if Path(save_path).is_file():
-            with open(save_path, "r", encoding="utf-8") as f:
-                return LyricsSceneJob.model_validate_json(f.read())
-        else:
-            return LyricsSceneJob(
-                name=name, file=file, video_duration_ms=video_duration_ms
-            )
-
 
 class SubtitlePass1Job(Job):
     """
@@ -250,39 +231,6 @@ class SubtitlePass1Job(Job):
     video_duration_ms: PositiveInt
     scene_response: Optional[SceneResponse] = None
     response: Optional[SubtitlePass1Response] = None
-
-    def save(self, filename: Path):
-        """Saves the current object to a JSON file.
-
-        Args:
-            filename (Path): The path to the file where the object should be saved.
-        """
-        json_str = self.model_dump_json(indent=2)
-        with open(filename, "w", encoding="utf-8") as file:
-            file.write(json_str)
-
-    @staticmethod
-    def load_or_return_new(
-        save_path: Path, name: str, file: File | Path, video_duration_ms: int
-    ):
-        """Loads the object from a JSON file, or returns a new object if the file doesn't exist.
-
-        Args:
-            save_path (Path): The path to the JSON file from which to load the object.
-            name (str): The name for a new job if one is created.
-            file (File | Path): The file for a new job if one is created.
-            video_duration_ms (int): The video duration for a new job if one is created.
-
-        Returns:
-            SubtitlePass1Job: The loaded object, or a new object if the file was not found.
-        """
-        if Path(save_path).is_file():
-            with open(save_path, "r", encoding="utf-8") as f:
-                return SubtitlePass1Job.model_validate_json(f.read())
-        else:
-            return SubtitlePass1Job(
-                name=name, file=file, video_duration_ms=video_duration_ms
-            )
 
 
 class SubtitlePass2Job(Job):
@@ -298,6 +246,16 @@ class SubtitlePass2Job(Job):
     draft: SubtitlePass1Response
     response: Optional[SubtitlePass2Response] = None
 
+
+class JobState(Job):
+    """Represents the overall state of all jobs in the pipeline."""
+
+    reencode: Optional[ReEncodingJob] = None
+    upload: Optional[UploadFileJob] = None
+    lyrics: dict[str, LyricsSceneJob] = Field(default_factory=dict)
+    pass1: dict[str, SubtitlePass1Job] = Field(default_factory=dict)
+    pass2: dict[str, SubtitlePass2Job] = Field(default_factory=dict)
+
     def save(self, filename: Path):
         """Saves the current object to a JSON file.
 
@@ -309,16 +267,16 @@ class SubtitlePass2Job(Job):
             file.write(json_str)
 
     @staticmethod
-    def load(save_path: Path) -> Optional["SubtitlePass2Job"]:
+    def load(save_path: Path) -> Optional["JobState"]:
         """Loads the object from a JSON file if it exists.
 
         Args:
             save_path (Path): The path to the JSON file from which to load the state.
 
         Returns:
-            Optional["SubtitlePass2Job"]: The loaded object, or None if the file was not found.
+            Optional["JobState"]: The loaded object, or None if the file was not found.
         """
         if Path(save_path).is_file():
             with open(save_path, "r", encoding="utf-8") as f:
-                return SubtitlePass2Job.model_validate_json(f.read())
+                return JobState.model_validate_json(f.read())
         return None
