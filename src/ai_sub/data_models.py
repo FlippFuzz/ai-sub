@@ -229,7 +229,6 @@ class SubtitlePass1Job(Job):
     name: str
     file: File | Path
     video_duration_ms: PositiveInt
-    scene_response: Optional[SceneResponse] = None
     response: Optional[SubtitlePass1Response] = None
 
 
@@ -242,8 +241,6 @@ class SubtitlePass2Job(Job):
     name: str
     file: File | Path
     video_duration_ms: PositiveInt
-    scene_response: Optional[SceneResponse] = None
-    draft: SubtitlePass1Response
     response: Optional[SubtitlePass2Response] = None
 
 

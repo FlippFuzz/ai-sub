@@ -210,8 +210,15 @@ class SubtitlePass1JobRunner(JobRunner):
         """
         pass1_job = job.pass1[self.sanitized_model_name]
         assert pass1_job is not None
+
+        sanitized_lyrics_model = self.settings.ai.get_sanitized_model_name(
+            self.settings.ai.lyrics_model
+        )
+        lyrics_job = job.lyrics.get(sanitized_lyrics_model)
+        scene_response = lyrics_job.response if lyrics_job else None
+
         with logfire.span(f"Subtitling Pass 1 {pass1_job.name}"):
-            prompt = get_subtitle_pass1_prompt(pass1_job.scene_response)
+            prompt = get_subtitle_pass1_prompt(scene_response)
             pass1_job.response = self.agent.run(
                 prompt,
                 pass1_job.file,
@@ -272,10 +279,27 @@ class SubtitlePass2JobRunner(JobRunner):
         """
         pass2_job = job.pass2[self.sanitized_model_name]
         assert pass2_job is not None
-        with logfire.span(f"Subtitling Pass 2 {pass2_job.name}"):
-            prompt = get_subtitle_pass2_prompt(
-                pass2_job.scene_response, pass2_job.draft
+
+        sanitized_lyrics_model = self.settings.ai.get_sanitized_model_name(
+            self.settings.ai.lyrics_model
+        )
+        lyrics_job = job.lyrics.get(sanitized_lyrics_model)
+        scene_response = lyrics_job.response if lyrics_job else None
+
+        sanitized_pass1_model = self.settings.ai.get_sanitized_model_name(
+            self.settings.ai.pass1_model
+        )
+        pass1_job = job.pass1.get(sanitized_pass1_model)
+        draft = pass1_job.response if pass1_job else None
+
+        if not draft:
+            logfire.error(
+                f"Could not find draft subtitles for {pass2_job.name}. Skipping pass 2."
             )
+            return
+
+        with logfire.span(f"Subtitling Pass 2 {pass2_job.name}"):
+            prompt = get_subtitle_pass2_prompt(scene_response, draft)
             pass2_job.response = self.agent.run(
                 prompt,
                 pass2_job.file,
@@ -572,7 +596,6 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                     name=lyrics_job.name,
                     file=lyrics_job.file,
                     video_duration_ms=lyrics_job.video_duration_ms,
-                    scene_response=lyrics_job.response,
                 )
                 subtitle_pass1_jobs_queue.append(job)
 
@@ -584,8 +607,6 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                     name=pass1_job.name,
                     file=pass1_job.file,
                     video_duration_ms=pass1_job.video_duration_ms,
-                    scene_response=pass1_job.scene_response,
-                    draft=pass1_job.response,
                 )
                 subtitle_pass2_jobs_queue.append(job)
 
@@ -682,8 +703,6 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                         name=pass1_job.name,
                         file=pass1_job.file,
                         video_duration_ms=pass1_job.video_duration_ms,
-                        scene_response=pass1_job.scene_response,
-                        draft=pass1_job.response,
                     )
                 subtitle_pass2_jobs_queue.append(job_state)
                 continue
@@ -699,7 +718,6 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                         name=lyrics_job.name,
                         file=lyrics_job.file,
                         video_duration_ms=lyrics_job.video_duration_ms,
-                        scene_response=lyrics_job.response,
                     )
                 subtitle_pass1_jobs_queue.append(job_state)
                 continue
