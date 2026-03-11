@@ -100,9 +100,9 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 | Argument                       | Description                                                                                                                                                   | Default                             |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
-| `--ai.model <model>`           | A shorthand to set both `subtitles_model` and `lyrics_model` to the same value.                                                                               | `None`                              |
-| `--ai.subtitles-model <model>` | The AI model for subtitle generation. Use 'google-gla:\<model\>' for Google models, 'openai:\<model\>' for OpenAI, or 'custom:\<url\>' for a custom endpoint. | `google-gla:gemini-3-flash-preview` |
-| `--ai.lyrics-model <model>`    | The AI model for lyrics research and scene detection.                                                                                                         | `google-gla:gemini-3-flash-preview` |
+| `--ai.model <model>`           | A shorthand to set both `model_subtitles` and `model_lyrics` to the same value.                                                                               | `None`                              |
+| `--ai.model-subtitles <model>` | The AI model for subtitle generation. Use 'google-gla:\<model\>' for Google models, 'openai:\<model\>' for OpenAI, or 'custom:\<url\>' for a custom endpoint. | `google-gla:gemini-3-flash-preview` |
+| `--ai.model-lyrics <model>`    | The AI model for lyrics research and scene detection.                                                                                                         | `google-gla:gemini-3-flash-preview` |
 | `--ai.rpm <int>`               | Maximum requests per minute for the AI model.                                                                                                                 | `4`                                 |
 | `--ai.tpm <int>`               | Maximum tokens per minute for the AI model.                                                                                                                   | `250000`                            |
 

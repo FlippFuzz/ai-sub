@@ -7,9 +7,10 @@ This release removes the two-pass subtitle generation system in favor of a simpl
 **BREAKING CHANGES:**
 
 - **Configuration:**
-  - The `ai.pass1_model` and `ai.pass2_model` settings have been removed and replaced with a single `ai.subtitles_model`.
+  - The `ai.pass1_model` and `ai.pass2_model` settings have been removed and replaced with a single `ai.model_subtitles`.
+  - The `ai.lyrics_model` setting has been renamed to `ai.model_lyrics`.
   - The `thread.subtitles1` and `thread.subtitles2` settings have been consolidated into `thread.subtitles`.
-  - The `ai.model` shorthand now sets `subtitles_model` and `lyrics_model`.
+  - The `ai.model` shorthand now sets `model_subtitles` and `model_lyrics`.
 - **State Persistence:** The format for intermediate job state files has changed.
   - `part_XXX.pass1.MODEL.json` is now `part_XXX.subtitles.MODEL.json`.
   - `part_XXX.pass2.MODEL.json` is no longer created.

@@ -213,7 +213,7 @@ class SubtitleJobRunner(JobRunner):
         assert subtitle_job is not None
 
         sanitized_lyrics_model = self.settings.ai.get_sanitized_model_name(
-            self.settings.ai.lyrics_model
+            self.settings.ai.model_lyrics
         )
         lyrics_job = job.lyrics.get(sanitized_lyrics_model)
         scene_response = lyrics_job.response if lyrics_job else None
@@ -248,7 +248,7 @@ class SubtitleJobRunner(JobRunner):
             )
             subtitle_job.save(job_state_path)
             sanitized_model = self.settings.ai.get_sanitized_model_name(
-                self.settings.ai.subtitles_model
+                self.settings.ai.model_subtitles
             )
             subtitle_job.response.get_ssafile().save(
                 str(
@@ -277,10 +277,10 @@ def stitch_subtitles(
     with logfire.span("Producing final SRT file"):
         all_subtitles = SSAFile()
         sanitized_lyrics_model = settings.ai.get_sanitized_model_name(
-            settings.ai.lyrics_model
+            settings.ai.model_lyrics
         )
         sanitized_subtitles_model = settings.ai.get_sanitized_model_name(
-            settings.ai.subtitles_model
+            settings.ai.model_subtitles
         )
 
         chunks_to_skip = int(
@@ -435,14 +435,14 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
 
     # Initialize the AI Agent.
     # A custom wrapper is used to make handling rate limits and differences in models more cleanly
-    agent_subtitles = RateLimitedAgentWrapper(settings, settings.ai.subtitles_model)
-    agent_scene = RateLimitedAgentWrapper(settings, settings.ai.lyrics_model)
+    agent_subtitles = RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
+    agent_scene = RateLimitedAgentWrapper(settings, settings.ai.model_lyrics)
 
     sanitized_lyrics_model = settings.ai.get_sanitized_model_name(
-        settings.ai.lyrics_model
+        settings.ai.model_lyrics
     )
     sanitized_subtitles_model = settings.ai.get_sanitized_model_name(
-        settings.ai.subtitles_model
+        settings.ai.model_subtitles
     )
 
     # Start the main application logic within a Logfire span for better tracing.

@@ -76,13 +76,13 @@ class AiSettings(BaseSettings):
 
     model: Optional[str] = Field(
         default=None,
-        description="A shorthand to set both subtitles_model and lyrics_model to the same value. If provided, this will override the other two settings.",
+        description="A shorthand to set both model_subtitles and model_lyrics to the same value. If provided, this will override the other two settings.",
     )
-    subtitles_model: str = Field(
+    model_subtitles: str = Field(
         description="The AI model for subtitle generation. Use 'google-gla:<model>' for Google models, 'openai:<model>' for OpenAI, or 'custom:<url>' for a custom endpoint.",
         default="google-gla:gemini-3-flash-preview",
     )
-    lyrics_model: str = Field(
+    model_lyrics: str = Field(
         description="The AI model for lyrics research and scene detection.",
         default="google-gla:gemini-3-flash-preview",
     )
@@ -104,15 +104,15 @@ class AiSettings(BaseSettings):
     @model_validator(mode="after")
     def validate_models(self):
         """
-        - If the 'model' field is set, it overrides 'subtitles_model' and 'lyrics_model'.
+        - If the 'model' field is set, it overrides 'model_subtitles' and 'model_lyrics'.
         - Validates that a Google AI API key is provided if a Google model is selected.
         """
         if self.model:
-            self.subtitles_model = self.model
-            self.lyrics_model = self.model
+            self.model_subtitles = self.model
+            self.model_lyrics = self.model
 
-        is_google_subtitles = self.subtitles_model.lower().startswith("google-gla")
-        is_google_scene = self.lyrics_model.lower().startswith("google-gla")
+        is_google_subtitles = self.model_subtitles.lower().startswith("google-gla")
+        is_google_scene = self.model_lyrics.lower().startswith("google-gla")
 
         if (is_google_subtitles or is_google_scene) and self.google.key is None:
             raise ValueError(
