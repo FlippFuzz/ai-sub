@@ -142,20 +142,13 @@ class SubtitleResponse(BaseModel):
 class AiResponse(SubtitleResponse):
     """Represents the structured response from the AI model containing a list of subtitles."""
 
-    qa_analysis: Optional[str] = None
     global_analysis: Optional[str] = None
 
 
-class SubtitlePass1Response(SubtitleResponse):
-    """Response model for the first pass of subtitle generation."""
+class SubtitleApiResponse(SubtitleResponse):
+    """Response model for the subtitle generation."""
 
     global_analysis: str
-
-
-class SubtitlePass2Response(SubtitleResponse):
-    """Response model for the second pass of subtitle generation."""
-
-    qa_analysis: str
 
 
 class SubtitleGenerationState(BaseModel):
@@ -247,28 +240,16 @@ class LyricsSceneJob(Job):
     response: Optional[SceneResponse] = None
 
 
-class SubtitlePass1Job(Job):
+class SubtitleJob(Job):
     """
-    Represents a job to generate the first pass of subtitles (Transcription),
+    Represents a job to generate subtitles (Transcription),
     using scene/lyrics data from a `SceneResponse` as a reference.
     """
 
     name: str
     file: File | Path
     video_duration_ms: PositiveInt
-    response: Optional[SubtitlePass1Response] = None
-
-
-class SubtitlePass2Job(Job):
-    """
-    Represents a job to generate the second pass of subtitles (QA & Refinement),
-    using the Pass 1 `draft` and scene/lyrics data from a `SceneResponse` as a reference.
-    """
-
-    name: str
-    file: File | Path
-    video_duration_ms: PositiveInt
-    response: Optional[SubtitlePass2Response] = None
+    response: Optional[SubtitleApiResponse] = None
 
 
 class JobState(Job):
@@ -277,8 +258,7 @@ class JobState(Job):
     reencode: Optional[ReEncodingJob] = None
     upload: Optional[UploadFileJob] = None
     lyrics: dict[str, LyricsSceneJob] = Field(default_factory=dict)
-    pass1: dict[str, SubtitlePass1Job] = Field(default_factory=dict)
-    pass2: dict[str, SubtitlePass2Job] = Field(default_factory=dict)
+    subtitles: dict[str, SubtitleJob] = Field(default_factory=dict)
 
 
 T = TypeVar("T", bound=Job)

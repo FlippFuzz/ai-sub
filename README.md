@@ -98,13 +98,13 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ### AI Settings (`--ai.*`)
 
-| Argument                   | Description                                                                                                                                                                     | Default                             |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
-| `--ai.model <model>`       | A shorthand to set both `pass1_model` and `pass2_model` to the same value.                                                                                                      | `None`                              |
-| `--ai.pass1-model <model>` | The AI model for the first pass of subtitle generation. Use 'google-gla:\<model\>' for Google models, 'openai:\<model\>' for OpenAI, or 'custom:\<url\>' for a custom endpoint. | `google-gla:gemini-3-flash-preview` |
-| `--ai.pass2-model <model>` | The AI model for the second pass of subtitle generation (QA & Refinement).                                                                                                      | `google-gla:gemini-3-flash-preview` |
-| `--ai.rpm <int>`           | Maximum requests per minute for the AI model.                                                                                                                                   | `4`                                 |
-| `--ai.tpm <int>`           | Maximum tokens per minute for the AI model.                                                                                                                                     | `250000`                            |
+| Argument                       | Description                                                                                                                                                   | Default                             |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
+| `--ai.model <model>`           | A shorthand to set both `subtitles_model` and `lyrics_model` to the same value.                                                                               | `None`                              |
+| `--ai.subtitles-model <model>` | The AI model for subtitle generation. Use 'google-gla:\<model\>' for Google models, 'openai:\<model\>' for OpenAI, or 'custom:\<url\>' for a custom endpoint. | `google-gla:gemini-3-flash-preview` |
+| `--ai.lyrics-model <model>`    | The AI model for lyrics research and scene detection.                                                                                                         | `google-gla:gemini-3-flash-preview` |
+| `--ai.rpm <int>`               | Maximum requests per minute for the AI model.                                                                                                                 | `4`                                 |
+| `--ai.tpm <int>`               | Maximum tokens per minute for the AI model.                                                                                                                   | `250000`                            |
 
 #### Google AI Settings (`--ai.google.*`)
 
@@ -149,12 +149,12 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ### Concurrency Settings (`--thread.*`)
 
-| Argument                    | Description                                                                                                      | Default |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------- |
-| `--thread.uploads <int>`    | The number of concurrent threads for uploading video segments. This is only used for Gemini (google-gla) models. | `4`     |
-| `--thread.re-encode <int>`  | The number of concurrent threads for re-encoding video chunks.                                                   | `2`     |
-| `--thread.subtitles1 <int>` | The number of concurrent threads to use for Pass 1 (Transcription).                                              | `4`     |
-| `--thread.subtitles2 <int>` | The number of concurrent threads to use for Pass 2 (QA).                                                         | `4`     |
+| Argument                   | Description                                                                                                      | Default |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------- |
+| `--thread.uploads <int>`   | The number of concurrent threads for uploading video segments. This is only used for Gemini (google-gla) models. | `4`     |
+| `--thread.re-encode <int>` | The number of concurrent threads for re-encoding video chunks.                                                   | `2`     |
+| `--thread.lyrics <int>`    | The number of concurrent threads to use for Lyrics/Scene Detection.                                              | `4`     |
+| `--thread.subtitles <int>` | The number of concurrent threads to use for Subtitle Generation (Transcription).                                 | `4`     |
 
 ### Retry Settings (`--retry.*`)
 

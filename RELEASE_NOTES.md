@@ -1,5 +1,24 @@
 # AI Sub Release Notes
 
+## v2.3.0
+
+This release removes the two-pass subtitle generation system in favor of a simpler, single-pass workflow. The second "QA" pass proved to be of limited value and added unnecessary complexity and cost.
+
+**BREAKING CHANGES:**
+
+- **Configuration:**
+  - The `ai.pass1_model` and `ai.pass2_model` settings have been removed and replaced with a single `ai.subtitles_model`.
+  - The `thread.subtitles1` and `thread.subtitles2` settings have been consolidated into `thread.subtitles`.
+  - The `ai.model` shorthand now sets `subtitles_model` and `lyrics_model`.
+- **State Persistence:** The format for intermediate job state files has changed.
+  - `part_XXX.pass1.MODEL.json` is now `part_XXX.subtitles.MODEL.json`.
+  - `part_XXX.pass2.MODEL.json` is no longer created.
+  - **You must delete temporary directories (e.g., `tmp_<video_name>`) from previous runs before using this version.**
+
+**Improvements:**
+
+- **Simplified Pipeline:** The subtitle generation process is now a single AI call, reducing complexity, processing time, and potential points of failure.
+
 ## v2.2.0b1
 
 This release introduces a major refactoring of the job processing pipeline to be more flexible and robust, improves state persistence, and refines the QA prompt to better handle timing errors.

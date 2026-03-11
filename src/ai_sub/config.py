@@ -76,18 +76,14 @@ class AiSettings(BaseSettings):
 
     model: Optional[str] = Field(
         default=None,
-        description="A shorthand to set both pass1_model and pass2_model to the same value. If provided, this will override the other two settings.",
+        description="A shorthand to set both subtitles_model and lyrics_model to the same value. If provided, this will override the other two settings.",
     )
-    pass1_model: str = Field(
-        description="The AI model for the first pass of subtitle generation. Use 'google-gla:<model>' for Google models, 'openai:<model>' for OpenAI, or 'custom:<url>' for a custom endpoint.",
+    subtitles_model: str = Field(
+        description="The AI model for subtitle generation. Use 'google-gla:<model>' for Google models, 'openai:<model>' for OpenAI, or 'custom:<url>' for a custom endpoint.",
         default="google-gla:gemini-3-flash-preview",
     )
     lyrics_model: str = Field(
         description="The AI model for lyrics research and scene detection.",
-        default="google-gla:gemini-3-flash-preview",
-    )
-    pass2_model: str = Field(
-        description="The AI model for the second pass of subtitle generation (QA & Refinement).",
         default="google-gla:gemini-3-flash-preview",
     )
     rpm: PositiveInt = Field(
@@ -108,19 +104,17 @@ class AiSettings(BaseSettings):
     @model_validator(mode="after")
     def validate_models(self):
         """
-        - If the 'model' field is set, it overrides 'pass1_model', 'pass2_model', and 'lyrics_model'.
+        - If the 'model' field is set, it overrides 'subtitles_model' and 'lyrics_model'.
         - Validates that a Google AI API key is provided if a Google model is selected.
         """
         if self.model:
-            self.pass1_model = self.model
-            self.pass2_model = self.model
+            self.subtitles_model = self.model
             self.lyrics_model = self.model
 
-        is_google_1 = self.pass1_model.lower().startswith("google-gla")
+        is_google_subtitles = self.subtitles_model.lower().startswith("google-gla")
         is_google_scene = self.lyrics_model.lower().startswith("google-gla")
-        is_google_2 = self.pass2_model.lower().startswith("google-gla")
 
-        if (is_google_1 or is_google_2 or is_google_scene) and self.google.key is None:
+        if (is_google_subtitles or is_google_scene) and self.google.key is None:
             raise ValueError(
                 "A Google AI API key must be provided either via the 'key' field, GOOGLE_API_KEY, GEMINI_API_KEY or AISUB_AI_GOOGLE_KEY environment variables."
             )
@@ -220,12 +214,8 @@ class ThreadSettings(BaseSettings):
         description="The number of concurrent threads to use for Lyrics/Scene Detection.",
         default=4,
     )
-    subtitles1: PositiveInt = Field(
-        description="The number of concurrent threads to use for Pass 1 (Transcription).",
-        default=4,
-    )
-    subtitles2: PositiveInt = Field(
-        description="The number of concurrent threads to use for Pass 2 (QA).",
+    subtitles: PositiveInt = Field(
+        description="The number of concurrent threads to use for Subtitle Generation (Transcription).",
         default=4,
     )
 

@@ -1,7 +1,6 @@
-import json
 from textwrap import dedent
 
-from ai_sub.data_models import SceneResponse, SubtitlePass1Response
+from ai_sub.data_models import SceneResponse
 
 SUBTITLES_PROMPT_VERSION = 9
 
@@ -49,7 +48,7 @@ def get_lyrics_scenes_prompt() -> str:
 # ==========================================
 # DRAFTING (WITH LYRIC REFERENCE)
 # ==========================================
-_SUBTITLES_PASS1_PROMPT_TEMPLATE = dedent(
+_SUBTITLES_PROMPT_TEMPLATE = dedent(
     """
     You are an advanced AI expert in audio-visual translation and subtitling. Your specialty is generating **audio-synchronized**, contextually rich subtitles from multimodal inputs using native audio tokenization.
 
@@ -162,9 +161,9 @@ _SUBTITLES_PASS1_PROMPT_TEMPLATE = dedent(
 ).strip()
 
 
-def get_subtitle_pass1_prompt(scene_response: SceneResponse | None) -> str:
+def get_subtitle_prompt(scene_response: SceneResponse | None) -> str:
     """
-    Generates the prompt for the first pass of subtitle generation.
+    Generates the prompt for subtitle generation.
 
     Args:
         scene_response (SceneResponse | None): The scene detection data.
@@ -173,81 +172,4 @@ def get_subtitle_pass1_prompt(scene_response: SceneResponse | None) -> str:
         str: The full prompt string.
     """
     scene_json = scene_response.model_dump_json(indent=2) if scene_response else ""
-    return f"{_SUBTITLES_PASS1_PROMPT_TEMPLATE}{scene_json}\n```"
-
-
-# ==========================================
-# QA/REFINEMENT
-# ==========================================
-_SUBTITLES_PASS2_PROMPT_TEMPLATE = dedent(
-    """
-    You are an Elite AI Subtitle Sync Auditor and QA Editor. Your primary job is to hunt down and fix TIMING DESYNCS (where Pass 1 placed text at the wrong time) and translation mistakes, while strictly enforcing professional subtitling constraints.
-
-    You have access to the original high-resolution audio, the 1 FPS visual track, the Scene & Lyrics Reference, and the Pass 1 Subtitles draft. 
-
-    ### QA PRIORITY 1: THE SYNC AUDIT (FIXING TIMING ERRORS)
-    Pass 1 often suffers from "Timestamp Drift" (placing subtitles seconds earlier or later than the actual audio) or hallucinates text during silence. You must verify and fix these.
-    1.  **Listen and Verify:** For every subtitle, check the audio at the `s` (start) time. Does the spoken audio actually match the text?
-    2.  **Re-Anchoring:** If the audio does NOT match, you must scan the timeline, find exactly where the words are actually spoken, and rewrite the `s` and `e` timestamps.
-    3.  **Purging Ghost Subtitles:** If Pass 1 generated text during pure silence, instrumental background music, or sound effects, DELETE the subtitle object entirely.
-
-    ### QA PRIORITY 2: STRICT TIMING CONSTRAINTS (THE ANTI-PADDING RULE)
-    When you verify or fix a timestamp, you MUST adhere to strict audio-waveform boundaries.
-    *   **The Anti-Padding Mandate:** Disable your AI bias to keep text on screen for readability. If a fast speaker says a full sentence in exactly 800ms, the subtitle duration MUST be exactly 800ms. Do not extend the `e` (end) timestamp into silence.
-    *   **Contiguous Timestamping:** If an uninterrupted, continuous sentence is split across multiple subtitle blocks (to stay under 50 characters), the `e` of Part 1 MUST EXACTLY EQUAL the `s` of Part 2 (e.g., Part 1 `e`: "00:05.500", Part 2 `s`: "00:05.500"). Do not insert artificial millisecond gaps during continuous speech.
-    *   **Strict Format:** Timestamps must be exactly `MM:SS.mmm` (e.g., `01:05.300`). Always zero-pad.
-
-    ### QA PRIORITY 3: CONTEXTUAL TRANSLATION & THE HIERARCHY OF TRUTH
-    *   **The Hierarchy of Truth (On-Screen Lyrics > JSON Reference):** If the 1 FPS visual track shows burnt-in subtitles or on-screen lyrics, treat them as the ULTIMATE GUIDE for the `og` (original language) transcription. They strictly override the external Scene & Lyrics Reference JSON.
-    *   **Lyrics Reference Warning (CRITICAL):** The Scene & Lyrics Reference JSON is a highly fallible web search. It might be **incomplete (missing verses)**, have **extra lines**, or be for the **wrong song entirely**. 
-        *   **If Missing Lines:** If the audio contains vocals/verses that are NOT in the reference, ensure Pass 1 didn't skip them. If Pass 1 missed them, you MUST transcribe and translate them by ear (or by using on-screen text).
-        *   **If Extra Lines:** If the reference contains lyrics that are NOT sung in the audio, ensure Pass 1 did NOT include them. If it did, DELETE them.
-        *   **If Wrong Song / Conflict:** If the reference lyrics contradict what is actually being sung or what is written on-screen, IGNORE THE REFERENCE ENTIRELY. Fix Pass 1 so it matches the actual audio and visuals.
-    *   **Visual Context:** Use the visuals to determine speaker gender, number of people, and relationships. Fix pronouns (he/she/they), tense, and tone.
-    *   **Formatting Check:** Ensure NO subtitle exceeds 50 characters per line. Remove any closed captioning tags (like `[music]`, `(sighs)`) if Pass 1 included them.
-
-    ### OUTPUT FORMAT
-    Return **ONLY** a valid, parseable JSON object. No markdown wrapping outside the JSON.
-    You MUST output `qa_analysis` FIRST. This acts as your scratchpad to plan your sync corrections.
-
-    **JSON Schema:**
-    {
-      "qa_analysis": "Detail your sync audit. EXPLICITLY state your fixes (e.g., 'Pass 1 skipped a verse at 01:10, transcribed using on-screen lyrics', 'Shifted line X to 00:48', 'Deleted hallucinated text at 01:20', 'Ignored JSON reference because it conflicted with on-screen text.').",
-      "subs": [
-        {
-          "s": "MM:SS.mmm",
-          "e": "MM:SS.mmm",
-          "og": "Refined Original Language Transcription",
-          "en": "Refined English Translation"
-        }
-      ]
-    }
-
-    ### PASS 1 SUBTITLES & LYRICS REFERENCE INPUT:
-    ```json
-    """
-).strip()
-
-
-def get_subtitle_pass2_prompt(
-    scene_response: SceneResponse | None, pass1_subs: SubtitlePass1Response
-) -> str:
-    """
-    Generates the prompt for the second pass of subtitle generation (QA).
-
-    Args:
-        scene_response (SceneResponse | None): The scene detection data.
-        pass1_subs (SubtitlePass1Response): The subtitles generated in pass 1.
-
-    Returns:
-        str: The full prompt string.
-    """
-    combined_input = {
-        "scene_data": (
-            scene_response.model_dump(mode="json") if scene_response else None
-        ),
-        "pass1_subs": pass1_subs.model_dump(mode="json"),
-    }
-    return (
-        f"{_SUBTITLES_PASS2_PROMPT_TEMPLATE}{json.dumps(combined_input, indent=2)}\n```"
-    )
+    return f"{_SUBTITLES_PROMPT_TEMPLATE}{scene_json}\n```"
