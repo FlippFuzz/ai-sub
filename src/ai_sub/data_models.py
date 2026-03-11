@@ -1,7 +1,7 @@
 import string
 from enum import IntEnum
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Type, TypeVar
 
 from google.genai.types import File
 from pydantic import (
@@ -190,8 +190,35 @@ class SceneResponse(BaseModel):
 class Job(BaseModel):
     """Base class for all job types in the processing pipeline."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     run_num_retries: NonNegativeInt = 0
     total_num_retries: NonNegativeInt = 0
+
+    def save(self, filename: Path):
+        """Saves the current object to a JSON file.
+
+        Args:
+            filename (Path): The path to the file where the object should be saved.
+        """
+        json_str = self.model_dump_json(indent=2)
+        with open(filename, "w", encoding="utf-8") as file:
+            file.write(json_str)
+
+    @classmethod
+    def load(cls: Type["T"], save_path: Path) -> Optional["T"]:
+        """Loads the object from a JSON file if it exists.
+
+        Args:
+            save_path (Path): The path to the JSON file from which to load the state.
+
+        Returns:
+            Optional[T]: The loaded object, or None if the file was not found.
+        """
+        if Path(save_path).is_file():
+            with open(save_path, "r", encoding="utf-8") as f:
+                return cls.model_validate_json(f.read())
+        return None
 
 
 class ReEncodingJob(Job):
@@ -253,27 +280,5 @@ class JobState(Job):
     pass1: dict[str, SubtitlePass1Job] = Field(default_factory=dict)
     pass2: dict[str, SubtitlePass2Job] = Field(default_factory=dict)
 
-    def save(self, filename: Path):
-        """Saves the current object to a JSON file.
 
-        Args:
-            filename (Path): The path to the file where the object should be saved.
-        """
-        json_str = self.model_dump_json(indent=2)
-        with open(filename, "w", encoding="utf-8") as file:
-            file.write(json_str)
-
-    @staticmethod
-    def load(save_path: Path) -> Optional["JobState"]:
-        """Loads the object from a JSON file if it exists.
-
-        Args:
-            save_path (Path): The path to the JSON file from which to load the state.
-
-        Returns:
-            Optional["JobState"]: The loaded object, or None if the file was not found.
-        """
-        if Path(save_path).is_file():
-            with open(save_path, "r", encoding="utf-8") as f:
-                return JobState.model_validate_json(f.read())
-        return None
+T = TypeVar("T", bound=Job)

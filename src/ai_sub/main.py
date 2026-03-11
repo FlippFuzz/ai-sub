@@ -179,8 +179,14 @@ class LyricsSceneJobRunner(JobRunner):
         """Saves the result to disk."""
         lyrics_job = job.lyrics[self.sanitized_model_name]
         assert lyrics_job is not None
-        job_state_path = self.settings.dir.tmp / f"{lyrics_job.name}.json"
-        job.save(job_state_path)
+        if lyrics_job.response:
+            lyrics_job.run_num_retries = job.run_num_retries
+            lyrics_job.total_num_retries = job.total_num_retries
+            job_state_path = (
+                self.settings.dir.tmp
+                / f"{lyrics_job.name}.lyrics.{self.sanitized_model_name}.json"
+            )
+            lyrics_job.save(job_state_path)
 
 
 class SubtitlePass1JobRunner(JobRunner):
@@ -236,11 +242,16 @@ class SubtitlePass1JobRunner(JobRunner):
         # Save the completed job state to a JSON file for persistence.
         pass1_job = job.pass1[self.sanitized_model_name]
         assert pass1_job is not None
-        job_state_path = self.settings.dir.tmp / f"{pass1_job.name}.json"
-        job.save(job_state_path)
 
         # Also generate a subtitle file for this job for the user to view.
         if pass1_job.response is not None:
+            pass1_job.run_num_retries = job.run_num_retries
+            pass1_job.total_num_retries = job.total_num_retries
+            job_state_path = (
+                self.settings.dir.tmp
+                / f"{pass1_job.name}.pass1.{self.sanitized_model_name}.json"
+            )
+            pass1_job.save(job_state_path)
             sanitized_model = self.settings.ai.get_sanitized_model_name(
                 self.settings.ai.pass1_model
             )
@@ -318,10 +329,15 @@ class SubtitlePass2JobRunner(JobRunner):
         # Save the completed job state to a JSON file for persistence.
         pass2_job = job.pass2[self.sanitized_model_name]
         assert pass2_job is not None
-        job_state_path = self.settings.dir.tmp / f"{pass2_job.name}.json"
-        job.save(job_state_path)
 
         if pass2_job.response is not None:
+            pass2_job.run_num_retries = job.run_num_retries
+            pass2_job.total_num_retries = job.total_num_retries
+            job_state_path = (
+                self.settings.dir.tmp
+                / f"{pass2_job.name}.pass2.{self.sanitized_model_name}.json"
+            )
+            pass2_job.save(job_state_path)
             # Also generate a subtitle file for this job for the user to view.
             sanitized_model = self.settings.ai.get_sanitized_model_name(
                 self.settings.ai.pass2_model
@@ -353,7 +369,15 @@ def stitch_subtitles(
     """
     with logfire.span("Producing final SRT file"):
         all_subtitles = SSAFile()
-        sanitized_model = settings.ai.get_sanitized_model_name(settings.ai.pass2_model)
+        sanitized_lyrics_model = settings.ai.get_sanitized_model_name(
+            settings.ai.lyrics_model
+        )
+        sanitized_pass1_model = settings.ai.get_sanitized_model_name(
+            settings.ai.pass1_model
+        )
+        sanitized_pass2_model = settings.ai.get_sanitized_model_name(
+            settings.ai.pass2_model
+        )
 
         chunks_to_skip = int(
             (settings.split.start_offset_min * 60) / settings.split.max_seconds
@@ -369,8 +393,11 @@ def stitch_subtitles(
         for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
             # Load the job result from the temporary JSON file.
             # We look for the final pass 2 output
-            job_state = JobState.load(settings.dir.tmp / f"{video_path.stem}.json")
-            job = job_state.pass2.get(sanitized_model) if job_state else None
+            job_path = (
+                settings.dir.tmp
+                / f"{video_path.stem}.pass2.{sanitized_pass2_model}.json"
+            )
+            job = SubtitlePass2Job.load(job_path)
             if job and job.response:
                 current_subtitles = job.response.get_ssafile()
                 # Shift the timestamps of the current subtitle segment by the
@@ -393,7 +420,29 @@ def stitch_subtitles(
             offset_ms += video_duration_ms
 
             # Sort out max retries exceeded
-            if job_state and job_state.total_num_retries >= settings.retry.max:
+            # The latest job file will have the highest retry count.
+            # We can check in reverse order of stages.
+            final_job_retry_count = 0
+            if job:  # pass2 job
+                final_job_retry_count = job.total_num_retries
+            else:
+                pass1_job_path = (
+                    settings.dir.tmp
+                    / f"{video_path.stem}.pass1.{sanitized_pass1_model}.json"
+                )
+                pass1_job = SubtitlePass1Job.load(pass1_job_path)
+                if pass1_job:
+                    final_job_retry_count = pass1_job.total_num_retries
+                else:
+                    lyrics_job_path = (
+                        settings.dir.tmp
+                        / f"{video_path.stem}.lyrics.{sanitized_lyrics_model}.json"
+                    )
+                    lyrics_job = LyricsSceneJob.load(lyrics_job_path)
+                    if lyrics_job:
+                        final_job_retry_count = lyrics_job.total_num_retries
+
+            if final_job_retry_count >= settings.retry.max:
                 state.max_retries_exceeded = True
 
         # Insert version and config, as a single SSAEvent at the beginning (0-1ms)
@@ -422,7 +471,7 @@ def stitch_subtitles(
         all_subtitles.save(
             str(
                 settings.dir.out
-                / f"{settings.input_video_file.stem}.{sanitized_model}.srt"
+                / f"{settings.input_video_file.stem}.{sanitized_pass2_model}.srt"
             )
         )
         return state
@@ -679,11 +728,36 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             reencode_dir.mkdir(exist_ok=True)
 
         for split, duration in splits_to_process:
-            job_state_path = settings.dir.tmp / f"{split.stem}.json"
-            job_state = JobState.load(job_state_path)
+            job_state = JobState()
+            max_retries = 0
 
-            if not job_state:
-                job_state = JobState()
+            # Load jobs if they exist and populate the in-memory JobState
+            lyrics_job_path = (
+                settings.dir.tmp / f"{split.stem}.lyrics.{sanitized_lyrics_model}.json"
+            )
+            lyrics_job = LyricsSceneJob.load(lyrics_job_path)
+            if lyrics_job:
+                job_state.lyrics[sanitized_lyrics_model] = lyrics_job
+                max_retries = max(max_retries, lyrics_job.total_num_retries)
+
+            pass1_job_path = (
+                settings.dir.tmp / f"{split.stem}.pass1.{sanitized_pass1_model}.json"
+            )
+            pass1_job = SubtitlePass1Job.load(pass1_job_path)
+            if pass1_job:
+                job_state.pass1[sanitized_pass1_model] = pass1_job
+                max_retries = max(max_retries, pass1_job.total_num_retries)
+
+            pass2_job_path = (
+                settings.dir.tmp / f"{split.stem}.pass2.{sanitized_pass2_model}.json"
+            )
+            pass2_job = SubtitlePass2Job.load(pass2_job_path)
+            if pass2_job:
+                job_state.pass2[sanitized_pass2_model] = pass2_job
+                max_retries = max(max_retries, pass2_job.total_num_retries)
+
+            # Restore the total retry count for the new in-memory JobState
+            job_state.total_num_retries = max_retries
 
             # 1. Check Pass 2 Done
             # Check if the final stage (Pass 2) has already been completed for the target model.
