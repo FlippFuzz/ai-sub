@@ -2,12 +2,11 @@ from textwrap import dedent
 
 from ai_sub.data_models import SceneResponse
 
-LYRICS_PROMPT_VERSION = 1
-SUBTITLES_PROMPT_VERSION = 10
-
 # ==========================================
 # SCENE DETECTION & LYRICS RESEARCH
 # ==========================================
+LYRICS_PROMPT_VERSION = 1
+
 _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
     """
     You are an AI Music and Audio Scene Analyzer. Your job is to analyze a video, break it down into chronological scenes, detect if a song is playing, and use your Web Search Tool to find the official lyrics.
@@ -49,6 +48,8 @@ def get_lyrics_scenes_prompt() -> str:
 # ==========================================
 # SUBTITLES GENERATION
 # ==========================================
+SUBTITLES_PROMPT_VERSION = 10
+
 _SUBTITLES_PROMPT_TEMPLATE = dedent(
     """
     You are an advanced AI expert in audio-visual translation and subtitling. Your specialty is generating **audio-synchronized**, contextually rich subtitles from multimodal inputs using native audio tokenization.
