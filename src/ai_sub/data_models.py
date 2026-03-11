@@ -1,8 +1,9 @@
 import string
 from enum import IntEnum
 from pathlib import Path
-from typing import Optional, Type, TypeVar
+from typing import Optional
 
+import logfire
 from google.genai.types import File
 from pydantic import (
     BaseModel,
@@ -10,6 +11,7 @@ from pydantic import (
     Field,
     NonNegativeInt,
     PositiveInt,
+    ValidationError,
     field_validator,
 )
 from pysubs2 import SSAEvent, SSAFile
@@ -155,6 +157,7 @@ class SubtitleGenerationState(BaseModel):
     """Represents the state of the subtitle generation process."""
 
     ai_sub_version: str
+    lyrics_prompt_version: int
     subtitles_prompt_version: int
     complete: bool = True
     max_retries_exceeded: bool = False
@@ -198,21 +201,6 @@ class Job(BaseModel):
         with open(filename, "w", encoding="utf-8") as file:
             file.write(json_str)
 
-    @classmethod
-    def load(cls: Type["T"], save_path: Path) -> Optional["T"]:
-        """Loads the object from a JSON file if it exists.
-
-        Args:
-            save_path (Path): The path to the JSON file from which to load the state.
-
-        Returns:
-            Optional[T]: The loaded object, or None if the file was not found.
-        """
-        if Path(save_path).is_file():
-            with open(save_path, "r", encoding="utf-8") as f:
-                return cls.model_validate_json(f.read())
-        return None
-
 
 class ReEncodingJob(Job):
     """Represents a job to re-encode a video file."""
@@ -238,6 +226,31 @@ class LyricsSceneJob(Job):
     file: File | Path
     video_duration_ms: PositiveInt
     response: Optional[SceneResponse] = None
+    lyrics_prompt_version: Optional[int] = None
+
+    @classmethod
+    def load(cls, save_path: Path) -> Optional["LyricsSceneJob"]:
+        """Loads the job from a JSON file, checking for prompt version mismatch."""
+        # Local import to avoid circular dependency
+        from ai_sub.prompt import LYRICS_PROMPT_VERSION
+
+        if Path(save_path).is_file():
+            with open(save_path, "r", encoding="utf-8") as f:
+                try:
+                    job = cls.model_validate_json(f.read())
+                except ValidationError as e:
+                    logfire.warning(
+                        f"Validation failed for {save_path.name}, ignoring cache. Error: {e}"
+                    )
+                    return None
+
+            if job.lyrics_prompt_version != LYRICS_PROMPT_VERSION:
+                logfire.info(
+                    f"Lyrics prompt version mismatch for {job.name} (file: {job.lyrics_prompt_version}, current: {LYRICS_PROMPT_VERSION}). Re-processing."
+                )
+                return None
+            return job
+        return None
 
 
 class SubtitleJob(Job):
@@ -250,6 +263,31 @@ class SubtitleJob(Job):
     file: File | Path
     video_duration_ms: PositiveInt
     response: Optional[SubtitleApiResponse] = None
+    subtitles_prompt_version: Optional[int] = None
+
+    @classmethod
+    def load(cls, save_path: Path) -> Optional["SubtitleJob"]:
+        """Loads the job from a JSON file, checking for prompt version mismatch."""
+        # Local import to avoid circular dependency
+        from ai_sub.prompt import SUBTITLES_PROMPT_VERSION
+
+        if Path(save_path).is_file():
+            with open(save_path, "r", encoding="utf-8") as f:
+                try:
+                    job = cls.model_validate_json(f.read())
+                except ValidationError as e:
+                    logfire.warning(
+                        f"Validation failed for {save_path.name}, ignoring cache. Error: {e}"
+                    )
+                    return None
+
+            if job.subtitles_prompt_version != SUBTITLES_PROMPT_VERSION:
+                logfire.info(
+                    f"Subtitles prompt version mismatch for {job.name} (file: {job.subtitles_prompt_version}, current: {SUBTITLES_PROMPT_VERSION}). Re-processing."
+                )
+                return None
+            return job
+        return None
 
 
 class JobState(Job):
@@ -259,6 +297,3 @@ class JobState(Job):
     upload: Optional[UploadFileJob] = None
     lyrics: dict[str, LyricsSceneJob] = Field(default_factory=dict)
     subtitles: dict[str, SubtitleJob] = Field(default_factory=dict)
-
-
-T = TypeVar("T", bound=Job)

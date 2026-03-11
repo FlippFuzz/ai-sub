@@ -26,6 +26,7 @@ from ai_sub.data_models import (
 from ai_sub.gemini_file_uploader import GeminiFileUploader
 from ai_sub.job_runner import JobRunner
 from ai_sub.prompt import (
+    LYRICS_PROMPT_VERSION,
     SUBTITLES_PROMPT_VERSION,
     get_lyrics_scenes_prompt,
     get_subtitle_prompt,
@@ -177,6 +178,7 @@ class LyricsSceneJobRunner(JobRunner):
         if lyrics_job.response:
             lyrics_job.run_num_retries = job.run_num_retries
             lyrics_job.total_num_retries = job.total_num_retries
+            lyrics_job.lyrics_prompt_version = LYRICS_PROMPT_VERSION
             job_state_path = (
                 self.settings.dir.tmp
                 / f"{lyrics_job.name}.lyrics.{self.sanitized_model_name}.json"
@@ -242,6 +244,7 @@ class SubtitleJobRunner(JobRunner):
         if subtitle_job.response is not None:
             subtitle_job.run_num_retries = job.run_num_retries
             subtitle_job.total_num_retries = job.total_num_retries
+            subtitle_job.subtitles_prompt_version = SUBTITLES_PROMPT_VERSION
             job_state_path = (
                 self.settings.dir.tmp
                 / f"{subtitle_job.name}.subtitles.{self.sanitized_model_name}.json"
@@ -290,6 +293,7 @@ def stitch_subtitles(
 
         state = SubtitleGenerationState(
             ai_sub_version=version("ai-sub"),
+            lyrics_prompt_version=LYRICS_PROMPT_VERSION,
             subtitles_prompt_version=SUBTITLES_PROMPT_VERSION,
             settings=settings,
         )

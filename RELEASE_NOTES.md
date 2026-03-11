@@ -20,6 +20,15 @@ This release removes the two-pass subtitle generation system in favor of a simpl
 
 - **Simplified Pipeline:** The subtitle generation process is now a single AI call, reducing complexity, processing time, and potential points of failure.
 
+- **Prompt Versioning & Auto-Reprocessing:**
+  - Introduced versioning for both the "Lyrics/Scene Detection" prompt (`LYRICS_PROMPT_VERSION`) and the "Subtitle Generation" prompt (`SUBTITLES_PROMPT_VERSION`).
+  - The application now automatically detects when a prompt has been updated between runs. It will invalidate cached results for affected segments and re-process them using the new prompt, ensuring subtitles always reflect the latest logic.
+  - Cache loading is now more robust. Corrupted or outdated job files from previous runs are automatically ignored and re-processed, preventing crashes.
+- **Prompt Engineering:**
+  - Updated `SUBTITLES_PROMPT_VERSION` to 10.
+  - The subtitle generation prompt has been significantly improved with a "Decoding Hierarchy" to better handle ambiguous audio by prioritizing on-screen text and reference JSON.
+  - Added stricter rules to prevent "cascading delay" timing errors and to enforce intelligent segmentation.
+
 ## v2.2.0b1
 
 This release introduces a major refactoring of the job processing pipeline to be more flexible and robust, improves state persistence, and refines the QA prompt to better handle timing errors.

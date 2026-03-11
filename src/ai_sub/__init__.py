@@ -12,7 +12,7 @@ from .config import (
 )
 from .data_models import AiSubResult
 from .main import ai_sub
-from .prompt import SUBTITLES_PROMPT_VERSION
+from .prompt import LYRICS_PROMPT_VERSION, SUBTITLES_PROMPT_VERSION
 
 __all__ = [
     "AiSettings",
@@ -27,5 +27,6 @@ __all__ = [
     "ThreadSettings",
     "AiSubResult",
     "ai_sub",
+    "LYRICS_PROMPT_VERSION",
     "SUBTITLES_PROMPT_VERSION",
 ]
