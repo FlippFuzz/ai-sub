@@ -71,10 +71,6 @@ class JobRunner:
                 job.run_num_retries += 1
                 job.total_num_retries += 1
 
-                result = self.process(job)
-                if self.on_complete:
-                    self.on_complete(job, result)
-
             except IndexError:
                 # The queue is empty.
                 if self.stop_events:
@@ -88,6 +84,11 @@ class JobRunner:
                 else:
                     # No stop event configured, so we are done.
                     break
+
+            try:
+                result = self.process(job)
+                if self.on_complete:
+                    self.on_complete(job, result)
 
             except Exception:
                 logfire.exception(f"Exception while running {self.name} job")
