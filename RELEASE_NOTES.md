@@ -1,5 +1,17 @@
 # AI Sub Release Notes
 
+## v2.3.1
+
+This release improves exception handling in logging and adds a fail-safe to the file uploader.
+
+**Fixes & Improvements:**
+
+- **Logging:**
+  - Replaced `logfire.error` with `logfire.exception` in `gemini_cli_wrapper.py` and `video.py` to ensure stack traces are properly captured within the active span before an exception propagates.
+  - Removed redundant exception details from log messages, allowing `logfire.exception` to handle context automatically.
+- **File Uploader:**
+  - Added a fail-fast check for `FileState.FAILED` in `gemini_file_uploader.py` to prevent an infinite loop while waiting for a file to be processed by the server.
+
 ## v2.3.0
 
 This release removes the two-pass subtitle generation system in favor of a simpler, single-pass workflow. The second "QA" pass proved to be of limited value and added unnecessary complexity and cost.
