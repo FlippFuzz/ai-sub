@@ -165,7 +165,7 @@ class GeminiCliWrapper:
                 try:
                     # There is usually leading and trailing ''' characters.
                     # repair_json will take care of it
-                    json_str = repair_json(cli_response.response)
+                    json_str = str(repair_json(cli_response.response))
                     response_obj = response_type.model_validate_json(json_str)
                 except ValidationError:
                     logfire.debug(f"GeminiCliResponse: {cli_response}")
