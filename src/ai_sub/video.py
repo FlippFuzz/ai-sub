@@ -39,7 +39,7 @@ def get_video_duration_ms(video_path: Path) -> int:
         )
         return int(float(result.stdout) * 1000)
     except (subprocess.CalledProcessError, ValueError) as e:
-        logfire.error(f"Could not determine duration for {video_path.name}: {e}")
+        logfire.exception(f"Could not determine duration for {video_path.name}")
         raise RuntimeError(
             f"Could not determine duration for video file: {video_path.name}"
         ) from e
@@ -166,7 +166,7 @@ def split_video(
                 errors="replace",
             )
         except subprocess.CalledProcessError as e:
-            logfire.error(
+            logfire.exception(
                 f"FFmpeg command failed. Stdout: {e.stdout}, Stderr: {e.stderr}"
             )
             raise
@@ -243,7 +243,7 @@ def reencode_video(
             errors="replace",
         )
     except subprocess.CalledProcessError as e:
-        logfire.error(
+        logfire.exception(
             f"FFmpeg re-encode failed for {input_path.name}. Stdout: {e.stdout}, Stderr: {e.stderr}"
         )
         raise

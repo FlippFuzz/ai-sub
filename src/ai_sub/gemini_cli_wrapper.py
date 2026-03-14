@@ -146,12 +146,12 @@ class GeminiCliWrapper:
                         )
 
             except subprocess.TimeoutExpired as e:
-                logfire.error(
+                logfire.exception(
                     f"Gemini CLI timed out.\nStdout: {e.stdout}\nStderr: {e.stderr}"
                 )
                 raise
             except subprocess.CalledProcessError as e:
-                logfire.error(
+                logfire.exception(
                     f"Gemini CLI failed with exit code {e.returncode}.\nStdout: {e.stdout}\nStderr: {e.stderr}"
                 )
                 raise
@@ -159,7 +159,7 @@ class GeminiCliWrapper:
             try:
                 cli_response = GeminiCliResponse.model_validate_json(stdout)
             except ValidationError:
-                logfire.error(f"Failed to validate Gemini CLI output: {stdout}")
+                logfire.exception(f"Failed to validate Gemini CLI output: {stdout}")
                 raise
             if cli_response.response is not None:
                 try:
@@ -169,7 +169,7 @@ class GeminiCliWrapper:
                     response_obj = response_type.model_validate_json(json_str)
                 except ValidationError:
                     logfire.debug(f"GeminiCliResponse: {cli_response}")
-                    logfire.error(f"Failed to validate JSON: {json_str}")
+                    logfire.exception(f"Failed to validate JSON: {json_str}")
                     raise
 
                 if isinstance(response_obj, SubtitleResponse):

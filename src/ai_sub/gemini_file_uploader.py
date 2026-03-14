@@ -158,6 +158,11 @@ class GeminiFileUploader:
 
         with logfire.span("Wait for the file to be ready", _level="debug"):
             while file.state != FileState.ACTIVE:
+                if file.state == FileState.FAILED:
+                    raise RuntimeError(
+                        f"File {display_name} failed to process on the server."
+                    )
+
                 sleep(1)
                 file = self._get_file(display_name)
                 if not file:
