@@ -96,6 +96,7 @@ class ReEncodeJobRunner(JobRunner):
             reencode_job.height,
             reencode_job.bitrate_kb,
             self.settings.split.re_encode.encoder or "libx264",
+            reencode_job.duration_tolerance_ms,
         )
 
         logfire.info(
@@ -726,6 +727,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                     fps=settings.split.re_encode.fps,
                     height=settings.split.re_encode.height,
                     bitrate_kb=settings.split.re_encode.bitrate_kb,
+                    duration_tolerance_ms=settings.split.re_encode.duration_tolerance_ms,
                 )
                 reencode_jobs_queue.append(job_state)
             elif use_upload:

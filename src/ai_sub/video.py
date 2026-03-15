@@ -183,10 +183,12 @@ def reencode_video(
     height: int,
     bitrate_kb: int,
     encoder: str,
+    duration_tolerance_ms: int = 100,
 ) -> None:
     """Re-encodes a video file to a specific format.
 
-    If the output file already exists, re-encoding is skipped.
+    If the output file already exists and has a valid duration matching the input,
+    re-encoding is skipped.
 
     Args:
         input_path (Path): The path to the input video file.
@@ -195,14 +197,29 @@ def reencode_video(
         height (int): The target height (resolution).
         bitrate_kb (int): The target bitrate in KB/s.
         encoder (str): The encoder to use.
+        duration_tolerance_ms (int): The allowed duration difference in ms.
     """
 
-    # If output file already exists, we can just skip the re-encode
+    # If output file already exists, verify validity by comparing duration with input
     if output_path.exists():
-        logfire.info(
-            f"Skipping re-encode for {input_path.name} as {output_path.name} already exists."
-        )
-        return
+        try:
+            input_duration = get_video_duration_ms(input_path)
+            output_duration = get_video_duration_ms(output_path)
+
+            # Allow tolerance for container overhead/frame rounding
+            if abs(input_duration - output_duration) < duration_tolerance_ms:
+                logfire.info(
+                    f"Skipping re-encode for {input_path.name} as {output_path.name} already exists and has a valid duration."
+                )
+                return
+
+            logfire.info(
+                f"Re-encoding {input_path.name}. Existing output duration ({output_duration}ms) mismatches input ({input_duration}ms)."
+            )
+        except Exception:
+            logfire.warning(
+                f"Re-encoding {input_path.name}. Could not verify duration of existing output file {output_path.name}."
+            )
 
     static_ffmpeg.add_paths(weak=True)
     video_bytes_per_sec = bitrate_kb * 1024

@@ -161,6 +161,10 @@ class ReEncodeSettings(BaseSettings):
         description="The threshold in MB for re-encoding. Files smaller than this will not be re-encoded. Set to 0 to re-encode everything.",
         default=20,
     )
+    duration_tolerance_ms: NonNegativeInt = Field(
+        description="The allowed difference in milliseconds between input and output video duration to consider a re-encode valid.",
+        default=100,
+    )
     encoder: Optional[str] = Field(
         description="The specific encoder to use (e.g., 'h264_nvenc', 'libx264'). If not provided, it will be automatically detected.",
         default=None,

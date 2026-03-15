@@ -214,6 +214,7 @@ class ReEncodingJob(Job):
     fps: PositiveInt
     height: PositiveInt
     bitrate_kb: PositiveInt
+    duration_tolerance_ms: NonNegativeInt
 
 
 class UploadFileJob(Job):
