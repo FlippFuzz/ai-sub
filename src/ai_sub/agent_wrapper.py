@@ -1,5 +1,6 @@
 from __future__ import annotations as _annotations
 
+import asyncio
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -234,8 +235,13 @@ class RateLimitedAgentWrapper:
             ]
 
         # Execute the AI agent to generate subtitles and get a structured response.
-        agent = self._create_agent()
-        result = agent.run_sync(user_prompt=user_prompt, output_type=response_type)
+        # We instantiate the agent inside the asyncio loop to ensure that any
+        # underlying HTTP clients (like httpx) are created within the same loop.
+        async def _run_agent():
+            agent = self._create_agent()
+            return await agent.run(user_prompt=user_prompt, output_type=response_type)
+
+        result = asyncio.run(_run_agent())
 
         if isinstance(result.output, SubtitleResponse):
             result.output.model_name = result.response.model_name
