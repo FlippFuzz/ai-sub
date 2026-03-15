@@ -210,8 +210,8 @@ class ThreadSettings(BaseSettings):
         description="The number of concurrent threads for re-encoding video chunks.",
         default=2,
     )
-    lyrics: PositiveInt = Field(
-        description="The number of concurrent threads to use for Lyrics/Scene Detection.",
+    lyrics: NonNegativeInt = Field(
+        description="The number of concurrent threads to use for Lyrics/Scene Detection. Set to 0 to disable Lyrics/Scene detection.",
         default=4,
     )
     subtitles: PositiveInt = Field(

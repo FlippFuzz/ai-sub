@@ -153,7 +153,7 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------- | ------- |
 | `--thread.uploads <int>`   | The number of concurrent threads for uploading video segments. This is only used for Gemini (google-gla) models. | `4`     |
 | `--thread.re-encode <int>` | The number of concurrent threads for re-encoding video chunks.                                                   | `2`     |
-| `--thread.lyrics <int>`    | The number of concurrent threads to use for Lyrics/Scene Detection.                                              | `4`     |
+| `--thread.lyrics <int>`    | The number of concurrent threads to use for Lyrics/Scene Detection. Set to 0 to disable.                         | `4`     |
 | `--thread.subtitles <int>` | The number of concurrent threads to use for Subtitle Generation (Transcription).                                 | `4`     |
 
 ### Retry Settings (`--retry.*`)

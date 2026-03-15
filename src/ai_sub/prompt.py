@@ -163,10 +163,10 @@ def get_subtitle_prompt(scene_response: SceneResponse | None) -> str:
     Generates the prompt for subtitle generation.
 
     Args:
-        scene_response (SceneResponse | None): The scene detection data.
+        scene_response (SceneResponse | None): The scene detection data. Can be None if lyrics/scene detection is disabled.
 
     Returns:
         str: The full prompt string.
     """
-    scene_json = scene_response.model_dump_json(indent=2) if scene_response else ""
+    scene_json = scene_response.model_dump_json(indent=2) if scene_response else "null"
     return f"{_SUBTITLES_PROMPT_TEMPLATE}{scene_json}\n```"

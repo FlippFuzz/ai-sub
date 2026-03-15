@@ -440,7 +440,12 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
     # Initialize the AI Agent.
     # A custom wrapper is used to make handling rate limits and differences in models more cleanly
     agent_subtitles = RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
-    agent_scene = RateLimitedAgentWrapper(settings, settings.ai.model_lyrics)
+    use_lyrics = settings.thread.lyrics > 0
+    agent_scene = (
+        RateLimitedAgentWrapper(settings, settings.ai.model_lyrics)
+        if use_lyrics
+        else None
+    )
 
     sanitized_lyrics_model = settings.ai.get_sanitized_model_name(
         settings.ai.model_lyrics
@@ -509,23 +514,38 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                     python_file=reencode_job.output_file, video_duration_ms=duration
                 )
                 gemini_upload_jobs_queue.append(job)
-            else:
+            elif use_lyrics:
                 job.lyrics[sanitized_lyrics_model] = LyricsSceneJob(  # type: ignore
                     name=reencode_job.output_file.stem,
                     file=reencode_job.output_file,
                     video_duration_ms=duration,
                 )
                 scene_detection_jobs_queue.append(job)
+            else:
+                job.subtitles[sanitized_subtitles_model] = SubtitleJob(
+                    name=reencode_job.output_file.stem,
+                    file=reencode_job.output_file,
+                    video_duration_ms=duration,
+                )
+                subtitle_jobs_queue.append(job)
 
         def on_upload_complete(job: JobState, file: Any) -> None:
             upload_job = job.upload
             assert upload_job is not None
-            job.lyrics[sanitized_lyrics_model] = LyricsSceneJob(  # type: ignore
-                name=upload_job.python_file.stem,
-                file=file,
-                video_duration_ms=upload_job.video_duration_ms,
-            )
-            scene_detection_jobs_queue.append(job)
+            if use_lyrics:
+                job.lyrics[sanitized_lyrics_model] = LyricsSceneJob(  # type: ignore
+                    name=upload_job.python_file.stem,
+                    file=file,
+                    video_duration_ms=upload_job.video_duration_ms,
+                )
+                scene_detection_jobs_queue.append(job)
+            else:
+                job.subtitles[sanitized_subtitles_model] = SubtitleJob(
+                    name=upload_job.python_file.stem,
+                    file=file,
+                    video_duration_ms=upload_job.video_duration_ms,
+                )
+                subtitle_jobs_queue.append(job)
 
         def on_scene_detection_complete(job: JobState, _: Any) -> None:
             lyrics_job = job.lyrics[sanitized_lyrics_model]
@@ -566,23 +586,33 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         elif use_reencode:
             scene_stop_events.append(reencode_complete_event)
 
-        scene_detection_runner = LyricsSceneJobRunner(
-            scene_detection_jobs_queue,
-            settings,
-            settings.thread.lyrics,
-            agent_scene,
-            on_complete=on_scene_detection_complete,
-            stop_events=scene_stop_events,
-        )
+        if use_lyrics:
+            assert agent_scene is not None
+            scene_detection_runner = LyricsSceneJobRunner(
+                scene_detection_jobs_queue,
+                settings,
+                settings.thread.lyrics,
+                agent_scene,
+                on_complete=on_scene_detection_complete,
+                stop_events=scene_stop_events,
+            )
 
         # Setup subtitle_runner
+        subtitle_stop_events = []
+        if use_lyrics:
+            subtitle_stop_events.append(scene_detection_complete_event)
+        elif use_upload:
+            subtitle_stop_events.append(gemini_upload_complete_event)
+        elif use_reencode:
+            subtitle_stop_events.append(reencode_complete_event)
+
         subtitle_runner = SubtitleJobRunner(
             subtitle_jobs_queue,
             settings,
             settings.thread.subtitles,
             agent_subtitles,
             on_complete=None,
-            stop_events=[scene_detection_complete_event],
+            stop_events=subtitle_stop_events,
         )
 
         # Step 4: Populate the initial job queues.
@@ -630,24 +660,25 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
 
             # 2. Check Scene Detection Done
             # If Subtitles are not done, check if the lyrics/scene detection is complete.
-            # If it is, we can create and queue a job for Pass 1.
-            lyrics_job = job_state.lyrics.get(sanitized_lyrics_model)
-            if lyrics_job and lyrics_job.response and _job_file_exists(lyrics_job):
-                # Create a Subtitle job if it doesn't already exist for the target model.
-                if not job_state.subtitles.get(sanitized_subtitles_model):
-                    job_state.subtitles[sanitized_subtitles_model] = SubtitleJob(
-                        name=lyrics_job.name,
-                        file=lyrics_job.file,
-                        video_duration_ms=lyrics_job.video_duration_ms,
-                    )
-                subtitle_jobs_queue.append(job_state)
-                continue
+            # If it is, we can create and queue a job for Subtitle Generation.
+            if use_lyrics:
+                lyrics_job = job_state.lyrics.get(sanitized_lyrics_model)
+                if lyrics_job and lyrics_job.response and _job_file_exists(lyrics_job):
+                    # Create a Subtitle job if it doesn't already exist for the target model.
+                    if not job_state.subtitles.get(sanitized_subtitles_model):
+                        job_state.subtitles[sanitized_subtitles_model] = SubtitleJob(
+                            name=lyrics_job.name,
+                            file=lyrics_job.file,
+                            video_duration_ms=lyrics_job.video_duration_ms,
+                        )
+                    subtitle_jobs_queue.append(job_state)
+                    continue
 
-            # 4. Start from scratch (Re-encode/Upload/Scene)
+            # 4. Start from scratch (Re-encode/Upload/Scene/Subtitles)
             # If none of the AI-driven stages are complete for the specified models,
             # we start the processing chain from the beginning for this segment.
             # This involves potentially re-encoding or uploading the video segment
-            # before queueing the first AI job (lyrics/scene detection).
+            # before queueing the first AI job (lyrics/scene detection or subtitles).
             input_file = split
 
             should_reencode = False
@@ -684,15 +715,24 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 )
                 gemini_upload_jobs_queue.append(job_state)
             else:
-                # If no re-encode or upload, queue the lyrics job directly.
-                # Create the job if it doesn't exist for the target model.
-                if not job_state.lyrics.get(sanitized_lyrics_model):
-                    job_state.lyrics[sanitized_lyrics_model] = LyricsSceneJob(  # type: ignore
-                        name=input_file.stem,
-                        file=input_file,
-                        video_duration_ms=duration,
-                    )
-                scene_detection_jobs_queue.append(job_state)
+                # If no re-encode or upload, queue the initial AI job directly.
+                if use_lyrics:
+                    # Create the job if it doesn't exist for the target model.
+                    if not job_state.lyrics.get(sanitized_lyrics_model):
+                        job_state.lyrics[sanitized_lyrics_model] = LyricsSceneJob(  # type: ignore
+                            name=input_file.stem,
+                            file=input_file,
+                            video_duration_ms=duration,
+                        )
+                    scene_detection_jobs_queue.append(job_state)
+                else:
+                    if not job_state.subtitles.get(sanitized_subtitles_model):
+                        job_state.subtitles[sanitized_subtitles_model] = SubtitleJob(
+                            name=input_file.stem,
+                            file=input_file,
+                            video_duration_ms=duration,
+                        )
+                    subtitle_jobs_queue.append(job_state)
 
         # Step 5: Start all runners and wait for them to complete
         # Start runners
@@ -700,7 +740,8 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             reencode_runner.start()
         if upload_runner:
             upload_runner.start()
-        scene_detection_runner.start()
+        if scene_detection_runner:
+            scene_detection_runner.start()
         subtitle_runner.start()
 
         # Wait for runners to complete and signal as needed
@@ -712,8 +753,9 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             upload_runner.wait()
             gemini_upload_complete_event.set()
 
-        scene_detection_runner.wait()
-        scene_detection_complete_event.set()
+        if scene_detection_runner:
+            scene_detection_runner.wait()
+            scene_detection_complete_event.set()
 
         subtitle_runner.wait()
 
@@ -722,7 +764,8 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             reencode_runner.shutdown()
         if upload_runner:
             upload_runner.shutdown()
-        scene_detection_runner.shutdown()
+        if scene_detection_runner:
+            scene_detection_runner.shutdown()
         subtitle_runner.shutdown()
 
         # Step 6: Assemble the final subtitle file.
