@@ -496,7 +496,11 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         subtitle_jobs_queue: deque[JobState] = deque()
 
         use_reencode = settings.split.re_encode.enabled
-        use_upload = agent_subtitles.is_google() and settings.ai.google.use_files_api
+        is_google_sub = agent_subtitles.is_google()
+        is_google_scene = agent_scene.is_google() if agent_scene else False
+        use_upload = (
+            is_google_sub or is_google_scene
+        ) and settings.ai.google.use_files_api
 
         reencode_complete_event = Event()
         gemini_upload_complete_event = Event()
@@ -556,9 +560,13 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             lyrics_job = job.lyrics[sanitized_lyrics_model]
             assert lyrics_job is not None
             if lyrics_job.response:
+                subtitle_file = lyrics_job.file
+                if not agent_subtitles.is_google() and job.upload:
+                    subtitle_file = job.upload.python_file
+
                 job.subtitles[sanitized_subtitles_model] = SubtitleJob(  # type: ignore
                     name=lyrics_job.name,
-                    file=lyrics_job.file,
+                    file=subtitle_file,
                     video_duration_ms=lyrics_job.video_duration_ms,
                 )
                 subtitle_jobs_queue.append(job)
@@ -668,9 +676,20 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 if lyrics_job and lyrics_job.response and _job_file_exists(lyrics_job):
                     # Create a Subtitle job if it doesn't already exist for the target model.
                     if not job_state.subtitles.get(sanitized_subtitles_model):
+                        subtitle_file = lyrics_job.file
+                        if not agent_subtitles.is_google() and not isinstance(
+                            subtitle_file, Path
+                        ):
+                            reencoded_path = (
+                                reencode_dir / split.with_suffix(".mov").name
+                            )
+                            if reencoded_path.exists():
+                                subtitle_file = reencoded_path
+                            else:
+                                subtitle_file = split
                         job_state.subtitles[sanitized_subtitles_model] = SubtitleJob(
                             name=lyrics_job.name,
-                            file=lyrics_job.file,
+                            file=subtitle_file,
                             video_duration_ms=lyrics_job.video_duration_ms,
                         )
                     subtitle_jobs_queue.append(job_state)
