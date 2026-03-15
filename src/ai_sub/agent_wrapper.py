@@ -72,7 +72,7 @@ class RateLimitedAgentWrapper:
         builtin_tools = []
         function_tools = []
         if use_web_search:
-            if self.settings.ai.google.web_search_tool == "duckduckgo":
+            if self.settings.ai.web_search_tool == "duckduckgo":
                 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 
                 function_tools.append(duckduckgo_search_tool())
@@ -157,7 +157,11 @@ class RateLimitedAgentWrapper:
             # TODO: Do we need to enable thinking, etc for other models?
             # For now, this is only tested to work against Google
             if builtin_tools or function_tools:
-                self.agent = Agent(model=self.model_name, builtin_tools=builtin_tools)
+                self.agent = Agent(
+                    model=self.model_name,
+                    builtin_tools=builtin_tools,
+                    tools=function_tools,
+                )
             else:
                 self.agent = Agent(model=self.model_name)
 

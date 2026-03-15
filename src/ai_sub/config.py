@@ -47,10 +47,6 @@ class GoogleAiSettings(BaseSettings):
     use_files_api: bool = Field(
         description="Whether to use the Gemini Files API.", default=True
     )
-    web_search_tool: Literal["google", "duckduckgo"] = Field(
-        description="The web search tool to use. Options are 'google' (Built-in Google Search) or 'duckduckgo'. DuckDuckGo is the default as it is free, whereas Google's built-in search may incur costs.",
-        default="duckduckgo",
-    )
     base_url: Optional[HttpUrl] = Field(
         description="The base URL for the Google AI API. This can be used to override the default endpoint, for instance, to use a proxy. If not provided, Google's default URL will be used.",
         default=None,
@@ -95,6 +91,10 @@ class AiSettings(BaseSettings):
     )
     tpm: PositiveInt = Field(
         description="Maximum tokens per minute for the AI model.", default=250000
+    )
+    web_search_tool: Literal["builtin", "duckduckgo"] = Field(
+        description="The web search tool to use. Options are 'builtin' (The provider's native search tool, e.g., Google Search for Gemini) or 'duckduckgo'. DuckDuckGo is the default because Gemini's built-in search does not have a free tier.",
+        default="duckduckgo",
     )
     google: GoogleAiSettings = Field(
         description="Settings that only apply to the Google AI model.",
