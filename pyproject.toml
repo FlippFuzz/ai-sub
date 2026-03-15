@@ -1,6 +1,6 @@
 [project]
 name = "ai-sub"
-version = "v2.3.1"
+version = "v2.4.0b1"
 authors = [
   { name="FlippFuzz" },
 ]
@@ -11,7 +11,7 @@ dependencies = [
     "pysubs2",
     "static-ffmpeg",
     "pydantic",
-    "pydantic-ai-slim[google, logfire]",
+    "pydantic-ai-slim[google, logfire, duckduckgo]",
     "pydantic-settings",
     "json_repair",
     "pyrate-limiter"

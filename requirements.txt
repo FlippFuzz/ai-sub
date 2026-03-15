@@ -1,7 +1,7 @@
 pysubs2
 static-ffmpeg
 pydantic
-pydantic-ai-slim[google, logfire]
+pydantic-ai-slim[google, logfire, duckduckgo]
 pydantic-settings
 pyrate-limiter
 json_repair

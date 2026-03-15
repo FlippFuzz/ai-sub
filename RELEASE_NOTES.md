@@ -1,5 +1,43 @@
 # AI Sub Release Notes
 
+## v2.4.0b1
+
+This release introduces significant improvements to prompt engineering for better accuracy, adds support for DuckDuckGo search, and allows for disabling the lyrics detection pass. It also includes architectural refactoring to improve stability and support mixed-model workflows.
+
+**BREAKING CHANGES:**
+
+- **Web Search Configuration:**
+  - The `web_search_tool` setting has been moved from `ai.google` to the global `ai` settings block (e.g., `--ai.web-search-tool`).
+  - The option `google` has been renamed to `builtin` to be provider-agnostic.
+  - The default search tool is now `duckduckgo` instead of `builtin` (Google).
+
+**New Features:**
+
+- **DuckDuckGo Search:** Added support for DuckDuckGo as a web search provider. This is now the default setting to avoid costs associated with Google's built-in search tool when using the API.
+- **Optional Lyrics Detection:** The lyrics and scene detection pass can now be disabled by setting `--thread.lyrics 0`. This allows for a transcription-only workflow, saving time and API costs.
+
+**Prompt Engineering:**
+
+- **Lyrics & Scene Detection (v2):**
+  - **Granular Metadata:** The model now explicitly separates the "Original Artist" from the "Video Performer" and includes a step-by-step search log.
+  - **Improved Search:** Search queries have been optimized with specific templates to improve hit rates for lyrics.
+- **Subtitle Generation (v11):**
+  - **The "Golden Rule":** Introduced strict logic where audio strictly dictates _timing_ ("When"), while visuals and context dictate _content_ ("What").
+  - **Anti-Hallucination:** Added strict rules to handle cases where the reference lyrics are for the wrong song or contain extra verses not present in the video segment.
+  - **Ambiguity Resolution:** Clarified the hierarchy for resolving ambiguous audio (On-screen text > Scene Context > JSON).
+
+**Fixes & Improvements:**
+
+- **Resumption Stability:**
+  - Fixed an issue where resuming a job with expired Gemini cloud files (older than 48 hours) would fail. The system now forces a re-check and re-upload if necessary.
+  - Fixed a `RuntimeError` related to asyncio event loops by lazily initializing the AI Agent.
+- **Mixed Provider Support:**
+  - Fixed file path handling when using a Google model for lyrics detection and a non-Google (e.g., local or different API) model for subtitle generation.
+  - Ensure `WebSearchTool` is correctly enabled for API-based lyrics detection.
+- **Internal Refactoring:**
+  - Decoupled `JobRunner` from the `Job` structure for better pipeline flexibility.
+  - Centralized job logging and error handling.
+
 ## v2.3.1
 
 This release improves exception handling in logging and adds a fail-safe to the file uploader.
