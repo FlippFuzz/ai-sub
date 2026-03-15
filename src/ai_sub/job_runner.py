@@ -7,7 +7,7 @@ from typing import Any, Callable
 import logfire
 
 from ai_sub.config import Settings
-from ai_sub.data_models import Job, JobState
+from ai_sub.data_models import Job, SegmentJobs
 
 
 class JobRunner:
@@ -24,10 +24,10 @@ class JobRunner:
 
     def __init__(
         self,
-        queue: deque[JobState],
+        queue: deque[SegmentJobs],
         settings: Settings,
         max_workers: int,
-        on_complete: Callable[[JobState, Any], None] | None = None,
+        on_complete: Callable[[SegmentJobs, Any], None] | None = None,
         stop_events: list[Event] | None = None,
         name: str = "JobRunner",
     ):
@@ -90,7 +90,7 @@ class JobRunner:
         6. Always calls `post_process()` for any cleanup tasks.
         """
         while True:
-            job_state: JobState | None = None
+            job_state: SegmentJobs | None = None
             current_job: Job | None = None
 
             try:
@@ -141,7 +141,7 @@ class JobRunner:
                                 f"Exception in post_process for {self.name} job"
                             )
 
-    def get_job(self, job_state: JobState) -> Job:
+    def get_job(self, job_state: SegmentJobs) -> Job:
         """
         Selects the correct Job from the JobState based on the runner's name.
 
@@ -165,7 +165,7 @@ class JobRunner:
             raise ValueError(f"Job {self.name} is missing in JobState")
         return job
 
-    def process(self, job: JobState) -> Any:
+    def process(self, job: SegmentJobs) -> Any:
         """
         Performs the actual processing for a job. Must be implemented by subclasses.
 
@@ -183,7 +183,7 @@ class JobRunner:
         """
         raise NotImplementedError
 
-    def post_process(self, job: JobState) -> None:
+    def post_process(self, job: SegmentJobs) -> None:
         """
         A hook for executing code after a job is processed, regardless of success.
 
@@ -196,7 +196,7 @@ class JobRunner:
         """
         pass
 
-    def _handle_retry(self, job_state: JobState, job: Job) -> None:
+    def _handle_retry(self, job_state: SegmentJobs, job: Job) -> None:
         """Handles the logic for re-queuing a failed job.
 
         It checks if the job's retry counts (`run_num_retries` for the current

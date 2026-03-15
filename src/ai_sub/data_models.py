@@ -292,8 +292,8 @@ class SubtitleJob(Job):
         return None
 
 
-class JobState(BaseModel):
-    """Represents the overall state of all jobs in the pipeline."""
+class SegmentJobs(BaseModel):
+    """Represents the collection of all jobs for a single video segment."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 

@@ -15,10 +15,10 @@ from ai_sub.config import Settings
 from ai_sub.data_models import (
     AiSubResult,
     Job,
-    JobState,
     LyricsSceneJob,
     ReEncodingJob,
     SceneResponse,
+    SegmentJobs,
     SubtitleApiResponse,
     SubtitleGenerationState,
     SubtitleJob,
@@ -72,16 +72,16 @@ class ReEncodeJobRunner(JobRunner):
 
     def __init__(
         self,
-        queue: deque[JobState],
+        queue: deque[SegmentJobs],
         settings: Settings,
         max_workers: int,
-        on_complete: Callable[[JobState, Any], None],
+        on_complete: Callable[[SegmentJobs, Any], None],
         stop_events: list[Event] | None = None,
         name: str = "reencode",
     ):
         super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
 
-    def process(self, job: JobState) -> None:
+    def process(self, job: SegmentJobs) -> None:
         """
         Re-encodes the video file specified in the job.
 
@@ -113,18 +113,18 @@ class UploadJobRunner(JobRunner):
 
     def __init__(
         self,
-        queue: deque[JobState],
+        queue: deque[SegmentJobs],
         settings: Settings,
         max_workers: int,
         uploader: GeminiFileUploader,
-        on_complete: Callable[[JobState, Any], None],
+        on_complete: Callable[[SegmentJobs, Any], None],
         stop_events: list[Event] | None = None,
         name: str = "upload",
     ):
         super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
         self.uploader = uploader
 
-    def process(self, job: JobState) -> Any:
+    def process(self, job: SegmentJobs) -> Any:
         """
         Uploads the specified file using the `GeminiFileUploader`.
 
@@ -145,11 +145,11 @@ class LyricsSceneJobRunner(JobRunner):
 
     def __init__(
         self,
-        queue: deque[JobState],
+        queue: deque[SegmentJobs],
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
-        on_complete: Callable[[JobState, Any], None],
+        on_complete: Callable[[SegmentJobs, Any], None],
         stop_events: list[Event] | None = None,
         name: str = "lyrics",
     ):
@@ -159,12 +159,12 @@ class LyricsSceneJobRunner(JobRunner):
             self.agent.model_name
         )
 
-    def get_job(self, job_state: JobState) -> Job:
+    def get_job(self, job_state: SegmentJobs) -> Job:
         job = job_state.lyrics.get(self.sanitized_model_name)
         assert job is not None
         return job
 
-    def process(self, job: JobState) -> None:
+    def process(self, job: SegmentJobs) -> None:
         """
         Invokes the AI agent to detect scenes.
         """
@@ -177,7 +177,7 @@ class LyricsSceneJobRunner(JobRunner):
             response_type=SceneResponse,
         )
 
-    def post_process(self, job: JobState) -> None:
+    def post_process(self, job: SegmentJobs) -> None:
         """Saves the result to disk."""
         lyrics_job = job.lyrics[self.sanitized_model_name]
         assert lyrics_job is not None
@@ -197,11 +197,11 @@ class SubtitleJobRunner(JobRunner):
 
     def __init__(
         self,
-        queue: deque[JobState],
+        queue: deque[SegmentJobs],
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
-        on_complete: Callable[[JobState, Any], None] | None = None,
+        on_complete: Callable[[SegmentJobs, Any], None] | None = None,
         stop_events: list[Event] | None = None,
         name: str = "subtitles",
     ):
@@ -211,12 +211,12 @@ class SubtitleJobRunner(JobRunner):
             self.agent.model_name
         )
 
-    def get_job(self, job_state: JobState) -> Job:
+    def get_job(self, job_state: SegmentJobs) -> Job:
         job = job_state.subtitles.get(self.sanitized_model_name)
         assert job is not None
         return job
 
-    def process(self, job: JobState) -> None:
+    def process(self, job: SegmentJobs) -> None:
         """
         Invokes the AI agent to generate subtitles.
         """
@@ -237,7 +237,7 @@ class SubtitleJobRunner(JobRunner):
             response_type=SubtitleApiResponse,
         )
 
-    def post_process(self, job: JobState) -> None:
+    def post_process(self, job: SegmentJobs) -> None:
         """
         Saves the result (or partial state) to disk.
 
@@ -493,10 +493,10 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
 
         # Initialize data structures for concurrent processing.
         # Deques are used as thread-safe queues for managing jobs.
-        reencode_jobs_queue: deque[JobState] = deque()
-        gemini_upload_jobs_queue: deque[JobState] = deque()
-        scene_detection_jobs_queue: deque[JobState] = deque()
-        subtitle_jobs_queue: deque[JobState] = deque()
+        reencode_jobs_queue: deque[SegmentJobs] = deque()
+        gemini_upload_jobs_queue: deque[SegmentJobs] = deque()
+        scene_detection_jobs_queue: deque[SegmentJobs] = deque()
+        subtitle_jobs_queue: deque[SegmentJobs] = deque()
 
         use_reencode = settings.split.re_encode.enabled
         is_google_sub = agent_subtitles.is_google()
@@ -515,7 +515,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         subtitle_runner: SubtitleJobRunner | None = None
 
         # Define callbacks
-        def on_reencode_complete(job: JobState, _: Any) -> None:
+        def on_reencode_complete(job: SegmentJobs, _: Any) -> None:
             reencode_job = job.reencode
             assert reencode_job is not None
             duration = get_video_duration_ms(reencode_job.output_file)
@@ -541,7 +541,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 )
                 subtitle_jobs_queue.append(job)
 
-        def on_upload_complete(job: JobState, file: Any) -> None:
+        def on_upload_complete(job: SegmentJobs, file: Any) -> None:
             upload_job = job.upload
             assert upload_job is not None
             if use_lyrics:
@@ -559,7 +559,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 )
                 subtitle_jobs_queue.append(job)
 
-        def on_scene_detection_complete(job: JobState, _: Any) -> None:
+        def on_scene_detection_complete(job: SegmentJobs, _: Any) -> None:
             lyrics_job = job.lyrics[sanitized_lyrics_model]
             assert lyrics_job is not None
             if lyrics_job.response:
@@ -640,7 +640,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             reencode_dir.mkdir(exist_ok=True)
 
         for split, duration in splits_to_process:
-            job_state = JobState()
+            job_state = SegmentJobs()
             max_retries = 0
 
             # Load jobs if they exist and populate the in-memory JobState
