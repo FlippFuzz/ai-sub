@@ -10,7 +10,7 @@ from google.genai.types import (
     ThinkingConfigDict,
 )
 from pydantic import BaseModel
-from pydantic_ai import Agent, BinaryContent
+from pydantic_ai import Agent, BinaryContent, WebSearchTool
 from pydantic_ai.messages import DocumentUrl
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.providers.google import GoogleProvider
@@ -52,19 +52,26 @@ class RateLimitedAgentWrapper:
         """
         return self.model_name.lower().startswith("gemini-cli")
 
-    def __init__(self, settings: Settings, model_name: str):
+    def __init__(
+        self, settings: Settings, model_name: str, use_web_search: bool = False
+    ):
         """
         Initializes the agent wrapper with settings.
 
         Args:
             settings (Settings): The application configuration settings.
             model_name (str): The name of the model to use.
+            use_web_search (bool): Whether to enable the web search tool.
         """
         self.settings = settings
         self.model_name = model_name
 
         self.request_limiter = Limiter(Rate(self.settings.ai.rpm, Duration.MINUTE))
         self.token_limiter = Limiter(Rate(self.settings.ai.tpm, Duration.MINUTE))
+
+        tools = None
+        if use_web_search:
+            tools = [WebSearchTool()]
 
         if self.is_gemini_cli():
             model_str = self.model_name.split(":", 1)[-1]
@@ -131,11 +138,19 @@ class RateLimitedAgentWrapper:
                     },
                 ],
             )
-            self.agent = Agent(model, model_settings=google_model_settings)
+            if tools:
+                self.agent = Agent(
+                    model, model_settings=google_model_settings, builtin_tools=tools
+                )
+            else:
+                self.agent = Agent(model, model_settings=google_model_settings)
         else:
             # TODO: Do we need to enable thinking, etc for other models?
             # For now, this is only tested to work against Google
-            self.agent = Agent(model=self.model_name)
+            if tools:
+                self.agent = Agent(model=self.model_name, builtin_tools=tools)
+            else:
+                self.agent = Agent(model=self.model_name)
 
     def run(
         self,
