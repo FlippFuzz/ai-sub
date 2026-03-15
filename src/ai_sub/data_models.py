@@ -172,6 +172,8 @@ class Scene(BaseModel):
     description: str
     contains_vocal_music: bool
     song_title: Optional[str] = None
+    original_artist: Optional[str] = None
+    performer_in_video: Optional[str] = None
     reference_lyrics_og: Optional[str] = None
     reference_lyrics_en: Optional[str] = None
 
@@ -179,6 +181,7 @@ class Scene(BaseModel):
 class SceneResponse(BaseModel):
     """Represents the structured response from the Scene Detection pass."""
 
+    step_by_step_log: str
     global_summary: str
     scenes: list[Scene]
 
