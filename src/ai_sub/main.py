@@ -445,7 +445,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
     agent_subtitles = RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
     use_lyrics = settings.thread.lyrics > 0
     agent_scene = (
-        RateLimitedAgentWrapper(settings, settings.ai.model_lyrics)
+        RateLimitedAgentWrapper(settings, settings.ai.model_lyrics, use_web_search=True)
         if use_lyrics
         else None
     )
