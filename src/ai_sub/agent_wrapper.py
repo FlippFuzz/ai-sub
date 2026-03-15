@@ -69,9 +69,15 @@ class RateLimitedAgentWrapper:
         self.request_limiter = Limiter(Rate(self.settings.ai.rpm, Duration.MINUTE))
         self.token_limiter = Limiter(Rate(self.settings.ai.tpm, Duration.MINUTE))
 
-        tools = None
+        builtin_tools = []
+        function_tools = []
         if use_web_search:
-            tools = [WebSearchTool()]
+            if self.settings.ai.google.web_search_tool == "duckduckgo":
+                from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
+
+                function_tools.append(duckduckgo_search_tool())
+            else:
+                builtin_tools.append(WebSearchTool())
 
         if self.is_gemini_cli():
             model_str = self.model_name.split(":", 1)[-1]
@@ -138,17 +144,20 @@ class RateLimitedAgentWrapper:
                     },
                 ],
             )
-            if tools:
+            if builtin_tools or function_tools:
                 self.agent = Agent(
-                    model, model_settings=google_model_settings, builtin_tools=tools
+                    model,
+                    model_settings=google_model_settings,
+                    builtin_tools=builtin_tools,
+                    tools=function_tools,
                 )
             else:
                 self.agent = Agent(model, model_settings=google_model_settings)
         else:
             # TODO: Do we need to enable thinking, etc for other models?
             # For now, this is only tested to work against Google
-            if tools:
-                self.agent = Agent(model=self.model_name, builtin_tools=tools)
+            if builtin_tools or function_tools:
+                self.agent = Agent(model=self.model_name, builtin_tools=builtin_tools)
             else:
                 self.agent = Agent(model=self.model_name)
 

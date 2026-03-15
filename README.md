@@ -113,6 +113,7 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | `--ai.google.key <key>`                | The API key for Google's generative language models.              | `None` (loads from `GOOGLE_API_KEY` or `GEMINI_API_KEY`) |
 | `--ai.google.file-cache-ttl <seconds>` | The time-to-live (TTL) in seconds for the Gemini file list cache. | `10`                                                     |
 | `--ai.google.use-files-api <bool>`     | Whether to use the Gemini Files API.                              | `True`                                                   |
+| `--ai.google.web-search-tool <tool>`   | The web search tool to use. Options: 'google', 'duckduckgo'.      | `duckduckgo`                                             |
 | `--ai.google.base-url <url>`           | The base URL for the Google AI API.                               | `None`                                                   |
 
 #### Gemini CLI Settings (`--ai.gemini-cli.*`)

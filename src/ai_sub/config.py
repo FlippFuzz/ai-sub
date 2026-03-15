@@ -1,7 +1,7 @@
 import os
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from logfire import LevelName
 from pydantic import (
@@ -46,6 +46,10 @@ class GoogleAiSettings(BaseSettings):
     )
     use_files_api: bool = Field(
         description="Whether to use the Gemini Files API.", default=True
+    )
+    web_search_tool: Literal["google", "duckduckgo"] = Field(
+        description="The web search tool to use. Options are 'google' (Built-in Google Search) or 'duckduckgo'. DuckDuckGo is the default as it is free, whereas Google's built-in search may incur costs.",
+        default="duckduckgo",
     )
     base_url: Optional[HttpUrl] = Field(
         description="The base URL for the Google AI API. This can be used to override the default endpoint, for instance, to use a proxy. If not provided, Google's default URL will be used.",
