@@ -470,6 +470,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             settings.dir.tmp,
             settings.split.max_seconds,
             output_pattern="part_%03d",
+            duration_tolerance_ms=settings.split.re_encode.duration_tolerance_ms,
         )
         video_splits: list[tuple[Path, int]] = [
             (path, get_video_duration_ms(path)) for path in video_splits_paths

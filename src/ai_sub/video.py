@@ -97,19 +97,25 @@ def split_video(
     output_dir: Path,
     split_duration_s: int,
     output_pattern: str = "part_%03d",
+    duration_tolerance_ms: int = 100,
 ) -> list[Path]:
     """Splits a video file into segments of a specified duration using FFmpeg.
 
-    If the first expected segment already exists in the output directory, the function
-    assumes the video has been previously split and skips the FFmpeg operation.
-    Otherwise, it creates the output directory (if it doesn't exist) and executes
-    an FFmpeg command to split the video.
+    If the segments already exist and their total duration matches the input video,
+    splitting is skipped.
+
+    If splitting is required, it creates the output directory (if it doesn't exist)
+    and executes an FFmpeg command.
 
     Args:
         input_video (Path): The path to the input video file.
         output_dir (Path): The directory where the video segments will be saved.
         split_duration_s (int): The target duration of each video segment in seconds.
         output_pattern (str): The filename pattern for the output segments. Defaults to "part_%03d".
+        duration_tolerance_ms (int): The allowed duration difference per segment in milliseconds.
+            This value is multiplied by the number of segments to determine the total
+            allowed variance between the input video duration and the sum of segment
+            durations. Defaults to 100ms.
 
     Returns:
         list[Path]: A sorted list of Path objects, each pointing to a generated video segment.
@@ -121,55 +127,78 @@ def split_video(
 
     # Check if we have files matching the pattern
     glob_pattern = output_pattern.replace("%03d", "*") + ext
+    existing_segments = list(sorted(output_dir.glob(glob_pattern)))
 
-    # Check for the first file to see if we can skip
-    first_file_name = output_pattern % 0 + ext
-    expected_first_segment_path = output_dir / first_file_name
-
-    if expected_first_segment_path.exists():
-        logfire.info(
-            f"Assuming video has already been split because {first_file_name} already exists"
-        )
-        return list(sorted(output_dir.glob(glob_pattern)))
-    else:
-        static_ffmpeg.add_paths(weak=True)
-
-        # Escape '%' in the directory path by doubling it ('%%').
-        # This is required because the segment muxer interprets '%' as a format specifier.
-        escaped_dir = str(output_dir).replace("%", "%%")
-        full_output_pattern = str(Path(escaped_dir) / f"{output_pattern}{ext}")
-
-        cmd = [
-            "ffmpeg",
-            "-i",
-            str(input_video),
-            "-c",
-            "copy",
-            "-map",
-            "0",
-            "-f",
-            "segment",
-            "-segment_time",
-            str(split_duration_s),
-            "-reset_timestamps",
-            "1",
-            full_output_pattern,
-        ]
-
+    if existing_segments:
         try:
-            subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+            input_duration = get_video_duration_ms(input_video)
+            total_segment_duration = sum(
+                get_video_duration_ms(s) for s in existing_segments
             )
-        except subprocess.CalledProcessError as e:
-            logfire.exception(
-                f"FFmpeg command failed. Stdout: {e.stdout}, Stderr: {e.stderr}"
+
+            # Allow tolerance per split
+            threshold = duration_tolerance_ms * len(existing_segments)
+
+            if abs(input_duration - total_segment_duration) < threshold:
+                logfire.info(
+                    f"Skipping split for {input_video.name} as {len(existing_segments)} segments exist with valid total duration."
+                )
+                return existing_segments
+
+            logfire.info(
+                f"Re-splitting {input_video.name}. Existing segments duration ({total_segment_duration}ms) mismatches input ({input_duration}ms)."
             )
-            raise
+
+            # Clean up existing invalid segments to avoid mixing old and new files
+            for segment in existing_segments:
+                try:
+                    segment.unlink()
+                except OSError:
+                    logfire.warning(f"Failed to delete invalid segment: {segment}")
+
+        except Exception:
+            logfire.warning(
+                f"Re-splitting {input_video.name}. Could not verify duration of existing segments."
+            )
+
+    static_ffmpeg.add_paths(weak=True)
+
+    # Escape '%' in the directory path by doubling it ('%%').
+    # This is required because the segment muxer interprets '%' as a format specifier.
+    escaped_dir = str(output_dir).replace("%", "%%")
+    full_output_pattern = str(Path(escaped_dir) / f"{output_pattern}{ext}")
+
+    cmd = [
+        "ffmpeg",
+        "-i",
+        str(input_video),
+        "-c",
+        "copy",
+        "-map",
+        "0",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(split_duration_s),
+        "-reset_timestamps",
+        "1",
+        full_output_pattern,
+    ]
+
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.CalledProcessError as e:
+        logfire.exception(
+            f"FFmpeg command failed. Stdout: {e.stdout}, Stderr: {e.stderr}"
+        )
+        raise
 
     result = list(sorted(output_dir.glob(glob_pattern)))
     logfire.info(f"Split into {len(result)} segments")
@@ -187,8 +216,8 @@ def reencode_video(
 ) -> None:
     """Re-encodes a video file to a specific format.
 
-    If the output file already exists and has a valid duration matching the input,
-    re-encoding is skipped.
+    If the output file already exists, its duration is compared to the input file.
+    If the difference is within the specified tolerance, re-encoding is skipped.
 
     Args:
         input_path (Path): The path to the input video file.
@@ -197,7 +226,9 @@ def reencode_video(
         height (int): The target height (resolution).
         bitrate_kb (int): The target bitrate in KB/s.
         encoder (str): The encoder to use.
-        duration_tolerance_ms (int): The allowed duration difference in ms.
+        duration_tolerance_ms (int): The maximum allowed difference in milliseconds between
+            the input and output video durations. This accounts for minor discrepancies
+            caused by container overhead or frame rounding. Defaults to 100ms.
     """
 
     # If output file already exists, verify validity by comparing duration with input
