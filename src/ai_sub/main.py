@@ -43,7 +43,7 @@ from ai_sub.video import (
 def _job_file_exists(job: LyricsSceneJob | SubtitleJob | None) -> bool:
     """
     Checks if the file associated with a job exists on the local filesystem.
-    For cloud files, it assumes they exist.
+    For cloud files, we return False to force a re-check/re-upload via the pipeline.
     """
     if not job:
         return False
@@ -54,9 +54,12 @@ def _job_file_exists(job: LyricsSceneJob | SubtitleJob | None) -> bool:
                 f"File {job.file} for completed job '{job.name}' is missing. Will re-process."
             )
             return False
-    # For google.genai.types.File objects, we assume they exist.
-    # The API call will fail later if the URI is invalid, which is handled by the retry logic.
-    return True
+        return True
+
+    # For cloud files (google.genai.types.File), we cannot be sure they exist
+    # (they expire after 48h). We return False to force the pipeline to
+    # re-verify/re-upload them via the upload runner.
+    return False
 
 
 class ReEncodeJobRunner(JobRunner):
@@ -661,11 +664,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             # 1. Check Subtitles Done
             # If Subtitles are done, we can skip this entire segment.
             subtitle_job = job_state.subtitles.get(sanitized_subtitles_model)
-            if (
-                subtitle_job
-                and subtitle_job.response
-                and _job_file_exists(subtitle_job)
-            ):
+            if subtitle_job and subtitle_job.response:
                 continue
 
             # 2. Check Scene Detection Done
