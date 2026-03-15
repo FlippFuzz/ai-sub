@@ -7,7 +7,6 @@ This release introduces significant improvements to prompt engineering for bette
 **BREAKING CHANGES:**
 
 - **Web Search Configuration:**
-  - The `web_search_tool` setting has been moved from `ai.google` to the global `ai` settings block (e.g., `--ai.web-search-tool`).
   - The option `google` has been renamed to `builtin` to be provider-agnostic.
   - The default search tool is now `duckduckgo` instead of `builtin` (Google).
 
