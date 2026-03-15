@@ -31,7 +31,6 @@ class RateLimitedAgentWrapper:
 
     rpm: int
     tpm: int
-    agent: Agent
     cli_wrapper: GeminiCliWrapper | None = None
     settings: Settings
     model_name: str
@@ -65,19 +64,10 @@ class RateLimitedAgentWrapper:
         """
         self.settings = settings
         self.model_name = model_name
+        self.use_web_search = use_web_search
 
         self.request_limiter = Limiter(Rate(self.settings.ai.rpm, Duration.MINUTE))
         self.token_limiter = Limiter(Rate(self.settings.ai.tpm, Duration.MINUTE))
-
-        builtin_tools = []
-        function_tools = []
-        if use_web_search:
-            if self.settings.ai.web_search_tool == "duckduckgo":
-                from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
-
-                function_tools.append(duckduckgo_search_tool())
-            else:
-                builtin_tools.append(WebSearchTool())
 
         if self.is_gemini_cli():
             model_str = self.model_name.split(":", 1)[-1]
@@ -85,7 +75,19 @@ class RateLimitedAgentWrapper:
                 model_str,
                 settings.ai.gemini_cli,
             )
-        elif self.is_google():
+
+    def _create_agent(self) -> Agent:
+        builtin_tools = []
+        function_tools = []
+        if self.use_web_search:
+            if self.settings.ai.web_search_tool == "duckduckgo":
+                from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
+
+                function_tools.append(duckduckgo_search_tool())
+            else:
+                builtin_tools.append(WebSearchTool())
+
+        if self.is_google():
             model_str = self.model_name.split(":", 1)[
                 -1
             ]  # Configure Max thinking possible
@@ -111,14 +113,14 @@ class RateLimitedAgentWrapper:
                 model_str,
                 provider=GoogleProvider(
                     api_key=(
-                        settings.ai.google.key.get_secret_value()
-                        if settings.ai.google.key
+                        self.settings.ai.google.key.get_secret_value()
+                        if self.settings.ai.google.key
                         else None
                     ),
                     http_client=None,
                     base_url=(
-                        str(settings.ai.google.base_url)
-                        if settings.ai.google.base_url
+                        str(self.settings.ai.google.base_url)
+                        if self.settings.ai.google.base_url
                         else None
                     ),
                 ),
@@ -145,25 +147,25 @@ class RateLimitedAgentWrapper:
                 ],
             )
             if builtin_tools or function_tools:
-                self.agent = Agent(
+                return Agent(
                     model,
                     model_settings=google_model_settings,
                     builtin_tools=builtin_tools,
                     tools=function_tools,
                 )
             else:
-                self.agent = Agent(model, model_settings=google_model_settings)
+                return Agent(model, model_settings=google_model_settings)
         else:
             # TODO: Do we need to enable thinking, etc for other models?
             # For now, this is only tested to work against Google
             if builtin_tools or function_tools:
-                self.agent = Agent(
+                return Agent(
                     model=self.model_name,
                     builtin_tools=builtin_tools,
                     tools=function_tools,
                 )
             else:
-                self.agent = Agent(model=self.model_name)
+                return Agent(model=self.model_name)
 
     def run(
         self,
@@ -232,7 +234,8 @@ class RateLimitedAgentWrapper:
             ]
 
         # Execute the AI agent to generate subtitles and get a structured response.
-        result = self.agent.run_sync(user_prompt=user_prompt, output_type=response_type)
+        agent = self._create_agent()
+        result = agent.run_sync(user_prompt=user_prompt, output_type=response_type)
 
         if isinstance(result.output, SubtitleResponse):
             result.output.model_name = result.response.model_name
