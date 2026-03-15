@@ -118,24 +118,28 @@ class JobRunner:
                     # No stop events are configured, so an empty queue means we are done.
                     break
 
-            try:
-                result = self.process(job_state)
-                if self.on_complete:
-                    self.on_complete(job_state, result)
+            with logfire.span(f"Executing {self.name} job for {current_job.name}"):
+                try:
+                    result = self.process(job_state)
+                    if self.on_complete:
+                        self.on_complete(job_state, result)
 
-            except Exception:
-                logfire.exception(f"Exception while running {self.name} job")
-                if job_state is not None and current_job is not None:
-                    self._handle_retry(job_state, current_job)
+                except Exception:
+                    job_name = f"'{current_job.name}'" if current_job else "unknown"
+                    logfire.exception(
+                        f"Exception while running {self.name} job {job_name}"
+                    )
+                    if job_state is not None and current_job is not None:
+                        self._handle_retry(job_state, current_job)
 
-            finally:
-                if job_state is not None:
-                    try:
-                        self.post_process(job_state)
-                    except Exception:
-                        logfire.exception(
-                            f"Exception in post_process for {self.name} job"
-                        )
+                finally:
+                    if job_state is not None:
+                        try:
+                            self.post_process(job_state)
+                        except Exception:
+                            logfire.exception(
+                                f"Exception in post_process for {self.name} job"
+                            )
 
     def get_job(self, job_state: JobState) -> Job:
         """

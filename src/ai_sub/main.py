@@ -86,19 +86,18 @@ class ReEncodeJobRunner(JobRunner):
         """
         reencode_job = job.reencode
         assert reencode_job is not None
-        with logfire.span(f"Re-encoding {reencode_job.input_file.name}"):
-            reencode_video(
-                reencode_job.input_file,
-                reencode_job.output_file,
-                reencode_job.fps,
-                reencode_job.height,
-                reencode_job.bitrate_kb,
-                self.settings.split.re_encode.encoder or "libx264",
-            )
+        reencode_video(
+            reencode_job.input_file,
+            reencode_job.output_file,
+            reencode_job.fps,
+            reencode_job.height,
+            reencode_job.bitrate_kb,
+            self.settings.split.re_encode.encoder or "libx264",
+        )
 
-            logfire.info(
-                f"{reencode_job.input_file.name} re-encoded to {reencode_job.output_file.name}"
-            )
+        logfire.info(
+            f"{reencode_job.name} re-encoded to {reencode_job.output_file.name}"
+        )
 
 
 class UploadJobRunner(JobRunner):
@@ -130,11 +129,10 @@ class UploadJobRunner(JobRunner):
         """
         upload_job = job.upload
         assert upload_job is not None
-        with logfire.span(f"Uploading {upload_job.python_file.name}"):
-            # Perform the file upload. This is a blocking operation.
-            file = self.uploader.upload_file(upload_job.python_file)
-            logfire.info(f"{upload_job.python_file.name} uploaded")
-            return file
+        # Perform the file upload. This is a blocking operation.
+        file = self.uploader.upload_file(upload_job.python_file)
+        logfire.info(f"{upload_job.name} uploaded")
+        return file
 
 
 class LyricsSceneJobRunner(JobRunner):
@@ -169,13 +167,12 @@ class LyricsSceneJobRunner(JobRunner):
         """
         lyrics_job = job.lyrics[self.sanitized_model_name]
         assert lyrics_job is not None
-        with logfire.span(f"Scene Detection {lyrics_job.name}"):
-            lyrics_job.response = self.agent.run(
-                get_lyrics_scenes_prompt(),
-                lyrics_job.file,
-                lyrics_job.video_duration_ms,
-                response_type=SceneResponse,
-            )
+        lyrics_job.response = self.agent.run(
+            get_lyrics_scenes_prompt(),
+            lyrics_job.file,
+            lyrics_job.video_duration_ms,
+            response_type=SceneResponse,
+        )
 
     def post_process(self, job: JobState) -> None:
         """Saves the result to disk."""
@@ -229,14 +226,13 @@ class SubtitleJobRunner(JobRunner):
         lyrics_job = job.lyrics.get(sanitized_lyrics_model)
         scene_response = lyrics_job.response if lyrics_job else None
 
-        with logfire.span(f"Subtitling {subtitle_job.name}"):
-            prompt = get_subtitle_prompt(scene_response)
-            subtitle_job.response = self.agent.run(
-                prompt,
-                subtitle_job.file,
-                subtitle_job.video_duration_ms,
-                response_type=SubtitleApiResponse,
-            )
+        prompt = get_subtitle_prompt(scene_response)
+        subtitle_job.response = self.agent.run(
+            prompt,
+            subtitle_job.file,
+            subtitle_job.video_duration_ms,
+            response_type=SubtitleApiResponse,
+        )
 
     def post_process(self, job: JobState) -> None:
         """
@@ -518,7 +514,9 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             duration = get_video_duration_ms(reencode_job.output_file)
             if use_upload:
                 job.upload = UploadFileJob(
-                    python_file=reencode_job.output_file, video_duration_ms=duration
+                    name=reencode_job.output_file.stem,
+                    python_file=reencode_job.output_file,
+                    video_duration_ms=duration,
                 )
                 gemini_upload_jobs_queue.append(job)
             elif use_lyrics:
@@ -704,6 +702,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 # Always create/update the re-encode job and queue it.
                 # The runner is idempotent and will skip if the output file already exists.
                 job_state.reencode = ReEncodingJob(
+                    name=input_file.stem,
                     input_file=input_file,
                     output_file=output_file,
                     fps=settings.split.re_encode.fps,
@@ -715,7 +714,9 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 # Always create/update the upload job and queue it.
                 # The uploader is idempotent and will check for existing files on the server.
                 job_state.upload = UploadFileJob(
-                    python_file=input_file, video_duration_ms=duration
+                    name=input_file.stem,
+                    python_file=input_file,
+                    video_duration_ms=duration,
                 )
                 gemini_upload_jobs_queue.append(job_state)
             else:

@@ -188,6 +188,7 @@ class Job(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    name: str
     run_num_retries: NonNegativeInt = 0
     total_num_retries: NonNegativeInt = 0
 
@@ -222,7 +223,6 @@ class UploadFileJob(Job):
 class LyricsSceneJob(Job):
     """Represents a job to detect lyrics and scenes in a video segment."""
 
-    name: str
     file: File | Path
     video_duration_ms: PositiveInt
     response: Optional[SceneResponse] = None
@@ -259,7 +259,6 @@ class SubtitleJob(Job):
     using scene/lyrics data from a `SceneResponse` as a reference.
     """
 
-    name: str
     file: File | Path
     video_duration_ms: PositiveInt
     response: Optional[SubtitleApiResponse] = None
