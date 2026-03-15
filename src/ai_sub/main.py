@@ -14,6 +14,7 @@ from ai_sub.agent_wrapper import RateLimitedAgentWrapper
 from ai_sub.config import Settings
 from ai_sub.data_models import (
     AiSubResult,
+    Job,
     JobState,
     LyricsSceneJob,
     ReEncodingJob,
@@ -73,7 +74,7 @@ class ReEncodeJobRunner(JobRunner):
         max_workers: int,
         on_complete: Callable[[JobState, Any], None],
         stop_events: list[Event] | None = None,
-        name: str = "ReEncode",
+        name: str = "reencode",
     ):
         super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
 
@@ -116,7 +117,7 @@ class UploadJobRunner(JobRunner):
         uploader: GeminiFileUploader,
         on_complete: Callable[[JobState, Any], None],
         stop_events: list[Event] | None = None,
-        name: str = "Upload",
+        name: str = "upload",
     ):
         super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
         self.uploader = uploader
@@ -149,13 +150,18 @@ class LyricsSceneJobRunner(JobRunner):
         agent: RateLimitedAgentWrapper,
         on_complete: Callable[[JobState, Any], None],
         stop_events: list[Event] | None = None,
-        name: str = "LyricsSceneJobRunner",
+        name: str = "lyrics",
     ):
         super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
         self.agent = agent
         self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(
             self.agent.model_name
         )
+
+    def get_job(self, job_state: JobState) -> Job:
+        job = job_state.lyrics.get(self.sanitized_model_name)
+        assert job is not None
+        return job
 
     def process(self, job: JobState) -> None:
         """
@@ -176,8 +182,6 @@ class LyricsSceneJobRunner(JobRunner):
         lyrics_job = job.lyrics[self.sanitized_model_name]
         assert lyrics_job is not None
         if lyrics_job.response:
-            lyrics_job.run_num_retries = job.run_num_retries
-            lyrics_job.total_num_retries = job.total_num_retries
             lyrics_job.lyrics_prompt_version = LYRICS_PROMPT_VERSION
             job_state_path = (
                 self.settings.dir.tmp
@@ -199,13 +203,18 @@ class SubtitleJobRunner(JobRunner):
         agent: RateLimitedAgentWrapper,
         on_complete: Callable[[JobState, Any], None] | None = None,
         stop_events: list[Event] | None = None,
-        name: str = "SubtitleJobRunner",
+        name: str = "subtitles",
     ):
         super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
         self.agent = agent
         self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(
             self.agent.model_name
         )
+
+    def get_job(self, job_state: JobState) -> Job:
+        job = job_state.subtitles.get(self.sanitized_model_name)
+        assert job is not None
+        return job
 
     def process(self, job: JobState) -> None:
         """
@@ -242,8 +251,6 @@ class SubtitleJobRunner(JobRunner):
 
         # Also generate a subtitle file for this job for the user to view.
         if subtitle_job.response is not None:
-            subtitle_job.run_num_retries = job.run_num_retries
-            subtitle_job.total_num_retries = job.total_num_retries
             subtitle_job.subtitles_prompt_version = SUBTITLES_PROMPT_VERSION
             job_state_path = (
                 self.settings.dir.tmp
@@ -644,9 +651,6 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             if subtitle_job:
                 job_state.subtitles[sanitized_subtitles_model] = subtitle_job
                 max_retries = max(max_retries, subtitle_job.total_num_retries)
-
-            # Restore the total retry count for the new in-memory JobState
-            job_state.total_num_retries = max_retries
 
             # 1. Check Subtitles Done
             # If Subtitles are done, we can skip this entire segment.

@@ -290,8 +290,10 @@ class SubtitleJob(Job):
         return None
 
 
-class JobState(Job):
+class JobState(BaseModel):
     """Represents the overall state of all jobs in the pipeline."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     reencode: Optional[ReEncodingJob] = None
     upload: Optional[UploadFileJob] = None
