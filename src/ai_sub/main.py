@@ -1,6 +1,7 @@
 import socket
 import sys
 from collections import deque
+from functools import partial
 from importlib.metadata import version
 from pathlib import Path
 from threading import Event
@@ -490,112 +491,96 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         # Define callbacks
         # These functions handle the transition between pipeline stages.
         # When a job completes, the next required job is created and queued.
-        def on_reencode_complete(job: SegmentJobs, _: Any) -> None:
-            """Transition: Re-encode -> [Upload | Lyrics | Subtitles]"""
-            reencode_job = job.reencode
-            assert reencode_job is not None
-            duration = get_video_duration_ms(reencode_job.output_file)
-            if use_upload:
+        def on_stage_complete(stage: str, job: SegmentJobs, result: Any) -> None:
+            """Handles the transition between pipeline stages."""
+            file_handle: Any = result
+            duration_ms: int = 0
+            name: str = ""
+
+            # Extract data based on the completed stage
+            if stage == "reencode":
+                assert job.reencode is not None
+                name = job.reencode.name
+                file_handle = job.reencode.output_file
+                duration_ms = get_video_duration_ms(file_handle)
+            elif stage == "upload":
+                assert job.upload is not None
+                name = job.upload.name
+                # file_handle is already the result (the uploaded file object)
+                duration_ms = job.upload.video_duration_ms
+            elif stage == "lyrics":
+                assert job.lyrics is not None
+                if not job.lyrics.response:
+                    return  # Should not happen if on_complete is called after success
+                name = job.lyrics.name
+                file_handle = job.lyrics.file
+                duration_ms = job.lyrics.video_duration_ms
+
+                # Logic for Subtitles file source:
+                # If we are using a non-Google model for subtitles, but we uploaded the file
+                # (e.g. for Google Lyrics), we might need to fallback to the local file.
+                if not agent_subtitles.is_google() and job.upload:
+                    file_handle = job.upload.python_file
+
+            # Determine next stage
+            next_stage = None
+            if stage == "reencode":
+                if use_upload:
+                    next_stage = "upload"
+                elif use_lyrics:
+                    next_stage = "lyrics"
+                else:
+                    next_stage = "subtitles"
+            elif stage == "upload":
+                if use_lyrics:
+                    next_stage = "lyrics"
+                else:
+                    next_stage = "subtitles"
+            elif stage == "lyrics":
+                next_stage = "subtitles"
+
+            if not next_stage:
+                return
+
+            # Queue next job
+            if next_stage == "upload":
                 job.upload = UploadFileJob(
-                    name=reencode_job.output_file.stem,
-                    python_file=reencode_job.output_file,
-                    video_duration_ms=duration,
+                    name=name,
+                    python_file=file_handle,
+                    video_duration_ms=duration_ms,
                 )
                 gemini_upload_jobs_queue.append(job)
-            elif use_lyrics:
-                existing = job.lyrics
-                new_job = LyricsSceneJob(  # type: ignore
-                    name=reencode_job.output_file.stem,
-                    file=reencode_job.output_file,
-                    video_duration_ms=duration,
-                )
-                if existing:
-                    new_job.total_num_retries = existing.total_num_retries
-                    if existing.response:
-                        new_job.response = existing.response
-                        new_job.lyrics_prompt_version = existing.lyrics_prompt_version
 
-                job.lyrics = new_job
+            elif next_stage == "lyrics":
+                existing_lyrics = job.lyrics
+                new_lyrics_job = LyricsSceneJob(
+                    name=name, file=file_handle, video_duration_ms=duration_ms
+                )
+                if existing_lyrics:
+                    new_lyrics_job.total_num_retries = existing_lyrics.total_num_retries
+                    if existing_lyrics.response:
+                        new_lyrics_job.response = existing_lyrics.response
+                        new_lyrics_job.lyrics_prompt_version = (
+                            existing_lyrics.lyrics_prompt_version
+                        )
+
+                job.lyrics = new_lyrics_job
                 scene_detection_jobs_queue.append(job)
-            else:
-                existing = job.subtitles
-                new_job = SubtitleJob(
-                    name=reencode_job.output_file.stem,
-                    file=reencode_job.output_file,
-                    video_duration_ms=duration,
+
+            elif next_stage == "subtitles":
+                existing_subs = job.subtitles
+                new_subs_job = SubtitleJob(
+                    name=name, file=file_handle, video_duration_ms=duration_ms
                 )
-                if existing:
-                    new_job.total_num_retries = existing.total_num_retries
-                    if existing.response:
-                        new_job.response = existing.response
-                        new_job.subtitles_prompt_version = (
-                            existing.subtitles_prompt_version
+                if existing_subs:
+                    new_subs_job.total_num_retries = existing_subs.total_num_retries
+                    if existing_subs.response:
+                        new_subs_job.response = existing_subs.response
+                        new_subs_job.subtitles_prompt_version = (
+                            existing_subs.subtitles_prompt_version
                         )
 
-                job.subtitles = new_job
-                subtitle_jobs_queue.append(job)
-
-        def on_upload_complete(job: SegmentJobs, file: Any) -> None:
-            """Transition: Upload -> [Lyrics | Subtitles]"""
-            upload_job = job.upload
-            assert upload_job is not None
-            if use_lyrics:
-                existing = job.lyrics
-                new_job = LyricsSceneJob(  # type: ignore
-                    name=upload_job.python_file.stem,
-                    file=file,
-                    video_duration_ms=upload_job.video_duration_ms,
-                )
-                if existing:
-                    new_job.total_num_retries = existing.total_num_retries
-                    if existing.response:
-                        new_job.response = existing.response
-                        new_job.lyrics_prompt_version = existing.lyrics_prompt_version
-
-                job.lyrics = new_job
-                scene_detection_jobs_queue.append(job)
-            else:
-                existing = job.subtitles
-                new_job = SubtitleJob(
-                    name=upload_job.python_file.stem,
-                    file=file,
-                    video_duration_ms=upload_job.video_duration_ms,
-                )
-                if existing:
-                    new_job.total_num_retries = existing.total_num_retries
-                    if existing.response:
-                        new_job.response = existing.response
-                        new_job.subtitles_prompt_version = (
-                            existing.subtitles_prompt_version
-                        )
-
-                job.subtitles = new_job
-                subtitle_jobs_queue.append(job)
-
-        def on_scene_detection_complete(job: SegmentJobs, _: Any) -> None:
-            """Transition: Lyrics -> Subtitles"""
-            lyrics_job = job.lyrics
-            assert lyrics_job is not None
-            if lyrics_job.response:
-                subtitle_file = lyrics_job.file
-                if not agent_subtitles.is_google() and job.upload:
-                    subtitle_file = job.upload.python_file
-
-                existing = job.subtitles
-                new_job = SubtitleJob(  # type: ignore
-                    name=lyrics_job.name,
-                    file=subtitle_file,
-                    video_duration_ms=lyrics_job.video_duration_ms,
-                )
-                if existing:
-                    new_job.total_num_retries = existing.total_num_retries
-                    if existing.response:
-                        new_job.response = existing.response
-                        new_job.subtitles_prompt_version = (
-                            existing.subtitles_prompt_version
-                        )
-
-                job.subtitles = new_job
+                job.subtitles = new_subs_job
                 subtitle_jobs_queue.append(job)
 
         # Setup reencode_runner
@@ -604,7 +589,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 reencode_jobs_queue,
                 settings,
                 settings.thread.re_encode,
-                on_complete=on_reencode_complete,
+                on_complete=partial(on_stage_complete, "reencode"),
             )
 
         # Setup upload_runner
@@ -615,7 +600,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 settings,
                 settings.thread.uploads,
                 uploader=GeminiFileUploader(settings),
-                on_complete=on_upload_complete,
+                on_complete=partial(on_stage_complete, "upload"),
                 stop_events=stop_events,
             )
 
@@ -633,7 +618,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 settings,
                 settings.thread.lyrics,
                 agent_scene,
-                on_complete=on_scene_detection_complete,
+                on_complete=partial(on_stage_complete, "lyrics"),
                 stop_events=scene_stop_events,
             )
 
