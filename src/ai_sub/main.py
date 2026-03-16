@@ -14,7 +14,6 @@ from ai_sub.agent_wrapper import RateLimitedAgentWrapper
 from ai_sub.config import Settings
 from ai_sub.data_models import (
     AiSubResult,
-    Job,
     LyricsSceneJob,
     ReEncodingJob,
     SceneResponse,
@@ -38,28 +37,6 @@ from ai_sub.video import (
     reencode_video,
     split_video,
 )
-
-
-def _job_file_exists(job: LyricsSceneJob | SubtitleJob | None) -> bool:
-    """
-    Checks if the file associated with a job exists on the local filesystem.
-    For cloud files, we return False to force a re-check/re-upload via the pipeline.
-    """
-    if not job:
-        return False
-    # If the job's file is a local path, check if it actually exists.
-    if isinstance(job.file, Path):
-        if not job.file.exists():
-            logfire.warning(
-                f"File {job.file} for completed job '{job.name}' is missing. Will re-process."
-            )
-            return False
-        return True
-
-    # For cloud files (google.genai.types.File), we cannot be sure they exist
-    # (they expire after 48h). We return False to force the pipeline to
-    # re-verify/re-upload them via the upload runner.
-    return False
 
 
 class ReEncodeJobRunner(JobRunner):
@@ -160,16 +137,11 @@ class LyricsSceneJobRunner(JobRunner):
             self.agent.model_name
         )
 
-    def get_job(self, job_state: SegmentJobs) -> Job:
-        job = job_state.lyrics.get(self.sanitized_model_name)
-        assert job is not None
-        return job
-
     def process(self, job: SegmentJobs) -> None:
         """
         Invokes the AI agent to detect scenes.
         """
-        lyrics_job = job.lyrics[self.sanitized_model_name]
+        lyrics_job = job.lyrics
         assert lyrics_job is not None
         if lyrics_job.response:
             logfire.info(
@@ -186,7 +158,7 @@ class LyricsSceneJobRunner(JobRunner):
 
     def post_process(self, job: SegmentJobs) -> None:
         """Saves the result to disk."""
-        lyrics_job = job.lyrics[self.sanitized_model_name]
+        lyrics_job = job.lyrics
         assert lyrics_job is not None
         if lyrics_job.response:
             lyrics_job.lyrics_prompt_version = LYRICS_PROMPT_VERSION
@@ -218,16 +190,11 @@ class SubtitleJobRunner(JobRunner):
             self.agent.model_name
         )
 
-    def get_job(self, job_state: SegmentJobs) -> Job:
-        job = job_state.subtitles.get(self.sanitized_model_name)
-        assert job is not None
-        return job
-
     def process(self, job: SegmentJobs) -> None:
         """
         Invokes the AI agent to generate subtitles.
         """
-        subtitle_job = job.subtitles[self.sanitized_model_name]
+        subtitle_job = job.subtitles
         assert subtitle_job is not None
         if subtitle_job.response:
             logfire.info(
@@ -235,10 +202,7 @@ class SubtitleJobRunner(JobRunner):
             )
             return
 
-        sanitized_lyrics_model = self.settings.ai.get_sanitized_model_name(
-            self.settings.ai.model_lyrics
-        )
-        lyrics_job = job.lyrics.get(sanitized_lyrics_model)
+        lyrics_job = job.lyrics
         scene_response = lyrics_job.response if lyrics_job else None
 
         prompt = get_subtitle_prompt(scene_response)
@@ -257,7 +221,7 @@ class SubtitleJobRunner(JobRunner):
         don't need to be re-processed.
         """
         # Save the completed job state to a JSON file for persistence.
-        subtitle_job = job.subtitles[self.sanitized_model_name]
+        subtitle_job = job.subtitles
         assert subtitle_job is not None
 
         # Also generate a subtitle file for this job for the user to view.
@@ -397,24 +361,22 @@ def stitch_subtitles(
 
 def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
     """
-    Runs the main subtitle generation pipeline.
+    Orchestrates the subtitle generation pipeline.
 
-    This function orchestrates the entire process, from video preparation to
-    final subtitle file generation. The workflow is as follows:
+    The pipeline consists of four sequential stages for each video segment:
+    1.  **Re-encode (Optional):** Compresses the video segment if it exceeds size thresholds.
+    2.  **Upload (Optional):** Uploads the file to the AI provider (e.g., Gemini Files API).
+    3.  **Lyrics/Scene Detection (Optional):** Analyzes the video for context and song lyrics.
+    4.  **Subtitle Generation:** Generates the final subtitles using context from previous steps.
 
-    1.  **Video Splitting:** The input video is divided into smaller, manageable segments.
-    2.  **Job Queueing:** For each segment, the application checks for cached results from
-        previous runs. If a step is not complete, it creates a chain of jobs:
-        - (Optional) **Re-encoding:** The video segment is re-encoded to a smaller size. - (Optional) **Uploading:** The file is uploaded to a cloud service (e.g., Gemini Files API).
-        - **Scene Detection:** The video is analyzed for scene changes and lyrics for any detected songs are researched. - **Subtitle Generation:** A subtitle draft is generated, using the scene/lyrics data as a reference.
-    3.  **Concurrent Processing:** Jobs for each stage are processed concurrently by
-        dedicated `JobRunner` instances. Callbacks are used to chain dependent jobs
-        (e.g., an upload job triggers a scene detection job, which in turn triggers a
-        subtitle job).
-    4.  **Stitching:** Once all segments are processed, the individual subtitle results
-        are stitched together, with timestamps adjusted to align with the original video.
-    5.  **Final Output:** A single `.srt` file is created, containing the final subtitles
-        and a state summary.
+    **Resumption Logic:**
+    The system is designed to be idempotent and resumable. For each segment, it checks
+    existing state files to determine if a stage is already complete. It queues the
+    segment at the *earliest incomplete stage*.
+
+    **Job Chaining:**
+    Completion of one stage triggers the next stage automatically via callbacks
+    (e.g., `on_reencode_complete` queues the `Upload` job).
 
     Args:
         settings (Settings): The application configuration.
@@ -500,9 +462,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 f"{initial_offset_ms}ms) due to start_offset_min={settings.split.start_offset_min}"
             )
 
-        # Step 2: Filter out segments that have already been processed.
-        # This allows the process to be resumed. It checks for the existence of a
-        # .json file which indicates a completed (or failed) job.
+        # Step 2: Configure the job processing pipeline.
 
         # Initialize data structures for concurrent processing.
         # Deques are used as thread-safe queues for managing jobs.
@@ -528,7 +488,10 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         subtitle_runner: SubtitleJobRunner | None = None
 
         # Define callbacks
+        # These functions handle the transition between pipeline stages.
+        # When a job completes, the next required job is created and queued.
         def on_reencode_complete(job: SegmentJobs, _: Any) -> None:
+            """Transition: Re-encode -> [Upload | Lyrics | Subtitles]"""
             reencode_job = job.reencode
             assert reencode_job is not None
             duration = get_video_duration_ms(reencode_job.output_file)
@@ -540,51 +503,99 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 )
                 gemini_upload_jobs_queue.append(job)
             elif use_lyrics:
-                job.lyrics[sanitized_lyrics_model] = LyricsSceneJob(  # type: ignore
+                existing = job.lyrics
+                new_job = LyricsSceneJob(  # type: ignore
                     name=reencode_job.output_file.stem,
                     file=reencode_job.output_file,
                     video_duration_ms=duration,
                 )
+                if existing:
+                    new_job.total_num_retries = existing.total_num_retries
+                    if existing.response:
+                        new_job.response = existing.response
+                        new_job.lyrics_prompt_version = existing.lyrics_prompt_version
+
+                job.lyrics = new_job
                 scene_detection_jobs_queue.append(job)
             else:
-                job.subtitles[sanitized_subtitles_model] = SubtitleJob(
+                existing = job.subtitles
+                new_job = SubtitleJob(
                     name=reencode_job.output_file.stem,
                     file=reencode_job.output_file,
                     video_duration_ms=duration,
                 )
+                if existing:
+                    new_job.total_num_retries = existing.total_num_retries
+                    if existing.response:
+                        new_job.response = existing.response
+                        new_job.subtitles_prompt_version = (
+                            existing.subtitles_prompt_version
+                        )
+
+                job.subtitles = new_job
                 subtitle_jobs_queue.append(job)
 
         def on_upload_complete(job: SegmentJobs, file: Any) -> None:
+            """Transition: Upload -> [Lyrics | Subtitles]"""
             upload_job = job.upload
             assert upload_job is not None
             if use_lyrics:
-                job.lyrics[sanitized_lyrics_model] = LyricsSceneJob(  # type: ignore
+                existing = job.lyrics
+                new_job = LyricsSceneJob(  # type: ignore
                     name=upload_job.python_file.stem,
                     file=file,
                     video_duration_ms=upload_job.video_duration_ms,
                 )
+                if existing:
+                    new_job.total_num_retries = existing.total_num_retries
+                    if existing.response:
+                        new_job.response = existing.response
+                        new_job.lyrics_prompt_version = existing.lyrics_prompt_version
+
+                job.lyrics = new_job
                 scene_detection_jobs_queue.append(job)
             else:
-                job.subtitles[sanitized_subtitles_model] = SubtitleJob(
+                existing = job.subtitles
+                new_job = SubtitleJob(
                     name=upload_job.python_file.stem,
                     file=file,
                     video_duration_ms=upload_job.video_duration_ms,
                 )
+                if existing:
+                    new_job.total_num_retries = existing.total_num_retries
+                    if existing.response:
+                        new_job.response = existing.response
+                        new_job.subtitles_prompt_version = (
+                            existing.subtitles_prompt_version
+                        )
+
+                job.subtitles = new_job
                 subtitle_jobs_queue.append(job)
 
         def on_scene_detection_complete(job: SegmentJobs, _: Any) -> None:
-            lyrics_job = job.lyrics[sanitized_lyrics_model]
+            """Transition: Lyrics -> Subtitles"""
+            lyrics_job = job.lyrics
             assert lyrics_job is not None
             if lyrics_job.response:
                 subtitle_file = lyrics_job.file
                 if not agent_subtitles.is_google() and job.upload:
                     subtitle_file = job.upload.python_file
 
-                job.subtitles[sanitized_subtitles_model] = SubtitleJob(  # type: ignore
+                existing = job.subtitles
+                new_job = SubtitleJob(  # type: ignore
                     name=lyrics_job.name,
                     file=subtitle_file,
                     video_duration_ms=lyrics_job.video_duration_ms,
                 )
+                if existing:
+                    new_job.total_num_retries = existing.total_num_retries
+                    if existing.response:
+                        new_job.response = existing.response
+                        new_job.subtitles_prompt_version = (
+                            existing.subtitles_prompt_version
+                        )
+
+                job.subtitles = new_job
                 subtitle_jobs_queue.append(job)
 
         # Setup reencode_runner
@@ -644,7 +655,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             stop_events=subtitle_stop_events,
         )
 
-        # Step 4: Populate the initial job queues.
+        # Step 3: Populate the job queues.
 
         # Create a directory for re-encoded files to avoid name collisions
         # and preserve the file stem for stitching.
@@ -652,9 +663,9 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         if use_reencode:
             reencode_dir.mkdir(exist_ok=True)
 
+        # Iterate through all video segments to determine their starting point in the pipeline.
         for split, duration in splits_to_process:
             job_state = SegmentJobs()
-            max_retries = 0
 
             # Load jobs if they exist and populate the in-memory JobState
             lyrics_job_path = (
@@ -662,8 +673,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             )
             lyrics_job = LyricsSceneJob.load(lyrics_job_path)
             if lyrics_job:
-                job_state.lyrics[sanitized_lyrics_model] = lyrics_job
-                max_retries = max(max_retries, lyrics_job.total_num_retries)
+                job_state.lyrics = lyrics_job
 
             subtitle_job_path = (
                 settings.dir.tmp
@@ -671,70 +681,34 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             )
             subtitle_job = SubtitleJob.load(subtitle_job_path)
             if subtitle_job:
-                job_state.subtitles[sanitized_subtitles_model] = subtitle_job
-                max_retries = max(max_retries, subtitle_job.total_num_retries)
+                job_state.subtitles = subtitle_job
 
-            # 1. Check Subtitles Done
-            # If Subtitles are done, we can skip this entire segment.
-            subtitle_job = job_state.subtitles.get(sanitized_subtitles_model)
+            # Check if the final stage (Subtitles) is already complete.
             if subtitle_job and subtitle_job.response:
                 continue
 
-            # 2. Check Scene Detection Done
-            # If Subtitles are not done, check if the lyrics/scene detection is complete.
-            # If it is, we can create and queue a job for Subtitle Generation.
-            if use_lyrics:
-                lyrics_job = job_state.lyrics.get(sanitized_lyrics_model)
-                if lyrics_job and lyrics_job.response and _job_file_exists(lyrics_job):
-                    # Create a Subtitle job if it doesn't already exist for the target model.
-                    if not job_state.subtitles.get(sanitized_subtitles_model):
-                        subtitle_file = lyrics_job.file
-                        if not agent_subtitles.is_google() and not isinstance(
-                            subtitle_file, Path
-                        ):
-                            reencoded_path = (
-                                reencode_dir / split.with_suffix(".mov").name
-                            )
-                            if reencoded_path.exists():
-                                subtitle_file = reencoded_path
-                            else:
-                                subtitle_file = split
-                        job_state.subtitles[sanitized_subtitles_model] = SubtitleJob(
-                            name=lyrics_job.name,
-                            file=subtitle_file,
-                            video_duration_ms=lyrics_job.video_duration_ms,
-                        )
-                    subtitle_jobs_queue.append(job_state)
-                    continue
+            # Determine the entry point for this segment.
+            # We check requirements in order: Re-encode -> Upload -> Lyrics -> Subtitles.
+            # If a step is required, we queue the job and 'continue' to the next segment.
+            # The completion of that job will trigger the subsequent steps via the
+            # callbacks defined above.
 
-            # 4. Start from scratch (Re-encode/Upload/Scene/Subtitles)
-            # If none of the AI-driven stages are complete for the specified models,
-            # we start the processing chain from the beginning for this segment.
-            # This involves potentially re-encoding or uploading the video segment
-            # before queueing the first AI job (lyrics/scene detection or subtitles).
-            input_file = split
-
+            # 1. Check Re-encode
             should_reencode = False
             if use_reencode:
                 if settings.split.re_encode.threshold_mb == 0:
                     should_reencode = True
                 else:
-                    file_size_mb = input_file.stat().st_size / (1024 * 1024)
-                    if file_size_mb >= settings.split.re_encode.threshold_mb:
-                        should_reencode = True
-                    else:
-                        logfire.info(
-                            f"Skipping re-encode for {input_file.name} "
-                            f"({file_size_mb:.2f}MB < {settings.split.re_encode.threshold_mb}MB)"
-                        )
+                    file_size_mb = split.stat().st_size / (1024 * 1024)
+                    should_reencode = (
+                        file_size_mb >= settings.split.re_encode.threshold_mb
+                    )
 
             if should_reencode:
-                output_file = reencode_dir / input_file.with_suffix(".mov").name
-                # Always create/update the re-encode job and queue it.
-                # The runner is idempotent and will skip if the output file already exists.
+                output_file = reencode_dir / split.with_suffix(".mov").name
                 job_state.reencode = ReEncodingJob(
-                    name=input_file.stem,
-                    input_file=input_file,
+                    name=split.stem,
+                    input_file=split,
                     output_file=output_file,
                     fps=settings.split.re_encode.fps,
                     height=settings.split.re_encode.height,
@@ -742,36 +716,39 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                     duration_tolerance_ms=settings.split.re_encode.duration_tolerance_ms,
                 )
                 reencode_jobs_queue.append(job_state)
-            elif use_upload:
-                # Always create/update the upload job and queue it.
-                # The uploader is idempotent and will check for existing files on the server.
+                continue
+
+            # 2. Check Upload
+            if use_upload:
                 job_state.upload = UploadFileJob(
-                    name=input_file.stem,
-                    python_file=input_file,
+                    name=split.stem,
+                    python_file=split,
                     video_duration_ms=duration,
                 )
                 gemini_upload_jobs_queue.append(job_state)
-            else:
-                # If no re-encode or upload, queue the initial AI job directly.
-                if use_lyrics:
-                    # Create the job if it doesn't exist for the target model.
-                    if not job_state.lyrics.get(sanitized_lyrics_model):
-                        job_state.lyrics[sanitized_lyrics_model] = LyricsSceneJob(  # type: ignore
-                            name=input_file.stem,
-                            file=input_file,
-                            video_duration_ms=duration,
-                        )
-                    scene_detection_jobs_queue.append(job_state)
-                else:
-                    if not job_state.subtitles.get(sanitized_subtitles_model):
-                        job_state.subtitles[sanitized_subtitles_model] = SubtitleJob(
-                            name=input_file.stem,
-                            file=input_file,
-                            video_duration_ms=duration,
-                        )
-                    subtitle_jobs_queue.append(job_state)
+                continue
 
-        # Step 5: Start all runners and wait for them to complete
+            # 3. Check Lyrics
+            if use_lyrics:
+                if not job_state.lyrics:
+                    job_state.lyrics = LyricsSceneJob(  # type: ignore
+                        name=split.stem,
+                        file=split,
+                        video_duration_ms=duration,
+                    )
+                scene_detection_jobs_queue.append(job_state)
+                continue
+
+            # 4. Subtitles
+            if not job_state.subtitles:
+                job_state.subtitles = SubtitleJob(
+                    name=split.stem,
+                    file=split,
+                    video_duration_ms=duration,
+                )
+            subtitle_jobs_queue.append(job_state)
+
+        # Step 4: Start all runners and wait for them to complete
         # Start runners
         if reencode_runner:
             reencode_runner.start()
@@ -805,7 +782,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             scene_detection_runner.shutdown()
         subtitle_runner.shutdown()
 
-        # Step 6: Assemble the final subtitle file.
+        # Step 5: Assemble the final subtitle file.
         state = stitch_subtitles(video_splits, settings)
 
         # Return the final result

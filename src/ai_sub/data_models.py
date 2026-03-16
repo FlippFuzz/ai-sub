@@ -300,5 +300,5 @@ class SegmentJobs(BaseModel):
 
     reencode: Optional[ReEncodingJob] = None
     upload: Optional[UploadFileJob] = None
-    lyrics: dict[str, LyricsSceneJob] = Field(default_factory=dict)
-    subtitles: dict[str, SubtitleJob] = Field(default_factory=dict)
+    lyrics: Optional[LyricsSceneJob] = None
+    subtitles: Optional[SubtitleJob] = None
