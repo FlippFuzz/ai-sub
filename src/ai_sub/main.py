@@ -171,6 +171,12 @@ class LyricsSceneJobRunner(JobRunner):
         """
         lyrics_job = job.lyrics[self.sanitized_model_name]
         assert lyrics_job is not None
+        if lyrics_job.response:
+            logfire.info(
+                f"Skipping lyrics generation for {lyrics_job.name} as valid response exists."
+            )
+            return
+
         lyrics_job.response = self.agent.run(
             get_lyrics_scenes_prompt(),
             lyrics_job.file,
@@ -223,6 +229,11 @@ class SubtitleJobRunner(JobRunner):
         """
         subtitle_job = job.subtitles[self.sanitized_model_name]
         assert subtitle_job is not None
+        if subtitle_job.response:
+            logfire.info(
+                f"Skipping subtitle generation for {subtitle_job.name} as valid response exists."
+            )
+            return
 
         sanitized_lyrics_model = self.settings.ai.get_sanitized_model_name(
             self.settings.ai.model_lyrics
