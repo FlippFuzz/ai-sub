@@ -1,5 +1,15 @@
 # AI Sub Release Notes
 
+## v2.4.0b3
+
+This release improves agent execution stability and compatibility by refining asynchronous operations.
+
+**Fixes & Improvements:**
+
+- **Async Stability:**
+  - **Agent Execution:** Replaced manual `asyncio.run()` with `pydantic-ai`'s built-in `run_sync()` method. This avoids potential `RuntimeError` issues when the agent is invoked from a thread with a running asyncio event loop and simplifies the code.
+  - **Event Loop Nesting:** Implemented `nest_asyncio` to patch the asyncio event loop. This allows for nested execution, ensuring compatibility with environments like Jupyter notebooks or web servers where an event loop is already active.
+
 ## v2.4.0b2
 
 This release significantly hardens the application architecture, improving state management security, data integrity during processing, and Gemini CLI integration. It also reorganizes the documentation for better accessibility.
