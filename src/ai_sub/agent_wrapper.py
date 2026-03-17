@@ -18,7 +18,6 @@ from pydantic_ai.providers.google import GoogleProvider
 from pyrate_limiter import Duration, Limiter, Rate
 
 from ai_sub.config import Settings
-from ai_sub.data_models import AiResponse, SubtitleResponse
 from ai_sub.gemini_cli_model import GeminiCliModel
 
 T = TypeVar("T", bound=BaseModel)
@@ -170,7 +169,7 @@ class RateLimitedAgentWrapper:
         prompt: str,
         video: genai.types.File | Path,
         video_duration_ms: int,
-        response_type: type[T] = AiResponse,  # type: ignore[assignment]
+        response_type: type[T],
     ) -> T:
         """
         Runs the AI agent to generate subtitles for the given video.
@@ -239,9 +238,6 @@ class RateLimitedAgentWrapper:
             return await agent.run(user_prompt=user_prompt, output_type=response_type)
 
         result = asyncio.run(_run_agent())
-
-        if isinstance(result.output, SubtitleResponse):
-            result.output.model_name = result.response.model_name
 
         return result.output
 

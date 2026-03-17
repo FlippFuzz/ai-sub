@@ -44,7 +44,6 @@ class SubtitleResponse(BaseModel):
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
     subtitles: list[Subtitles] = Field(alias="subs")
-    model_name: Optional[str] = None
 
     @field_validator("subtitles")
     @classmethod
@@ -139,12 +138,6 @@ class SubtitleResponse(BaseModel):
             subtitles.append(SSAEvent(start=start, end=end, text=text))
 
         return subtitles
-
-
-class AiResponse(SubtitleResponse):
-    """Represents the structured response from the AI model containing a list of subtitles."""
-
-    global_analysis: Optional[str] = None
 
 
 class SubtitleApiResponse(SubtitleResponse):
