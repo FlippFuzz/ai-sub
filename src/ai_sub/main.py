@@ -1,3 +1,4 @@
+import json
 import socket
 import sys
 from collections import deque
@@ -15,12 +16,11 @@ from ai_sub.agent_wrapper import RateLimitedAgentWrapper
 from ai_sub.config import Settings
 from ai_sub.data_models import (
     AiSubResult,
+    LyricsSceneAiResponse,
     LyricsSceneJob,
     ReEncodingJob,
-    SceneResponse,
     SegmentJobs,
-    SubtitleApiResponse,
-    SubtitleGenerationState,
+    SubtitleAiResponse,
     SubtitleJob,
     UploadFileJob,
 )
@@ -154,7 +154,7 @@ class LyricsSceneJobRunner(JobRunner):
             get_lyrics_scenes_prompt(),
             lyrics_job.file,
             lyrics_job.video_duration_ms,
-            response_type=SceneResponse,
+            response_type=LyricsSceneAiResponse,
         )
 
     def post_process(self, job: SegmentJobs) -> None:
@@ -211,7 +211,7 @@ class SubtitleJobRunner(JobRunner):
             prompt,
             subtitle_job.file,
             subtitle_job.video_duration_ms,
-            response_type=SubtitleApiResponse,
+            response_type=SubtitleAiResponse,
         )
 
     def post_process(self, job: SegmentJobs) -> None:
@@ -245,7 +245,7 @@ class SubtitleJobRunner(JobRunner):
 
 def stitch_subtitles(
     video_splits: list[tuple[Path, int]], settings: Settings
-) -> SubtitleGenerationState:
+) -> AiSubResult:
     """
     Assembles the final subtitle file from processed segments.
 
@@ -258,7 +258,7 @@ def stitch_subtitles(
         settings: The application's configuration settings.
 
     Returns:
-        SubtitleGenerationState: The final state of the subtitle generation process.
+        AiSubResult: The overall result status of the subtitle generation (COMPLETE, INCOMPLETE, etc.).
     """
     with logfire.span("Producing final SRT file"):
         all_subtitles = SSAFile()
@@ -274,12 +274,8 @@ def stitch_subtitles(
         )
         offset_ms = sum(duration for _, duration in video_splits[:chunks_to_skip])
 
-        state = SubtitleGenerationState(
-            ai_sub_version=version("ai-sub"),
-            lyrics_prompt_version=LYRICS_PROMPT_VERSION,
-            subtitles_prompt_version=SUBTITLES_PROMPT_VERSION,
-            settings=settings,
-        )
+        complete = True
+        max_retries_exceeded = False
 
         for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
             # Load the job result from the temporary JSON file.
@@ -305,7 +301,7 @@ def stitch_subtitles(
                         text="Error processing subtitles for this segment.",
                     )
                 )
-                state.complete = False
+                complete = False
 
             # Add the duration of the current segment to the offset for the next one.
             offset_ms += video_duration_ms
@@ -326,25 +322,28 @@ def stitch_subtitles(
                     final_job_retry_count = lyrics_job.total_num_retries
 
             if final_job_retry_count >= settings.retry.max:
-                state.max_retries_exceeded = True
+                max_retries_exceeded = True
 
         # Insert version and config, as a single SSAEvent at the beginning (0-1ms)
         # JSON curly braces {} are treated as formatting codes in SRT, so replace them.
         # Also exclude sensitive fields from being displayed
-        info_text = (
-            state.model_dump_json(
-                indent=2,
-                exclude={
-                    "settings": {
-                        "input_video_file": True,
-                        "dir": True,
-                        "ai": {"google": {"key": True, "base_url": True}},
-                    },
-                },
-            )
-            .replace("{", "(")
-            .replace("}", ")")
+        settings_dict = settings.model_dump(
+            mode="json",
+            exclude={
+                "input_video_file": True,
+                "dir": True,
+                "ai": {"google": {"key": True, "base_url": True}},
+            },
         )
+        state_info = {
+            "ai_sub_version": version("ai-sub"),
+            "lyrics_prompt_version": LYRICS_PROMPT_VERSION,
+            "subtitles_prompt_version": SUBTITLES_PROMPT_VERSION,
+            "complete": complete,
+            "max_retries_exceeded": max_retries_exceeded,
+            "settings": settings_dict,
+        }
+        info_text = json.dumps(state_info, indent=2).replace("{", "(").replace("}", ")")
         all_subtitles.insert(0, SSAEvent(start=0, end=1, text=info_text))
 
         # Make sure that the info_text don't overlap with the first actual subtitle
@@ -357,7 +356,12 @@ def stitch_subtitles(
                 / f"{settings.input_video_file.stem}.{sanitized_subtitles_model}.srt"
             )
         )
-        return state
+
+        if max_retries_exceeded:
+            return AiSubResult.MAX_RETRIES_EXHAUSTED
+        elif not complete:
+            return AiSubResult.INCOMPLETE
+        return AiSubResult.COMPLETE
 
 
 def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
@@ -768,14 +772,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         subtitle_runner.shutdown()
 
         # Step 5: Assemble the final subtitle file.
-        state = stitch_subtitles(video_splits, settings)
-
-        # Return the final result
-        result = AiSubResult.COMPLETE
-        if state.max_retries_exceeded:
-            result = AiSubResult.MAX_RETRIES_EXHAUSTED
-        elif not state.complete:
-            result = AiSubResult.INCOMPLETE
+        result = stitch_subtitles(video_splits, settings)
 
         logfire.info(f"Done - {result.name}")
         return result

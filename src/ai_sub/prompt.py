@@ -1,6 +1,6 @@
 from textwrap import dedent
 
-from ai_sub.data_models import SceneResponse
+from ai_sub.data_models import LyricsSceneAiResponse
 
 # ==========================================
 # SCENE DETECTION & LYRICS RESEARCH
@@ -183,7 +183,7 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
 ).strip()
 
 
-def get_subtitle_prompt(scene_response: SceneResponse | None) -> str:
+def get_subtitle_prompt(scene_response: LyricsSceneAiResponse | None) -> str:
     """
     Generates the prompt for subtitle generation.
 
