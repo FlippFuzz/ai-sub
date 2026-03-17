@@ -1,5 +1,19 @@
 # AI Sub Release Notes
 
+## v2.4.0b4
+
+This release fixes critical bugs related to concurrent processing and file path handling, significantly improving stability and compatibility, especially when using the Gemini CLI backend.
+
+**Fixes & Improvements:**
+
+- **Async Stability (Per-Thread Agent Caching):**
+  - Fixed a `RuntimeError` related to `asyncio` event loops that occurred during concurrent agent execution.
+  - The issue was caused by creating new AI Agent instances on every call within a worker thread, leading to event loop conflicts.
+  - The fix now caches a single `Agent` instance per thread using `threading.local()`. This ensures stability by aligning the agent's lifecycle with the thread's event loop and improves performance by reusing the agent and its connection pool.
+- **File Path Resolution (Gemini CLI):**
+  - Resolved a `ValueError: relative path can't be expressed as a file URI` that occurred when using the `gemini-cli` backend.
+  - All relevant file paths (`input_video_file`, `dir.out`, `dir.tmp`) are now resolved to absolute paths upon configuration load, ensuring compatibility with tools that require absolute file URIs.
+
 ## v2.4.0b3
 
 This release improves agent execution stability and compatibility by refining asynchronous operations.
