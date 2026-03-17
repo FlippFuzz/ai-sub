@@ -720,22 +720,38 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
             # 3. Check Lyrics
             if use_lyrics:
                 if not job_state.lyrics:
-                    job_state.lyrics = LyricsSceneJob(  # type: ignore
+                    # Fall-through: If execution reaches here, it means previous stages (Re-encode/Upload)
+                    # were either disabled or skipped (e.g. file size < threshold).
+                    # Therefore, we use the original local split file as the input.
+                    job_state.lyrics = LyricsSceneJob(
                         name=split.stem,
                         file=split,
                         video_duration_ms=duration,
                     )
-                scene_detection_jobs_queue.append(job_state)
-                continue
+                    scene_detection_jobs_queue.append(job_state)
+                    continue
+                elif job_state.lyrics.file is None:
+                    # Resumption: 'file' is excluded from JSON save. Restore local split path.
+                    job_state.lyrics.file = split
+                    if not job_state.lyrics.response:
+                        scene_detection_jobs_queue.append(job_state)
+                        continue
 
             # 4. Subtitles
             if not job_state.subtitles:
+                # Fall-through: If execution reaches here, it means previous stages (Re-encode/Upload)
+                # were either disabled or skipped (e.g. file size < threshold).
+                # Therefore, we use the original local split file as the input.
                 job_state.subtitles = SubtitleJob(
                     name=split.stem,
                     file=split,
                     video_duration_ms=duration,
                 )
-            subtitle_jobs_queue.append(job_state)
+                subtitle_jobs_queue.append(job_state)
+            elif job_state.subtitles.file is None:
+                # Resumption: 'file' is excluded from JSON save. Restore local split path.
+                job_state.subtitles.file = split
+                subtitle_jobs_queue.append(job_state)
 
         # Step 4: Start all runners and wait for them to complete
         # Start runners

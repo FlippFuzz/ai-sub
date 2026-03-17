@@ -291,7 +291,7 @@ class UploadFileJob(Job):
 class LyricsSceneJob(Job):
     """Represents a job to detect lyrics and scenes in a video segment."""
 
-    file: File | Path
+    file: Optional[File | Path] = Field(default=None, exclude=True)
     video_duration_ms: PositiveInt
     response: Optional[LyricsSceneAiResponse] = Field(
         default=None,
@@ -333,7 +333,7 @@ class SubtitleJob(Job):
     using scene/lyrics data from a `SceneResponse` as a reference.
     """
 
-    file: File | Path
+    file: Optional[File | Path] = Field(default=None, exclude=True)
     video_duration_ms: PositiveInt
     response: Optional[SubtitleAiResponse] = Field(
         default=None,
