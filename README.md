@@ -94,7 +94,7 @@ You can use AI Sub with either a Google AI Studio API Key or the Gemini CLI.
 
 ## Configuration
 
-For a detailed list of all configuration options, including AI models, re-encoding settings, and concurrency controls, please refer to [CONFIGURATION.md](https://github.com/FlippFuzz/ai-sub/blob/main/CONFIGURATION.md).
+For a detailed list of all configuration options, including AI models, re-encoding settings, and concurrency controls, please refer to [CONFIGURATION.md](https://github.com/FlippFuzz/ai-sub/blob/main/docs/CONFIGURATION.md).
 
 All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) or environment variables with the `AISUB_` prefix (e.g., `AISUB_AI_RPM=10`).
 
