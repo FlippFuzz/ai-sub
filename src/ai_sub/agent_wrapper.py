@@ -1,5 +1,6 @@
 from __future__ import annotations as _annotations
 
+import threading
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -69,6 +70,7 @@ class RateLimitedAgentWrapper:
 
         self.request_limiter = Limiter(Rate(self.settings.ai.rpm, Duration.MINUTE))
         self.token_limiter = Limiter(Rate(self.settings.ai.tpm, Duration.MINUTE))
+        self._thread_local = threading.local()
 
     def _create_agent(self) -> Agent:
         builtin_tools = []
@@ -166,6 +168,21 @@ class RateLimitedAgentWrapper:
             else:
                 return Agent(model=self.model_name)
 
+    def _get_or_create_agent_for_thread(self) -> Agent:
+        """
+        Retrieves or creates an AI Agent instance specific to the current thread.
+
+        This ensures that each thread has its own instance of the agent and its
+        underlying HTTP client, avoiding cross-thread contamination of asyncio objects.
+        This is necessary because `nest_asyncio` causes the event loop to be reused
+        across `run_sync` calls within the same thread.
+        """
+        agent = getattr(self._thread_local, "agent", None)
+        if agent is None:
+            agent = self._create_agent()
+            self._thread_local.agent = agent
+        return agent
+
     def run(
         self,
         prompt: str,
@@ -233,7 +250,7 @@ class RateLimitedAgentWrapper:
             ]
 
         # Execute the AI agent to generate subtitles and get a structured response.
-        agent = self._create_agent()
+        agent = self._get_or_create_agent_for_thread()
         result = agent.run_sync(user_prompt=user_prompt, output_type=response_type)
 
         return result.output
