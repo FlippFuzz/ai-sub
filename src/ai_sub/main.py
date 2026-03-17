@@ -150,6 +150,7 @@ class LyricsSceneJobRunner(JobRunner):
             )
             return
 
+        assert lyrics_job.file is not None
         lyrics_job.response = self.agent.run(
             get_lyrics_scenes_prompt(),
             lyrics_job.file,
@@ -207,6 +208,7 @@ class SubtitleJobRunner(JobRunner):
         scene_response = lyrics_job.response if lyrics_job else None
 
         prompt = get_subtitle_prompt(scene_response)
+        assert subtitle_job.file is not None
         subtitle_job.response = self.agent.run(
             prompt,
             subtitle_job.file,
