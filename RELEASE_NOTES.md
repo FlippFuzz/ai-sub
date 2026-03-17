@@ -1,5 +1,43 @@
 # AI Sub Release Notes
 
+## v2.4.0b2
+
+This release significantly hardens the application architecture, improving state management security, data integrity during processing, and Gemini CLI integration. It also reorganizes the documentation for better accessibility.
+
+**Documentation:**
+
+- **Configuration:** Moved all configuration flags to a dedicated [`CONFIGURATION.md`](CONFIGURATION.md) file to declutter the main README.
+- **New Settings:** Added documentation for the `duration-tolerance-ms` setting.
+
+**New Features & Improvements:**
+
+- **Gemini CLI Integration:**
+  - Refactored the Gemini CLI wrapper into a formal `pydantic_ai.models.Model`.
+  - Added automatic instrumentation for `logfire`, allowing capture of token usage and latency metrics from CLI-based executions.
+- **Data Integrity:**
+  - **Video Splitting:** `split_video` now calculates the total duration of existing segments to verify integrity before skipping the split operation.
+  - **Re-encoding:** `reencode_video` now compares the duration of existing output files against the input (with a configurable `duration_tolerance_ms`) to ensure validity.
+- **Optimization:** Job runners now check for existing valid responses in the job object before processing, preventing unnecessary API calls.
+
+**Fixes:**
+
+- **Asyncio Stability:** Fixed a `RuntimeError` by ensuring the AI agent and its underlying HTTP client are initialized within the active `asyncio` event loop.
+- **Security & Privacy:**
+  - **State Sanitization:** The `file` attribute is no longer saved to the JSON state files, preventing the persistence of absolute file paths (which may contain sensitive usernames).
+  - **Resumption Logic:** Updated the pipeline to correctly handle job resumption when file handles are missing from the state.
+- **Type Safety:** Added runtime assertions in job runners to satisfy type checkers regarding optional file paths.
+
+**Refactoring:**
+
+- **Data Models:**
+  - Renamed `JobState` to `SegmentJobs` to better reflect its purpose.
+  - Renamed `SceneResponse` to `LyricsSceneAiResponse` and merged `SubtitleResponse` into `SubtitleAiResponse`.
+  - Simplified `SegmentJobs` to use optional fields instead of dictionaries.
+- **Pipeline:**
+  - Centralized pipeline stage completion callbacks into a single `on_stage_complete` function.
+  - Simplified the main orchestration logic in `main.py` to use a linear dependency chain.
+- **Code Cleanup:** Removed unused data models (`AiResponse`, `SubtitleGenerationState`) and redundant fields.
+
 ## v2.4.0b1
 
 This release introduces significant improvements to prompt engineering for better accuracy, adds support for DuckDuckGo search, and allows for disabling the lyrics detection pass. It also includes architectural refactoring to improve stability and support mixed-model workflows.
