@@ -308,6 +308,8 @@ class Settings(BaseSettings):
         Validator that sets up default file locations for output and temporary directories
         if they are not explicitly provided by the user. It also creates the temporary directory.
         """
+        # Resolve input video file to an absolute path first
+        self.input_video_file = self.input_video_file.resolve()
 
         # If the user didn't set out_dir, set it automatically
         if self.dir.out == Path("directory_of_input_file"):
@@ -316,6 +318,10 @@ class Settings(BaseSettings):
         # If the user didn't set tmp_dir, set it automatically
         if self.dir.tmp == Path("tmp_input_video_file"):
             self.dir.tmp = self.dir.out / f"tmp_{self.input_video_file.stem}"
+
+        # Now resolve the directory paths to be absolute
+        self.dir.out = self.dir.out.resolve()
+        self.dir.tmp = self.dir.tmp.resolve()
 
         # Create the tmp directory (works for both user-provided and default paths)
         self.dir.tmp.mkdir(parents=True, exist_ok=True)
