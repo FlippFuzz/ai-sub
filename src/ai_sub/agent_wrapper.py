@@ -19,7 +19,7 @@ from pyrate_limiter import Duration, Limiter, Rate
 
 from ai_sub.config import Settings
 from ai_sub.data_models import AiResponse, SubtitleResponse
-from ai_sub.gemini_cli_wrapper import GeminiCliWrapper
+from ai_sub.gemini_cli_model import GeminiCliModel
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -32,7 +32,6 @@ class RateLimitedAgentWrapper:
 
     rpm: int
     tpm: int
-    cli_wrapper: GeminiCliWrapper | None = None
     settings: Settings
     model_name: str
 
@@ -69,13 +68,6 @@ class RateLimitedAgentWrapper:
 
         self.request_limiter = Limiter(Rate(self.settings.ai.rpm, Duration.MINUTE))
         self.token_limiter = Limiter(Rate(self.settings.ai.tpm, Duration.MINUTE))
-
-        if self.is_gemini_cli():
-            model_str = self.model_name.split(":", 1)[-1]
-            self.cli_wrapper = GeminiCliWrapper(
-                model_str,
-                settings.ai.gemini_cli,
-            )
 
     def _create_agent(self) -> Agent:
         builtin_tools = []
@@ -156,6 +148,11 @@ class RateLimitedAgentWrapper:
                 )
             else:
                 return Agent(model, model_settings=google_model_settings)
+        elif self.is_gemini_cli():
+            # Note: No support for custom tools.
+            model_str = self.model_name.split(":", 1)[-1]
+            model = GeminiCliModel(model_str, self.settings.ai.gemini_cli)
+            return Agent(model=model)
         else:
             # TODO: Do we need to enable thinking, etc for other models?
             # For now, this is only tested to work against Google
@@ -193,16 +190,6 @@ class RateLimitedAgentWrapper:
         tokens = self._calculate_tokens(prompt, video_duration_ms)
         self.token_limiter.try_acquire("tpm", weight=tokens)
 
-        if self.is_gemini_cli():
-            if isinstance(video, Path):
-                assert self.cli_wrapper
-                result = self.cli_wrapper.run_sync(prompt, video, response_type)
-                if result:
-                    return result
-                raise RuntimeError("Gemini CLI failed to generate response")
-            else:
-                raise ValueError("Gemini CLI requires a local file path.")
-
         # Prepare the prompt
         # Each model provider requires a different input format for video.
         if self.is_google():
@@ -222,6 +209,16 @@ class RateLimitedAgentWrapper:
                     ),
                     prompt,
                 ]
+        elif self.is_gemini_cli():
+            if isinstance(video, Path):
+                python_file = cast(Path, video)
+                # Pass file path as a DocumentUrl with file:// scheme
+                user_prompt = [
+                    DocumentUrl(url=python_file.as_uri()),
+                    prompt,
+                ]
+            else:
+                raise ValueError("Gemini CLI requires a local file path.")
 
         else:
             # For other models (e.g., OpenAI), we read the file into memory
