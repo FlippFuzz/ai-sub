@@ -1,9 +1,9 @@
 from __future__ import annotations as _annotations
 
-import asyncio
 from pathlib import Path
 from typing import TypeVar, cast
 
+import nest_asyncio2
 from google import genai as genai
 from google.genai.types import (
     HarmBlockThreshold,
@@ -19,6 +19,8 @@ from pyrate_limiter import Duration, Limiter, Rate
 
 from ai_sub.config import Settings
 from ai_sub.gemini_cli_model import GeminiCliModel
+
+nest_asyncio2.apply()
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -231,13 +233,8 @@ class RateLimitedAgentWrapper:
             ]
 
         # Execute the AI agent to generate subtitles and get a structured response.
-        # We instantiate the agent inside the asyncio loop to ensure that any
-        # underlying HTTP clients (like httpx) are created within the same loop.
-        async def _run_agent():
-            agent = self._create_agent()
-            return await agent.run(user_prompt=user_prompt, output_type=response_type)
-
-        result = asyncio.run(_run_agent())
+        agent = self._create_agent()
+        result = agent.run_sync(user_prompt=user_prompt, output_type=response_type)
 
         return result.output
 
