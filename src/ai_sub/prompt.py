@@ -70,7 +70,7 @@ def get_lyrics_scenes_prompt() -> str:
 # ==========================================
 # SUBTITLES GENERATION
 # ==========================================
-SUBTITLES_PROMPT_VERSION = 11
+SUBTITLES_PROMPT_VERSION = 12
 
 _SUBTITLES_PROMPT_TEMPLATE = dedent(
     """
@@ -101,20 +101,22 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
     *   **No Rapid-Fire Dumping:** DO NOT guess timestamps just to quickly squeeze the provided JSON lyrics into the clip. If there is a 5-second gap between sung words, there MUST be a 5-second gap in your subtitles. 
     *   **Ghost Subtitles:** Remain SILENT during pure instrumental music, long pauses, or sound effects. Output nothing if no vocals are present.
 
-    ### PRIORITY 1: PRECISION TIMESTAMPS & PREVENTING CASCADING DELAYS
+    ### PRIORITY 1: PRECISION TIMESTAMPS & TEXT-AUDIO ALIGNMENT
     Treat every subtitle entry as a discrete, isolated event tied exclusively to the audio waveform.
     *   **Timecode Format:** MUST strictly adhere to `MM:SS.mmm` (e.g., `01:05.300`). Always pad with zeros. 
+    *   **Text-to-Audio Duration Match (NO EARLY CUTOFFS):** The duration between `s` and `e` MUST cover the time it takes to speak the *entirety* of the text in the `og` field. Never dump a long sentence into a timestamp that only covers the first few words. The `e` timestamp must match the exact moment the LAST word in the block is spoken.
     *   **Prevent Cascading Delays (The "Traffic Jam" Effect):** In fast-paced songs or rapid speech, AI models often artificially stretch the `e` (end) timestamp to keep text on screen longer for human readability. YOU MUST DISABLE THIS BIAS. 
         *   **The Strict Rule:** A subtitle's `e` timestamp MUST NEVER bleed into the start of the next spoken line. If a singer fires off 15 words in a 600ms burst, the subtitle duration MUST be exactly 600ms. If you stretch the `e` timestamp too long, it pushes all subsequent subtitles out of sync. Make sure `s` and `e` tightly wrap the current phrase so the timeline remains clear for the next one.
 
-    ### PRIORITY 2: INTELLIGENT SEGMENTATION (Max 50 Chars)
+
+    ### PRIORITY 2: INTELLIGENT SEGMENTATION & HANDLING PAUSES
+    *   **Handling Pauses (The Splitting Rule):** If there is a physical pause or breath in the audio in the middle of a sentence, YOU MUST SPLIT the text into a new subtitle block. NEVER merge text across an audio pause into a single JSON block. 
     *   **Max Length:** Limit each subtitle block to a maximum of 50 characters (for both `og` and `en`). Group phrases logically.
-    *   **Contiguous Timestamping:** If splitting a continuous, uninterrupted sentence to stay under 50 chars, Part 1 `e` MUST EXACTLY EQUAL Part 2 `s` (e.g., `00:05.500`). Do not invent an audio gap in the middle of a continuous breath.
-    *   **Pauses:** Only separate timestamps if there is an actual physical pause or breath in the audio.
+    *   **Contiguous Timestamping:** If splitting a continuous, uninterrupted sentence (no pauses) to stay under 50 chars, Part 1 `e` MUST EXACTLY EQUAL Part 2 `s` (e.g., `00:05.500`). Do not invent an audio gap in the middle of a continuous breath.
 
     ### PRIORITY 3: HOLISTIC CONTEXT & TRANSLATION
-    *   **Context-Aware Translation (NO ISOLATION):** NEVER translate lines in isolation. Analyze the previous/next lines and the visual narrative to determine pronouns (he/she/they), tense, and tone.
-    *   **Semantic Continuity:** If splitting a sentence, ensure the translation of "Part 1" grammatically anticipates "Part 2" (e.g., using open-ended connective forms). Do not close a sentence prematurely.
+    *   **Context-Aware Translation (NO ISOLATION):** NEVER translate lines in isolation. Analyze the previous/next lines and the visual narrative to determine pronouns, tense, and tone.
+    *   **Semantic Continuity:** If you must split a sentence due to an audio pause or character limits, ensure the translation of "Part 1" grammatically anticipates "Part 2" (e.g., using ellipses `...` or connective forms). 
     *   **Visual Text Rules:** Transcribe/translate prominent, relevant visual text (titles, signs). Exclude meaningless background clutter or UI elements.
     *   **No CC Tags:** Transcribe speech/vocals only. NO closed captioning tags like `[applause]`, `(sighs)`, or `♪`. 
 
@@ -122,7 +124,7 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
     
     ### EXAMPLES
 
-    **Example 1: Resolving Ambiguous Audio with Text/JSON (The "Pa-re" Example)**
+    **Example 1: Resolving Ambiguous Audio with Text/JSON**
     *Output:*
     ```json
     {
@@ -160,13 +162,36 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
     }
     ```
 
+    **Example 3: Handling Pauses Mid-Sentence (Preventing Early Cutoff)**
+    *Scenario:* The speaker says "人の世に" (01:07.800 - 01:13.200), pauses for 1 second, then says "生まれし悪を 闇にへと 葬れよ" (01:14.200 - 01:18.500).
+    *Output:*
+    ```json
+    {
+      "global_analysis": "Sentence contains a mid-sentence audio pause. I split the sentence into two discrete blocks to match the vocal bursts, ensuring the text is not dumped early and the English translation maintains semantic continuity across the pause.",
+      "subs": [
+        {
+          "s": "01:07.800",
+          "e": "01:13.200",
+          "og": "人の世に",
+          "en": "From the world of men..."
+        },
+        {
+          "s": "01:14.200",
+          "e": "01:18.500",
+          "og": "生まれし悪を 闇にへと 葬れよ",
+          "en": "exorcise born evil into the darkness."
+        }
+      ]
+    }
+    ```
+
     ### OUTPUT FORMAT
     Return **ONLY** a valid, parseable JSON object. No markdown wrapping outside the JSON.
     You MUST output `global_analysis` FIRST.
 
     **JSON Schema:**
     {
-      "global_analysis": "Strict Verification Step: 1. State if the audio phonetically matches the JSON reference. 2. If it's the wrong song, explicitly state you are ignoring the JSON. 3. If the JSON has more lyrics than the video clip, explicitly state you are discarding the leftovers. 4. Confirm you resolved ambiguities correctly without rapid text dumping.",
+      "global_analysis": "Strict Verification Step: 1. State if the audio phonetically matches the JSON reference. 2. If wrong song, state ignore. 3. If leftover lyrics, state discard. 4. Confirm text matches full audio duration without early cutoffs or cross-pause merging.",
       "subs": [
         {
           "s": "MM:SS.mmm",
