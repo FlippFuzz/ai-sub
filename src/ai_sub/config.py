@@ -15,11 +15,18 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, CliPositionalArg, SettingsConfigDict
 
+_BASE_CONFIG: SettingsConfigDict = {
+    "env_file": ".env",
+    "env_file_encoding": "utf-8",
+    "extra": "ignore",
+}
+
 
 class GeminiCliSettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_AI_GEMINI_CLI_",
-    )
+    model_config = {
+        "env_prefix": "AISUB_AI_GEMINI_CLI_",
+        **_BASE_CONFIG,
+    }
 
     timeout: PositiveInt = Field(
         description="The timeout in seconds for Gemini CLI operations.", default=600
@@ -31,9 +38,10 @@ class GeminiCliSettings(BaseSettings):
 
 
 class GoogleAiSettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_AI_GOOGLE_",
-    )
+    model_config = {
+        "env_prefix": "AISUB_AI_GOOGLE_",
+        **_BASE_CONFIG,
+    }
 
     file_cache_ttl: PositiveInt = Field(
         description="The time-to-live (TTL) in seconds for the Gemini file list cache. This cache helps avoid frequent API calls to list uploaded files.",
@@ -74,9 +82,10 @@ class GoogleAiSettings(BaseSettings):
 
 
 class AiSettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_AI_",
-    )
+    model_config = {
+        "env_prefix": "AISUB_AI_",
+        **_BASE_CONFIG,
+    }
 
     model: Optional[str] = Field(
         default=None,
@@ -132,9 +141,10 @@ class AiSettings(BaseSettings):
 
 
 class ReEncodeSettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_SPLIT_RE_ENCODE_",
-    )
+    model_config = {
+        "env_prefix": "AISUB_SPLIT_RE_ENCODE_",
+        **_BASE_CONFIG,
+    }
 
     enabled: bool = Field(
         description="Re-encode the video chunks to save bandwidth.",
@@ -167,9 +177,10 @@ class ReEncodeSettings(BaseSettings):
 
 
 class SplittingSettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_SPLIT_",
-    )
+    model_config = {
+        "env_prefix": "AISUB_SPLIT_",
+        **_BASE_CONFIG,
+    }
 
     max_seconds: PositiveInt = Field(
         description="The maximum duration in seconds for each video chunk. The input video will be split into these smaller segments for processing.",
@@ -186,9 +197,10 @@ class SplittingSettings(BaseSettings):
 
 
 class DirectorySettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_DIR_",
-    )
+    model_config = {
+        "env_prefix": "AISUB_DIR_",
+        **_BASE_CONFIG,
+    }
 
     tmp: Path = Field(
         description="Temporary directory for intermediate files (e.g., video segments). Defaults to a 'tmp_<video_name>' folder in the output directory.",
@@ -201,9 +213,10 @@ class DirectorySettings(BaseSettings):
 
 
 class ThreadSettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_THREAD_",
-    )
+    model_config = {
+        "env_prefix": "AISUB_THREAD_",
+        **_BASE_CONFIG,
+    }
 
     uploads: PositiveInt = Field(
         description="The number of concurrent threads for uploading video segments. This is only used for Gemini (google-gla) models.",
@@ -224,9 +237,10 @@ class ThreadSettings(BaseSettings):
 
 
 class RetrySettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_RETRY_",
-    )
+    model_config = {
+        "env_prefix": "AISUB_RETRY_",
+        **_BASE_CONFIG,
+    }
 
     run: NonNegativeInt = Field(
         description="The maximum number of times to retry a failed job in this run of the program.",
@@ -243,9 +257,10 @@ class RetrySettings(BaseSettings):
 
 
 class LoggingSettings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_LOG_",
-    )
+    model_config = {
+        "env_prefix": "AISUB_LOG_",
+        **_BASE_CONFIG,
+    }
 
     level: LevelName = Field(
         description="The minimum log level to display.", default="info"
@@ -261,14 +276,13 @@ class LoggingSettings(BaseSettings):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        nested_model_default_partial_update=True,
-        cli_avoid_json=True,
-        cli_kebab_case=True,
-        env_file=".env",
-        env_file_encoding="utf-8",
-        env_prefix="AISUB_",
-    )
+    model_config = {
+        "nested_model_default_partial_update": True,
+        "cli_avoid_json": True,
+        "cli_kebab_case": True,
+        "env_prefix": "AISUB_",
+        **_BASE_CONFIG,
+    }
 
     ai: AiSettings = Field(
         description="Settings related to the AI model.", default_factory=AiSettings
