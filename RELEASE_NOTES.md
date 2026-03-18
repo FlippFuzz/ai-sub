@@ -1,5 +1,15 @@
 # AI Sub Release Notes
 
+## v2.4.1
+
+This release fixes a configuration issue where nested settings were ignoring the `.env` file.
+
+**Fixes:**
+
+- **Configuration (.env loading):**
+  - Fixed an issue where `AISUB_AI_GOOGLE_KEY` and other nested variables in `.env` were not being loaded because nested Pydantic models do not inherit configuration from the parent Settings class.
+  - Defined `_BASE_CONFIG` with `env_file=".env"` and applied it to all nested `BaseSettings` models (`GoogleAiSettings`, `GeminiCliSettings`, `AiSettings`, etc.) to ensure consistent behavior.
+
 ## v2.4.0
 
 This release promotes the v2.4.0 beta series to production, incorporating all stability fixes, prompt engineering enhancements, and configuration improvements introduced in the beta cycle.
