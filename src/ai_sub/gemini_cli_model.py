@@ -262,7 +262,11 @@ class GeminiCliModel(Model):
                         f"Gemini CLI did not return statistics for {self._model_name}. Returned statistics: {cli_response.stats}"
                     )
 
-                return ModelResponse(parts=[TextPart(content=json_str)], usage=usage)
+                return ModelResponse(
+                    parts=[TextPart(content=json_str)],
+                    model_name=self.model_name,
+                    usage=usage,
+                )
 
         raise RuntimeError("Gemini CLI did not return a response.")
 
