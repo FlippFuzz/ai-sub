@@ -73,7 +73,7 @@ This option provides the best quality for the free tier but is slightly more inv
 
 - As of 18 Mar 2026:
 - Gemini API provides 500 free requests/day for gemini-3.1-flash-lite-preview
-- Gemini CLI provides 50 free requests/day for gemini-3-pro-preview and 1000 free requests/day for gemini-3-flash-preview
+- Gemini CLI provides 1000 free requests/day for gemini-3.1-flash-lite-preview, ~140 for gemini-3-flash-preview, and 20 for gemini-3-pro-preview.
 
 1.  **Obtain your API Key:**
     - Sign in to [Google AI Studio](https://aistudio.google.com/app/apikey).
