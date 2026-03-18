@@ -1,5 +1,20 @@
 # AI Sub Release Notes
 
+## v2.4.0
+
+This release promotes the v2.4.0 beta series to production, incorporating all stability fixes, prompt engineering enhancements, and configuration improvements introduced in the beta cycle.
+
+**Fixes & Improvements:**
+
+- **Documentation:**
+  - Updated the README to clarify the current free request limits for the Gemini CLI.
+
+**Known Issues:**
+
+- **Asyncio Event Loop:**
+  - Users may see errors like `RuntimeError: <asyncio.locks.Event object ...> is bound to a different event loop`.
+  - This is currently under investigation. The application will automatically retry the affected job, so these errors can be ignored.
+
 ## v2.4.0b5
 
 This release enhances configuration robustness, improves prompt engineering for subtitles, and updates documentation for clarity.
