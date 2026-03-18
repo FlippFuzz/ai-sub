@@ -114,6 +114,7 @@ class UploadJobRunner(JobRunner):
         # Perform the file upload. This is a blocking operation.
         file = self.uploader.upload_file(upload_job.python_file)
         logfire.info(f"{upload_job.name} uploaded")
+        logfire.debug(f"File: {file}")
         return file
 
 
