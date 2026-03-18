@@ -66,6 +66,10 @@ class GoogleAiSettings(BaseSettings):
             if key:
                 values["key"] = key
 
+        # Sanitize the key to remove accidental surrounding quotes or whitespace
+        if values.get("key") and isinstance(values["key"], str):
+            values["key"] = values["key"].strip().strip('"').strip("'")
+
         return values
 
 
