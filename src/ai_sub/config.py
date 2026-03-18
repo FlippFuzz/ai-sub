@@ -113,19 +113,10 @@ class AiSettings(BaseSettings):
     def validate_models(self):
         """
         - If the 'model' field is set, it overrides 'model_subtitles' and 'model_lyrics'.
-        - Validates that a Google AI API key is provided if a Google model is selected.
         """
         if self.model:
             self.model_subtitles = self.model
             self.model_lyrics = self.model
-
-        is_google_subtitles = self.model_subtitles.lower().startswith("google-gla")
-        is_google_scene = self.model_lyrics.lower().startswith("google-gla")
-
-        if (is_google_subtitles or is_google_scene) and self.google.key is None:
-            raise ValueError(
-                "A Google AI API key must be provided either via the 'key' field, GOOGLE_API_KEY, GEMINI_API_KEY or AISUB_AI_GOOGLE_KEY environment variables."
-            )
         return self
 
     def get_sanitized_model_name(self, model_name: str) -> str:
@@ -305,6 +296,24 @@ class Settings(BaseSettings):
     input_video_file: CliPositionalArg[FilePath] = Field(
         description="The path to the video file for which to generate subtitles."
     )
+
+    @model_validator(mode="after")
+    def validate_api_keys(self):
+        """
+        Validates that a Google AI API key is provided if a Google model is selected.
+        """
+        is_google_subtitles = self.ai.model_subtitles.lower().startswith("google-gla")
+        # Only check lyrics model if lyrics threads are > 0 (i.e. enabled)
+        is_google_scene = (
+            self.thread.lyrics > 0
+            and self.ai.model_lyrics.lower().startswith("google-gla")
+        )
+
+        if (is_google_subtitles or is_google_scene) and self.ai.google.key is None:
+            raise ValueError(
+                "A Google AI API key must be provided either via the 'key' field, GOOGLE_API_KEY, GEMINI_API_KEY or AISUB_AI_GOOGLE_KEY environment variables."
+            )
+        return self
 
     @model_validator(mode="after")
     def setup_file_locations(self):
