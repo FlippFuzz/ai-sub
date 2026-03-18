@@ -1,5 +1,39 @@
 # AI Sub Release Notes
 
+## v2.4.0b5
+
+This release enhances configuration robustness, improves prompt engineering for subtitles, and updates documentation for clarity.
+
+**New Features:**
+
+- **Configuration (API Key Sanitization):**
+  - The application now automatically strips leading/trailing whitespace and surrounding quotes from the Google AI API key during configuration loading. This prevents common authentication failures caused by copy-paste errors or shell quoting.
+
+**Fixes & Improvements:**
+
+- **Configuration (API Key Validation):**
+  - Fixed an issue where a Google API key was required even when lyrics processing was disabled (`--thread.lyrics=0`). The API key is now only validated if the lyrics stage is active, allowing for API-key-free workflows when using `gemini-cli` for subtitles.
+- **Gemini CLI (Cost Calculation):**
+  - Resolved a `CostCalculationFailedWarning` by ensuring the `model_name` is correctly passed to `pydantic-ai`'s instrumentation layer, enabling accurate cost tracking for CLI-based executions.
+- **Upload (Logging):**
+  - Added debug logging for the full file object details returned by the Gemini Files API after a successful upload, aiding in troubleshooting.
+
+**Prompt Engineering:**
+
+- **Subtitle Generation (v12):**
+  - Incremented `SUBTITLES_PROMPT_VERSION` to 12.
+  - The prompt has been significantly enhanced with stricter guidelines to improve accuracy:
+    - **The "Golden Rule":** Reinforces that audio dictates timing ("When") while visuals and context dictate content ("What").
+    - **Decoding Hierarchy:** Establishes a clear fallback order (On-screen Text > Scene Context > Reference JSON) for resolving ambiguous audio.
+    - **Anti-Hallucination Rules:** Added robust logic to handle scenarios where the reference JSON contains lyrics for the wrong song or extra verses not present in the video segment.
+    - **Timestamp Alignment:** Introduced stricter rules to prevent "cascading delay" errors by ensuring end timestamps tightly wrap the spoken audio, disabling readability biases that could cause sync issues.
+    - **Pause Handling:** Mandates splitting subtitles across audible pauses to maintain precise synchronization.
+
+**Documentation:**
+
+- **README Update:** The main `README.md` has been updated with a clearer overview and revised usage instructions, including the latest recommendations for free-tier models.
+- **Configuration File:** The detailed `CONFIGURATION.md` has been moved from the root directory to the `docs/` folder for better project organization.
+
 ## v2.4.0b4
 
 This release fixes critical bugs related to concurrent processing and file path handling, significantly improving stability and compatibility, especially when using the Gemini CLI backend.
