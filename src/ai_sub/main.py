@@ -1,11 +1,12 @@
+from __future__ import annotations
+
+import asyncio
 import json
 import socket
 import sys
-from collections import deque
 from functools import partial
 from importlib.metadata import version
 from pathlib import Path
-from threading import Event
 from typing import Any, Callable
 
 import logfire
@@ -50,16 +51,15 @@ class ReEncodeJobRunner(JobRunner):
 
     def __init__(
         self,
-        queue: deque[SegmentJobs],
+        queue: asyncio.Queue[SegmentJobs],
         settings: Settings,
         max_workers: int,
         on_complete: Callable[[SegmentJobs, Any], None],
-        stop_events: list[Event] | None = None,
         name: str = "reencode",
     ):
-        super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
+        super().__init__(queue, settings, max_workers, on_complete, name=name)
 
-    def process(self, job: SegmentJobs) -> None:
+    async def process(self, job: SegmentJobs) -> None:
         """
         Re-encodes the video file specified in the job.
 
@@ -67,7 +67,8 @@ class ReEncodeJobRunner(JobRunner):
         """
         reencode_job = job.reencode
         assert reencode_job is not None
-        reencode_video(
+        await asyncio.to_thread(
+            reencode_video,
             reencode_job.input_file,
             reencode_job.output_file,
             reencode_job.fps,
@@ -92,18 +93,17 @@ class UploadJobRunner(JobRunner):
 
     def __init__(
         self,
-        queue: deque[SegmentJobs],
+        queue: asyncio.Queue[SegmentJobs],
         settings: Settings,
         max_workers: int,
         uploader: GeminiFileUploader,
         on_complete: Callable[[SegmentJobs, Any], None],
-        stop_events: list[Event] | None = None,
         name: str = "upload",
     ):
-        super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
+        super().__init__(queue, settings, max_workers, on_complete, name=name)
         self.uploader = uploader
 
-    def process(self, job: SegmentJobs) -> Any:
+    async def process(self, job: SegmentJobs) -> Any:
         """
         Uploads the specified file using the `GeminiFileUploader`.
 
@@ -112,7 +112,9 @@ class UploadJobRunner(JobRunner):
         upload_job = job.upload
         assert upload_job is not None
         # Perform the file upload. This is a blocking operation.
-        file = self.uploader.upload_file(upload_job.python_file)
+        file = await asyncio.to_thread(
+            self.uploader.upload_file, upload_job.python_file
+        )
         logfire.info(f"{upload_job.name} uploaded")
         logfire.debug(f"File: {file}")
         return file
@@ -125,21 +127,20 @@ class LyricsSceneJobRunner(JobRunner):
 
     def __init__(
         self,
-        queue: deque[SegmentJobs],
+        queue: asyncio.Queue[SegmentJobs],
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
         on_complete: Callable[[SegmentJobs, Any], None],
-        stop_events: list[Event] | None = None,
         name: str = "lyrics",
     ):
-        super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
+        super().__init__(queue, settings, max_workers, on_complete, name=name)
         self.agent = agent
         self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(
             self.agent.model_name
         )
 
-    def process(self, job: SegmentJobs) -> None:
+    async def process(self, job: SegmentJobs) -> None:
         """
         Invokes the AI agent to detect scenes.
         """
@@ -152,14 +153,17 @@ class LyricsSceneJobRunner(JobRunner):
             return
 
         assert lyrics_job.file is not None
-        lyrics_job.response = self.agent.run(
+        # agent.run uses nest_asyncio and run_sync, so we wrap it in a thread
+        # to avoid blocking the main event loop.
+        lyrics_job.response = await asyncio.to_thread(
+            self.agent.run,
             get_lyrics_scenes_prompt(),
             lyrics_job.file,
             lyrics_job.video_duration_ms,
-            response_type=LyricsSceneAiResponse,
+            LyricsSceneAiResponse,
         )
 
-    def post_process(self, job: SegmentJobs) -> None:
+    async def post_process(self, job: SegmentJobs) -> None:
         """Saves the result to disk."""
         lyrics_job = job.lyrics
         assert lyrics_job is not None
@@ -169,7 +173,7 @@ class LyricsSceneJobRunner(JobRunner):
                 self.settings.dir.tmp
                 / f"{lyrics_job.name}.lyrics.{self.sanitized_model_name}.json"
             )
-            lyrics_job.save(job_state_path)
+            await asyncio.to_thread(lyrics_job.save, job_state_path)
 
 
 class SubtitleJobRunner(JobRunner):
@@ -179,21 +183,20 @@ class SubtitleJobRunner(JobRunner):
 
     def __init__(
         self,
-        queue: deque[SegmentJobs],
+        queue: asyncio.Queue[SegmentJobs],
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
         on_complete: Callable[[SegmentJobs, Any], None] | None = None,
-        stop_events: list[Event] | None = None,
         name: str = "subtitles",
     ):
-        super().__init__(queue, settings, max_workers, on_complete, stop_events, name)
+        super().__init__(queue, settings, max_workers, on_complete, name=name)
         self.agent = agent
         self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(
             self.agent.model_name
         )
 
-    def process(self, job: SegmentJobs) -> None:
+    async def process(self, job: SegmentJobs) -> None:
         """
         Invokes the AI agent to generate subtitles.
         """
@@ -210,14 +213,15 @@ class SubtitleJobRunner(JobRunner):
 
         prompt = get_subtitle_prompt(scene_response)
         assert subtitle_job.file is not None
-        subtitle_job.response = self.agent.run(
+        subtitle_job.response = await asyncio.to_thread(
+            self.agent.run,
             prompt,
             subtitle_job.file,
             subtitle_job.video_duration_ms,
-            response_type=SubtitleAiResponse,
+            SubtitleAiResponse,
         )
 
-    def post_process(self, job: SegmentJobs) -> None:
+    async def post_process(self, job: SegmentJobs) -> None:
         """
         Saves the result (or partial state) to disk.
 
@@ -235,14 +239,15 @@ class SubtitleJobRunner(JobRunner):
                 self.settings.dir.tmp
                 / f"{subtitle_job.name}.subtitles.{self.sanitized_model_name}.json"
             )
-            subtitle_job.save(job_state_path)
+            await asyncio.to_thread(subtitle_job.save, job_state_path)
             sanitized_model = self.settings.ai.get_sanitized_model_name(
                 self.settings.ai.model_subtitles
             )
-            subtitle_job.response.get_ssafile().save(
+            await asyncio.to_thread(
+                subtitle_job.response.get_ssafile().save,
                 str(
                     self.settings.dir.tmp / f"{subtitle_job.name}.{sanitized_model}.srt"
-                )
+                ),
             )
 
 
@@ -367,7 +372,7 @@ def stitch_subtitles(
         return AiSubResult.COMPLETE
 
 
-def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
+async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
     """
     Orchestrates the subtitle generation pipeline.
 
@@ -474,10 +479,10 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
 
         # Initialize data structures for concurrent processing.
         # Deques are used as thread-safe queues for managing jobs.
-        reencode_jobs_queue: deque[SegmentJobs] = deque()
-        gemini_upload_jobs_queue: deque[SegmentJobs] = deque()
-        scene_detection_jobs_queue: deque[SegmentJobs] = deque()
-        subtitle_jobs_queue: deque[SegmentJobs] = deque()
+        reencode_jobs_queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
+        gemini_upload_jobs_queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
+        scene_detection_jobs_queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
+        subtitle_jobs_queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
 
         use_reencode = settings.split.re_encode.enabled
         is_google_sub = agent_subtitles.is_google()
@@ -485,10 +490,6 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
         use_upload = (
             is_google_sub or is_google_scene
         ) and settings.ai.google.use_files_api
-
-        reencode_complete_event = Event()
-        gemini_upload_complete_event = Event()
-        scene_detection_complete_event = Event()
 
         reencode_runner: ReEncodeJobRunner | None = None
         upload_runner: UploadJobRunner | None = None
@@ -556,7 +557,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                     python_file=file_handle,
                     video_duration_ms=duration_ms,
                 )
-                gemini_upload_jobs_queue.append(job)
+                gemini_upload_jobs_queue.put_nowait(job)
 
             elif next_stage == "lyrics":
                 existing_lyrics = job.lyrics
@@ -572,7 +573,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                         )
 
                 job.lyrics = new_lyrics_job
-                scene_detection_jobs_queue.append(job)
+                scene_detection_jobs_queue.put_nowait(job)
 
             elif next_stage == "subtitles":
                 existing_subs = job.subtitles
@@ -588,7 +589,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                         )
 
                 job.subtitles = new_subs_job
-                subtitle_jobs_queue.append(job)
+                subtitle_jobs_queue.put_nowait(job)
 
         # Setup reencode_runner
         if use_reencode:
@@ -601,23 +602,15 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
 
         # Setup upload_runner
         if use_upload:
-            stop_events = [reencode_complete_event] if use_reencode else []
             upload_runner = UploadJobRunner(
                 gemini_upload_jobs_queue,
                 settings,
                 settings.thread.uploads,
                 uploader=GeminiFileUploader(settings),
                 on_complete=partial(on_stage_complete, "upload"),
-                stop_events=stop_events,
             )
 
         # Setup scene_detection_runner
-        scene_stop_events = []
-        if use_upload:
-            scene_stop_events.append(gemini_upload_complete_event)
-        elif use_reencode:
-            scene_stop_events.append(reencode_complete_event)
-
         if use_lyrics:
             assert agent_scene is not None
             scene_detection_runner = LyricsSceneJobRunner(
@@ -626,25 +619,15 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                 settings.thread.lyrics,
                 agent_scene,
                 on_complete=partial(on_stage_complete, "lyrics"),
-                stop_events=scene_stop_events,
             )
 
         # Setup subtitle_runner
-        subtitle_stop_events = []
-        if use_lyrics:
-            subtitle_stop_events.append(scene_detection_complete_event)
-        elif use_upload:
-            subtitle_stop_events.append(gemini_upload_complete_event)
-        elif use_reencode:
-            subtitle_stop_events.append(reencode_complete_event)
-
         subtitle_runner = SubtitleJobRunner(
             subtitle_jobs_queue,
             settings,
             settings.thread.subtitles,
             agent_subtitles,
             on_complete=None,
-            stop_events=subtitle_stop_events,
         )
 
         # Step 3: Populate the job queues.
@@ -707,7 +690,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                     bitrate_kb=settings.split.re_encode.bitrate_kb,
                     duration_tolerance_ms=settings.split.re_encode.duration_tolerance_ms,
                 )
-                reencode_jobs_queue.append(job_state)
+                reencode_jobs_queue.put_nowait(job_state)
                 continue
 
             # 2. Check Upload
@@ -717,7 +700,7 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                     python_file=split,
                     video_duration_ms=duration,
                 )
-                gemini_upload_jobs_queue.append(job_state)
+                gemini_upload_jobs_queue.put_nowait(job_state)
                 continue
 
             # 3. Check Lyrics
@@ -731,13 +714,13 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                         file=split,
                         video_duration_ms=duration,
                     )
-                    scene_detection_jobs_queue.append(job_state)
+                    scene_detection_jobs_queue.put_nowait(job_state)
                     continue
                 elif job_state.lyrics.file is None:
                     # Resumption: 'file' is excluded from JSON save. Restore local split path.
                     job_state.lyrics.file = split
                     if not job_state.lyrics.response:
-                        scene_detection_jobs_queue.append(job_state)
+                        scene_detection_jobs_queue.put_nowait(job_state)
                         continue
 
             # 4. Subtitles
@@ -750,11 +733,11 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
                     file=split,
                     video_duration_ms=duration,
                 )
-                subtitle_jobs_queue.append(job_state)
+                subtitle_jobs_queue.put_nowait(job_state)
             elif job_state.subtitles.file is None:
                 # Resumption: 'file' is excluded from JSON save. Restore local split path.
                 job_state.subtitles.file = split
-                subtitle_jobs_queue.append(job_state)
+                subtitle_jobs_queue.put_nowait(job_state)
 
         # Step 4: Start all runners and wait for them to complete
         # Start runners
@@ -768,27 +751,19 @@ def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
 
         # Wait for runners to complete and signal as needed
         if reencode_runner:
-            reencode_runner.wait()
-            reencode_complete_event.set()
+            await reencode_jobs_queue.join()
+            await reencode_runner.shutdown()
 
         if upload_runner:
-            upload_runner.wait()
-            gemini_upload_complete_event.set()
+            await gemini_upload_jobs_queue.join()
+            await upload_runner.shutdown()
 
         if scene_detection_runner:
-            scene_detection_runner.wait()
-            scene_detection_complete_event.set()
+            await scene_detection_jobs_queue.join()
+            await scene_detection_runner.shutdown()
 
-        subtitle_runner.wait()
-
-        # Shutdown runners when all done
-        if reencode_runner:
-            reencode_runner.shutdown()
-        if upload_runner:
-            upload_runner.shutdown()
-        if scene_detection_runner:
-            scene_detection_runner.shutdown()
-        subtitle_runner.shutdown()
+        await subtitle_jobs_queue.join()
+        await subtitle_runner.shutdown()
 
         # Step 5: Assemble the final subtitle file.
         result = stitch_subtitles(video_splits, settings)
@@ -809,7 +784,7 @@ def main() -> None:
     # Parse settings from CLI arguments, environment variables, and .env file.
     settings = CliApp.run(Settings)
 
-    sys.exit(ai_sub(settings).value)
+    sys.exit(asyncio.run(ai_sub(settings)).value)
 
 
 if __name__ == "__main__":
