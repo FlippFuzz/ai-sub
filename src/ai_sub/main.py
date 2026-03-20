@@ -453,7 +453,13 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         )
 
         # Get durations in parallel
-        tasks = [get_video_duration_ms(path) for path in video_splits_paths]
+        semaphore = asyncio.Semaphore(8)
+
+        async def probe_with_sema(path: Path) -> int:
+            async with semaphore:
+                return await get_video_duration_ms(path)
+
+        tasks = [probe_with_sema(path) for path in video_splits_paths]
         durations = await asyncio.gather(*tasks)
         video_splits: list[tuple[Path, int]] = list(
             zip(video_splits_paths, durations, strict=True)
