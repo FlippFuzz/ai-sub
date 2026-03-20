@@ -739,12 +739,12 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         # Step 4: Start all runners and wait for them to complete
         # Start runners
         if reencode_runner:
-            reencode_runner.start()
+            await reencode_runner.start()
         if upload_runner:
-            upload_runner.start()
+            await upload_runner.start()
         if scene_detection_runner:
-            scene_detection_runner.start()
-        subtitle_runner.start()
+            await scene_detection_runner.start()
+        await subtitle_runner.start()
 
         # Wait for runners to complete and signal as needed
         if reencode_runner:

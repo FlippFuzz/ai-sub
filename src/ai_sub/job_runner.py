@@ -49,7 +49,7 @@ class JobRunner:
         self.name = name
         self.tasks: list[asyncio.Task] = []
 
-    def start(self) -> None:
+    async def start(self) -> None:
         """Starts the worker tasks."""
         self.tasks = [asyncio.create_task(self.run()) for _ in range(self.max_workers)]
 
