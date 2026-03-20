@@ -91,6 +91,11 @@ class GeminiCliModel(Model):
     def provider(self) -> GeminiCliProvider:
         return self._provider
 
+    def _write_prompt_file(self, path: Path, content: str) -> None:
+        """Writes the prompt to a file synchronously (to be used in a thread)."""
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
     async def request(
         self,
         messages: list[ModelMessage],
@@ -146,8 +151,7 @@ class GeminiCliModel(Model):
             # Write the prompt to a unique .md file in the video directory
             prompt_file_name = f"{video_path.stem}-prompt.md"
             prompt_file = video_directory / prompt_file_name
-            with open(prompt_file, "w", encoding="utf-8") as f:
-                f.write(prompt)
+            await asyncio.to_thread(self._write_prompt_file, prompt_file, prompt)
 
             if self._cli_settings.overwrite_system_prompt:
                 prompt_arg = f"@{video_path.name}"
@@ -198,9 +202,14 @@ class GeminiCliModel(Model):
                 except asyncio.TimeoutError:
                     if sys.platform == "win32":
                         # Kill the entire process tree
-                        subprocess.run(
-                            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                            capture_output=True,
+                        await asyncio.create_subprocess_exec(
+                            "taskkill",
+                            "/F",
+                            "/T",
+                            "/PID",
+                            str(process.pid),
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
                         )
                     try:
                         process.kill()

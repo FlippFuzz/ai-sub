@@ -473,7 +473,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         # Step 2: Configure the job processing pipeline.
 
         # Initialize data structures for concurrent processing.
-        # Deques are used as thread-safe queues for managing jobs.
+        # Asyncio Queues are used for managing jobs between coroutines.
         reencode_jobs_queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
         gemini_upload_jobs_queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
         scene_detection_jobs_queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
