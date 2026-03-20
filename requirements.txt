@@ -6,4 +6,3 @@ pydantic-settings
 pyrate-limiter
 json_repair
 black
-nest_asyncio2
