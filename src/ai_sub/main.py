@@ -51,13 +51,12 @@ class ReEncodeJobRunner(JobRunner):
 
     def __init__(
         self,
-        queue: asyncio.Queue[SegmentJobs],
         settings: Settings,
         max_workers: int,
         on_complete: Callable[[SegmentJobs, Any], Awaitable[None]],
         name: str = "reencode",
     ):
-        super().__init__(queue, settings, max_workers, on_complete, name=name)
+        super().__init__(settings, max_workers, on_complete, name=name)
 
     async def process(self, job: SegmentJobs) -> None:
         """
@@ -92,14 +91,13 @@ class UploadJobRunner(JobRunner):
 
     def __init__(
         self,
-        queue: asyncio.Queue[SegmentJobs],
         settings: Settings,
         max_workers: int,
         uploader: GeminiFileUploader,
         on_complete: Callable[[SegmentJobs, Any], Awaitable[None]],
         name: str = "upload",
     ):
-        super().__init__(queue, settings, max_workers, on_complete, name=name)
+        super().__init__(settings, max_workers, on_complete, name=name)
         self.uploader = uploader
 
     async def process(self, job: SegmentJobs) -> Any:
@@ -124,14 +122,13 @@ class LyricsSceneJobRunner(JobRunner):
 
     def __init__(
         self,
-        queue: asyncio.Queue[SegmentJobs],
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
         on_complete: Callable[[SegmentJobs, Any], Awaitable[None]],
         name: str = "lyrics",
     ):
-        super().__init__(queue, settings, max_workers, on_complete, name=name)
+        super().__init__(settings, max_workers, on_complete, name=name)
         self.agent = agent
         self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(
             self.agent.model_name
@@ -177,14 +174,13 @@ class SubtitleJobRunner(JobRunner):
 
     def __init__(
         self,
-        queue: asyncio.Queue[SegmentJobs],
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
         on_complete: Callable[[SegmentJobs, Any], Awaitable[None]] | None = None,
         name: str = "subtitles",
     ):
-        super().__init__(queue, settings, max_workers, on_complete, name=name)
+        super().__init__(settings, max_workers, on_complete, name=name)
         self.agent = agent
         self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(
             self.agent.model_name
@@ -480,13 +476,6 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
         # Step 2: Configure the job processing pipeline.
 
-        # Initialize data structures for concurrent processing.
-        # Asyncio Queues are used for managing jobs between coroutines.
-        reencode_jobs_queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
-        gemini_upload_jobs_queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
-        scene_detection_jobs_queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
-        subtitle_jobs_queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
-
         use_reencode = settings.split.re_encode.enabled
         is_google_sub = agent_subtitles.is_google()
         is_google_scene = agent_scene.is_google() if agent_scene else False
@@ -560,7 +549,8 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     python_file=file_handle,
                     video_duration_ms=duration_ms,
                 )
-                gemini_upload_jobs_queue.put_nowait(job)
+                if upload_runner:
+                    await upload_runner.add_job(job)
 
             elif next_stage == "lyrics":
                 existing_lyrics = job.lyrics
@@ -576,7 +566,8 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                         )
 
                 job.lyrics = new_lyrics_job
-                scene_detection_jobs_queue.put_nowait(job)
+                if scene_detection_runner:
+                    await scene_detection_runner.add_job(job)
 
             elif next_stage == "subtitles":
                 existing_subs = job.subtitles
@@ -592,12 +583,12 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                         )
 
                 job.subtitles = new_subs_job
-                subtitle_jobs_queue.put_nowait(job)
+                if subtitle_runner:
+                    await subtitle_runner.add_job(job)
 
         # Setup reencode_runner
         if use_reencode:
             reencode_runner = ReEncodeJobRunner(
-                reencode_jobs_queue,
                 settings,
                 settings.thread.re_encode,
                 on_complete=partial(on_stage_complete, "reencode"),
@@ -606,7 +597,6 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         # Setup upload_runner
         if use_upload:
             upload_runner = UploadJobRunner(
-                gemini_upload_jobs_queue,
                 settings,
                 settings.thread.uploads,
                 uploader=GeminiFileUploader(settings),
@@ -617,7 +607,6 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         if use_lyrics:
             assert agent_scene is not None
             scene_detection_runner = LyricsSceneJobRunner(
-                scene_detection_jobs_queue,
                 settings,
                 settings.thread.lyrics,
                 agent_scene,
@@ -626,7 +615,6 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
         # Setup subtitle_runner
         subtitle_runner = SubtitleJobRunner(
-            subtitle_jobs_queue,
             settings,
             settings.thread.subtitles,
             agent_subtitles,
@@ -693,7 +681,8 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     bitrate_kb=settings.split.re_encode.bitrate_kb,
                     duration_tolerance_ms=settings.split.re_encode.duration_tolerance_ms,
                 )
-                reencode_jobs_queue.put_nowait(job_state)
+                if reencode_runner:
+                    await reencode_runner.add_job(job_state)
                 continue
 
             # 2. Check Upload
@@ -703,7 +692,8 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     python_file=split,
                     video_duration_ms=duration,
                 )
-                gemini_upload_jobs_queue.put_nowait(job_state)
+                if upload_runner:
+                    await upload_runner.add_job(job_state)
                 continue
 
             # 3. Check Lyrics
@@ -717,13 +707,15 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                         file=split,
                         video_duration_ms=duration,
                     )
-                    scene_detection_jobs_queue.put_nowait(job_state)
+                    if scene_detection_runner:
+                        await scene_detection_runner.add_job(job_state)
                     continue
                 elif job_state.lyrics.file is None:
                     # Resumption: 'file' is excluded from JSON save. Restore local split path.
                     job_state.lyrics.file = split
                     if not job_state.lyrics.response:
-                        scene_detection_jobs_queue.put_nowait(job_state)
+                        if scene_detection_runner:
+                            await scene_detection_runner.add_job(job_state)
                         continue
 
             # 4. Subtitles
@@ -736,11 +728,13 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     file=split,
                     video_duration_ms=duration,
                 )
-                subtitle_jobs_queue.put_nowait(job_state)
+                if subtitle_runner:
+                    await subtitle_runner.add_job(job_state)
             elif job_state.subtitles.file is None:
                 # Resumption: 'file' is excluded from JSON save. Restore local split path.
                 job_state.subtitles.file = split
-                subtitle_jobs_queue.put_nowait(job_state)
+                if subtitle_runner:
+                    await subtitle_runner.add_job(job_state)
 
         # Step 4: Start all runners and wait for them to complete
         # Start runners
@@ -754,18 +748,18 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
         # Wait for runners to complete and signal as needed
         if reencode_runner:
-            await reencode_jobs_queue.join()
+            await reencode_runner.join()
             await reencode_runner.shutdown()
 
         if upload_runner:
-            await gemini_upload_jobs_queue.join()
+            await upload_runner.join()
             await upload_runner.shutdown()
 
         if scene_detection_runner:
-            await scene_detection_jobs_queue.join()
+            await scene_detection_runner.join()
             await scene_detection_runner.shutdown()
 
-        await subtitle_jobs_queue.join()
+        await subtitle_runner.join()
         await subtitle_runner.shutdown()
 
         # Step 5: Assemble the final subtitle file.

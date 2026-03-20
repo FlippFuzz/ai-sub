@@ -23,7 +23,6 @@ class JobRunner:
 
     def __init__(
         self,
-        queue: asyncio.Queue[SegmentJobs],
         settings: Settings,
         max_workers: int,
         on_complete: Callable[[SegmentJobs, Any], Awaitable[None]] | None = None,
@@ -32,7 +31,6 @@ class JobRunner:
         """Initializes the JobRunner.
 
         Args:
-            queue (asyncio.Queue[SegmentJobs]): The queue from which to pull job containers for processing.
             settings (Settings): The application's configuration settings.
             max_workers (int): The maximum number of concurrent tasks.
             on_complete (Callable[[SegmentJobs, Any], Awaitable[None]] | None): An optional callback
@@ -42,12 +40,20 @@ class JobRunner:
                 dynamically access the corresponding job attribute from the `SegmentJobs` object
                 (e.g., a runner with name 'reencode' will process `job_state.reencode`).
         """
-        self.queue = queue
+        self.queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
         self.settings = settings
         self.max_workers = max_workers
         self.on_complete = on_complete
         self.name = name
         self.tasks: list[asyncio.Task] = []
+
+    async def add_job(self, job: SegmentJobs) -> None:
+        """Adds a job to the runner's queue."""
+        await self.queue.put(job)
+
+    async def join(self) -> None:
+        """Waits until all items in the queue have been processed."""
+        await self.queue.join()
 
     async def start(self) -> None:
         """Starts the worker tasks."""
@@ -195,4 +201,4 @@ class JobRunner:
         if can_retry_run and can_retry_total:
             await asyncio.sleep(self.settings.retry.delay)
             # Put back into the queue. Note: asyncio.Queue is FIFO, so it goes to the back.
-            await self.queue.put(job_state)
+            await self.add_job(job_state)
