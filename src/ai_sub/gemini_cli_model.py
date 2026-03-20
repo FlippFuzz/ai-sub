@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -169,42 +170,56 @@ class GeminiCliModel(Model):
                 "json",
             ]
             try:
-                with subprocess.Popen(
-                    cmd,
-                    cwd=video_directory,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    # On Windows, shell=True is required to execute batch files/scripts (like npm binaries).
-                    # On Linux, shell=True with a list of args causes the args to be passed to the shell itself,
-                    # effectively stripping them from the command, so we must use shell=False.
-                    shell=sys.platform == "win32",
-                ) as process:
+                # On Windows, shell=True is required to execute batch files/scripts (like npm binaries).
+                # asyncio.create_subprocess_exec does not support shell=True directly.
+                # We use create_subprocess_shell on Windows, and create_subprocess_exec elsewhere.
+                if sys.platform == "win32":
+                    cmd_str = subprocess.list2cmdline(cmd)
+                    process = await asyncio.create_subprocess_shell(
+                        cmd_str,
+                        cwd=video_directory,
+                        env=env,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                else:
+                    process = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        cwd=video_directory,
+                        env=env,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+
+                try:
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        process.communicate(), timeout=self._cli_settings.timeout
+                    )
+                except asyncio.TimeoutError:
+                    if sys.platform == "win32":
+                        # Kill the entire process tree
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                            capture_output=True,
+                        )
                     try:
-                        stdout, stderr = process.communicate(
-                            timeout=self._cli_settings.timeout
-                        )
-                    except subprocess.TimeoutExpired:
-                        if sys.platform == "win32":
-                            # Kill the entire process tree
-                            subprocess.run(
-                                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-                                capture_output=True,
-                            )
                         process.kill()
-                        process.communicate()
-                        raise
+                    except OSError:
+                        pass
+                    await process.communicate()
+                    raise subprocess.TimeoutExpired(cmd, self._cli_settings.timeout)
 
-                    if process.returncode != 0:
-                        raise subprocess.CalledProcessError(
-                            process.returncode, cmd, output=stdout, stderr=stderr
-                        )
+                stdout = stdout_bytes.decode("utf-8", errors="replace")
+                stderr = stderr_bytes.decode("utf-8", errors="replace")
 
-            except subprocess.TimeoutExpired as e:
+                if process.returncode != 0:
+                    raise subprocess.CalledProcessError(
+                        process.returncode or 1, cmd, output=stdout, stderr=stderr
+                    )
+
+            except subprocess.TimeoutExpired:
                 logfire.exception(
-                    f"Gemini CLI timed out.\nStdout: {e.stdout}\nStderr: {e.stderr}"
+                    f"Gemini CLI timed out after {self._cli_settings.timeout}s."
                 )
                 raise
             except subprocess.CalledProcessError as e:

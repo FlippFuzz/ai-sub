@@ -150,10 +150,7 @@ class LyricsSceneJobRunner(JobRunner):
             return
 
         assert lyrics_job.file is not None
-        # agent.run uses nest_asyncio and run_sync, so we wrap it in a thread
-        # to avoid blocking the main event loop.
-        lyrics_job.response = await asyncio.to_thread(
-            self.agent.run,
+        lyrics_job.response = await self.agent.run(
             get_lyrics_scenes_prompt(),
             lyrics_job.file,
             lyrics_job.video_duration_ms,
@@ -210,8 +207,7 @@ class SubtitleJobRunner(JobRunner):
 
         prompt = get_subtitle_prompt(scene_response)
         assert subtitle_job.file is not None
-        subtitle_job.response = await asyncio.to_thread(
-            self.agent.run,
+        subtitle_job.response = await self.agent.run(
             prompt,
             subtitle_job.file,
             subtitle_job.video_duration_ms,
