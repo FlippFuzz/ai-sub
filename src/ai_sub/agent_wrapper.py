@@ -1,5 +1,6 @@
 from __future__ import annotations as _annotations
 
+import asyncio
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -224,7 +225,7 @@ class RateLimitedAgentWrapper:
             # and send it as binary content.
             # TODO: This is not tested. Only tested against Google's models
             python_file = cast(Path, video)
-            data = python_file.read_bytes()
+            data = await asyncio.to_thread(python_file.read_bytes)
             user_prompt = [
                 BinaryContent(data=data, media_type=f"video/{python_file.suffix[1:]}"),
                 prompt,

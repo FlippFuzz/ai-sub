@@ -13,12 +13,12 @@ class JobRunner:
     """
     A generic, concurrent job processor.
 
-    This class provides a framework for processing `JobState` objects from an
+    This class provides a framework for processing `SegmentJobs` objects from an
     asyncio.Queue in a concurrent manner using `asyncio.Task`. It handles job
     acquisition, retries on failure, and graceful shutdown.
 
     Subclasses must implement the `process` method to define the actual work.
-    The `on_complete` callback can be used to chain dependent jobs.
+    The `on_complete` callback can be used to chain dependent jobs by creating the next job in the pipeline.
     """
 
     def __init__(
@@ -32,14 +32,14 @@ class JobRunner:
         """Initializes the JobRunner.
 
         Args:
-            queue (asyncio.Queue[JobState]): The queue from which to pull job states for processing.
+            queue (asyncio.Queue[SegmentJobs]): The queue from which to pull job containers for processing.
             settings (Settings): The application's configuration settings.
             max_workers (int): The maximum number of concurrent tasks.
-            on_complete (Callable[[JobState, Any], Awaitable[None]] | None): An optional callback
+            on_complete (Callable[[SegmentJobs, Any], Awaitable[None]] | None): An optional callback
                 function that is executed upon successful completion of a job. It receives
-                the job state and the result of the `process` method.
+                the job container and the result of the `process` method.
             name (str): The name of the runner. This name is crucial as it's used to
-                dynamically access the corresponding job attribute from the `JobState` object
+                dynamically access the corresponding job attribute from the `SegmentJobs` object
                 (e.g., a runner with name 'reencode' will process `job_state.reencode`).
         """
         self.queue = queue
@@ -65,10 +65,10 @@ class JobRunner:
         The main worker loop that processes jobs from the async queue.
 
         This method runs in a continuous loop on each worker task. It attempts to
-        get a `JobState` from the queue. It exits when the task is cancelled.
+        get a `SegmentJobs` container from the queue. It exits when the task is cancelled.
 
-        For each `JobState`, it:
-        1. Uses `get_job()` to retrieve the specific `Job` object for this runner.
+        For each `SegmentJobs`, it:
+        1. Uses `get_job()` to retrieve the specific `Job` object (e.g. `reencode`) for this runner.
         2. Increments the job's retry counters.
         3. Calls the `process()` method to perform the work (async).
         4. On success, calls the `on_complete` callback if it exists.
@@ -81,13 +81,13 @@ class JobRunner:
 
             try:
                 try:
-                    # Attempt to get a JobState container from the queue (async blocking).
+                    # Attempt to get a SegmentJobs container from the queue (async blocking).
                     job_state = await self.queue.get()
                 except asyncio.CancelledError:
                     # Task cancellation requested.
                     break
 
-                # Get the specific job for this runner from the JobState container.
+                # Get the specific job for this runner from the SegmentJobs container.
                 current_job = self.get_job(job_state)
 
                 # Increment retry counters for the specific job.
@@ -124,19 +124,19 @@ class JobRunner:
 
     def get_job(self, job_state: SegmentJobs) -> Job:
         """
-        Selects the correct Job from the JobState based on the runner's name.
+        Selects the correct Job from the SegmentJobs container based on the runner's name.
 
         This method uses the `name` attribute of the runner to dynamically
-        access the corresponding job field within the `JobState` container.
+        access the corresponding job field within the `SegmentJobs` container.
         For example, if the runner's name is "reencode", this method will
         return `job_state.reencode`.
 
         Args:
-            job_state (JobState): The container holding all jobs for a segment.
+            job_state (SegmentJobs): The container holding all jobs for a segment.
 
         Raises:
             ValueError: If the job corresponding to the runner's name is not
-                        found in the `JobState`.
+                        found in the `SegmentJobs` container.
 
         Returns:
             Job: The specific job instance for this runner to process.
@@ -151,7 +151,7 @@ class JobRunner:
         Performs the actual processing for a job. Must be implemented by subclasses.
 
         Args:
-            job (JobState): The `JobState` container. Subclasses can access their
+            job (SegmentJobs): The `SegmentJobs` container. Subclasses can access their
                             specific job object (e.g., `job.reencode`) and any
                             other prerequisite data from this container.
 
@@ -173,7 +173,7 @@ class JobRunner:
         save state, or other final actions.
 
         Args:
-            job (JobState): The `JobState` container that was just processed.
+            job (SegmentJobs): The `SegmentJobs` container that was just processed.
         """
         pass
 
@@ -183,10 +183,10 @@ class JobRunner:
         It checks if the job's retry counts (`run_num_retries` for the current
         application execution and `total_num_retries` across all executions)
         are within the configured limits. If they are, it waits for a delay
-        and puts the `JobState` back into the queue.
+        and puts the `SegmentJobs` back into the queue.
 
         Args:
-            job_state (JobState): The `JobState` container of the failed job.
+            job_state (SegmentJobs): The `SegmentJobs` container of the failed job.
             job (Job): The specific `Job` instance that failed.
         """
         can_retry_run = job.run_num_retries < self.settings.retry.run

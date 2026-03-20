@@ -103,7 +103,8 @@ class GeminiCliModel(Model):
         model_request_parameters: ModelRequestParameters | None,
     ) -> ModelResponse:
         """
-        Executes the Gemini CLI.
+        Executes the Gemini CLI to process the request.
+        This involves writing the prompt to a file, setting up the environment, and running the subprocess.
         """
         prompt_parts: list[str] = []
         video_path: Path | None = None

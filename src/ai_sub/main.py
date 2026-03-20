@@ -641,7 +641,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
             lyrics_job_path = (
                 settings.dir.tmp / f"{split.stem}.lyrics.{sanitized_lyrics_model}.json"
             )
-            lyrics_job = LyricsSceneJob.load(lyrics_job_path)
+            lyrics_job = await asyncio.to_thread(LyricsSceneJob.load, lyrics_job_path)
             if lyrics_job:
                 job_state.lyrics = lyrics_job
 
@@ -649,7 +649,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                 settings.dir.tmp
                 / f"{split.stem}.subtitles.{sanitized_subtitles_model}.json"
             )
-            subtitle_job = SubtitleJob.load(subtitle_job_path)
+            subtitle_job = await asyncio.to_thread(SubtitleJob.load, subtitle_job_path)
             if subtitle_job:
                 job_state.subtitles = subtitle_job
 
@@ -761,7 +761,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         await subtitle_runner.shutdown()
 
         # Step 5: Assemble the final subtitle file.
-        result = stitch_subtitles(video_splits, settings)
+        result = await asyncio.to_thread(stitch_subtitles, video_splits, settings)
 
         logfire.info(f"Done - {result.name}")
         return result
