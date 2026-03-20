@@ -455,7 +455,9 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         # Get durations in parallel
         tasks = [get_video_duration_ms(path) for path in video_splits_paths]
         durations = await asyncio.gather(*tasks)
-        video_splits: list[tuple[Path, int]] = list(zip(video_splits_paths, durations))
+        video_splits: list[tuple[Path, int]] = list(
+            zip(video_splits_paths, durations, strict=True)
+        )
 
         chunks_to_skip = int(
             (settings.split.start_offset_min * 60) / settings.split.max_seconds

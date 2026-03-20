@@ -200,10 +200,10 @@ class GeminiCliModel(Model):
                     stdout_bytes, stderr_bytes = await asyncio.wait_for(
                         process.communicate(), timeout=self._cli_settings.timeout
                     )
-                except asyncio.TimeoutError:
+                except asyncio.TimeoutError as err:
                     if sys.platform == "win32":
                         # Kill the entire process tree
-                        await asyncio.create_subprocess_exec(
+                        proc = await asyncio.create_subprocess_exec(
                             "taskkill",
                             "/F",
                             "/T",
@@ -212,12 +212,20 @@ class GeminiCliModel(Model):
                             stdout=asyncio.subprocess.DEVNULL,
                             stderr=asyncio.subprocess.DEVNULL,
                         )
+                        await proc.wait()
+                        if proc.returncode != 0:
+                            logfire.warning(
+                                f"Failed to taskkill process {process.pid}, return code: {proc.returncode}"
+                            )
+
                     try:
                         process.kill()
                     except OSError:
                         pass
                     await process.communicate()
-                    raise subprocess.TimeoutExpired(cmd, self._cli_settings.timeout)
+                    raise subprocess.TimeoutExpired(
+                        cmd, self._cli_settings.timeout
+                    ) from err
 
                 stdout = stdout_bytes.decode("utf-8", errors="replace")
                 stderr = stderr_bytes.decode("utf-8", errors="replace")

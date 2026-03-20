@@ -202,7 +202,7 @@ class RateLimitedAgentWrapper:
                 ]
             else:
                 python_file = cast(Path, video)
-                data = python_file.read_bytes()
+                data = await asyncio.to_thread(python_file.read_bytes)
                 user_prompt = [
                     BinaryContent(
                         data=data, media_type=f"video/{python_file.suffix[1:]}"

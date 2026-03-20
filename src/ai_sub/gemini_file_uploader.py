@@ -92,7 +92,7 @@ class GeminiFileUploader:
             if (now - self._last_update_time) > self._list_cache_ttl_seconds:
                 # The cache is stale, refresh it.
                 self._state = {}
-                for file in await self._client.aio.files.list(
+                async for file in await self._client.aio.files.list(
                     config=ListFilesConfig(page_size=100)
                 ):
                     if file.display_name:
