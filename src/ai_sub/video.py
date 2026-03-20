@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 from pathlib import Path
 
@@ -5,7 +6,26 @@ import logfire
 import static_ffmpeg
 
 
-def get_video_duration_ms(video_path: Path) -> int:
+async def _run_ffmpeg(cmd: list[str]) -> str:
+    """Helper to run ffmpeg command asynchronously."""
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+
+    stdout_str = stdout.decode("utf-8", errors="replace")
+    stderr_str = stderr.decode("utf-8", errors="replace")
+
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(
+            process.returncode or 1, cmd, output=stdout_str, stderr=stderr_str
+        )
+    return stdout_str
+
+
+async def get_video_duration_ms(video_path: Path) -> int:
     """Retrieves the duration of a video file in milliseconds.
 
     Args:
@@ -29,15 +49,8 @@ def get_video_duration_ms(video_path: Path) -> int:
             "default=noprint_wrappers=1:nokey=1",
             str(video_path),
         ]
-        result = subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        return int(float(result.stdout) * 1000)
+        stdout = await _run_ffmpeg(cmd)
+        return int(float(stdout) * 1000)
     except (subprocess.CalledProcessError, ValueError) as e:
         logfire.exception(f"Could not determine duration for {video_path.name}")
         raise RuntimeError(
@@ -45,7 +58,7 @@ def get_video_duration_ms(video_path: Path) -> int:
         ) from e
 
 
-def get_working_encoder() -> str:
+async def get_working_encoder() -> str:
     """
     Checks for available hardware acceleration for H.264 encoding.
     Returns the name of the encoder to use (e.g., 'h264_nvenc', 'libx264').
@@ -57,8 +70,8 @@ def get_working_encoder() -> str:
     for encoder in candidates:
         try:
             # Attempt to encode a 1-frame dummy video to null output
-            subprocess.run(
-                [
+            await _run_ffmpeg(
+                cmd=[
                     "ffmpeg",
                     "-f",
                     "lavfi",
@@ -71,12 +84,7 @@ def get_working_encoder() -> str:
                     "-f",
                     "null",
                     "-",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                ]
             )
             return encoder
         except subprocess.CalledProcessError as e:
@@ -92,7 +100,7 @@ def get_working_encoder() -> str:
 
 
 @logfire.instrument("Splitting video into segments")
-def split_video(
+async def split_video(
     input_video: Path,
     output_dir: Path,
     split_duration_s: int,
@@ -131,10 +139,13 @@ def split_video(
 
     if existing_segments:
         try:
-            input_duration = get_video_duration_ms(input_video)
-            total_segment_duration = sum(
-                get_video_duration_ms(s) for s in existing_segments
+            input_duration = await get_video_duration_ms(input_video)
+
+            # Run duration checks in parallel for speed
+            durations = await asyncio.gather(
+                *[get_video_duration_ms(s) for s in existing_segments]
             )
+            total_segment_duration = sum(durations)
 
             # Allow tolerance per split
             threshold = duration_tolerance_ms * len(existing_segments)
@@ -186,14 +197,7 @@ def split_video(
     ]
 
     try:
-        subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        await _run_ffmpeg(cmd)
     except subprocess.CalledProcessError as e:
         logfire.exception(
             f"FFmpeg command failed. Stdout: {e.stdout}, Stderr: {e.stderr}"
@@ -205,7 +209,7 @@ def split_video(
     return result
 
 
-def reencode_video(
+async def reencode_video(
     input_path: Path,
     output_path: Path,
     fps: int,
@@ -234,8 +238,8 @@ def reencode_video(
     # If output file already exists, verify validity by comparing duration with input
     if output_path.exists():
         try:
-            input_duration = get_video_duration_ms(input_path)
-            output_duration = get_video_duration_ms(output_path)
+            input_duration = await get_video_duration_ms(input_path)
+            output_duration = await get_video_duration_ms(output_path)
 
             # Allow tolerance for container overhead/frame rounding
             if abs(input_duration - output_duration) < duration_tolerance_ms:
@@ -282,14 +286,7 @@ def reencode_video(
     ]
 
     try:
-        subprocess.run(
-            cmd_encode,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        await _run_ffmpeg(cmd_encode)
     except subprocess.CalledProcessError as e:
         logfire.exception(
             f"FFmpeg re-encode failed for {input_path.name}. Stdout: {e.stdout}, Stderr: {e.stderr}"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import logfire
 
@@ -26,7 +26,7 @@ class JobRunner:
         queue: asyncio.Queue[SegmentJobs],
         settings: Settings,
         max_workers: int,
-        on_complete: Callable[[SegmentJobs, Any], None] | None = None,
+        on_complete: Callable[[SegmentJobs, Any], Awaitable[None]] | None = None,
         name: str = "JobRunner",
     ):
         """Initializes the JobRunner.
@@ -35,7 +35,7 @@ class JobRunner:
             queue (asyncio.Queue[JobState]): The queue from which to pull job states for processing.
             settings (Settings): The application's configuration settings.
             max_workers (int): The maximum number of concurrent tasks.
-            on_complete (Callable[[JobState, Any], None] | None): An optional callback
+            on_complete (Callable[[JobState, Any], Awaitable[None]] | None): An optional callback
                 function that is executed upon successful completion of a job. It receives
                 the job state and the result of the `process` method.
             name (str): The name of the runner. This name is crucial as it's used to
@@ -102,7 +102,7 @@ class JobRunner:
                 try:
                     result = await self.process(job_state)
                     if self.on_complete:
-                        self.on_complete(job_state, result)
+                        await self.on_complete(job_state, result)
 
                 except Exception:
                     job_name = f"'{current_job.name}'" if current_job else "unknown"

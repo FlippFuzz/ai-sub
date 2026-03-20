@@ -7,7 +7,7 @@ import sys
 from functools import partial
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import logfire
 from pydantic_settings import CliApp
@@ -54,7 +54,7 @@ class ReEncodeJobRunner(JobRunner):
         queue: asyncio.Queue[SegmentJobs],
         settings: Settings,
         max_workers: int,
-        on_complete: Callable[[SegmentJobs, Any], None],
+        on_complete: Callable[[SegmentJobs, Any], Awaitable[None]],
         name: str = "reencode",
     ):
         super().__init__(queue, settings, max_workers, on_complete, name=name)
@@ -67,8 +67,7 @@ class ReEncodeJobRunner(JobRunner):
         """
         reencode_job = job.reencode
         assert reencode_job is not None
-        await asyncio.to_thread(
-            reencode_video,
+        await reencode_video(
             reencode_job.input_file,
             reencode_job.output_file,
             reencode_job.fps,
@@ -97,7 +96,7 @@ class UploadJobRunner(JobRunner):
         settings: Settings,
         max_workers: int,
         uploader: GeminiFileUploader,
-        on_complete: Callable[[SegmentJobs, Any], None],
+        on_complete: Callable[[SegmentJobs, Any], Awaitable[None]],
         name: str = "upload",
     ):
         super().__init__(queue, settings, max_workers, on_complete, name=name)
@@ -131,7 +130,7 @@ class LyricsSceneJobRunner(JobRunner):
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
-        on_complete: Callable[[SegmentJobs, Any], None],
+        on_complete: Callable[[SegmentJobs, Any], Awaitable[None]],
         name: str = "lyrics",
     ):
         super().__init__(queue, settings, max_workers, on_complete, name=name)
@@ -187,7 +186,7 @@ class SubtitleJobRunner(JobRunner):
         settings: Settings,
         max_workers: int,
         agent: RateLimitedAgentWrapper,
-        on_complete: Callable[[SegmentJobs, Any], None] | None = None,
+        on_complete: Callable[[SegmentJobs, Any], Awaitable[None]] | None = None,
         name: str = "subtitles",
     ):
         super().__init__(queue, settings, max_workers, on_complete, name=name)
@@ -427,7 +426,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
     if settings.split.re_encode.enabled and not settings.split.re_encode.encoder:
         with logfire.span("Detecting hardware encoder"):
-            settings.split.re_encode.encoder = get_working_encoder()
+            settings.split.re_encode.encoder = await get_working_encoder()
             logfire.info(f"Using encoder: {settings.split.re_encode.encoder}")
 
     # Initialize the AI Agent.
@@ -451,16 +450,18 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
     with logfire.span(f"Generating subtitles for {settings.input_video_file.name}"):
 
         # Step 1: Split the input video into smaller segments.
-        video_splits_paths = split_video(
+        video_splits_paths = await split_video(
             settings.input_video_file,
             settings.dir.tmp,
             settings.split.max_seconds,
             output_pattern="part_%03d",
             duration_tolerance_ms=settings.split.re_encode.duration_tolerance_ms,
         )
-        video_splits: list[tuple[Path, int]] = [
-            (path, get_video_duration_ms(path)) for path in video_splits_paths
-        ]
+
+        # Get durations in parallel
+        tasks = [get_video_duration_ms(path) for path in video_splits_paths]
+        durations = await asyncio.gather(*tasks)
+        video_splits: list[tuple[Path, int]] = list(zip(video_splits_paths, durations))
 
         chunks_to_skip = int(
             (settings.split.start_offset_min * 60) / settings.split.max_seconds
@@ -499,7 +500,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         # Define callbacks
         # These functions handle the transition between pipeline stages.
         # When a job completes, the next required job is created and queued.
-        def on_stage_complete(stage: str, job: SegmentJobs, result: Any) -> None:
+        async def on_stage_complete(stage: str, job: SegmentJobs, result: Any) -> None:
             """Handles the transition between pipeline stages."""
             file_handle: Any = result
             duration_ms: int = 0
@@ -510,7 +511,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                 assert job.reencode is not None
                 name = job.reencode.name
                 file_handle = job.reencode.output_file
-                duration_ms = get_video_duration_ms(file_handle)
+                duration_ms = await get_video_duration_ms(file_handle)
             elif stage == "upload":
                 assert job.upload is not None
                 name = job.upload.name
