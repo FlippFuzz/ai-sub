@@ -232,8 +232,13 @@ class SubtitleJobRunner(JobRunner):
             sanitized_model = self.settings.ai.get_sanitized_model_name(
                 self.settings.ai.model_subtitles
             )
+
+            def _save_ssa(response: SubtitleAiResponse, path: str) -> None:
+                response.get_ssafile().save(path)
+
             await asyncio.to_thread(
-                subtitle_job.response.get_ssafile().save,
+                _save_ssa,
+                subtitle_job.response,
                 str(
                     self.settings.dir.tmp / f"{subtitle_job.name}.{sanitized_model}.srt"
                 ),

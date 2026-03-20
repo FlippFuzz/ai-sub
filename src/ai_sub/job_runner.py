@@ -57,6 +57,8 @@ class JobRunner:
 
     async def start(self) -> None:
         """Starts the worker tasks."""
+        if self.max_workers <= 0:
+            raise ValueError(f"max_workers must be > 0, got {self.max_workers}")
         self.tasks = [asyncio.create_task(self.run()) for _ in range(self.max_workers)]
 
     async def shutdown(self) -> None:
@@ -83,50 +85,52 @@ class JobRunner:
         """
         while True:
             job_state: SegmentJobs | None = None
-            current_job: Job | None = None
 
             try:
+                # Attempt to get a SegmentJobs container from the queue (async blocking).
+                job_state = await self.queue.get()
+            except asyncio.CancelledError:
+                # Task cancellation requested.
+                break
+
+            try:
+                current_job: Job | None = None
                 try:
-                    # Attempt to get a SegmentJobs container from the queue (async blocking).
-                    job_state = await self.queue.get()
-                except asyncio.CancelledError:
-                    # Task cancellation requested.
-                    break
+                    # Get the specific job for this runner from the SegmentJobs container.
+                    current_job = self.get_job(job_state)
 
-                # Get the specific job for this runner from the SegmentJobs container.
-                current_job = self.get_job(job_state)
-
-                # Increment retry counters for the specific job.
-                current_job.run_num_retries += 1
-                current_job.total_num_retries += 1
-
-            except Exception:
-                logfire.exception(f"Unexpected error in {self.name} runner loop")
-                continue
-
-            with logfire.span(f"Executing {self.name} job for {current_job.name}"):
-                try:
-                    result = await self.process(job_state)
-                    if self.on_complete:
-                        await self.on_complete(job_state, result)
+                    # Increment retry counters for the specific job.
+                    current_job.run_num_retries += 1
+                    current_job.total_num_retries += 1
 
                 except Exception:
-                    job_name = f"'{current_job.name}'" if current_job else "unknown"
-                    logfire.exception(
-                        f"Exception while running {self.name} job {job_name}"
-                    )
-                    if job_state is not None and current_job is not None:
-                        await self._handle_retry(job_state, current_job)
+                    logfire.exception(f"Unexpected error in {self.name} runner loop")
+                    continue
 
-                finally:
-                    if job_state is not None:
-                        try:
-                            await self.post_process(job_state)
-                        except Exception:
-                            logfire.exception(
-                                f"Exception in post_process for {self.name} job"
-                            )
-                    self.queue.task_done()
+                with logfire.span(f"Executing {self.name} job for {current_job.name}"):
+                    try:
+                        result = await self.process(job_state)
+                        if self.on_complete:
+                            await self.on_complete(job_state, result)
+
+                    except Exception:
+                        job_name = f"'{current_job.name}'" if current_job else "unknown"
+                        logfire.exception(
+                            f"Exception while running {self.name} job {job_name}"
+                        )
+                        if job_state is not None and current_job is not None:
+                            await self._handle_retry(job_state, current_job)
+
+                    finally:
+                        if job_state is not None:
+                            try:
+                                await self.post_process(job_state)
+                            except Exception:
+                                logfire.exception(
+                                    f"Exception in post_process for {self.name} job"
+                                )
+            finally:
+                self.queue.task_done()
 
     def get_job(self, job_state: SegmentJobs) -> Job:
         """
