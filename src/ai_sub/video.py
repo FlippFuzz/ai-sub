@@ -238,8 +238,10 @@ async def reencode_video(
     # If output file already exists, verify validity by comparing duration with input
     if output_path.exists():
         try:
-            input_duration = await get_video_duration_ms(input_path)
-            output_duration = await get_video_duration_ms(output_path)
+            input_duration, output_duration = await asyncio.gather(
+                get_video_duration_ms(input_path),
+                get_video_duration_ms(output_path),
+            )
 
             # Allow tolerance for container overhead/frame rounding
             if abs(input_duration - output_duration) < duration_tolerance_ms:
