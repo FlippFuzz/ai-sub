@@ -1,19 +1,20 @@
+import asyncio
 import base64
 import hashlib
 import os
 from pathlib import Path
-from threading import Lock
-from time import sleep, time
+from time import time
 from typing import Optional
 
 import logfire
+from google import genai
 from google.genai.types import (
     File,
     FileState,
+    HttpOptions,
     ListFilesConfig,
     UploadFileConfig,
 )
-from pydantic_ai.providers.google import GoogleProvider
 
 from ai_sub.config import Settings
 
@@ -49,11 +50,11 @@ class GeminiFileUploader:
     file lists to avoid redundant API calls and checking for existing files.
     """
 
-    _provider: GoogleProvider
+    _client: genai.Client
     _state: dict[str, File]
     _last_update_time: float = 0
     _list_cache_ttl_seconds: int
-    _lock: Lock
+    _lock: asyncio.Lock
 
     def __init__(self, settings: Settings) -> None:
         """
@@ -62,24 +63,23 @@ class GeminiFileUploader:
         Args:
             settings (Settings): The application configuration settings.
         """
-        self._provider = GoogleProvider(
+        http_options: Optional[HttpOptions] = None
+        if settings.ai.google.base_url:
+            http_options = HttpOptions(base_url=str(settings.ai.google.base_url))
+
+        self._client = genai.Client(
             api_key=(
                 settings.ai.google.key.get_secret_value()
                 if settings.ai.google.key
                 else None
             ),
-            http_client=None,
-            base_url=(
-                str(settings.ai.google.base_url)
-                if settings.ai.google.base_url
-                else None
-            ),
+            http_options=http_options,
         )
         self._list_cache_ttl_seconds = settings.ai.google.file_cache_ttl
         self._state = {}
-        self._lock = Lock()
+        self._lock = asyncio.Lock()
 
-    def _update_file_list(self) -> None:
+    async def _update_file_list(self) -> None:
         """
         Updates the local file list cache from the server if the cache is stale.
 
@@ -88,11 +88,11 @@ class GeminiFileUploader:
         serves as a simple rate limit to avoid excessive `files.list` API calls.
         """
         now = time()
-        with self._lock:
+        async with self._lock:
             if (now - self._last_update_time) > self._list_cache_ttl_seconds:
                 # The cache is stale, refresh it.
                 self._state = {}
-                for file in self._provider.client.files.list(
+                for file in await self._client.aio.files.list(
                     config=ListFilesConfig(page_size=100)
                 ):
                     if file.display_name:
@@ -100,7 +100,7 @@ class GeminiFileUploader:
                         self._state[display_name] = file
                 self._last_update_time = now
 
-    def _get_file(self, display_name: str) -> Optional[File]:
+    async def _get_file(self, display_name: str) -> Optional[File]:
         """
         Retrieves a file from the cached list by its display name.
         Updates the cache if it's stale.
@@ -111,10 +111,10 @@ class GeminiFileUploader:
         Returns:
             Optional[File]: The File object if found, otherwise None.
         """
-        self._update_file_list()
+        await self._update_file_list()
         return self._state.get(display_name, None)
 
-    def upload_file(self, file_path: Path) -> File:
+    async def upload_file(self, file_path: Path) -> File:
         """
         Uploads a file to Gemini Files API. If a file with the same display name
         already exists, it checks for differences (size, SHA256 hash) and
@@ -123,7 +123,7 @@ class GeminiFileUploader:
         display_name = file_path.name
 
         with logfire.span("Check if the file is already uploaded", _level="debug"):
-            file = self._get_file(display_name)
+            file = await self._get_file(display_name)
             if file is not None:
                 needs_delete = False
                 # Compare file sizes - If filesizes are different, it's not the same file.
@@ -133,7 +133,9 @@ class GeminiFileUploader:
 
                 # Compare sha256 hashes to be sure
                 if not needs_delete:
-                    sha256_hex_string = calculate_sha256(file_path)
+                    sha256_hex_string = await asyncio.to_thread(
+                        calculate_sha256, file_path
+                    )
                     base64_sha256 = base64.b64encode(
                         sha256_hex_string.encode()
                     ).decode()
@@ -142,19 +144,19 @@ class GeminiFileUploader:
 
                 if needs_delete and file.name is not None:
                     logfire.debug("Deleting old file with same name")
-                    self._provider.client.files.delete(name=file.name)
+                    await self._client.aio.files.delete(name=file.name)
                     file = None  # Reset file to trigger upload
 
         # Upload the file
         if file is None:
             with logfire.span("Uploading File", _level="debug"):
-                file = self._provider.client.files.upload(
+                file = await self._client.aio.files.upload(
                     file=file_path,
                     config=UploadFileConfig(display_name=file_path.name),
                 )
                 # We need to sleep for at least _list_cache_ttl_seconds to make sure that
                 # the cache contains the file that we just uploaded
-                sleep(self._list_cache_ttl_seconds + 1)
+                await asyncio.sleep(self._list_cache_ttl_seconds + 1)
 
         with logfire.span("Wait for the file to be ready", _level="debug"):
             while file.state != FileState.ACTIVE:
@@ -163,8 +165,12 @@ class GeminiFileUploader:
                         f"File {display_name} failed to process on the server."
                     )
 
-                sleep(1)
-                file = self._get_file(display_name)
+                await asyncio.sleep(1)
+                if file.name:
+                    file = await self._client.aio.files.get(name=file.name)
+                else:
+                    file = await self._get_file(display_name)
+
                 if not file:
                     # This shouldn't happen. We literally just uploaded the file above
                     raise RuntimeError(

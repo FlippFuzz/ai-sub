@@ -110,10 +110,8 @@ class UploadJobRunner(JobRunner):
         """
         upload_job = job.upload
         assert upload_job is not None
-        # Perform the file upload. This is a blocking operation.
-        file = await asyncio.to_thread(
-            self.uploader.upload_file, upload_job.python_file
-        )
+        # Perform the file upload.
+        file = await self.uploader.upload_file(upload_job.python_file)
         logfire.info(f"{upload_job.name} uploaded")
         logfire.debug(f"File: {file}")
         return file
