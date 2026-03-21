@@ -1,5 +1,32 @@
 # AI Sub Release Notes
 
+## v2.5.0b1
+
+This release marks a major architectural shift, migrating the core application from a threaded model to a fully asynchronous model using `asyncio`. This improves concurrency handling, reduces blocking operations, and enhances overall stability.
+
+**Refactoring (Asyncio Migration):**
+
+- **Core Architecture:**
+  - Transitioned `JobRunner` and the main orchestration loop from `concurrent.futures` and threading to `asyncio.Queue` and `asyncio.Task`.
+  - The application entry point now utilizes `asyncio.run()`.
+- **Non-Blocking I/O:**
+  - **Video Processing:** Converted FFmpeg calls (`split`, `re-encode`, `duration`) to use `asyncio.create_subprocess_exec`.
+  - **Gemini Integration:** `GeminiFileUploader` now uses the asynchronous `google.genai.Client`. CPU-intensive tasks like SHA256 hashing are offloaded to threads.
+  - **CLI Execution:** `GeminiCliModel` now uses async subprocesses for model execution and offloads prompt file writing to threads.
+  - **File Operations:** Heavy synchronous I/O operations (loading job states, reading video bytes, stitching subtitles) are now offloaded using `asyncio.to_thread` to keep the event loop responsive.
+- **Agent Execution:**
+  - Refactored `RateLimitedAgentWrapper` to use native async methods, removing the need for `nest_asyncio` and thread-local storage.
+
+**Improvements:**
+
+- **Parallelization:** Video duration checks in the splitting stage are now executed in parallel using `asyncio.gather`.
+- **Windows Stability:** Fixed a blocking I/O issue where the taskkill command (used for timeouts) relied on synchronous subprocess calls, which could freeze the event loop.
+
+**Internal Changes:**
+
+- Removed the `nest_asyncio` dependency.
+- Fixed type safety for `HttpOptions` in the GenAI client initialization.
+
 ## v2.4.1
 
 This release fixes a configuration issue where nested settings were ignoring the `.env` file.

@@ -1,10 +1,9 @@
 from __future__ import annotations as _annotations
 
-import threading
+import asyncio
 from pathlib import Path
 from typing import TypeVar, cast
 
-import nest_asyncio2
 from google import genai as genai
 from google.genai.types import (
     HarmBlockThreshold,
@@ -20,8 +19,6 @@ from pyrate_limiter import Duration, Limiter, Rate
 
 from ai_sub.config import Settings
 from ai_sub.gemini_cli_model import GeminiCliModel
-
-nest_asyncio2.apply()
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -70,7 +67,7 @@ class RateLimitedAgentWrapper:
 
         self.request_limiter = Limiter(Rate(self.settings.ai.rpm, Duration.MINUTE))
         self.token_limiter = Limiter(Rate(self.settings.ai.tpm, Duration.MINUTE))
-        self._thread_local = threading.local()
+        self.agent = self._create_agent()
 
     def _create_agent(self) -> Agent:
         builtin_tools = []
@@ -168,22 +165,7 @@ class RateLimitedAgentWrapper:
             else:
                 return Agent(model=self.model_name)
 
-    def _get_or_create_agent_for_thread(self) -> Agent:
-        """
-        Retrieves or creates an AI Agent instance specific to the current thread.
-
-        This ensures that each thread has its own instance of the agent and its
-        underlying HTTP client, avoiding cross-thread contamination of asyncio objects.
-        This is necessary because `nest_asyncio` causes the event loop to be reused
-        across `run_sync` calls within the same thread.
-        """
-        agent = getattr(self._thread_local, "agent", None)
-        if agent is None:
-            agent = self._create_agent()
-            self._thread_local.agent = agent
-        return agent
-
-    def run(
+    async def run(
         self,
         prompt: str,
         video: genai.types.File | Path,
@@ -220,7 +202,7 @@ class RateLimitedAgentWrapper:
                 ]
             else:
                 python_file = cast(Path, video)
-                data = python_file.read_bytes()
+                data = await asyncio.to_thread(python_file.read_bytes)
                 user_prompt = [
                     BinaryContent(
                         data=data, media_type=f"video/{python_file.suffix[1:]}"
@@ -243,15 +225,14 @@ class RateLimitedAgentWrapper:
             # and send it as binary content.
             # TODO: This is not tested. Only tested against Google's models
             python_file = cast(Path, video)
-            data = python_file.read_bytes()
+            data = await asyncio.to_thread(python_file.read_bytes)
             user_prompt = [
                 BinaryContent(data=data, media_type=f"video/{python_file.suffix[1:]}"),
                 prompt,
             ]
 
         # Execute the AI agent to generate subtitles and get a structured response.
-        agent = self._get_or_create_agent_for_thread()
-        result = agent.run_sync(user_prompt=user_prompt, output_type=response_type)
+        result = await self.agent.run(user_prompt, output_type=response_type)
 
         return result.output
 
