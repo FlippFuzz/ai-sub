@@ -1,5 +1,30 @@
 # AI Sub Release Notes
 
+## v2.5.0
+
+This release promotes the v2.5.0 beta series to production, finalizing the migration to a fully asynchronous architecture. It includes significant stability improvements to the job runner, improved resource management for concurrent tasks, and critical fixes for blocking I/O operations.
+
+**Fixes & Improvements:**
+
+- **Async Stability & Performance:**
+  - **Job Runner Safety:** Refactored the `JobRunner` loop to ensure `queue.task_done()` is always called, preventing deadlocks if an exception occurs during job setup.
+  - **Blocking I/O:**
+    - Offloaded synchronous video file reading in `RateLimitedAgentWrapper` to a thread to prevent blocking the event loop.
+    - Moved the CPU-intensive `get_ssafile()` call in `main.py` to a worker thread during post-processing.
+  - **Windows Process Management:** Fixed an issue where the `taskkill` command used for timeouts in `GeminiCliModel` was not properly awaited.
+
+- **Refactoring:**
+  - **JobRunner Encapsulation:** The `JobRunner` class now manages its own `asyncio.Queue`, simplifying the main orchestration logic.
+  - **Async Start:** `JobRunner.start()` is now an `async` method, ensuring it executes within the correct event loop context.
+  - **Optimization:** `reencode_video` now uses `asyncio.gather` for parallel duration checks of input and output files.
+
+- **Resource Management:**
+  - **Concurrency Limits:** Implemented a semaphore (limit: 8) for concurrent `ffprobe` duration checks to prevent "Too many open files" errors.
+
+- **Bug Fixes:**
+  - **Gemini File Uploader:** Fixed a runtime error by using `async for` when iterating over file lists.
+  - **Data Integrity:** Enforced strict zipping of video split paths and durations in `main.py` to fail immediately if list lengths mismatch.
+
 ## v2.5.0b1
 
 This release marks a major architectural shift, migrating the core application from a threaded model to a fully asynchronous model using `asyncio`. This improves concurrency handling, reduces blocking operations, and enhances overall stability.
