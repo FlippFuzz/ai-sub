@@ -1,5 +1,20 @@
 # AI Sub Release Notes
 
+## v2.6.0b1
+
+This release focuses on improving subtitle synchronization and timing precision by refining the AI's internal logic for handling rapid speech.
+
+**Prompt Engineering:**
+
+- **Subtitle Generation (v13):**
+  - **Anti-Drift Mechanics:** Introduced strict "mechanical rules" to solve the "Cascading Delay" effect where subtitles fall behind the audio.
+    - **The Sacred Start Time:** Forces the model to anchor start timestamps strictly to audio onsets, regardless of previous line lengths.
+    - **Truncation over Extension:** Mandates aggressive truncation of end timestamps to ensure upcoming lines start on time.
+    - **Instantaneous Transitions:** Enforces zero-gap transitions for rapid-fire speech.
+  - **New Rapid Speech Example:** Added a dedicated prompt example demonstrating how to handle high-speed vocals without synchronization loss.
+  - **Verification Logic:** Updated the required `global_analysis` to force the AI to acknowledge audio pacing and its truncation strategy before generating subtitles.
+
+
 ## v2.5.0
 
 This release promotes the v2.5.0 beta series to production, finalizing the migration to a fully asynchronous architecture. It includes significant stability improvements to the job runner, improved resource management for concurrent tasks, and critical fixes for blocking I/O operations.
