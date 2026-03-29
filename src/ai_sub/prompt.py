@@ -70,7 +70,7 @@ def get_lyrics_scenes_prompt() -> str:
 # ==========================================
 # SUBTITLES GENERATION
 # ==========================================
-SUBTITLES_PROMPT_VERSION = 12
+SUBTITLES_PROMPT_VERSION = 13
 
 _SUBTITLES_PROMPT_TEMPLATE = dedent(
     """
@@ -101,18 +101,17 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
     *   **No Rapid-Fire Dumping:** DO NOT guess timestamps just to quickly squeeze the provided JSON lyrics into the clip. If there is a 5-second gap between sung words, there MUST be a 5-second gap in your subtitles. 
     *   **Ghost Subtitles:** Remain SILENT during pure instrumental music, long pauses, or sound effects. Output nothing if no vocals are present.
 
-    ### PRIORITY 1: PRECISION TIMESTAMPS & TEXT-AUDIO ALIGNMENT
-    Treat every subtitle entry as a discrete, isolated event tied exclusively to the audio waveform.
-    *   **Timecode Format:** MUST strictly adhere to `MM:SS.mmm` (e.g., `01:05.300`). Always pad with zeros. 
-    *   **Text-to-Audio Duration Match (NO EARLY CUTOFFS):** The duration between `s` and `e` MUST cover the time it takes to speak the *entirety* of the text in the `og` field. Never dump a long sentence into a timestamp that only covers the first few words. The `e` timestamp must match the exact moment the LAST word in the block is spoken.
-    *   **Prevent Cascading Delays (The "Traffic Jam" Effect):** In fast-paced songs or rapid speech, AI models often artificially stretch the `e` (end) timestamp to keep text on screen longer for human readability. YOU MUST DISABLE THIS BIAS. 
-        *   **The Strict Rule:** A subtitle's `e` timestamp MUST NEVER bleed into the start of the next spoken line. If a singer fires off 15 words in a 600ms burst, the subtitle duration MUST be exactly 600ms. If you stretch the `e` timestamp too long, it pushes all subsequent subtitles out of sync. Make sure `s` and `e` tightly wrap the current phrase so the timeline remains clear for the next one.
-
+    ### PRIORITY 1: PRECISION TIMESTAMPS & SOLVING "CASCADING DELAYS"
+    AI models frequently suffer from "Cascading Delays" (where subtitles gradually fall behind the audio) because they try to keep text on screen longer for readability. **YOU MUST OVERRIDE THIS BIAS USING THESE STRICT MECHANICAL RULES:**
+    
+    *   **Rule 1: The Sacred Start Time:** The `s` (start) timestamp is an absolute, immutable anchor. It MUST trigger the exact millisecond the word is spoken. NEVER delay a start time just because the previous subtitle was long.
+    *   **Rule 2: Truncation Over Extension:** If Line 1 is spoken, and Line 2 begins immediately after it, Line 1's `e` timestamp MUST be aggressively truncated to make room for Line 2's `s` timestamp. Do not artificially stretch the duration of Line 1.
+    *   **Rule 3: Instantaneous Transitions (No Artificial Gaps):** In rapid speech, do not invent visual padding. If there is no breath between sentences, Line 1's `e` MUST EXACTLY EQUAL Line 2's `s` (e.g., Line 1 `e`: 01:05.500 -> Line 2 `s`: 01:05.500). 
+    *   **Rule 4: Timecode Format:** MUST strictly adhere to `MM:SS.mmm` (e.g., `01:05.300`). Always pad with zeros.
 
     ### PRIORITY 2: INTELLIGENT SEGMENTATION & HANDLING PAUSES
     *   **Handling Pauses (The Splitting Rule):** If there is a physical pause or breath in the audio in the middle of a sentence, YOU MUST SPLIT the text into a new subtitle block. NEVER merge text across an audio pause into a single JSON block. 
     *   **Max Length:** Limit each subtitle block to a maximum of 50 characters (for both `og` and `en`). Group phrases logically.
-    *   **Contiguous Timestamping:** If splitting a continuous, uninterrupted sentence (no pauses) to stay under 50 chars, Part 1 `e` MUST EXACTLY EQUAL Part 2 `s` (e.g., `00:05.500`). Do not invent an audio gap in the middle of a continuous breath.
 
     ### PRIORITY 3: HOLISTIC CONTEXT & TRANSLATION
     *   **Context-Aware Translation (NO ISOLATION):** NEVER translate lines in isolation. Analyze the previous/next lines and the visual narrative to determine pronouns, tense, and tone.
@@ -185,13 +184,36 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
     }
     ```
 
+    **Example 4: Preventing Cascading Delays in Rapid Speech**
+    *Scenario:* Speaker delivers a rapid-fire line with zero pauses. If the model extends Line 1's reading time, Line 2 will fall behind the audio.
+    *Output:*
+    ```json
+    {
+      "global_analysis": "Detected rapid, continuous speech. Applying strict anti-cascading rules: anchoring start times exclusively to the audio onset and using instantaneous transitions (Line 1 'e' equals Line 2 's'). I am aggressively truncating the first subtitle's end time to prevent a traffic jam.",
+      "subs": [
+        {
+          "s": "00:45.200",
+          "e": "00:46.000",
+          "og": "考える隙すらなく",
+          "en": "With no time to even think,"
+        },
+        {
+          "s": "00:46.000",
+          "e": "00:46.900",
+          "og": "直感だけで動いた",
+          "en": "I moved on pure instinct."
+        }
+      ]
+    }
+    ```
+
     ### OUTPUT FORMAT
     Return **ONLY** a valid, parseable JSON object. No markdown wrapping outside the JSON.
     You MUST output `global_analysis` FIRST.
 
     **JSON Schema:**
     {
-      "global_analysis": "Strict Verification Step: 1. State if the audio phonetically matches the JSON reference. 2. If wrong song, state ignore. 3. If leftover lyrics, state discard. 4. Confirm text matches full audio duration without early cutoffs or cross-pause merging.",
+      "global_analysis": "Strict Verification Step: 1. State if the audio phonetically matches the JSON reference. 2. If wrong song, state ignore. 3. If leftover lyrics, state discard. 4. Acknowledge the pacing of the audio and pledge to use aggressive truncation if speech is rapid to prevent delays.",
       "subs": [
         {
           "s": "MM:SS.mmm",
