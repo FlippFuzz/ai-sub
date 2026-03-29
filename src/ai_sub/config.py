@@ -1,7 +1,7 @@
 import os
 import re
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional, cast
 
 from logfire import LevelName
 from pydantic import (
@@ -336,15 +336,16 @@ class Settings(BaseSettings):
         if they are not explicitly provided by the user. It also creates the temporary directory.
         """
         # Resolve input video file to an absolute path first
-        self.input_video_file = self.input_video_file.resolve()
+        input_video_path = cast(Path, self.input_video_file).resolve()
+        self.input_video_file = cast(Any, input_video_path)
 
         # If the user didn't set out_dir, set it automatically
         if self.dir.out == Path("directory_of_input_file"):
-            self.dir.out = self.input_video_file.parent
+            self.dir.out = input_video_path.parent
 
         # If the user didn't set tmp_dir, set it automatically
         if self.dir.tmp == Path("tmp_input_video_file"):
-            self.dir.tmp = self.dir.out / f"tmp_{self.input_video_file.stem}"
+            self.dir.tmp = self.dir.out / f"tmp_{input_video_path.stem}"
 
         # Now resolve the directory paths to be absolute
         self.dir.out = self.dir.out.resolve()

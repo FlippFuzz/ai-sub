@@ -7,7 +7,7 @@ import sys
 from functools import partial
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, cast
 
 import logfire
 from pydantic_settings import CliApp
@@ -352,10 +352,11 @@ def stitch_subtitles(
         if len(all_subtitles) > 1 and all_subtitles[1].start < 1:
             all_subtitles[1].start = 1
 
+        input_video_path = cast(Path, settings.input_video_file)
         all_subtitles.save(
             str(
                 settings.dir.out
-                / f"{settings.input_video_file.stem}.{sanitized_subtitles_model}.srt"
+                / f"{input_video_path.stem}.{sanitized_subtitles_model}.srt"
             )
         )
 
@@ -441,12 +442,14 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         settings.ai.model_subtitles
     )
 
+    input_video_path = cast(Path, settings.input_video_file)
+
     # Start the main application logic within a Logfire span for better tracing.
-    with logfire.span(f"Generating subtitles for {settings.input_video_file.name}"):
+    with logfire.span(f"Generating subtitles for {input_video_path.name}"):
 
         # Step 1: Split the input video into smaller segments.
         video_splits_paths = await split_video(
-            settings.input_video_file,
+            input_video_path,
             settings.dir.tmp,
             settings.split.max_seconds,
             output_pattern="part_%03d",
