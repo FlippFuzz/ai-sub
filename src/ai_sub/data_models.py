@@ -12,7 +12,7 @@ from pydantic import (
     NonNegativeInt,
     PositiveInt,
     ValidationError,
-    field_validator,
+    model_validator,
 )
 from pysubs2 import SSAEvent, SSAFile
 
@@ -41,6 +41,51 @@ class AiSubResult(IntEnum):
 
 
 # ==============================================================================
+# Utility Functions
+# ==============================================================================
+
+
+def _parse_timestamp_string_ms(timestamp_string: str) -> int:
+    """Parses a timestamp string into milliseconds.
+
+    Supports "MM:SS.mmm", "MM:SS:mmm", and "MM:SS" formats.
+
+    Args:
+        timestamp_string (str): The timestamp string to parse.
+
+    Returns:
+        int: The parsed timestamp in milliseconds.
+
+    Raises:
+        ValueError: If the timestamp string is None or in an invalid format.
+    """
+    if "." in timestamp_string:
+        # Handles "MM:SS.mmm"
+        split1 = timestamp_string.split(".")
+        split2 = split1[0].split(":")
+        minutes = int(split2[0])
+        seconds = int(split2[1])
+        milliseconds = int(split1[1])
+        timestamp = minutes * 60000 + seconds * 1000 + milliseconds
+    elif timestamp_string.count(":") == 2:
+        # Handles "MM:SS:mmm"
+        split = timestamp_string.split(":")
+        minutes = int(split[0])
+        seconds = int(split[1])
+        milliseconds = int(split[2])
+        timestamp = minutes * 60000 + seconds * 1000 + milliseconds
+    elif timestamp_string.count(":") == 1:
+        # Handles "MM:SS"
+        split = timestamp_string.split(":")
+        minutes = int(split[0])
+        seconds = int(split[1])
+        timestamp = minutes * 60000 + seconds * 1000
+    else:
+        raise ValueError(f"Invalid timestamp format: {timestamp_string}")
+    return timestamp
+
+
+# ==============================================================================
 # AI Response Models
 # ==============================================================================
 
@@ -62,6 +107,22 @@ class Subtitles(BaseModel):
     )
     english: str = Field(alias="en", description="The English translation of the text.")
 
+    @model_validator(mode="after")
+    def validate_timestamps(self) -> "Subtitles":
+        """
+        Validates the timestamps for a subtitle.
+        """
+        try:
+            start_ms = _parse_timestamp_string_ms(self.start)
+            end_ms = _parse_timestamp_string_ms(self.end)
+            if start_ms >= end_ms:
+                raise ValueError(
+                    f"Start time ({self.start}) must be strictly before end time ({self.end})"
+                )
+        except ValueError as e:
+            raise ValueError(f"Invalid timestamp: {e}")
+        return self
+
 
 class SubtitleAiResponse(BaseModel):
     """
@@ -81,69 +142,6 @@ class SubtitleAiResponse(BaseModel):
         alias="subs", description="A list of individual subtitle entries."
     )
 
-    @field_validator("subtitles")
-    @classmethod
-    def validate_timestamps(cls, v: list[Subtitles]) -> list[Subtitles]:
-        """
-        Validates the timestamps for all subtitles.
-
-        Checks:
-        1. Format: Timestamps must be parseable (e.g., "MM:SS.mmm").
-        2. Logic: Start time must be strictly before end time.
-        """
-        for subtitle in v:
-            try:
-                start_ms = cls._parse_timestamp_string_ms(subtitle.start)
-                end_ms = cls._parse_timestamp_string_ms(subtitle.end)
-
-                if start_ms >= end_ms:
-                    raise ValueError(
-                        f"Start time ({subtitle.start}) must be strictly before end time ({subtitle.end})"
-                    )
-            except ValueError as e:
-                raise ValueError(f"Invalid timestamp in subtitle: {subtitle}. {e}")
-        return v
-
-    @staticmethod
-    def _parse_timestamp_string_ms(timestamp_string: str) -> int:
-        """Parses a timestamp string into milliseconds.
-
-        Supports "MM:SS.mmm", "MM:SS:mmm", and "MM:SS" formats.
-
-        Args:
-            timestamp_string (str): The timestamp string to parse.
-
-        Returns:
-            int: The parsed timestamp in milliseconds.
-
-        Raises:
-            ValueError: If the timestamp string is None or in an invalid format.
-        """
-        if "." in timestamp_string:
-            # Handles "MM:SS.mmm"
-            split1 = timestamp_string.split(".")
-            split2 = split1[0].split(":")
-            minutes = int(split2[0])
-            seconds = int(split2[1])
-            milliseconds = int(split1[1])
-            timestamp = minutes * 60000 + seconds * 1000 + milliseconds
-        elif timestamp_string.count(":") == 2:
-            # Handles "MM:SS:mmm"
-            split = timestamp_string.split(":")
-            minutes = int(split[0])
-            seconds = int(split[1])
-            milliseconds = int(split[2])
-            timestamp = minutes * 60000 + seconds * 1000 + milliseconds
-        elif timestamp_string.count(":") == 1:
-            # Handles "MM:SS"
-            split = timestamp_string.split(":")
-            minutes = int(split[0])
-            seconds = int(split[1])
-            timestamp = minutes * 60000 + seconds * 1000
-        else:
-            raise ValueError(f"Invalid timestamp format: {timestamp_string}")
-        return timestamp
-
     def get_ssafile(self) -> SSAFile:
         """
         Converts the response's subtitles into an SSAFile object.
@@ -157,8 +155,8 @@ class SubtitleAiResponse(BaseModel):
         translator = str.maketrans("", "", string.punctuation)
 
         for subtitle in self.subtitles:
-            start = self._parse_timestamp_string_ms(subtitle.start)
-            end = self._parse_timestamp_string_ms(subtitle.end)
+            start = _parse_timestamp_string_ms(subtitle.start)
+            end = _parse_timestamp_string_ms(subtitle.end)
             english_text = subtitle.english.strip()
             original_text = subtitle.original.strip()
 
@@ -207,6 +205,22 @@ class Scene(BaseModel):
         default=None,
         description="The English translation of the lyrics, found via web search.",
     )
+
+    @model_validator(mode="after")
+    def validate_timestamps(self) -> "Scene":
+        """
+        Validates the timestamps for a scene.
+        """
+        try:
+            start_ms = _parse_timestamp_string_ms(self.start)
+            end_ms = _parse_timestamp_string_ms(self.end)
+            if start_ms >= end_ms:
+                raise ValueError(
+                    f"Start time ({self.start}) must be strictly before end time ({self.end})"
+                )
+        except ValueError as e:
+            raise ValueError(f"Invalid timestamp: {e}")
+        return self
 
 
 class LyricsSceneAiResponse(BaseModel):
