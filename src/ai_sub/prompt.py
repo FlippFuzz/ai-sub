@@ -70,7 +70,7 @@ def get_lyrics_scenes_prompt() -> str:
 # ==========================================
 # SUBTITLES GENERATION
 # ==========================================
-SUBTITLES_PROMPT_VERSION = 13
+SUBTITLES_PROMPT_VERSION = 14
 
 _SUBTITLES_PROMPT_TEMPLATE = dedent(
     """
@@ -86,19 +86,21 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
     ### DECODING HIERARCHY (DETERMINING THE "WHAT")
     When the spoken audio/vocals are difficult to hear, slurred, or ambiguous, you MUST use the following fallback hierarchy to determine the correct intended words:
     1. **Primary Fallback (On-Screen Text):** Burnt-in lyrics and hardcoded subtitles are your absolute most reliable guide for correct spelling and strictly override everything else.
-    2. **Secondary Fallback (Scene Context & Visual Actions):** Look at what is actively happening in the video. Character actions, emotions, environments (e.g., rain, night), and non-vocal audio (sound effects, music tone) are powerful clues. Use the events on screen to logically deduce the ambiguous word.
+    2. **Secondary Fallback (Scene Context & Visual Actions):** Look at what is actively happening in the video. Character actions, emotions, environments (e.g., rain, night), and non-vocal audio (sound effects, music tone) are powerful clues.
     3. **Tertiary Fallback (Reference JSON):** If text and scene context are not enough, use the provided Reference JSON to figure out the intended word. 
+    4. **The Manual Transcription Mandate (Null JSON):** If the Reference JSON states lyrics are `null`, or if the current audio does not match the provided JSON lyrics, YOU ARE NOT EXEMPT from subtitling. You MUST use your native audio perception to manually transcribe and translate the spoken vocals yourself. Do not skip audio segments just because text isn't handed to you.
 
     ### RESOLVING AMBIGUITIES & STYLIZED SINGING
     Singers frequently drop syllables, slur words, or sing stylistically. 
-    *   **The Disambiguation Rule:** If the audio sounds ambiguous (e.g., singing "pa-re... pa-re..." which might sound like "hare" / sunny), CHECK THE ON-SCREEN TEXT AND JSON. If either source says the lyrics are "パレード" (parade), output the intended word ("パレード"), NOT the literal phonetic fragments. 
+    *   **The Disambiguation Rule:** If the audio sounds ambiguous (e.g., singing "pa-re... pa-re..." which might sound like "hare"), CHECK THE ON-SCREEN TEXT AND JSON. If either source says the lyrics are "パレード" (parade), output the intended word ("パレード"), NOT the literal phonetic fragments. 
     *   **Wait for the Cue:** Even when you know "WHAT" the word is from the text/JSON, you MUST wait for the actual audio waveform to dictate "WHEN" to show it. Do not rapid-fire dump text.
 
     ### HANDLING THE LYRICS REFERENCE (ANTI-HALLUCINATION)
     Because the Reference JSON is web-scraped, it often contains the entire song, the wrong verse, or a completely different song. Apply these strict safety rules:
-    *   **The "Wrong Song" Scenario (Phonetic Mismatch):** The JSON lyrics MUST roughly match the phonetics of the audio. If the audio is clearly singing one phrase (e.g., "Arigato") but the JSON says something completely different (e.g., "Sayonara"), you have been given the wrong song or wrong verse. **ACTION:** Completely IGNORE the JSON and rely solely on the audio and on-screen text.
-    *   **The "Partial Video" Scenario (Leftover Lyrics):** The provided JSON will often contain the lyrics for the *entire* 3-minute song, but your video segment might only be 15 seconds long. **ACTION:** ONLY subtitle what is actively sung within the video's actual duration. When the vocals in the video stop, YOU MUST STOP. Discard the rest of the unused JSON lyrics.
-    *   **No Rapid-Fire Dumping:** DO NOT guess timestamps just to quickly squeeze the provided JSON lyrics into the clip. If there is a 5-second gap between sung words, there MUST be a 5-second gap in your subtitles. 
+    *   **Strict Scene Boundaries (DO NOT CROSS-CONTAMINATE):** The Reference JSON often divides the video into scenes with specific `start` and `end` times. **You MUST respect these timelines.** If the JSON says a song starts at `03:38`, DO NOT apply those lyrics to audio at `00:20`. 
+    *   **The "Wrong Song" Scenario (Phonetic Mismatch):** The JSON lyrics MUST roughly match the phonetics of the audio. If the audio at `00:20` is clearly singing something else, but you have lyrics for a later scene, manually transcribe what you actually hear at `00:20`. Do not force later lyrics to fit early audio.
+    *   **The "Partial Video" Scenario (Leftover Lyrics):** The provided JSON will often contain lyrics for an *entire* 3-minute song, but your video segment might only be 15 seconds long. **ACTION:** ONLY subtitle what is actively sung within the video's actual duration. Discard unused JSON lyrics.
+    *   **No Rapid-Fire Dumping:** DO NOT guess timestamps just to squeeze the provided JSON lyrics into the clip. If there is a 5-second gap between sung words, there MUST be a 5-second gap in your subtitles. 
     *   **Ghost Subtitles:** Remain SILENT during pure instrumental music, long pauses, or sound effects. Output nothing if no vocals are present.
 
     ### PRIORITY 1: PRECISION TIMESTAMPS & SOLVING "CASCADING DELAYS"
@@ -114,7 +116,7 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
     *   **Max Length:** Limit each subtitle block to a maximum of 50 characters (for both `og` and `en`). Group phrases logically.
 
     ### PRIORITY 3: HOLISTIC CONTEXT & TRANSLATION
-    *   **Context-Aware Translation (NO ISOLATION):** NEVER translate lines in isolation. Analyze the previous/next lines and the visual narrative to determine pronouns, tense, and tone.
+    *   **Context-Aware Translation (NO ISOLATION):** NEVER translate lines in isolation. Always analyze the **Previous 2 Sentences**, the **Next 2 Sentences**, and the **Full Current Sentence**. Use this context to determine pronouns, tense, and tone.
     *   **Semantic Continuity:** If you must split a sentence due to an audio pause or character limits, ensure the translation of "Part 1" grammatically anticipates "Part 2" (e.g., using ellipses `...` or connective forms). 
     *   **Visual Text Rules:** Transcribe/translate prominent, relevant visual text (titles, signs). Exclude meaningless background clutter or UI elements.
     *   **No CC Tags:** Transcribe speech/vocals only. NO closed captioning tags like `[applause]`, `(sighs)`, or `♪`. 

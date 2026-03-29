@@ -1,5 +1,18 @@
 # AI Sub Release Notes
 
+## v2.6.1b1
+
+This release focuses on hardening the AI's transcription logic and translation accuracy by introducing stricter boundaries for reference data and expanding the contextual window for translations.
+
+**Prompt Engineering:**
+
+- **Subtitle Generation (v14):**
+  - **The Manual Transcription Mandate:** Explicitly instructs the AI that it is "not exempt" from subtitling if the reference JSON is null or mismatching; it must rely on native audio perception to transcribe.
+  - **Strict Scene Boundaries:** Added rules to prevent "cross-contamination" where lyrics from a later scene in the reference JSON are incorrectly applied to earlier audio.
+  - **Enhanced Contextual Window:** Refined the translation logic to mandate analysis of the **Previous 2 Sentences** and **Next 2 Sentences** to improve pronoun resolution and tonal consistency.
+  - **Refined Anti-Hallucination:** Updated the "Wrong Song" and "Partial Video" scenarios with specific timestamp-based examples to help the model ignore irrelevant reference data.
+  - **Improved Decoding Hierarchy:** Streamlined the fallback logic for resolving ambiguous audio, prioritizing visual OCR and scene context.
+
 ## v2.6.0
 
 This release promotes the v2.6.0 beta series to production, focusing on improving subtitle synchronization and timing precision by refining the AI's internal logic for handling rapid speech.
