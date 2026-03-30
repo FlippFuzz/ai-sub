@@ -5,7 +5,7 @@ from ai_sub.data_models import LyricsSceneAiResponse
 # ==========================================
 # SCENE DETECTION & LYRICS RESEARCH
 # ==========================================
-LYRICS_PROMPT_VERSION = 3
+LYRICS_PROMPT_VERSION = 4
 
 
 _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
@@ -21,16 +21,17 @@ _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
     For every vocal segment, resolve: Song Title, Original Artist (simplified), Performer, and Original Language.
 
     **Step 3: High-Efficiency Web Search**
-    Perform a bilingual search for every song: `"[Song Title]" [Artist] [Language] and English lyrics`.
+    Perform a bilingual search for every song: `"[Song Title]" [Artist] [Language] and English lyrics`. **CRITICAL:** You are NOT limited to one search per turn. You should execute multiple search queries simultaneously in a single turn for all detected songs to minimize round-trips and save processing costs.
 
     **Step 4: JSON Generation**
-    Return ONLY a valid, parseable JSON object. No markdown wrapping.
+    Construct the JSON response following the strict schema below.
 
     ### JSON SYNTAX GUARD (CRITICAL)
-    1. **NO MERGING:** Every key must be on a new line within the object. Do NOT combine "start" and "end" into a single string.
-    2. **ESCAPING:** You MUST escape internal double quotes in lyrics using `\\\"`.
-    3. **NEWLINES:** Use `\\n` for line breaks. Do NOT use literal line breaks inside the JSON string.
-    4. **COMPLETENESS:** You MUST provide the FULL lyrics. Do not truncate.
+    1. **NO FIELD LEAKAGE:** String values must contain ONLY the data requested. Do NOT include field names, subsequent field names, or markers like `",start:"` inside the quotes.
+    2. **TIMESTAMPS:** Values for "start" and "end" must be exactly `MM:SS.mmm` (e.g., "01:23.456").
+    3. **ESCAPING:** You MUST escape internal double quotes in lyrics using `\\\"`.
+    4. **NEWLINES:** Use `\\n` for line breaks. Do NOT use literal line breaks inside the JSON string.
+    5. **COMPLETENESS:** You MUST provide the FULL lyrics. Do not truncate.
 
     ### MULTI-SCENE EXAMPLE
     {
@@ -64,8 +65,32 @@ _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
       ]
     }
 
-    ### FINAL TASK
-    Analyze the provided video. Ensure every scene is a separate object in the `scenes` array. Provide the COMPLETE lyrics for every song. Return only the JSON.
+    ### OUTPUT FORMAT
+    Return ONLY a valid JSON object wrapped in a markdown block. You MUST include all fields.
+
+    ```json
+    {
+      "step_by_step_log": "Detailed log of metadata identification and search queries.",
+      "global_summary": "Overall summary of the video content.",
+      "scenes": [
+        {
+          "start": "MM:SS.mmm",
+          "end": "MM:SS.mmm",
+          "description": "Comprehensive description of visual and audio cues.",
+          "contains_vocal_music": true,
+          "song_title": "The name of the detected song or null.",
+          "original_artist": "The original artist/composer or null.",
+          "performer_in_video": "The person performing the song in this video.",
+          "original_language": "The language of the song (e.g., Japanese, English).",
+          "reference_lyrics_og": "The full lyrics in the original language or null.",
+          "reference_lyrics_en": "The full English translation of the lyrics or null."
+        }
+      ]
+    }
+    ```
+
+    **FINAL TASK:**
+    Analyze the provided video. Ensure every scene is a separate object in the `scenes` array. Provide the COMPLETE lyrics for every song. Return ONLY the JSON.
     """
 ).strip()
 

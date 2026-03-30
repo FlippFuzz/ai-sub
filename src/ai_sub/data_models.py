@@ -1,3 +1,4 @@
+import re
 import string
 from enum import IntEnum
 from pathlib import Path
@@ -59,24 +60,31 @@ def _parse_timestamp_string_ms(timestamp_string: str) -> int:
     Raises:
         ValueError: If the timestamp string is None or in an invalid format.
     """
-    if "." in timestamp_string:
+    # Use regex to extract the time part, ignoring any LLM "field leakage" (e.g., "03:52.000,start:")
+    match = re.search(r"(\d{1,2}:\d{2}(?:[:.]\d{1,3})?)", timestamp_string)
+    if not match:
+        raise ValueError(f"Invalid timestamp format: {timestamp_string}")
+
+    ts = match.group(1)
+
+    if "." in ts:
         # Handles "MM:SS.mmm"
-        split1 = timestamp_string.split(".")
+        split1 = ts.split(".")
         split2 = split1[0].split(":")
         minutes = int(split2[0])
         seconds = int(split2[1])
         milliseconds = int(split1[1])
         timestamp = minutes * 60000 + seconds * 1000 + milliseconds
-    elif timestamp_string.count(":") == 2:
+    elif ts.count(":") == 2:
         # Handles "MM:SS:mmm"
-        split = timestamp_string.split(":")
+        split = ts.split(":")
         minutes = int(split[0])
         seconds = int(split[1])
         milliseconds = int(split[2])
         timestamp = minutes * 60000 + seconds * 1000 + milliseconds
-    elif timestamp_string.count(":") == 1:
+    elif ts.count(":") == 1:
         # Handles "MM:SS"
-        split = timestamp_string.split(":")
+        split = ts.split(":")
         minutes = int(split[0])
         seconds = int(split[1])
         timestamp = minutes * 60000 + seconds * 1000
@@ -196,6 +204,10 @@ class Scene(BaseModel):
     performer_in_video: Optional[str] = Field(
         default=None,
         description="The performer singing in the video, if different from the original artist.",
+    )
+    original_language: Optional[str] = Field(
+        default=None,
+        description="The language the song is primarily sung in.",
     )
     reference_lyrics_og: Optional[str] = Field(
         default=None,
