@@ -5,7 +5,7 @@ from ai_sub.data_models import LyricsSceneAiResponse
 # ==========================================
 # SCENE DETECTION & LYRICS RESEARCH
 # ==========================================
-LYRICS_PROMPT_VERSION = 2
+LYRICS_PROMPT_VERSION = 3
 
 
 _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
@@ -15,49 +15,57 @@ _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
     ### EXECUTION PIPELINE
 
     **Step 1: Scene Mapping & Visual OCR**
-    Watch the entire video. Pay close attention to the corners and the bottom of the screen (lower thirds) for on-screen text.
-    *   **Identify Song Metadata:** Look for text appearing at the start of a song. This often contains the "Song Title" and "Original Artist/Composer". 
-    *   **Identify the Performer:** Note who is physically (or virtually) singing in the video. This is often a cover artist/performer, not the original creator.
-
+    Watch the entire video. Identify song metadata from on-screen text and determine the performer.
+    
     **Step 2: Song Metadata Resolution**
-    For every scene containing vocals, determine:
-    1.  **Song Title:** (From on-screen text or audio recognition).
-    2.  **Original Artist/Source:** Extract ONLY the primary artist, band, or anime/game franchise. If the screen lists multiple detailed credits (e.g., "Music: TeddyLoid, Giga", "Lyrics: Reol"), do NOT use the whole string. Pick just the main producer or franchise.
-    3.  **Video Performer:** (The specific person/character singing in this clip).
-    4.  **Original Language:** (e.g., Japanese, Korean, French).
+    For every vocal segment, resolve: Song Title, Original Artist (simplified), Performer, and Original Language.
 
     **Step 3: High-Efficiency Web Search**
-    For ALL identified songs, you must find BOTH the **Original Language lyrics** and the **English Translation**. 
-    *   **Combined Search Strategy:** Look for both languages at the same time using the word "and" to find bilingual lyric pages.
-    *   **KEEP IT SIMPLE:** Do NOT over-complicate the search query. Do NOT put long credit strings in quotes. Use minimal, essential keywords.
-    *   **Primary Search Template:** `"[Song Title]" [Primary Artist/Source] [Original Language] and English lyrics`
-    *   **Good Example:** `"ULTRA C" Giga Japanese and English lyrics`
-    *   **Bad Example:** `""ULTRA C" "Lyrics: Reol" "Music: TeddyLoid, Giga" lyrics"` (Too many terms and quotes will cause the search to fail).
-    *   **Fallback Search:** If your first search returns no results, simplify it by dropping the artist entirely: `"[Song Title]" [Original Language] and English lyrics`
-    *   **Multi-Song Mandate:** Do not stop after the first song. If there are multiple songs, you MUST perform a separate search for each one. 
+    Perform a bilingual search for every song: `"[Song Title]" [Artist] [Language] and English lyrics`.
 
     **Step 4: JSON Generation**
     Return ONLY a valid, parseable JSON object. No markdown wrapping.
 
-    ### JSON SCHEMA
+    ### JSON SYNTAX GUARD (CRITICAL)
+    1. **NO MERGING:** Every key must be on a new line within the object. Do NOT combine "start" and "end" into a single string.
+    2. **ESCAPING:** You MUST escape internal double quotes in lyrics using `\\\"`.
+    3. **NEWLINES:** Use `\\n` for line breaks. Do NOT use literal line breaks inside the JSON string.
+    4. **COMPLETENESS:** You MUST provide the FULL lyrics. Do not truncate.
+
+    ### MULTI-SCENE EXAMPLE
     {
-      "step_by_step_log": "Describe the on-screen text found, how you simplified the artist name for the search, and list the exact, simple search strings used for each song.",
-      "global_summary": "Summary of video structure (e.g., 'A 3-song medley performed by [Performer] with dialogue intervals').",
+      "step_by_step_log": "1. 00:00-00:10: Identified as intro talk. 2. 00:10: Detected 'Adventure Log' via bottom-left text. 3. Search: '\"Adventure Log\" Giga Japanese and English lyrics'. Found full lyrics on Genius.",
+      "global_summary": "A video featuring an introductory greeting followed by a full vocal performance of 'Adventure Log'.",
       "scenes": [
         {
-          "start": "MM:SS.mmm",
-          "end": "MM:SS.mmm",
-          "description": "Visual/Audio description (e.g., 'Character starts singing while text [Title/Artist] appears in bottom-left').",
+          "start": "00:00.000",
+          "end": "00:10.500",
+          "description": "The performer waves to the camera and introduces the upcoming song. No vocal music is playing.",
+          "contains_vocal_music": false,
+          "song_title": null,
+          "original_artist": null,
+          "performer_in_video": "Mori Calliope",
+          "original_language": "Japanese",
+          "reference_lyrics_og": null,
+          "reference_lyrics_en": null
+        },
+        {
+          "start": "00:10.501",
+          "end": "04:30.000",
+          "description": "The song 'Adventure Log' begins. The performer sings while dancing. Text 'Music: Giga' appears.",
           "contains_vocal_music": true,
-          "song_title": "Title found on-screen or via audio",
-          "original_artist": "Original composer/band/franchise (e.g., Giga)",
-          "performer_in_video": "The person singing in this clip (e.g., Mori Calliope)",
-          "original_language": "The language the song is sung in",
-          "reference_lyrics_og": "Full lyrics in original language script. Separate lines with \\n. Put null if not found.",
-          "reference_lyrics_en": "Full English translation lyrics. Separate lines with \\n. Put null if not found."
+          "song_title": "Adventure Log",
+          "original_artist": "Giga",
+          "performer_in_video": "Mori Calliope",
+          "original_language": "Japanese",
+          "reference_lyrics_og": "ぼうけんのしょがきえました！\\nてててて ててて ててて...\\n[...ALL REMAINING VERSES AND CHORUSES INCLUDED UNTIL THE END...]",
+          "reference_lyrics_en": "Your adventure log has been deleted!\\nTe-te-te-te-te...\\n[...ALL REMAINING VERSES AND CHORUSES INCLUDED UNTIL THE END...]"
         }
       ]
     }
+
+    ### FINAL TASK
+    Analyze the provided video. Ensure every scene is a separate object in the `scenes` array. Provide the COMPLETE lyrics for every song. Return only the JSON.
     """
 ).strip()
 
@@ -70,55 +78,46 @@ def get_lyrics_scenes_prompt() -> str:
 # ==========================================
 # SUBTITLES GENERATION
 # ==========================================
-SUBTITLES_PROMPT_VERSION = 14
+SUBTITLES_PROMPT_VERSION = 15
 
 _SUBTITLES_PROMPT_TEMPLATE = dedent(
     """
     You are an advanced AI expert in audio-visual translation and subtitling. Your specialty is generating **audio-synchronized**, contextually rich subtitles from multimodal inputs using native audio tokenization.
 
-    **Task:** Generate precise subtitles. Your Primary Priority is transcribing/translating spoken audio/vocals. Your Secondary Priority is transcribing/translating relevant on-screen text. Output both original language (`og`) and English translation (`en`).
+    **Task:** Generate precise subtitles. Your absolute priority is transcribing/translating spoken audio/vocals. Output both the original spoken language (`og`) and the English translation (`en`).
     
-    ### THE GOLDEN RULE: AUDIO DICTATES "WHEN", VISUALS/CONTEXT & JSON DICTATE "WHAT"
-    You must strictly separate the task of *timing* from the task of *transcription*. 
-    *   **WHEN (Timing):** The vocal audio waveform is your absolute ground truth for timestamps. The exact millisecond a vocal cord activates dictates the `s` (start) timestamp. NEVER output text if there is no vocal audio driving it. 
-    *   **WHAT (Content):** On-Screen Text, the Visual/Audio Scene Context, and the Reference JSON are your tools for spelling, intent, and disambiguation. 
+    ### THE GOLDEN RULE: TWO SUBTITLE TRIGGERS (AUDIO & VISUAL)
+    You must strictly separate the task of *timing* from the task of *transcription*. A subtitle block is triggered by ONLY two things:
+    1. **VOCAL EVENTS (The Audio Rule):** The vocal audio waveform is your absolute ground truth for spoken dialogue. The exact millisecond a vocal cord activates dictates the `s` (start) timestamp. NEVER output dialogue text if there is no vocal audio driving it.
+    2. **VISUAL EVENTS (The On-Screen Text Exception):** If prominent, relevant text (e.g., Chapter Titles, Location Signs, Letters) appears on screen, subtitle it for the duration it is clearly visible, **even if there is no audio.**
 
-    ### DECODING HIERARCHY (DETERMINING THE "WHAT")
-    When the spoken audio/vocals are difficult to hear, slurred, or ambiguous, you MUST use the following fallback hierarchy to determine the correct intended words:
-    1. **Primary Fallback (On-Screen Text):** Burnt-in lyrics and hardcoded subtitles are your absolute most reliable guide for correct spelling and strictly override everything else.
-    2. **Secondary Fallback (Scene Context & Visual Actions):** Look at what is actively happening in the video. Character actions, emotions, environments (e.g., rain, night), and non-vocal audio (sound effects, music tone) are powerful clues.
-    3. **Tertiary Fallback (Reference JSON):** If text and scene context are not enough, use the provided Reference JSON to figure out the intended word. 
-    4. **The Manual Transcription Mandate (Null JSON):** If the Reference JSON states lyrics are `null`, or if the current audio does not match the provided JSON lyrics, YOU ARE NOT EXEMPT from subtitling. You MUST use your native audio perception to manually transcribe and translate the spoken vocals yourself. Do not skip audio segments just because text isn't handed to you.
-
-    ### RESOLVING AMBIGUITIES & STYLIZED SINGING
-    Singers frequently drop syllables, slur words, or sing stylistically. 
-    *   **The Disambiguation Rule:** If the audio sounds ambiguous (e.g., singing "pa-re... pa-re..." which might sound like "hare"), CHECK THE ON-SCREEN TEXT AND JSON. If either source says the lyrics are "パレード" (parade), output the intended word ("パレード"), NOT the literal phonetic fragments. 
-    *   **Wait for the Cue:** Even when you know "WHAT" the word is from the text/JSON, you MUST wait for the actual audio waveform to dictate "WHEN" to show it. Do not rapid-fire dump text.
+    ### DECODING HIERARCHY (FOR VOCAL EVENTS)
+    When transcribing spoken audio (Trigger 1), if the vocals are slurred, fast, or ambiguous, use this fallback hierarchy to determine the correct intended words:
+    1. **Primary Fallback (Burnt-in Subs/Lyrics):** Hardcoded subtitles or on-screen lyrics that correspond to the audio are your most reliable guide for correct spelling and strictly override everything else.
+    2. **Secondary Fallback (Scene Context):** Visual actions, character emotions, and environments (e.g., rain, night) provide powerful context clues.
+    3. **Tertiary Fallback (Reference JSON):** Use the provided Reference JSON to figure out the intended word. 
+    4. **The Manual Transcription Mandate:** If the Reference JSON is null, incomplete, or deviates from the audio, YOU ARE NOT EXEMPT. You MUST manually transcribe and translate the remaining vocals using your native audio perception. 
 
     ### HANDLING THE LYRICS REFERENCE (ANTI-HALLUCINATION)
-    Because the Reference JSON is web-scraped, it often contains the entire song, the wrong verse, or a completely different song. Apply these strict safety rules:
-    *   **Strict Scene Boundaries (DO NOT CROSS-CONTAMINATE):** The Reference JSON often divides the video into scenes with specific `start` and `end` times. **You MUST respect these timelines.** If the JSON says a song starts at `03:38`, DO NOT apply those lyrics to audio at `00:20`. 
-    *   **The "Wrong Song" Scenario (Phonetic Mismatch):** The JSON lyrics MUST roughly match the phonetics of the audio. If the audio at `00:20` is clearly singing something else, but you have lyrics for a later scene, manually transcribe what you actually hear at `00:20`. Do not force later lyrics to fit early audio.
-    *   **The "Partial Video" Scenario (Leftover Lyrics):** The provided JSON will often contain lyrics for an *entire* 3-minute song, but your video segment might only be 15 seconds long. **ACTION:** ONLY subtitle what is actively sung within the video's actual duration. Discard unused JSON lyrics.
-    *   **No Rapid-Fire Dumping:** DO NOT guess timestamps just to squeeze the provided JSON lyrics into the clip. If there is a 5-second gap between sung words, there MUST be a 5-second gap in your subtitles. 
-    *   **Ghost Subtitles:** Remain SILENT during pure instrumental music, long pauses, or sound effects. Output nothing if no vocals are present.
+    The Reference JSON is web-scraped and may be incomplete or incorrect. Apply these strict safety rules:
+    *   **The Disambiguation Rule:** If audio sounds like phonetic fragments (e.g., "pa-re..."), but the JSON/Text says "パレード" (parade), output the full intended word, NOT the fragments.
+    *   **Strict Boundaries:** Respect the `start` and `end` times of the scenes in the Reference JSON. Do not apply Scene 2's lyrics to Scene 1's audio.
+    *   **Mismatch / Wrong Song:** If the audio clearly differs from the JSON, ignore the JSON entirely.
+    *   **JSON is Longer than Video:** Stop subtitling exactly when the vocals in the video stop. Do not hallucinate the rest of the song.
+    *   **Video is Longer than JSON:** Do not stop subtitling. Switch to 100% manual transcription for the remainder of the video. Subtitle 100% of the audible vocals.
+    *   **Ghost Subtitles:** Remain SILENT during pure instrumental music, long pauses, or sound effects. Output nothing if no vocals are present (unless triggered by a prominent Visual Event).
 
-    ### PRIORITY 1: PRECISION TIMESTAMPS & SOLVING "CASCADING DELAYS"
-    AI models frequently suffer from "Cascading Delays" (where subtitles gradually fall behind the audio) because they try to keep text on screen longer for readability. **YOU MUST OVERRIDE THIS BIAS USING THESE STRICT MECHANICAL RULES:**
-    
-    *   **Rule 1: The Sacred Start Time:** The `s` (start) timestamp is an absolute, immutable anchor. It MUST trigger the exact millisecond the word is spoken. NEVER delay a start time just because the previous subtitle was long.
-    *   **Rule 2: Truncation Over Extension:** If Line 1 is spoken, and Line 2 begins immediately after it, Line 1's `e` timestamp MUST be aggressively truncated to make room for Line 2's `s` timestamp. Do not artificially stretch the duration of Line 1.
-    *   **Rule 3: Instantaneous Transitions (No Artificial Gaps):** In rapid speech, do not invent visual padding. If there is no breath between sentences, Line 1's `e` MUST EXACTLY EQUAL Line 2's `s` (e.g., Line 1 `e`: 01:05.500 -> Line 2 `s`: 01:05.500). 
-    *   **Rule 4: Timecode Format:** MUST strictly adhere to `MM:SS.mmm` (e.g., `01:05.300`). Always pad with zeros.
+    ### TIMESTAMPS & SOLVING "CASCADING DELAYS"
+    AI models frequently suffer from "Cascading Delays" (subtitles falling behind audio). **OVERRIDE THIS BIAS USING THESE STRICT MECHANICAL RULES:**
+    *   **Rule 1 - The Sacred Start Time:** The `s` (start) timestamp is immutable. It MUST trigger the exact millisecond the word is spoken. Never delay a start time to accommodate a previous long subtitle.
+    *   **Rule 2 - Truncation Over Extension:** If Line 1 is spoken, and Line 2 begins immediately after, Line 1's `e` timestamp MUST be aggressively truncated to make room for Line 2's `s` timestamp. 
+    *   **Rule 3 - Instantaneous Transitions:** In rapid speech with no breaths, Line 1's `e` MUST EXACTLY EQUAL Line 2's `s` (e.g., Line 1 `e`: 01:05.500 -> Line 2 `s`: 01:05.500). 
+    *   **Rule 4 - Timecode Format:** MUST strictly adhere to `MM:SS.mmm` (e.g., `01:05.300`). Always pad with zeros.
 
-    ### PRIORITY 2: INTELLIGENT SEGMENTATION & HANDLING PAUSES
-    *   **Handling Pauses (The Splitting Rule):** If there is a physical pause or breath in the audio in the middle of a sentence, YOU MUST SPLIT the text into a new subtitle block. NEVER merge text across an audio pause into a single JSON block. 
-    *   **Max Length:** Limit each subtitle block to a maximum of 50 characters (for both `og` and `en`). Group phrases logically.
-
-    ### PRIORITY 3: HOLISTIC CONTEXT & TRANSLATION
-    *   **Context-Aware Translation (NO ISOLATION):** NEVER translate lines in isolation. Always analyze the **Previous 2 Sentences**, the **Next 2 Sentences**, and the **Full Current Sentence**. Use this context to determine pronouns, tense, and tone.
-    *   **Semantic Continuity:** If you must split a sentence due to an audio pause or character limits, ensure the translation of "Part 1" grammatically anticipates "Part 2" (e.g., using ellipses `...` or connective forms). 
-    *   **Visual Text Rules:** Transcribe/translate prominent, relevant visual text (titles, signs). Exclude meaningless background clutter or UI elements.
+    ### SEGMENTATION, PAUSES & TRANSLATION
+    *   **Max Length:** Limit each subtitle block to 50 characters per line. Group phrases logically.
+    *   **Context-Aware Translation:** Ensure semantic continuity. If a sentence is split across two blocks, ensure the English translation grammatically flows from Part 1 to Part 2 (e.g., using ellipses `...`). Always analyze the **Previous 2 Sentences**, the **Next 2 Sentences**, and the **Full Current Sentence**. Use this context to determine pronouns, tense, and tone.
+    *   **Visual Text Rules & Formatting:** Translate prominent, relevant visual text (titles, signs). Exclude meaningless background clutter or UI elements. If visual text appears simultaneously with spoken dialogue, prioritize translating the spoken dialogue (do not merge them).
     *   **No CC Tags:** Transcribe speech/vocals only. NO closed captioning tags like `[applause]`, `(sighs)`, or `♪`. 
 
     ---
@@ -126,10 +125,9 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
     ### EXAMPLES
 
     **Example 1: Resolving Ambiguous Audio with Text/JSON**
-    *Output:*
     ```json
     {
-      "global_analysis": "Audio features stylized singing ('pa-re, pa-re'). Used On-Screen Text/Reference JSON to confirm the intended word is 'パレード' (parade). Timing strictly tied to the audio vocalizations.",
+      "global_analysis": "1. JSON Match: Audio phonetics ('pa-re') were ambiguous but matched JSON intended word ('パレード'). 2. JSON Usage: Fully utilized for disambiguation. 3. Timing & Pacing: Normal pacing, timing strictly anchored to audio vocalizations.",
       "subs": [
         {
           "s": "00:10.000",
@@ -142,10 +140,9 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
     ```
 
     **Example 2: Partial Video Scenario & Fast-Paced Song**
-    *Output:*
     ```json
     {
-      "global_analysis": "Fast-paced vocals detected. Verified JSON matches phonetics. The JSON contains the full song, but the video ends after two lines. I am discarding the unused JSON lyrics. Keeping durations tightly wrapped to the audio.",
+      "global_analysis": "1. JSON Match: Fast-paced vocals match JSON phonetics perfectly. 2. JSON Usage: JSON contained the full song, but video ended early; discarded unused leftover lyrics. 3. Timing & Pacing: Kept durations tightly wrapped to audio to handle fast pacing.",
       "subs": [
         {
           "s": "01:12.100",
@@ -165,15 +162,14 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
 
     **Example 3: Handling Pauses Mid-Sentence (Preventing Early Cutoff)**
     *Scenario:* The speaker says "人の世に" (01:07.800 - 01:13.200), pauses for 1 second, then says "生まれし悪を 闇にへと 葬れよ" (01:14.200 - 01:18.500).
-    *Output:*
     ```json
     {
-      "global_analysis": "Sentence contains a mid-sentence audio pause. I split the sentence into two discrete blocks to match the vocal bursts, ensuring the text is not dumped early and the English translation maintains semantic continuity across the pause.",
+      "global_analysis": "1. JSON Match: Audio matches JSON reference. 2. JSON Usage: Fully utilized. 3. Timing & Pacing: Detected a 1-second audio pause mid-sentence. Split into two discrete blocks to match vocal bursts and maintain semantic continuity.",
       "subs": [
         {
           "s": "01:07.800",
           "e": "01:13.200",
-          "og": "人の世に",
+          "og": "人の世に...",
           "en": "From the world of men..."
         },
         {
@@ -188,10 +184,9 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
 
     **Example 4: Preventing Cascading Delays in Rapid Speech**
     *Scenario:* Speaker delivers a rapid-fire line with zero pauses. If the model extends Line 1's reading time, Line 2 will fall behind the audio.
-    *Output:*
     ```json
     {
-      "global_analysis": "Detected rapid, continuous speech. Applying strict anti-cascading rules: anchoring start times exclusively to the audio onset and using instantaneous transitions (Line 1 'e' equals Line 2 's'). I am aggressively truncating the first subtitle's end time to prevent a traffic jam.",
+      "global_analysis": "1. JSON Match: Audio matches JSON reference. 2. JSON Usage: Fully utilized. 3. Timing & Pacing: Detected continuous rapid speech. Applied aggressive end-time truncation and instantaneous transitions (Line 1 'e' equals Line 2 's') to prevent cascading delays.",
       "subs": [
         {
           "s": "00:45.200",
@@ -209,13 +204,34 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
     }
     ```
 
-    ### OUTPUT FORMAT
-    Return **ONLY** a valid, parseable JSON object. No markdown wrapping outside the JSON.
-    You MUST output `global_analysis` FIRST.
-
-    **JSON Schema:**
+    **Example 5: Handling Silent On-Screen Text Before Dialogue**
+    *Scenario:* A silent title card reads "第1章" from 00:02.000 to 00:05.000. Then, a character speaks at 00:06.500.
+    ```json
     {
-      "global_analysis": "Strict Verification Step: 1. State if the audio phonetically matches the JSON reference. 2. If wrong song, state ignore. 3. If leftover lyrics, state discard. 4. Acknowledge the pacing of the audio and pledge to use aggressive truncation if speech is rapid to prevent delays.",
+      "global_analysis": "1. JSON Match: N/A. 2. JSON Usage: Manual translation utilized for on-screen title card. 3. Timing & Pacing: Timed visual text to its on-screen duration during silence, followed by audio-anchored timing for spoken dialogue.",
+      "subs": [
+        {
+          "s": "00:02.000",
+          "e": "00:05.000",
+          "og": "第1章",
+          "en": "[Title: Chapter 1]"
+        },
+        {
+          "s": "00:06.500",
+          "e": "00:08.000",
+          "og": "さあ、始めようか",
+          "en": "Now then, shall we begin?"
+        }
+      ]
+    }
+    ```
+
+    ### OUTPUT FORMAT
+    Return ONLY a valid JSON object wrapped in a markdown block. You MUST output `global_analysis` FIRST.
+
+    ```json
+    {
+      "global_analysis": "1. JSON Match: State if audio phonetically matches JSON. 2. JSON Usage: State if JSON was ignored, discarded, or if manual transcription was required. 3. Timing & Pacing: Note any aggressive truncation for rapid speech, splitting for pauses, or inclusion of visual text.",
       "subs": [
         {
           "s": "MM:SS.mmm",
@@ -225,6 +241,7 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
         }
       ]
     }
+    ```
 
     ### SCENE & LYRICS REFERENCE JSON INPUT:
     ```json
@@ -243,4 +260,4 @@ def get_subtitle_prompt(scene_response: LyricsSceneAiResponse | None) -> str:
         str: The full prompt string.
     """
     scene_json = scene_response.model_dump_json(indent=2) if scene_response else "null"
-    return f"{_SUBTITLES_PROMPT_TEMPLATE}{scene_json}\n```"
+    return f"{_SUBTITLES_PROMPT_TEMPLATE}\n{scene_json}\n```"
