@@ -1,5 +1,31 @@
 # AI Sub Release Notes
 
+## v2.6.1b2
+
+This release refines the AI prompting strategy to improve formatting reliability and better handle visual-only cues.
+
+**Prompt Engineering:**
+
+- **Lyrics Detection (v3):**
+  - **JSON Syntax Guards:** Introduced strict rules for escaping, newlines, and key separation to ensure valid JSON output under all conditions.
+  - **Simplified Pipeline:** Streamlined the metadata resolution steps for improved efficiency.
+- **Subtitle Generation (v15):**
+  - **Dual-Trigger System:** Clarified that subtitles are triggered by both vocal audio and prominent on-screen text.
+  - **Visual Events Exception:** Explicitly instructs the AI to subtitle relevant visual text (like chapter titles) even when no audio is present.
+  - **Anti-Hallucination Hardening:** Strengthened rules for ignoring incorrect or incomplete reference data and mandated manual transcription when the JSON reference fails.
+  - **Standardized Analysis:** Updated examples to use a consistent, structured `global_analysis` format.
+  - **New Visual Text Example:** Added a dedicated example for handling silent title cards.
+
+**Backend & Validation:**
+
+- **Timestamp Validation:**
+  - Refactored timestamp parsing into an internal utility function `_parse_timestamp_string_ms`.
+  - Implemented Pydantic `model_validator` on both `Subtitles` and `Scene` models to verify timestamp format and ensure the start time is strictly before the end time.
+  - Improved robustness against malformed AI-generated strings (e.g., truncated JSON noise in timestamp fields).
+- **Static Analysis Fixes:**
+  - Resolved `CliPositionalArg` to `Path` type mismatch for static analysis.
+  - Added explicit type casting in `config.py` and `main.py` to address errors where `CliPositionalArg` was not assignable to `Path` for methods like `.resolve()`, `.stem`, and `.name` in Pyright/mypy.
+
 ## v2.6.1b1
 
 This release focuses on hardening the AI's transcription logic and translation accuracy by introducing stricter boundaries for reference data and expanding the contextual window for translations.
