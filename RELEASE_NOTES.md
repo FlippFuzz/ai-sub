@@ -1,5 +1,28 @@
 # AI Sub Release Notes
 
+## v2.6.1b3
+
+This release focuses on hardening the lyrics detection stage against AI formatting errors and improving the efficiency of the web search pipeline.
+
+**Prompt Engineering:**
+
+- **Lyrics Detection (v4):**
+  - **JSON Syntax Guard:** Introduced a critical safety layer to prevent "field leakage," where the AI might accidentally include JSON keys or structural markers inside string values.
+  - **High-Efficiency Search:** Re-engineered the execution pipeline to explicitly mandate simultaneous, multi-query web searches. This significantly reduces the number of AI turns required, lowering both latency and API costs.
+  - **Structured Output Format:** Refined the prompt's output block to provide a clearer template for the model, ensuring consistent JSON generation.
+
+**Backend & Validation:**
+
+- **Robust Timestamp Parsing:**
+  - Refactored `_parse_timestamp_string_ms` to use regular expressions. This allows the system to successfully extract valid timecodes even if the AI response contains "noisy" prefixes or suffixes (e.g., `"01:23.456,start:"`) within the timestamp field.
+- **Data Model Enhancements:**
+  - **Original Language Tracking:** Added a dedicated `original_language` field to the `Scene` model to better capture and track the primary language of detected songs.
+  - **Scene Integrity:** Implemented a Pydantic `model_validator` for the `Scene` class, ensuring that all detected scenes maintain chronological integrity (start time must be strictly before end time) before processing continues.
+
+**Bug Fixes:**
+
+- Fixed an issue where "field leakage" in AI responses could lead to JSON validation failures.
+
 ## v2.6.1b2
 
 This release refines the AI prompting strategy to improve formatting reliability and better handle visual-only cues.
