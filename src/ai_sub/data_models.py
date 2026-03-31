@@ -2,7 +2,7 @@ import re
 import string
 from enum import IntEnum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import logfire
 from google.genai.types import File
@@ -46,6 +46,24 @@ class AiSubResult(IntEnum):
 # ==============================================================================
 
 
+def _clean_timestamp_string(ts_str: str) -> str:
+    """
+    Extracts a valid timestamp pattern from a potentially noisy LLM string.
+
+    LLMs occasionally suffer from "field leakage" where they include the subsequent
+    JSON key or structural markers inside a string value. This function uses
+    regex to isolate the actual timecode from such noise.
+
+    Example:
+        "03:52.000,start:" -> "03:52.000"
+        "01:23.456"        -> "01:23.456"
+        "start: 00:10"     -> "00:10"
+    """
+    # Matches MM:SS, MM:SS.mmm, or MM:SS:mmm
+    match = re.search(r"(\d{1,2}:\d{2}(?:[:.]\d{1,3})?)", ts_str)
+    return match.group(1) if match else ts_str
+
+
 def _parse_timestamp_string_ms(timestamp_string: str) -> int:
     """Parses a timestamp string into milliseconds.
 
@@ -60,12 +78,7 @@ def _parse_timestamp_string_ms(timestamp_string: str) -> int:
     Raises:
         ValueError: If the timestamp string is None or in an invalid format.
     """
-    # Use regex to extract the time part, ignoring any LLM "field leakage" (e.g., "03:52.000,start:")
-    match = re.search(r"(\d{1,2}:\d{2}(?:[:.]\d{1,3})?)", timestamp_string)
-    if not match:
-        raise ValueError(f"Invalid timestamp format: {timestamp_string}")
-
-    ts = match.group(1)
+    ts = timestamp_string
 
     if "." in ts:
         # Handles "MM:SS.mmm"
@@ -114,6 +127,17 @@ class Subtitles(BaseModel):
         alias="og", description="The transcription/text in its original language."
     )
     english: str = Field(alias="en", description="The English translation of the text.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def clean_leakage(cls, data: Any) -> Any:
+        """Strips LLM noise from timestamps before field assignment."""
+        if isinstance(data, dict):
+            # Check both field names and aliases
+            for key in ("start", "s", "end", "e"):
+                if key in data and isinstance(data[key], str):
+                    data[key] = _clean_timestamp_string(data[key])
+        return data
 
     @model_validator(mode="after")
     def validate_timestamps(self) -> "Subtitles":
@@ -217,6 +241,16 @@ class Scene(BaseModel):
         default=None,
         description="The English translation of the lyrics, found via web search.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def clean_leakage(cls, data: Any) -> Any:
+        """Strips LLM noise from timestamps before field assignment."""
+        if isinstance(data, dict):
+            for key in ("start", "end"):
+                if key in data and isinstance(data[key], str):
+                    data[key] = _clean_timestamp_string(data[key])
+        return data
 
     @model_validator(mode="after")
     def validate_timestamps(self) -> "Scene":
