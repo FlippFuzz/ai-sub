@@ -1,3 +1,8 @@
+"""Main entry point for the AI Sub subtitle generation pipeline.
+
+Orchestrates video splitting, re-encoding, uploading, and AI transcription.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -42,8 +47,7 @@ from ai_sub.video import (
 
 
 class ReEncodeJobRunner(JobRunner):
-    """
-    Worker that re-encodes video segments to a lower quality/different format.
+    """Worker that re-encodes video segments to a lower quality/different format.
 
     This is typically done to reduce file size before uploading to an API,
     saving bandwidth and potentially processing time.
@@ -56,11 +60,20 @@ class ReEncodeJobRunner(JobRunner):
         on_complete: Callable[[SegmentJobs, Any], Awaitable[None]],
         name: str = "reencode",
     ):
+        """Initializes the ReEncodeJobRunner.
+
+        Args:
+            settings (Settings): The application's configuration settings.
+            max_workers (int): The maximum number of concurrent tasks.
+            on_complete (Callable[[SegmentJobs, Any], Awaitable[None]]): Callback executed
+                upon successful completion of a job.
+            name (str): The name of the runner.
+
+        """
         super().__init__(settings, max_workers, on_complete, name=name)
 
     async def process(self, job: SegmentJobs) -> None:
-        """
-        Re-encodes the video file specified in the job.
+        """Re-encodes the video file specified in the job.
 
         After re-encoding, it returns None, triggering the on_complete callback in the runner.
         """
@@ -76,14 +89,11 @@ class ReEncodeJobRunner(JobRunner):
             reencode_job.duration_tolerance_ms,
         )
 
-        logfire.info(
-            f"{reencode_job.name} re-encoded to {reencode_job.output_file.name}"
-        )
+        logfire.info(f"{reencode_job.name} re-encoded to {reencode_job.output_file.name}")
 
 
 class UploadJobRunner(JobRunner):
-    """
-    Worker that uploads video files to the Gemini Files API.
+    """Worker that uploads video files to the Gemini Files API.
 
     This runner is used when the AI model requires the file to be hosted
     on Google's servers (e.g., for Gemini models).
@@ -97,14 +107,28 @@ class UploadJobRunner(JobRunner):
         on_complete: Callable[[SegmentJobs, Any], Awaitable[None]],
         name: str = "upload",
     ):
+        """Initializes the UploadJobRunner.
+
+        Args:
+            settings (Settings): The application's configuration settings.
+            max_workers (int): The maximum number of concurrent tasks.
+            uploader (GeminiFileUploader): The uploader instance to use.
+            on_complete (Callable[[SegmentJobs, Any], Awaitable[None]]): Callback executed
+                upon successful completion of a job.
+            name (str): The name of the runner.
+
+        """
         super().__init__(settings, max_workers, on_complete, name=name)
         self.uploader = uploader
 
     async def process(self, job: SegmentJobs) -> Any:
-        """
-        Uploads the specified file using the `GeminiFileUploader`.
+        """Uploads the specified file using the `GeminiFileUploader`.
 
         Upon successful upload, it returns the file object, triggering the on_complete callback.
+
+        Returns:
+            Any: The uploaded file metadata object.
+
         """
         upload_job = job.upload
         assert upload_job is not None
@@ -116,9 +140,7 @@ class UploadJobRunner(JobRunner):
 
 
 class LyricsSceneJobRunner(JobRunner):
-    """
-    Worker that executes the AI agent to detect lyrics and scenes.
-    """
+    """Worker that executes the AI agent to detect lyrics and scenes."""
 
     def __init__(
         self,
@@ -128,22 +150,27 @@ class LyricsSceneJobRunner(JobRunner):
         on_complete: Callable[[SegmentJobs, Any], Awaitable[None]],
         name: str = "lyrics",
     ):
+        """Initializes the LyricsSceneJobRunner.
+
+        Args:
+            settings (Settings): The application's configuration settings.
+            max_workers (int): The maximum number of concurrent tasks.
+            agent (RateLimitedAgentWrapper): The AI agent instance for processing.
+            on_complete (Callable[[SegmentJobs, Any], Awaitable[None]]): Callback executed
+                upon successful completion of a job.
+            name (str): The name of the runner.
+
+        """
         super().__init__(settings, max_workers, on_complete, name=name)
         self.agent = agent
-        self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(
-            self.agent.model_name
-        )
+        self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(self.agent.model_name)
 
     async def process(self, job: SegmentJobs) -> None:
-        """
-        Invokes the AI agent to detect scenes.
-        """
+        """Invokes the AI agent to detect scenes."""
         lyrics_job = job.lyrics
         assert lyrics_job is not None
         if lyrics_job.response:
-            logfire.info(
-                f"Skipping lyrics generation for {lyrics_job.name} as valid response exists."
-            )
+            logfire.info(f"Skipping lyrics generation for {lyrics_job.name} as valid response exists.")
             return
 
         assert lyrics_job.file is not None
@@ -160,17 +187,12 @@ class LyricsSceneJobRunner(JobRunner):
         assert lyrics_job is not None
         if lyrics_job.response:
             lyrics_job.lyrics_prompt_version = LYRICS_PROMPT_VERSION
-            job_state_path = (
-                self.settings.dir.tmp
-                / f"{lyrics_job.name}.lyrics.{self.sanitized_model_name}.json"
-            )
+            job_state_path = self.settings.dir.tmp / f"{lyrics_job.name}.lyrics.{self.sanitized_model_name}.json"
             await asyncio.to_thread(lyrics_job.save, job_state_path)
 
 
 class SubtitleJobRunner(JobRunner):
-    """
-    Worker that executes the AI agent to generate subtitles.
-    """
+    """Worker that executes the AI agent to generate subtitles."""
 
     def __init__(
         self,
@@ -180,22 +202,27 @@ class SubtitleJobRunner(JobRunner):
         on_complete: Callable[[SegmentJobs, Any], Awaitable[None]] | None = None,
         name: str = "subtitles",
     ):
+        """Initializes the SubtitleJobRunner.
+
+        Args:
+            settings (Settings): The application's configuration settings.
+            max_workers (int): The maximum number of concurrent tasks.
+            agent (RateLimitedAgentWrapper): The AI agent instance for processing.
+            on_complete (Callable[[SegmentJobs, Any], Awaitable[None]] | None): Optional callback
+                executed upon successful completion of a job.
+            name (str): The name of the runner.
+
+        """
         super().__init__(settings, max_workers, on_complete, name=name)
         self.agent = agent
-        self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(
-            self.agent.model_name
-        )
+        self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(self.agent.model_name)
 
     async def process(self, job: SegmentJobs) -> None:
-        """
-        Invokes the AI agent to generate subtitles.
-        """
+        """Invokes the AI agent to generate subtitles."""
         subtitle_job = job.subtitles
         assert subtitle_job is not None
         if subtitle_job.response:
-            logfire.info(
-                f"Skipping subtitle generation for {subtitle_job.name} as valid response exists."
-            )
+            logfire.info(f"Skipping subtitle generation for {subtitle_job.name} as valid response exists.")
             return
 
         lyrics_job = job.lyrics
@@ -211,8 +238,7 @@ class SubtitleJobRunner(JobRunner):
         )
 
     async def post_process(self, job: SegmentJobs) -> None:
-        """
-        Saves the result (or partial state) to disk.
+        """Saves the result (or partial state) to disk.
 
         This ensures that if the process is interrupted, completed segments
         don't need to be re-processed.
@@ -224,14 +250,9 @@ class SubtitleJobRunner(JobRunner):
         # Also generate a subtitle file for this job for the user to view.
         if subtitle_job.response is not None:
             subtitle_job.subtitles_prompt_version = SUBTITLES_PROMPT_VERSION
-            job_state_path = (
-                self.settings.dir.tmp
-                / f"{subtitle_job.name}.subtitles.{self.sanitized_model_name}.json"
-            )
+            job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.sanitized_model_name}.json"
             await asyncio.to_thread(subtitle_job.save, job_state_path)
-            sanitized_model = self.settings.ai.get_sanitized_model_name(
-                self.settings.ai.model_subtitles
-            )
+            sanitized_model = self.settings.ai.get_sanitized_model_name(self.settings.ai.model_subtitles)
 
             def _save_ssa(response: SubtitleAiResponse, path: str) -> None:
                 response.get_ssafile().save(path)
@@ -239,17 +260,12 @@ class SubtitleJobRunner(JobRunner):
             await asyncio.to_thread(
                 _save_ssa,
                 subtitle_job.response,
-                str(
-                    self.settings.dir.tmp / f"{subtitle_job.name}.{sanitized_model}.srt"
-                ),
+                str(self.settings.dir.tmp / f"{subtitle_job.name}.{sanitized_model}.srt"),
             )
 
 
-def stitch_subtitles(
-    video_splits: list[tuple[Path, int]], settings: Settings
-) -> AiSubResult:
-    """
-    Assembles the final subtitle file from processed segments.
+def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -> AiSubResult:
+    """Assembles the final subtitle file from processed segments.
 
     It iterates through the expected video segments, loads the corresponding
     processed subtitle jobs, and concatenates them. Timestamps are shifted
@@ -261,19 +277,14 @@ def stitch_subtitles(
 
     Returns:
         AiSubResult: The overall result status of the subtitle generation (COMPLETE, INCOMPLETE, etc.).
+
     """
     with logfire.span("Producing final SRT file"):
         all_subtitles = SSAFile()
-        sanitized_lyrics_model = settings.ai.get_sanitized_model_name(
-            settings.ai.model_lyrics
-        )
-        sanitized_subtitles_model = settings.ai.get_sanitized_model_name(
-            settings.ai.model_subtitles
-        )
+        sanitized_lyrics_model = settings.ai.get_sanitized_model_name(settings.ai.model_lyrics)
+        sanitized_subtitles_model = settings.ai.get_sanitized_model_name(settings.ai.model_subtitles)
 
-        chunks_to_skip = int(
-            (settings.split.start_offset_min * 60) / settings.split.max_seconds
-        )
+        chunks_to_skip = int((settings.split.start_offset_min * 60) / settings.split.max_seconds)
         offset_ms = sum(duration for _, duration in video_splits[:chunks_to_skip])
 
         complete = True
@@ -282,10 +293,7 @@ def stitch_subtitles(
         for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
             # Load the job result from the temporary JSON file.
             # We look for the final subtitle output
-            job_path = (
-                settings.dir.tmp
-                / f"{video_path.stem}.subtitles.{sanitized_subtitles_model}.json"
-            )
+            job_path = settings.dir.tmp / f"{video_path.stem}.subtitles.{sanitized_subtitles_model}.json"
             job = SubtitleJob.load(job_path)
             if job and job.response:
                 current_subtitles = job.response.get_ssafile()
@@ -315,10 +323,7 @@ def stitch_subtitles(
             if job:  # subtitle job
                 final_job_retry_count = job.total_num_retries
             else:
-                lyrics_job_path = (
-                    settings.dir.tmp
-                    / f"{video_path.stem}.lyrics.{sanitized_lyrics_model}.json"
-                )
+                lyrics_job_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{sanitized_lyrics_model}.json"
                 lyrics_job = LyricsSceneJob.load(lyrics_job_path)
                 if lyrics_job:
                     final_job_retry_count = lyrics_job.total_num_retries
@@ -353,12 +358,7 @@ def stitch_subtitles(
             all_subtitles[1].start = 1
 
         input_video_path = cast(Path, settings.input_video_file)
-        all_subtitles.save(
-            str(
-                settings.dir.out
-                / f"{input_video_path.stem}.{sanitized_subtitles_model}.srt"
-            )
-        )
+        all_subtitles.save(str(settings.dir.out / f"{input_video_path.stem}.{sanitized_subtitles_model}.srt"))
 
         if max_retries_exceeded:
             return AiSubResult.MAX_RETRIES_EXHAUSTED
@@ -368,8 +368,7 @@ def stitch_subtitles(
 
 
 async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
-    """
-    Orchestrates the subtitle generation pipeline.
+    """Orchestrates the subtitle generation pipeline.
 
     The pipeline consists of four sequential stages for each video segment:
     1.  **Re-encode (Optional):** Compresses the video segment if it exceeds size thresholds.
@@ -394,6 +393,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
     Returns:
         AiSubResult: An enum indicating the final status (COMPLETE, INCOMPLETE, etc.).
+
     """
     if configure_logging:
         # Configure Logfire for observability. This setup includes a console logger
@@ -430,23 +430,16 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
     agent_subtitles = RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
     use_lyrics = settings.thread.lyrics > 0
     agent_scene = (
-        RateLimitedAgentWrapper(settings, settings.ai.model_lyrics, use_web_search=True)
-        if use_lyrics
-        else None
+        RateLimitedAgentWrapper(settings, settings.ai.model_lyrics, use_web_search=True) if use_lyrics else None
     )
 
-    sanitized_lyrics_model = settings.ai.get_sanitized_model_name(
-        settings.ai.model_lyrics
-    )
-    sanitized_subtitles_model = settings.ai.get_sanitized_model_name(
-        settings.ai.model_subtitles
-    )
+    sanitized_lyrics_model = settings.ai.get_sanitized_model_name(settings.ai.model_lyrics)
+    sanitized_subtitles_model = settings.ai.get_sanitized_model_name(settings.ai.model_subtitles)
 
     input_video_path = cast(Path, settings.input_video_file)
 
     # Start the main application logic within a Logfire span for better tracing.
     with logfire.span(f"Generating subtitles for {input_video_path.name}"):
-
         # Step 1: Split the input video into smaller segments.
         video_splits_paths = await split_video(
             input_video_path,
@@ -465,13 +458,9 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
         tasks = [probe_with_sema(path) for path in video_splits_paths]
         durations = await asyncio.gather(*tasks)
-        video_splits: list[tuple[Path, int]] = list(
-            zip(video_splits_paths, durations, strict=True)
-        )
+        video_splits: list[tuple[Path, int]] = list(zip(video_splits_paths, durations, strict=True))
 
-        chunks_to_skip = int(
-            (settings.split.start_offset_min * 60) / settings.split.max_seconds
-        )
+        chunks_to_skip = int((settings.split.start_offset_min * 60) / settings.split.max_seconds)
         splits_to_process = video_splits
         if chunks_to_skip > 0:
             skipped_splits = video_splits[:chunks_to_skip]
@@ -487,9 +476,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         use_reencode = settings.split.re_encode.enabled
         is_google_sub = agent_subtitles.is_google()
         is_google_scene = agent_scene.is_google() if agent_scene else False
-        use_upload = (
-            is_google_sub or is_google_scene
-        ) and settings.ai.google.use_files_api
+        use_upload = (is_google_sub or is_google_scene) and settings.ai.google.use_files_api
 
         reencode_runner: ReEncodeJobRunner | None = None
         upload_runner: UploadJobRunner | None = None
@@ -562,16 +549,12 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
             elif next_stage == "lyrics":
                 existing_lyrics = job.lyrics
-                new_lyrics_job = LyricsSceneJob(
-                    name=name, file=file_handle, video_duration_ms=duration_ms
-                )
+                new_lyrics_job = LyricsSceneJob(name=name, file=file_handle, video_duration_ms=duration_ms)
                 if existing_lyrics:
                     new_lyrics_job.total_num_retries = existing_lyrics.total_num_retries
                     if existing_lyrics.response:
                         new_lyrics_job.response = existing_lyrics.response
-                        new_lyrics_job.lyrics_prompt_version = (
-                            existing_lyrics.lyrics_prompt_version
-                        )
+                        new_lyrics_job.lyrics_prompt_version = existing_lyrics.lyrics_prompt_version
 
                 job.lyrics = new_lyrics_job
                 if scene_detection_runner:
@@ -579,16 +562,12 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
             elif next_stage == "subtitles":
                 existing_subs = job.subtitles
-                new_subs_job = SubtitleJob(
-                    name=name, file=file_handle, video_duration_ms=duration_ms
-                )
+                new_subs_job = SubtitleJob(name=name, file=file_handle, video_duration_ms=duration_ms)
                 if existing_subs:
                     new_subs_job.total_num_retries = existing_subs.total_num_retries
                     if existing_subs.response:
                         new_subs_job.response = existing_subs.response
-                        new_subs_job.subtitles_prompt_version = (
-                            existing_subs.subtitles_prompt_version
-                        )
+                        new_subs_job.subtitles_prompt_version = existing_subs.subtitles_prompt_version
 
                 job.subtitles = new_subs_job
                 if subtitle_runner:
@@ -642,17 +621,12 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
             job_state = SegmentJobs()
 
             # Load jobs if they exist and populate the in-memory JobState
-            lyrics_job_path = (
-                settings.dir.tmp / f"{split.stem}.lyrics.{sanitized_lyrics_model}.json"
-            )
+            lyrics_job_path = settings.dir.tmp / f"{split.stem}.lyrics.{sanitized_lyrics_model}.json"
             lyrics_job = await asyncio.to_thread(LyricsSceneJob.load, lyrics_job_path)
             if lyrics_job:
                 job_state.lyrics = lyrics_job
 
-            subtitle_job_path = (
-                settings.dir.tmp
-                / f"{split.stem}.subtitles.{sanitized_subtitles_model}.json"
-            )
+            subtitle_job_path = settings.dir.tmp / f"{split.stem}.subtitles.{sanitized_subtitles_model}.json"
             subtitle_job = await asyncio.to_thread(SubtitleJob.load, subtitle_job_path)
             if subtitle_job:
                 job_state.subtitles = subtitle_job
@@ -674,9 +648,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     should_reencode = True
                 else:
                     file_size_mb = split.stat().st_size / (1024 * 1024)
-                    should_reencode = (
-                        file_size_mb >= settings.split.re_encode.threshold_mb
-                    )
+                    should_reencode = file_size_mb >= settings.split.re_encode.threshold_mb
 
             if should_reencode:
                 output_file = reencode_dir / split.with_suffix(".mov").name
@@ -778,8 +750,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
 
 def main() -> None:
-    """
-    Parses CLI arguments and runs the main `ai_sub` function.
+    """Parses CLI arguments and runs the main `ai_sub` function.
 
     This is the primary entry point for the command-line application. It uses
     `pydantic-settings.CliApp` to build a `Settings` object from command-line

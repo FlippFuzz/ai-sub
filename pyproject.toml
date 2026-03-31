@@ -26,3 +26,14 @@ ai-sub = "ai_sub.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+preview = true
+select = ["D", "DOC", "E", "F", "I"]
+fixable = ["ALL"]
+ignore = ["D401"]
+

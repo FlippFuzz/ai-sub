@@ -23,8 +23,7 @@ from pysubs2 import SSAEvent, SSAFile
 
 
 class AiSubResult(IntEnum):
-    """
-    Defines standardized exit codes for the application.
+    """Defines standardized exit codes for the application.
 
     These codes are returned by the main `ai_sub` function to indicate the final
     status of the subtitle generation process, allowing for programmatic checks
@@ -47,8 +46,7 @@ class AiSubResult(IntEnum):
 
 
 def _clean_timestamp_string(ts_str: str) -> str:
-    """
-    Extracts a valid timestamp pattern from a potentially noisy LLM string.
+    """Extracts a valid timestamp pattern from a potentially noisy LLM string.
 
     LLMs occasionally suffer from "field leakage" where they include the subsequent
     JSON key or structural markers inside a string value. This function uses
@@ -58,6 +56,7 @@ def _clean_timestamp_string(ts_str: str) -> str:
         "03:52.000,start:" -> "03:52.000"
         "01:23.456"        -> "01:23.456"
         "start: 00:10"     -> "00:10"
+
     """
     # Matches MM:SS, MM:SS.mmm, or MM:SS:mmm
     match = re.search(r"(\d{1,2}:\d{2}(?:[:.]\d{1,3})?)", ts_str)
@@ -77,6 +76,7 @@ def _parse_timestamp_string_ms(timestamp_string: str) -> int:
 
     Raises:
         ValueError: If the timestamp string is None or in an invalid format.
+
     """
     ts = timestamp_string
 
@@ -141,9 +141,7 @@ class Subtitles(BaseModel):
 
     @model_validator(mode="after")
     def validate_timestamps(self) -> "Subtitles":
-        """
-        Validates the timestamps for a subtitle.
-        """
+        """Validates the timestamps for a subtitle."""
         try:
             start_ms = _parse_timestamp_string_ms(self.start)
             end_ms = _parse_timestamp_string_ms(self.end)
@@ -157,8 +155,7 @@ class Subtitles(BaseModel):
 
 
 class SubtitleAiResponse(BaseModel):
-    """
-    Represents the structured JSON response from the AI model for subtitle generation.
+    """Represents the structured JSON response from the AI model for subtitle generation.
 
     This model is the expected output from the AI after it has processed a video
     segment for transcription and translation. It includes a high-level analysis
@@ -175,12 +172,12 @@ class SubtitleAiResponse(BaseModel):
     )
 
     def get_ssafile(self) -> SSAFile:
-        """
-        Converts the response's subtitles into an SSAFile object.
+        """Converts the response's subtitles into an SSAFile object.
         Handles timestamp parsing and combines English and Original text.
 
         Returns:
             SSAFile: An SSAFile object containing the parsed subtitles.
+
         """
         subtitles = SSAFile()
 
@@ -254,9 +251,7 @@ class Scene(BaseModel):
 
     @model_validator(mode="after")
     def validate_timestamps(self) -> "Scene":
-        """
-        Validates the timestamps for a scene.
-        """
+        """Validates the timestamps for a scene."""
         try:
             start_ms = _parse_timestamp_string_ms(self.start)
             end_ms = _parse_timestamp_string_ms(self.end)
@@ -270,8 +265,7 @@ class Scene(BaseModel):
 
 
 class LyricsSceneAiResponse(BaseModel):
-    """
-    Represents the structured JSON response from the AI for the lyrics/scene detection pass.
+    """Represents the structured JSON response from the AI for the lyrics/scene detection pass.
 
     This model captures the AI's analysis of a video segment, including a breakdown
     of scenes, identification of music, and any lyrics found through web searches.
@@ -312,6 +306,7 @@ class Job(BaseModel):
 
         Args:
             filename (Path): The path to the file where the object should be saved.
+
         """
         json_str = self.model_dump_json(indent=2)
         with open(filename, "w", encoding="utf-8") as file:
@@ -388,8 +383,7 @@ class LyricsSceneJob(Job):
 
 
 class SubtitleJob(Job):
-    """
-    Represents a job to generate subtitles (Transcription),
+    """Represents a job to generate subtitles (Transcription),
     using scene/lyrics data from a `SceneResponse` as a reference.
     """
 
@@ -430,8 +424,7 @@ class SubtitleJob(Job):
 
 
 class SegmentJobs(BaseModel):
-    """
-    A container for all potential jobs related to a single video segment.
+    """A container for all potential jobs related to a single video segment.
 
     This model acts as a state-passing object that moves through the pipeline.
     As a segment completes one stage (e.g., re-encoding), the result is stored,

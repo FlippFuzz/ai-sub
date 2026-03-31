@@ -1,3 +1,5 @@
+"""System prompts and templates for the AI subtitle generation pipeline."""
+
 from textwrap import dedent
 
 from ai_sub.data_models import LyricsSceneAiResponse
@@ -91,12 +93,17 @@ _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
 
     **FINAL TASK:**
     Analyze the provided video. Ensure every scene is a separate object in the `scenes` array. Provide the COMPLETE lyrics for every song. Return ONLY the JSON.
-    """
+    """  # noqa: E501
 ).strip()
 
 
 def get_lyrics_scenes_prompt() -> str:
-    """Returns the prompt for scene detection and lyrics research."""
+    """Returns the prompt for scene detection and lyrics research.
+
+    Returns:
+        str: The full prompt template for lyrics and scene detection.
+
+    """
     return _LYRICS_SCENES_PROMPT_TEMPLATE
 
 
@@ -270,19 +277,20 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
 
     ### SCENE & LYRICS REFERENCE JSON INPUT:
     ```json
-    """
+    """  # noqa: E501
 ).strip()
 
 
 def get_subtitle_prompt(scene_response: LyricsSceneAiResponse | None) -> str:
-    """
-    Generates the prompt for subtitle generation.
+    """Generates the prompt for subtitle generation.
 
     Args:
-        scene_response (SceneResponse | None): The scene detection data. Can be None if lyrics/scene detection is disabled.
+        scene_response (SceneResponse | None): The scene detection data.
+            Can be None if lyrics/scene detection is disabled.
 
     Returns:
         str: The full prompt string.
+
     """
     scene_json = scene_response.model_dump_json(indent=2) if scene_response else "null"
     return f"{_SUBTITLES_PROMPT_TEMPLATE}\n{scene_json}\n```"
