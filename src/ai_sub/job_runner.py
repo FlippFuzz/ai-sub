@@ -1,3 +1,5 @@
+"""Generic job processing framework for the subtitle generation pipeline."""
+
 from __future__ import annotations
 
 import asyncio
@@ -10,8 +12,7 @@ from ai_sub.data_models import Job, SegmentJobs
 
 
 class JobRunner:
-    """
-    A generic, concurrent job processor.
+    """A generic, concurrent job processor.
 
     This class provides a framework for processing `SegmentJobs` objects from an
     asyncio.Queue in a concurrent manner using `asyncio.Task`. It handles job
@@ -39,6 +40,7 @@ class JobRunner:
             name (str): The name of the runner. This name is crucial as it's used to
                 dynamically access the corresponding job attribute from the `SegmentJobs` object
                 (e.g., a runner with name 'reencode' will process `job_state.reencode`).
+
         """
         self.queue: asyncio.Queue[SegmentJobs] = asyncio.Queue()
         self.settings = settings
@@ -56,7 +58,12 @@ class JobRunner:
         await self.queue.join()
 
     async def start(self) -> None:
-        """Starts the worker tasks."""
+        """Starts the worker tasks.
+
+        Raises:
+            ValueError: If max_workers is less than or equal to 0.
+
+        """
         if self.max_workers <= 0:
             raise ValueError(f"max_workers must be > 0, got {self.max_workers}")
         self.tasks = [asyncio.create_task(self.run()) for _ in range(self.max_workers)]
@@ -69,8 +76,7 @@ class JobRunner:
             await asyncio.gather(*self.tasks, return_exceptions=True)
 
     async def run(self) -> None:
-        """
-        The main worker loop that processes jobs from the async queue.
+        """The main worker loop that processes jobs from the async queue.
 
         This method runs in a continuous loop on each worker task. It attempts to
         get a `SegmentJobs` container from the queue. It exits when the task is cancelled.
@@ -115,9 +121,7 @@ class JobRunner:
 
                     except Exception:
                         job_name = f"'{current_job.name}'" if current_job else "unknown"
-                        logfire.exception(
-                            f"Exception while running {self.name} job {job_name}"
-                        )
+                        logfire.exception(f"Exception while running {self.name} job {job_name}")
                         if job_state is not None and current_job is not None:
                             await self._handle_retry(job_state, current_job)
 
@@ -126,15 +130,12 @@ class JobRunner:
                             try:
                                 await self.post_process(job_state)
                             except Exception:
-                                logfire.exception(
-                                    f"Exception in post_process for {self.name} job"
-                                )
+                                logfire.exception(f"Exception in post_process for {self.name} job")
             finally:
                 self.queue.task_done()
 
     def get_job(self, job_state: SegmentJobs) -> Job:
-        """
-        Selects the correct Job from the SegmentJobs container based on the runner's name.
+        """Selects the correct Job from the SegmentJobs container based on the runner's name.
 
         This method uses the `name` attribute of the runner to dynamically
         access the corresponding job field within the `SegmentJobs` container.
@@ -144,12 +145,13 @@ class JobRunner:
         Args:
             job_state (SegmentJobs): The container holding all jobs for a segment.
 
+        Returns:
+            Job: The specific job instance for this runner to process.
+
         Raises:
             ValueError: If the job corresponding to the runner's name is not
                         found in the `SegmentJobs` container.
 
-        Returns:
-            Job: The specific job instance for this runner to process.
         """
         job = getattr(job_state, self.name)
         if job is None:
@@ -157,26 +159,25 @@ class JobRunner:
         return job
 
     async def process(self, job: SegmentJobs) -> Any:
-        """
-        Performs the actual processing for a job. Must be implemented by subclasses.
+        """Performs the actual processing for a job. Must be implemented by subclasses.
 
         Args:
             job (SegmentJobs): The `SegmentJobs` container. Subclasses can access their
                             specific job object (e.g., `job.reencode`) and any
                             other prerequisite data from this container.
 
-        Raises:
-            NotImplementedError: If the subclass does not implement this method.
-
         Returns:
             Any: The result of the processing, which will be passed to the
                  `on_complete` callback.
+
+        Raises:
+            NotImplementedError: If the subclass does not implement this method.
+
         """
         raise NotImplementedError
 
     async def post_process(self, job: SegmentJobs) -> None:
-        """
-        A hook for executing code after a job is processed, regardless of success.
+        """A hook for executing code after a job is processed, regardless of success.
 
         This method is called in a `finally` block after `process()` and any
         exception handling. Subclasses can override it to perform cleanup,
@@ -184,6 +185,7 @@ class JobRunner:
 
         Args:
             job (SegmentJobs): The `SegmentJobs` container that was just processed.
+
         """
         pass
 
@@ -198,6 +200,7 @@ class JobRunner:
         Args:
             job_state (SegmentJobs): The `SegmentJobs` container of the failed job.
             job (Job): The specific `Job` instance that failed.
+
         """
         can_retry_run = job.run_num_retries < self.settings.retry.run
         can_retry_total = job.total_num_retries < self.settings.retry.max

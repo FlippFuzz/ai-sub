@@ -76,6 +76,9 @@ class ReEncodeJobRunner(JobRunner):
         """Re-encodes the video file specified in the job.
 
         After re-encoding, it returns None, triggering the on_complete callback in the runner.
+
+        Args:
+            job (SegmentJobs): The segment job container containing re-encoding details.
         """
         reencode_job = job.reencode
         assert reencode_job is not None
@@ -166,7 +169,11 @@ class LyricsSceneJobRunner(JobRunner):
         self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(self.agent.model_name)
 
     async def process(self, job: SegmentJobs) -> None:
-        """Invokes the AI agent to detect scenes."""
+        """Invokes the AI agent to detect scenes.
+
+        Args:
+            job (SegmentJobs): The segment job container containing lyrics/scene detection details.
+        """
         lyrics_job = job.lyrics
         assert lyrics_job is not None
         if lyrics_job.response:
@@ -182,7 +189,11 @@ class LyricsSceneJobRunner(JobRunner):
         )
 
     async def post_process(self, job: SegmentJobs) -> None:
-        """Saves the result to disk."""
+        """Saves the result of the lyrics detection to disk.
+
+        Args:
+            job (SegmentJobs): The segment job container with the processed response.
+        """
         lyrics_job = job.lyrics
         assert lyrics_job is not None
         if lyrics_job.response:
@@ -218,7 +229,11 @@ class SubtitleJobRunner(JobRunner):
         self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(self.agent.model_name)
 
     async def process(self, job: SegmentJobs) -> None:
-        """Invokes the AI agent to generate subtitles."""
+        """Invokes the AI agent to generate subtitles.
+
+        Args:
+            job (SegmentJobs): The segment job container containing subtitle generation details.
+        """
         subtitle_job = job.subtitles
         assert subtitle_job is not None
         if subtitle_job.response:
@@ -242,6 +257,9 @@ class SubtitleJobRunner(JobRunner):
 
         This ensures that if the process is interrupted, completed segments
         don't need to be re-processed.
+
+        Args:
+            job (SegmentJobs): The segment job container with the processed subtitles.
         """
         # Save the completed job state to a JSON file for persistence.
         subtitle_job = job.subtitles

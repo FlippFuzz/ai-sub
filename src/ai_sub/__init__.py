@@ -1,3 +1,5 @@
+"""AI Sub: AI-Powered Subtitle Generation with Translation."""
+
 from .config import (
     AiSettings,
     DirectorySettings,

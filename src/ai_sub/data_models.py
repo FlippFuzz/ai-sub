@@ -1,3 +1,5 @@
+"""Data models for the AI subtitle generation pipeline."""
+
 import re
 import string
 from enum import IntEnum
@@ -51,6 +53,12 @@ def _clean_timestamp_string(ts_str: str) -> str:
     LLMs occasionally suffer from "field leakage" where they include the subsequent
     JSON key or structural markers inside a string value. This function uses
     regex to isolate the actual timecode from such noise.
+
+    Args:
+        ts_str (str): The potentially noisy timestamp string.
+
+    Returns:
+        str: The extracted timestamp string.
 
     Example:
         "03:52.000,start:" -> "03:52.000"
@@ -120,18 +128,21 @@ class Subtitles(BaseModel):
         alias="s",
         description="The start timestamp of the subtitle (e.g., 'MM:SS.mmm').",
     )
-    end: str = Field(
-        alias="e", description="The end timestamp of the subtitle (e.g., 'MM:SS.mmm')."
-    )
-    original: str = Field(
-        alias="og", description="The transcription/text in its original language."
-    )
+    end: str = Field(alias="e", description="The end timestamp of the subtitle (e.g., 'MM:SS.mmm').")
+    original: str = Field(alias="og", description="The transcription/text in its original language.")
     english: str = Field(alias="en", description="The English translation of the text.")
 
     @model_validator(mode="before")
     @classmethod
     def clean_leakage(cls, data: Any) -> Any:
-        """Strips LLM noise from timestamps before field assignment."""
+        """Strips LLM noise from timestamps before field assignment.
+
+        Args:
+            data (Any): The raw input data.
+
+        Returns:
+            Any: The cleaned data.
+        """
         if isinstance(data, dict):
             # Check both field names and aliases
             for key in ("start", "s", "end", "e"):
@@ -141,14 +152,20 @@ class Subtitles(BaseModel):
 
     @model_validator(mode="after")
     def validate_timestamps(self) -> "Subtitles":
-        """Validates the timestamps for a subtitle."""
+        """Validates the timestamps for a subtitle.
+
+        Returns:
+            Subtitles: The validated subtitle instance.
+
+        Raises:
+            ValueError: If the timestamp format is invalid or if the start time
+                is not strictly before the end time.
+        """
         try:
             start_ms = _parse_timestamp_string_ms(self.start)
             end_ms = _parse_timestamp_string_ms(self.end)
             if start_ms >= end_ms:
-                raise ValueError(
-                    f"Start time ({self.start}) must be strictly before end time ({self.end})"
-                )
+                raise ValueError(f"Start time ({self.start}) must be strictly before end time ({self.end})")
         except ValueError as e:
             raise ValueError(f"Invalid timestamp: {e}")
         return self
@@ -164,15 +181,12 @@ class SubtitleAiResponse(BaseModel):
 
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
-    global_analysis: str = Field(
-        description="A high-level analysis or summary from the AI about its process."
-    )
-    subtitles: list[Subtitles] = Field(
-        alias="subs", description="A list of individual subtitle entries."
-    )
+    global_analysis: str = Field(description="A high-level analysis or summary from the AI about its process.")
+    subtitles: list[Subtitles] = Field(alias="subs", description="A list of individual subtitle entries.")
 
     def get_ssafile(self) -> SSAFile:
         """Converts the response's subtitles into an SSAFile object.
+
         Handles timestamp parsing and combines English and Original text.
 
         Returns:
@@ -206,22 +220,12 @@ class SubtitleAiResponse(BaseModel):
 class Scene(BaseModel):
     """Represents a detected scene in the video."""
 
-    start: str = Field(
-        description="The start timestamp of the scene (e.g., 'MM:SS.mmm')."
-    )
+    start: str = Field(description="The start timestamp of the scene (e.g., 'MM:SS.mmm').")
     end: str = Field(description="The end timestamp of the scene (e.g., 'MM:SS.mmm').")
-    description: str = Field(
-        description="A brief description of the visual and audio elements in the scene."
-    )
-    contains_vocal_music: bool = Field(
-        description="True if the scene contains music with vocals."
-    )
-    song_title: Optional[str] = Field(
-        default=None, description="The title of the song detected in the scene."
-    )
-    original_artist: Optional[str] = Field(
-        default=None, description="The original artist or composer of the song."
-    )
+    description: str = Field(description="A brief description of the visual and audio elements in the scene.")
+    contains_vocal_music: bool = Field(description="True if the scene contains music with vocals.")
+    song_title: Optional[str] = Field(default=None, description="The title of the song detected in the scene.")
+    original_artist: Optional[str] = Field(default=None, description="The original artist or composer of the song.")
     performer_in_video: Optional[str] = Field(
         default=None,
         description="The performer singing in the video, if different from the original artist.",
@@ -242,7 +246,14 @@ class Scene(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def clean_leakage(cls, data: Any) -> Any:
-        """Strips LLM noise from timestamps before field assignment."""
+        """Strips LLM noise from timestamps before field assignment.
+
+        Args:
+            data (Any): The raw input data.
+
+        Returns:
+            Any: The cleaned data.
+        """
         if isinstance(data, dict):
             for key in ("start", "end"):
                 if key in data and isinstance(data[key], str):
@@ -251,14 +262,20 @@ class Scene(BaseModel):
 
     @model_validator(mode="after")
     def validate_timestamps(self) -> "Scene":
-        """Validates the timestamps for a scene."""
+        """Validates the timestamps for a scene.
+
+        Returns:
+            Scene: The validated scene instance.
+
+        Raises:
+            ValueError: If the timestamp format is invalid or if the start time
+                is not strictly before the end time.
+        """
         try:
             start_ms = _parse_timestamp_string_ms(self.start)
             end_ms = _parse_timestamp_string_ms(self.end)
             if start_ms >= end_ms:
-                raise ValueError(
-                    f"Start time ({self.start}) must be strictly before end time ({self.end})"
-                )
+                raise ValueError(f"Start time ({self.start}) must be strictly before end time ({self.end})")
         except ValueError as e:
             raise ValueError(f"Invalid timestamp: {e}")
         return self
@@ -274,9 +291,7 @@ class LyricsSceneAiResponse(BaseModel):
 
     step_by_step_log: str
     global_summary: str
-    scenes: list[Scene] = Field(
-        description="A list of chronological scenes detected in the video segment."
-    )
+    scenes: list[Scene] = Field(description="A list of chronological scenes detected in the video segment.")
 
 
 # ==============================================================================
@@ -317,18 +332,10 @@ class ReEncodingJob(Job):
     """Represents a job to re-encode a video file."""
 
     input_file: Path = Field(description="Path to the original video segment.")
-    output_file: Path = Field(
-        description="Path where the re-encoded video will be saved."
-    )
-    fps: PositiveInt = Field(
-        description="Target frames per second for the re-encoded video."
-    )
-    height: PositiveInt = Field(
-        description="Target height (resolution) for the re-encoded video."
-    )
-    bitrate_kb: PositiveInt = Field(
-        description="Target bitrate in kilobytes per second."
-    )
+    output_file: Path = Field(description="Path where the re-encoded video will be saved.")
+    fps: PositiveInt = Field(description="Target frames per second for the re-encoded video.")
+    height: PositiveInt = Field(description="Target height (resolution) for the re-encoded video.")
+    bitrate_kb: PositiveInt = Field(description="Target bitrate in kilobytes per second.")
     duration_tolerance_ms: NonNegativeInt = Field(
         description="Allowed duration difference in milliseconds to consider an existing re-encoded file valid."
     )
@@ -338,9 +345,7 @@ class UploadFileJob(Job):
     """Represents a job to upload a file to the AI provider."""
 
     python_file: Path = Field(description="Path to the local file to be uploaded.")
-    video_duration_ms: PositiveInt = Field(
-        description="Duration of the video file in milliseconds."
-    )
+    video_duration_ms: PositiveInt = Field(description="Duration of the video file in milliseconds.")
 
 
 class LyricsSceneJob(Job):
@@ -359,7 +364,15 @@ class LyricsSceneJob(Job):
 
     @classmethod
     def load(cls, save_path: Path) -> Optional["LyricsSceneJob"]:
-        """Loads the job from a JSON file, checking for prompt version mismatch."""
+        """Loads the job from a JSON file, checking for prompt version mismatch.
+
+        Args:
+            save_path (Path): The path to the saved job file.
+
+        Returns:
+            Optional[LyricsSceneJob]: The loaded job, or None if validation fails
+                or if there is a version mismatch.
+        """
         # Local import to avoid circular dependency
         from ai_sub.prompt import LYRICS_PROMPT_VERSION
 
@@ -368,14 +381,13 @@ class LyricsSceneJob(Job):
                 try:
                     job = cls.model_validate_json(f.read())
                 except ValidationError as e:
-                    logfire.warning(
-                        f"Validation failed for {save_path.name}, ignoring cache. Error: {e}"
-                    )
+                    logfire.warning(f"Validation failed for {save_path.name}, ignoring cache. Error: {e}")
                     return None
 
             if job.lyrics_prompt_version != LYRICS_PROMPT_VERSION:
                 logfire.info(
-                    f"Lyrics prompt version mismatch for {job.name} (file: {job.lyrics_prompt_version}, current: {LYRICS_PROMPT_VERSION}). Re-processing."
+                    f"Lyrics prompt version mismatch for {job.name} "
+                    f"(file: {job.lyrics_prompt_version}, current: {LYRICS_PROMPT_VERSION}). Re-processing."
                 )
                 return None
             return job
@@ -383,8 +395,9 @@ class LyricsSceneJob(Job):
 
 
 class SubtitleJob(Job):
-    """Represents a job to generate subtitles (Transcription),
-    using scene/lyrics data from a `SceneResponse` as a reference.
+    """Represents a job to generate subtitles (Transcription).
+
+    Uses scene/lyrics data from a `SceneResponse` as a reference.
     """
 
     file: Optional[File | Path] = Field(default=None, exclude=True)
@@ -400,7 +413,15 @@ class SubtitleJob(Job):
 
     @classmethod
     def load(cls, save_path: Path) -> Optional["SubtitleJob"]:
-        """Loads the job from a JSON file, checking for prompt version mismatch."""
+        """Loads the job from a JSON file, checking for prompt version mismatch.
+
+        Args:
+            save_path (Path): The path to the saved job file.
+
+        Returns:
+            Optional[SubtitleJob]: The loaded job, or None if validation fails
+                or if there is a version mismatch.
+        """
         # Local import to avoid circular dependency
         from ai_sub.prompt import SUBTITLES_PROMPT_VERSION
 
@@ -409,14 +430,13 @@ class SubtitleJob(Job):
                 try:
                     job = cls.model_validate_json(f.read())
                 except ValidationError as e:
-                    logfire.warning(
-                        f"Validation failed for {save_path.name}, ignoring cache. Error: {e}"
-                    )
+                    logfire.warning(f"Validation failed for {save_path.name}, ignoring cache. Error: {e}")
                     return None
 
             if job.subtitles_prompt_version != SUBTITLES_PROMPT_VERSION:
                 logfire.info(
-                    f"Subtitles prompt version mismatch for {job.name} (file: {job.subtitles_prompt_version}, current: {SUBTITLES_PROMPT_VERSION}). Re-processing."
+                    f"Subtitles prompt version mismatch for {job.name}"
+                    f"(file: {job.subtitles_prompt_version}, current: {SUBTITLES_PROMPT_VERSION}). Re-processing."
                 )
                 return None
             return job
@@ -434,12 +454,8 @@ class SegmentJobs(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    reencode: Optional[ReEncodingJob] = Field(
-        default=None, description="The re-encoding job for the segment."
-    )
-    upload: Optional[UploadFileJob] = Field(
-        default=None, description="The file upload job for the segment."
-    )
+    reencode: Optional[ReEncodingJob] = Field(default=None, description="The re-encoding job for the segment.")
+    upload: Optional[UploadFileJob] = Field(default=None, description="The file upload job for the segment.")
     lyrics: Optional[LyricsSceneJob] = Field(
         default=None, description="The lyrics/scene detection job for the segment."
     )

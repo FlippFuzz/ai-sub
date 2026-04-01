@@ -1,3 +1,5 @@
+"""Module for handling file uploads to the Google Gemini Files API."""
+
 import asyncio
 import base64
 import hashlib
@@ -20,14 +22,14 @@ from ai_sub.config import Settings
 
 
 def calculate_sha256(filename: Path):
-    """
-    Calculates the SHA256 hash of a file, reading it in chunks.
+    """Calculates the SHA256 hash of a file, reading it in chunks.
 
     Args:
         filename (Path): The path to the file.
 
     Returns:
         str: The hexadecimal representation of the SHA256 hash.
+
     """
     # Create a sha256 hash object
     h = hashlib.sha256()
@@ -45,9 +47,10 @@ def calculate_sha256(filename: Path):
 
 
 class GeminiFileUploader:
-    """
-    Handles uploading files to the Google Gemini Files API, including caching
-    file lists to avoid redundant API calls and checking for existing files.
+    """Handles uploading files to the Google Gemini Files API.
+
+    Includes caching file lists to avoid redundant API calls and checking for
+    existing files.
     """
 
     _client: genai.Client
@@ -57,8 +60,7 @@ class GeminiFileUploader:
     _lock: asyncio.Lock
 
     def __init__(self, settings: Settings) -> None:
-        """
-        Initializes the GeminiFileUploader.
+        """Initializes the GeminiFileUploader instance.
 
         Args:
             settings (Settings): The application configuration settings.
@@ -68,11 +70,7 @@ class GeminiFileUploader:
             http_options = HttpOptions(base_url=str(settings.ai.google.base_url))
 
         self._client = genai.Client(
-            api_key=(
-                settings.ai.google.key.get_secret_value()
-                if settings.ai.google.key
-                else None
-            ),
+            api_key=(settings.ai.google.key.get_secret_value() if settings.ai.google.key else None),
             http_options=http_options,
         )
         self._list_cache_ttl_seconds = settings.ai.google.file_cache_ttl
@@ -80,8 +78,7 @@ class GeminiFileUploader:
         self._lock = asyncio.Lock()
 
     async def _update_file_list(self) -> None:
-        """
-        Updates the local file list cache from the server if the cache is stale.
+        """Updates the local file list cache from the server if the cache is stale.
 
         The cache is considered stale if the time since the last update is
         greater than the configured `_list_cache_ttl_seconds`. This mechanism
@@ -92,17 +89,15 @@ class GeminiFileUploader:
             if (now - self._last_update_time) > self._list_cache_ttl_seconds:
                 # The cache is stale, refresh it.
                 self._state = {}
-                async for file in await self._client.aio.files.list(
-                    config=ListFilesConfig(page_size=100)
-                ):
+                async for file in await self._client.aio.files.list(config=ListFilesConfig(page_size=100)):
                     if file.display_name:
                         display_name = str(file.display_name)
                         self._state[display_name] = file
                 self._last_update_time = now
 
     async def _get_file(self, display_name: str) -> Optional[File]:
-        """
-        Retrieves a file from the cached list by its display name.
+        """Retrieves a file from the cached list by its display name.
+
         Updates the cache if it's stale.
 
         Args:
@@ -115,10 +110,20 @@ class GeminiFileUploader:
         return self._state.get(display_name, None)
 
     async def upload_file(self, file_path: Path) -> File:
-        """
-        Uploads a file to Gemini Files API. If a file with the same display name
-        already exists, it checks for differences (size, SHA256 hash) and
-        re-uploads if necessary, deleting the old version.
+        """Uploads a file to the Gemini Files API.
+
+        If a file with the same display name already exists, it checks for
+        differences (size, SHA256 hash) and re-uploads if necessary, deleting
+        the old version.
+
+        Args:
+            file_path (Path): The path to the local file to be uploaded.
+
+        Returns:
+            File: The uploaded file metadata object.
+
+        Raises:
+            RuntimeError: If the file fails to process or cannot be retrieved.
         """
         display_name = file_path.name
 
@@ -133,12 +138,8 @@ class GeminiFileUploader:
 
                 # Compare sha256 hashes to be sure
                 if not needs_delete:
-                    sha256_hex_string = await asyncio.to_thread(
-                        calculate_sha256, file_path
-                    )
-                    base64_sha256 = base64.b64encode(
-                        sha256_hex_string.encode()
-                    ).decode()
+                    sha256_hex_string = await asyncio.to_thread(calculate_sha256, file_path)
+                    base64_sha256 = base64.b64encode(sha256_hex_string.encode()).decode()
                     if base64_sha256 != str(file.sha256_hash):
                         needs_delete = True
 
@@ -161,9 +162,7 @@ class GeminiFileUploader:
         with logfire.span("Wait for the file to be ready", _level="debug"):
             while file.state != FileState.ACTIVE:
                 if file.state == FileState.FAILED:
-                    raise RuntimeError(
-                        f"File {display_name} failed to process on the server."
-                    )
+                    raise RuntimeError(f"File {display_name} failed to process on the server.")
 
                 await asyncio.sleep(1)
                 if file.name:
@@ -173,8 +172,6 @@ class GeminiFileUploader:
 
                 if not file:
                     # This shouldn't happen. We literally just uploaded the file above
-                    raise RuntimeError(
-                        f"Could not retrieve file '{display_name}' after upload."
-                    )
+                    raise RuntimeError(f"Could not retrieve file '{display_name}' after upload.")
 
         return file
