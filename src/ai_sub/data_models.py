@@ -15,6 +15,7 @@ from pydantic import (
     NonNegativeInt,
     PositiveInt,
     ValidationError,
+    ValidationInfo,
     model_validator,
 )
 from pysubs2 import SSAEvent, SSAFile
@@ -216,6 +217,25 @@ class SubtitleAiResponse(BaseModel):
 
         return subtitles
 
+    def validate_against_duration(self, video_duration_ms: int, buffer_ms: int = 1000) -> None:
+        """Validates that no subtitle end timestamp exceeds the video duration + buffer.
+
+        Args:
+            video_duration_ms (int): The duration of the video in milliseconds.
+            buffer_ms (int): The allowed buffer in milliseconds.
+
+        Raises:
+            ValueError: If a subtitle end timestamp is too far beyond the duration.
+        """
+        limit_ms = video_duration_ms + buffer_ms
+        for i, sub in enumerate(self.subtitles):
+            end_ms = _parse_timestamp_string_ms(sub.end)
+            if end_ms > limit_ms:
+                raise ValueError(
+                    f"Subtitle {i} end time ({sub.end}) exceeds video duration ({video_duration_ms}ms) "
+                    f"by more than {buffer_ms}ms."
+                )
+
 
 class Scene(BaseModel):
     """Represents a detected scene in the video."""
@@ -293,6 +313,25 @@ class LyricsSceneAiResponse(BaseModel):
     global_summary: str
     scenes: list[Scene] = Field(description="A list of chronological scenes detected in the video segment.")
 
+    def validate_against_duration(self, video_duration_ms: int, buffer_ms: int = 1000) -> None:
+        """Validates that no scene end timestamp exceeds the video duration + buffer.
+
+        Args:
+            video_duration_ms (int): The duration of the video in milliseconds.
+            buffer_ms (int): The allowed buffer in milliseconds.
+
+        Raises:
+            ValueError: If a scene end timestamp is too far beyond the duration.
+        """
+        limit_ms = video_duration_ms + buffer_ms
+        for i, scene in enumerate(self.scenes):
+            end_ms = _parse_timestamp_string_ms(scene.end)
+            if end_ms > limit_ms:
+                raise ValueError(
+                    f"Scene {i} end time ({scene.end}) exceeds video duration ({video_duration_ms}ms) "
+                    f"by more than {buffer_ms}ms."
+                )
+
 
 # ==============================================================================
 # Job & Pipeline Models
@@ -362,12 +401,28 @@ class LyricsSceneJob(Job):
         description="The version of the prompt used to generate the response, for cache validation.",
     )
 
+    @model_validator(mode="after")
+    def validate_response_timestamps(self, info: ValidationInfo) -> "LyricsSceneJob":
+        """Ensures that the response timestamps are within the video duration.
+
+        Args:
+            info (ValidationInfo): The validation context containing the buffer setting.
+
+        Returns:
+            LyricsSceneJob: The validated job instance.
+        """
+        if self.response:
+            buffer_ms = info.context.get("validation_buffer_ms", 1000) if info.context else 1000
+            self.response.validate_against_duration(self.video_duration_ms, buffer_ms)
+        return self
+
     @classmethod
-    def load(cls, save_path: Path) -> Optional["LyricsSceneJob"]:
+    def load(cls, save_path: Path, validation_buffer_ms: int = 1000) -> Optional["LyricsSceneJob"]:
         """Loads the job from a JSON file, checking for prompt version mismatch.
 
         Args:
             save_path (Path): The path to the saved job file.
+            validation_buffer_ms (int): The allowed buffer in milliseconds.
 
         Returns:
             Optional[LyricsSceneJob]: The loaded job, or None if validation fails
@@ -379,7 +434,10 @@ class LyricsSceneJob(Job):
         if Path(save_path).is_file():
             with open(save_path, "r", encoding="utf-8") as f:
                 try:
-                    job = cls.model_validate_json(f.read())
+                    job = cls.model_validate_json(
+                        f.read(),
+                        context={"validation_buffer_ms": validation_buffer_ms},
+                    )
                 except ValidationError as e:
                     logfire.warning(f"Validation failed for {save_path.name}, ignoring cache. Error: {e}")
                     return None
@@ -411,12 +469,28 @@ class SubtitleJob(Job):
         description="The version of the prompt used to generate the response, for cache validation.",
     )
 
+    @model_validator(mode="after")
+    def validate_response_timestamps(self, info: ValidationInfo) -> "SubtitleJob":
+        """Ensures that the response timestamps are within the video duration.
+
+        Args:
+            info (ValidationInfo): The validation context containing the buffer setting.
+
+        Returns:
+            SubtitleJob: The validated job instance.
+        """
+        if self.response:
+            buffer_ms = info.context.get("validation_buffer_ms", 1000) if info.context else 1000
+            self.response.validate_against_duration(self.video_duration_ms, buffer_ms)
+        return self
+
     @classmethod
-    def load(cls, save_path: Path) -> Optional["SubtitleJob"]:
+    def load(cls, save_path: Path, validation_buffer_ms: int = 1000) -> Optional["SubtitleJob"]:
         """Loads the job from a JSON file, checking for prompt version mismatch.
 
         Args:
             save_path (Path): The path to the saved job file.
+            validation_buffer_ms (int): The allowed buffer in milliseconds.
 
         Returns:
             Optional[SubtitleJob]: The loaded job, or None if validation fails
@@ -428,7 +502,10 @@ class SubtitleJob(Job):
         if Path(save_path).is_file():
             with open(save_path, "r", encoding="utf-8") as f:
                 try:
-                    job = cls.model_validate_json(f.read())
+                    job = cls.model_validate_json(
+                        f.read(),
+                        context={"validation_buffer_ms": validation_buffer_ms},
+                    )
                 except ValidationError as e:
                     logfire.warning(f"Validation failed for {save_path.name}, ignoring cache. Error: {e}")
                     return None

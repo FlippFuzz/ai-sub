@@ -187,6 +187,10 @@ class LyricsSceneJobRunner(JobRunner):
             lyrics_job.video_duration_ms,
             LyricsSceneAiResponse,
         )
+        if lyrics_job.response:
+            lyrics_job.response.validate_against_duration(
+                lyrics_job.video_duration_ms, self.settings.ai.validation_buffer_ms
+            )
 
     async def post_process(self, job: SegmentJobs) -> None:
         """Saves the result of the lyrics detection to disk.
@@ -251,6 +255,10 @@ class SubtitleJobRunner(JobRunner):
             subtitle_job.video_duration_ms,
             SubtitleAiResponse,
         )
+        if subtitle_job.response:
+            subtitle_job.response.validate_against_duration(
+                subtitle_job.video_duration_ms, self.settings.ai.validation_buffer_ms
+            )
 
     async def post_process(self, job: SegmentJobs) -> None:
         """Saves the result (or partial state) to disk.
@@ -312,7 +320,7 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
             # Load the job result from the temporary JSON file.
             # We look for the final subtitle output
             job_path = settings.dir.tmp / f"{video_path.stem}.subtitles.{sanitized_subtitles_model}.json"
-            job = SubtitleJob.load(job_path)
+            job = SubtitleJob.load(job_path, settings.ai.validation_buffer_ms)
             if job and job.response:
                 current_subtitles = job.response.get_ssafile()
                 # Shift the timestamps of the current subtitle segment by the
@@ -342,7 +350,7 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
                 final_job_retry_count = job.total_num_retries
             else:
                 lyrics_job_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{sanitized_lyrics_model}.json"
-                lyrics_job = LyricsSceneJob.load(lyrics_job_path)
+                lyrics_job = LyricsSceneJob.load(lyrics_job_path, settings.ai.validation_buffer_ms)
                 if lyrics_job:
                     final_job_retry_count = lyrics_job.total_num_retries
 
@@ -640,12 +648,14 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
             # Load jobs if they exist and populate the in-memory JobState
             lyrics_job_path = settings.dir.tmp / f"{split.stem}.lyrics.{sanitized_lyrics_model}.json"
-            lyrics_job = await asyncio.to_thread(LyricsSceneJob.load, lyrics_job_path)
+            lyrics_job = await asyncio.to_thread(LyricsSceneJob.load, lyrics_job_path, settings.ai.validation_buffer_ms)
             if lyrics_job:
                 job_state.lyrics = lyrics_job
 
             subtitle_job_path = settings.dir.tmp / f"{split.stem}.subtitles.{sanitized_subtitles_model}.json"
-            subtitle_job = await asyncio.to_thread(SubtitleJob.load, subtitle_job_path)
+            subtitle_job = await asyncio.to_thread(
+                SubtitleJob.load, subtitle_job_path, settings.ai.validation_buffer_ms
+            )
             if subtitle_job:
                 job_state.subtitles = subtitle_job
 

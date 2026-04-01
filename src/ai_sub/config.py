@@ -131,6 +131,10 @@ class AiSettings(BaseSettings):
         description="Settings that only apply to the Gemini CLI.",
         default_factory=GeminiCliSettings,
     )
+    validation_buffer_ms: NonNegativeInt = Field(
+        description="The allowed buffer in milliseconds for AI-generated timestamps to exceed the video duration.",
+        default=1000,
+    )
 
     @model_validator(mode="after")
     def validate_models(self):
