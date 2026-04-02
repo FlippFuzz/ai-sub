@@ -1,5 +1,25 @@
 # AI Sub Release Notes
 
+## v2.6.1
+
+This release focuses on hardening the subtitle generation pipeline by implementing configurable timestamp validation and improving data hygiene when handling AI responses.
+
+**New Features:**
+
+- **Configurable AI Timestamp Validation:** Added `validation_buffer_ms` to `AiSettings` (defaulting to 1000ms). This allows users to control how strictly generated timestamps are verified against video segment durations.
+- **Hallucination Protection:** The system now explicitly validates AI-generated timestamps for both subtitles and scene detection against the video duration. This prevents the AI from generating content that extends beyond the actual media length.
+
+**Refactoring & Improvements:**
+
+- **Automated Timestamp Sanitization:** Introduced Pydantic "before-validators" and a new `_clean_timestamp_string` utility. This allows the system to gracefully handle "field leakage" in LLM responses—such as extracting `03:52.000` from noisy strings like `03:52.000,start:`—before data is assigned to model fields.
+- **Improved Data Hygiene:** Re-engineered the `Subtitles` and `Scene` data models to ensure they store only sanitized timecodes, improving internal consistency and reducing downstream parsing errors.
+- **Validation Pipeline Hardening:** Updated `Job.load` and internal runners to propagate validation context. This ensures that even cached results are re-validated against current duration limits and buffer settings.
+- **Strict Parsing:** Refactored the core timestamp parser to enforce strict formats, delegating noise removal to the pre-validation layer.
+
+**Internal Tooling:**
+
+- Transitioned the project's formatting and linting from `black` to `ruff` for a faster and more integrated developer experience.
+
 ## v2.6.1b3
 
 This release focuses on hardening the lyrics detection stage against AI formatting errors and improving the efficiency of the web search pipeline.
