@@ -168,7 +168,7 @@ class Subtitles(BaseModel):
             if start_ms >= end_ms:
                 raise ValueError(f"Start time ({self.start}) must be strictly before end time ({self.end})")
         except ValueError as e:
-            raise ValueError(f"Invalid timestamp: {e}")
+            raise ValueError(f"Invalid timestamp: {e}") from e
         return self
 
 
@@ -297,7 +297,7 @@ class Scene(BaseModel):
             if start_ms >= end_ms:
                 raise ValueError(f"Start time ({self.start}) must be strictly before end time ({self.end})")
         except ValueError as e:
-            raise ValueError(f"Invalid timestamp: {e}")
+            raise ValueError(f"Invalid timestamp: {e}") from e
         return self
 
 
@@ -512,7 +512,7 @@ class SubtitleJob(Job):
 
             if job.subtitles_prompt_version != SUBTITLES_PROMPT_VERSION:
                 logfire.info(
-                    f"Subtitles prompt version mismatch for {job.name}"
+                    f"Subtitles prompt version mismatch for {job.name} "
                     f"(file: {job.subtitles_prompt_version}, current: {SUBTITLES_PROMPT_VERSION}). Re-processing."
                 )
                 return None

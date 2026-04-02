@@ -176,7 +176,7 @@ class RateLimitedAgentWrapper:
             prompt (str): The system prompt to guide the AI.
             video (genai.types.File | Path): The video file (either a Google File object or a local Path).
             video_duration_ms (int): The duration of the video in milliseconds (used for token estimation).
-            response_type (type[T]): The expected Pydantic model for the response. Defaults to AiResponse.
+            response_type (type[T]): The expected Pydantic model for the response.
 
         Returns:
             T: The structured response containing subtitles or scene data.
