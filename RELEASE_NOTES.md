@@ -1,5 +1,67 @@
 # AI Sub Release Notes
 
+## v2.6.1b3
+
+This release focuses on hardening the lyrics detection stage against AI formatting errors and improving the efficiency of the web search pipeline.
+
+**Prompt Engineering:**
+
+- **Lyrics Detection (v4):**
+  - **JSON Syntax Guard:** Introduced a critical safety layer to prevent "field leakage," where the AI might accidentally include JSON keys or structural markers inside string values.
+  - **High-Efficiency Search:** Re-engineered the execution pipeline to explicitly mandate simultaneous, multi-query web searches. This significantly reduces the number of AI turns required, lowering both latency and API costs.
+  - **Structured Output Format:** Refined the prompt's output block to provide a clearer template for the model, ensuring consistent JSON generation.
+
+**Backend & Validation:**
+
+- **Robust Timestamp Parsing:**
+  - Refactored `_parse_timestamp_string_ms` to use regular expressions. This allows the system to successfully extract valid timecodes even if the AI response contains "noisy" prefixes or suffixes (e.g., `"01:23.456,start:"`) within the timestamp field.
+- **Data Model Enhancements:**
+  - **Original Language Tracking:** Added a dedicated `original_language` field to the `Scene` model to better capture and track the primary language of detected songs.
+  - **Scene Integrity:** Implemented a Pydantic `model_validator` for the `Scene` class, ensuring that all detected scenes maintain chronological integrity (start time must be strictly before end time) before processing continues.
+
+**Bug Fixes:**
+
+- Fixed an issue where "field leakage" in AI responses could lead to JSON validation failures.
+
+## v2.6.1b2
+
+This release refines the AI prompting strategy to improve formatting reliability and better handle visual-only cues.
+
+**Prompt Engineering:**
+
+- **Lyrics Detection (v3):**
+  - **JSON Syntax Guards:** Introduced strict rules for escaping, newlines, and key separation to ensure valid JSON output under all conditions.
+  - **Simplified Pipeline:** Streamlined the metadata resolution steps for improved efficiency.
+- **Subtitle Generation (v15):**
+  - **Dual-Trigger System:** Clarified that subtitles are triggered by both vocal audio and prominent on-screen text.
+  - **Visual Events Exception:** Explicitly instructs the AI to subtitle relevant visual text (like chapter titles) even when no audio is present.
+  - **Anti-Hallucination Hardening:** Strengthened rules for ignoring incorrect or incomplete reference data and mandated manual transcription when the JSON reference fails.
+  - **Standardized Analysis:** Updated examples to use a consistent, structured `global_analysis` format.
+  - **New Visual Text Example:** Added a dedicated example for handling silent title cards.
+
+**Backend & Validation:**
+
+- **Timestamp Validation:**
+  - Refactored timestamp parsing into an internal utility function `_parse_timestamp_string_ms`.
+  - Implemented Pydantic `model_validator` on both `Subtitles` and `Scene` models to verify timestamp format and ensure the start time is strictly before the end time.
+  - Improved robustness against malformed AI-generated strings (e.g., truncated JSON noise in timestamp fields).
+- **Static Analysis Fixes:**
+  - Resolved `CliPositionalArg` to `Path` type mismatch for static analysis.
+  - Added explicit type casting in `config.py` and `main.py` to address errors where `CliPositionalArg` was not assignable to `Path` for methods like `.resolve()`, `.stem`, and `.name` in Pyright/mypy.
+
+## v2.6.1b1
+
+This release focuses on hardening the AI's transcription logic and translation accuracy by introducing stricter boundaries for reference data and expanding the contextual window for translations.
+
+**Prompt Engineering:**
+
+- **Subtitle Generation (v14):**
+  - **The Manual Transcription Mandate:** Explicitly instructs the AI that it is "not exempt" from subtitling if the reference JSON is null or mismatching; it must rely on native audio perception to transcribe.
+  - **Strict Scene Boundaries:** Added rules to prevent "cross-contamination" where lyrics from a later scene in the reference JSON are incorrectly applied to earlier audio.
+  - **Enhanced Contextual Window:** Refined the translation logic to mandate analysis of the **Previous 2 Sentences** and **Next 2 Sentences** to improve pronoun resolution and tonal consistency.
+  - **Refined Anti-Hallucination:** Updated the "Wrong Song" and "Partial Video" scenarios with specific timestamp-based examples to help the model ignore irrelevant reference data.
+  - **Improved Decoding Hierarchy:** Streamlined the fallback logic for resolving ambiguous audio, prioritizing visual OCR and scene context.
+
 ## v2.6.0
 
 This release promotes the v2.6.0 beta series to production, focusing on improving subtitle synchronization and timing precision by refining the AI's internal logic for handling rapid speech.

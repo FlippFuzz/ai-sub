@@ -1,3 +1,5 @@
+"""Pydantic AI Model implementation for the Gemini CLI tool."""
+
 from __future__ import annotations
 
 import asyncio
@@ -29,11 +31,15 @@ from ai_sub.config import GeminiCliSettings
 
 
 class GeminiCliResponseModelStats(BaseModel):
+    """Statistics for a specific model in the Gemini CLI response."""
+
     api: Dict[str, Any]
     tokens: Dict[str, int]
 
 
 class GeminiCliResponseToolsStats(BaseModel):
+    """Statistics for tool usage in the Gemini CLI response."""
+
     totalCalls: int
     totalSuccess: int
     totalFail: int
@@ -43,52 +49,69 @@ class GeminiCliResponseToolsStats(BaseModel):
 
 
 class GeminiCliResponseFilesStats(BaseModel):
+    """Statistics for file operations in the Gemini CLI response."""
+
     totalLinesAdded: int
     totalLinesRemoved: int
 
 
 class GeminiCliResponseStats(BaseModel):
+    """Aggregated statistics for a Gemini CLI execution."""
+
     models: Dict[str, GeminiCliResponseModelStats]
     tools: GeminiCliResponseToolsStats
     files: GeminiCliResponseFilesStats
 
 
 class GeminiCliResponseError(BaseModel):
+    """Represents an error returned by the Gemini CLI."""
+
     type: str
     message: str
     code: Optional[int] = None
 
 
 class GeminiCliResponse(BaseModel):
+    """The structured response object from the Gemini CLI tool."""
+
     response: Optional[str] = None
     stats: Optional[GeminiCliResponseStats] = None
     error: Optional[GeminiCliResponseError] = None
 
 
 class GeminiCliProvider(BaseModel):
+    """Model provider information for Gemini CLI."""
+
     name: str = "gemini-cli"
 
 
 class GeminiCliModel(Model):
-    """
-    A Pydantic AI Model implementation for the Gemini CLI tool.
-    """
+    """A Pydantic AI Model implementation for the Gemini CLI tool."""
 
     def __init__(self, model_name: str, settings: GeminiCliSettings):
+        """Initializes the GeminiCliModel.
+
+        Args:
+            model_name (str): The name of the Gemini model to use (e.g., 'gemini-1.5-flash').
+            settings (GeminiCliSettings): Configuration settings for the CLI execution.
+        """
         self._model_name = model_name
         self._cli_settings = settings
         self._provider = GeminiCliProvider()
 
     @property
     def model_name(self) -> str:
+        """Returns the name of the model."""
         return self._model_name
 
     @property
     def system(self) -> str | None:
+        """Returns the system prompt (not supported by CLI currently)."""
         return ""
 
     @property
     def provider(self) -> GeminiCliProvider:
+        """Returns the model provider."""
         return self._provider
 
     def _write_prompt_file(self, path: Path, content: str) -> None:
@@ -102,9 +125,25 @@ class GeminiCliModel(Model):
         model_settings: ModelSettings | None,
         model_request_parameters: ModelRequestParameters | None,
     ) -> ModelResponse:
-        """
-        Executes the Gemini CLI to process the request.
-        This involves writing the prompt to a file, setting up the environment, and running the subprocess.
+        """Executes the Gemini CLI to process the request.
+
+        This involves writing the prompt to a file, setting up the environment,
+        and running the subprocess.
+
+        Args:
+            messages (list[ModelMessage]): The list of messages in the conversation.
+            model_settings (ModelSettings | None): Optional model settings.
+            model_request_parameters (ModelRequestParameters | None): Optional request parameters.
+
+        Returns:
+            ModelResponse: The response from the AI model.
+
+        Raises:
+            ValueError: If a local video file path is missing from the messages.
+            subprocess.TimeoutExpired: If the CLI execution exceeds the configured timeout.
+            subprocess.CalledProcessError: If the CLI returns a non-zero exit code.
+            ValidationError: If the CLI output cannot be parsed into a `GeminiCliResponse`.
+            RuntimeError: If the CLI finishes successfully but returns no response content.
         """
         prompt_parts: list[str] = []
         video_path: Path | None = None
@@ -124,9 +163,7 @@ class GeminiCliModel(Model):
                                     prompt_parts.append(sub_part.content)
                                 elif isinstance(sub_part, str):
                                     prompt_parts.append(sub_part)
-                                elif isinstance(
-                                    sub_part, DocumentUrl
-                                ) and sub_part.url.startswith("file:"):
+                                elif isinstance(sub_part, DocumentUrl) and sub_part.url.startswith("file:"):
                                     # Extract path from file URI
                                     parsed = urlparse(sub_part.url)
                                     path_str = unquote(parsed.path)
@@ -141,9 +178,7 @@ class GeminiCliModel(Model):
                                     video_path = Path(path_str)
 
         if not video_path:
-            raise ValueError(
-                "Gemini CLI requires a local video file path passed as a DocumentUrl."
-            )
+            raise ValueError("Gemini CLI requires a local video file path passed as a DocumentUrl.")
 
         prompt = "\n".join(prompt_parts)
         video_directory = video_path.parent
@@ -214,31 +249,23 @@ class GeminiCliModel(Model):
                         )
                         await proc.wait()
                         if proc.returncode != 0:
-                            logfire.warning(
-                                f"Failed to taskkill process {process.pid}, return code: {proc.returncode}"
-                            )
+                            logfire.warning(f"Failed to taskkill process {process.pid}, return code: {proc.returncode}")
 
                     try:
                         process.kill()
                     except OSError:
                         pass
                     await process.communicate()
-                    raise subprocess.TimeoutExpired(
-                        cmd, self._cli_settings.timeout
-                    ) from err
+                    raise subprocess.TimeoutExpired(cmd, self._cli_settings.timeout) from err
 
                 stdout = stdout_bytes.decode("utf-8", errors="replace")
                 stderr = stderr_bytes.decode("utf-8", errors="replace")
 
                 if process.returncode != 0:
-                    raise subprocess.CalledProcessError(
-                        process.returncode or 1, cmd, output=stdout, stderr=stderr
-                    )
+                    raise subprocess.CalledProcessError(process.returncode or 1, cmd, output=stdout, stderr=stderr)
 
             except subprocess.TimeoutExpired:
-                logfire.exception(
-                    f"Gemini CLI timed out after {self._cli_settings.timeout}s."
-                )
+                logfire.exception(f"Gemini CLI timed out after {self._cli_settings.timeout}s.")
                 raise
             except subprocess.CalledProcessError as e:
                 logfire.exception(
@@ -262,11 +289,7 @@ class GeminiCliModel(Model):
                     json_str = cli_response.response
 
                 # Sort out the statistics
-                if (
-                    cli_response.stats
-                    and cli_response.stats.models
-                    and cli_response.stats.models.get(self._model_name)
-                ):
+                if cli_response.stats and cli_response.stats.models and cli_response.stats.models.get(self._model_name):
                     model_stats = cli_response.stats.models[self._model_name]
                     input_tokens = model_stats.tokens.get("input", 0)
                     output_tokens = model_stats.tokens.get("candidates", 0)
@@ -292,7 +315,8 @@ class GeminiCliModel(Model):
                     # If we cannot locate the statistics, just log a warning and return an empty usage
                     usage = RequestUsage()
                     logfire.warning(
-                        f"Gemini CLI did not return statistics for {self._model_name}. Returned statistics: {cli_response.stats}"
+                        f"Gemini CLI did not return statistics for {self._model_name}. "
+                        f"Returned statistics: {cli_response.stats}"
                     )
 
                 return ModelResponse(
@@ -310,8 +334,22 @@ class GeminiCliModel(Model):
         model_settings: ModelSettings | None,
         model_request_parameters: ModelRequestParameters | None,
     ) -> AsyncIterator[StreamedResponse]:
+        """Initiates a streamed request to the model.
+
+        Note:
+            Streaming is not currently supported by the Gemini CLI wrapper.
+
+        Args:
+            messages (list[ModelMessage]): The list of messages in the conversation.
+            model_settings (ModelSettings | None): Optional model settings.
+            model_request_parameters (ModelRequestParameters | None): Optional request parameters.
+
+        Yields:
+            StreamedResponse: The response stream.
+
+        Raises:
+            NotImplementedError: Always raised as streaming is not supported.
+        """
         if False:
             yield  # pragma: no cover
-        raise NotImplementedError(
-            "Streamed requests not supported by Gemini CLI wrapper."
-        )
+        raise NotImplementedError("Streamed requests not supported by Gemini CLI wrapper.")

@@ -1,3 +1,5 @@
+"""AI Agent wrapper for the subtitle generation pipeline."""
+
 from __future__ import annotations as _annotations
 
 import asyncio
@@ -24,9 +26,10 @@ T = TypeVar("T", bound=BaseModel)
 
 
 class RateLimitedAgentWrapper:
-    """
-    A wrapper around the Pydantic AI Agent that handles rate limiting,
-    token usage tracking, and model-specific configurations (e.g., Google vs CLI).
+    """A wrapper around the Pydantic AI Agent.
+
+    Handles rate limiting, token usage tracking, and model-specific configurations
+    (e.g., Google vs CLI).
     """
 
     rpm: int
@@ -39,6 +42,7 @@ class RateLimitedAgentWrapper:
 
         Returns:
             bool: True if the model is a Google model, False otherwise.
+
         """
         return self.model_name.lower().startswith("google-gla")
 
@@ -47,19 +51,18 @@ class RateLimitedAgentWrapper:
 
         Returns:
             bool: True if the model is a Gemini CLI model, False otherwise.
+
         """
         return self.model_name.lower().startswith("gemini-cli")
 
-    def __init__(
-        self, settings: Settings, model_name: str, use_web_search: bool = False
-    ):
-        """
-        Initializes the agent wrapper with settings.
+    def __init__(self, settings: Settings, model_name: str, use_web_search: bool = False):
+        """Initializes the agent wrapper with settings.
 
         Args:
             settings (Settings): The application configuration settings.
             model_name (str): The name of the model to use.
             use_web_search (bool): Whether to enable the web search tool.
+
         """
         self.settings = settings
         self.model_name = model_name
@@ -70,6 +73,11 @@ class RateLimitedAgentWrapper:
         self.agent = self._create_agent()
 
     def _create_agent(self) -> Agent:
+        """Creates and configures the Pydantic AI Agent based on the model type.
+
+        Returns:
+            Agent: The configured Pydantic AI Agent.
+        """
         builtin_tools = []
         function_tools = []
         if self.use_web_search:
@@ -81,9 +89,7 @@ class RateLimitedAgentWrapper:
                 builtin_tools.append(WebSearchTool())
 
         if self.is_google():
-            model_str = self.model_name.split(":", 1)[
-                -1
-            ]  # Configure Max thinking possible
+            model_str = self.model_name.split(":", 1)[-1]  # Configure Max thinking possible
             # https://ai.google.dev/gemini-api/docs/thinking
             thinking_config: ThinkingConfigDict
             if model_str.lower().startswith("gemini-3"):
@@ -105,17 +111,9 @@ class RateLimitedAgentWrapper:
             model = GoogleModel(
                 model_str,
                 provider=GoogleProvider(
-                    api_key=(
-                        self.settings.ai.google.key.get_secret_value()
-                        if self.settings.ai.google.key
-                        else None
-                    ),
+                    api_key=(self.settings.ai.google.key.get_secret_value() if self.settings.ai.google.key else None),
                     http_client=None,
-                    base_url=(
-                        str(self.settings.ai.google.base_url)
-                        if self.settings.ai.google.base_url
-                        else None
-                    ),
+                    base_url=(str(self.settings.ai.google.base_url) if self.settings.ai.google.base_url else None),
                 ),
             )
             google_model_settings = GoogleModelSettings(
@@ -172,17 +170,20 @@ class RateLimitedAgentWrapper:
         video_duration_ms: int,
         response_type: type[T],
     ) -> T:
-        """
-        Runs the AI agent to generate subtitles for the given video.
+        """Runs the AI agent to generate subtitles for the given video.
 
         Args:
             prompt (str): The system prompt to guide the AI.
             video (genai.types.File | Path): The video file (either a Google File object or a local Path).
             video_duration_ms (int): The duration of the video in milliseconds (used for token estimation).
-            response_type (type[T]): The expected Pydantic model for the response. Defaults to AiResponse.
+            response_type (type[T]): The expected Pydantic model for the response.
 
         Returns:
             T: The structured response containing subtitles or scene data.
+
+        Raises:
+            ValueError: If Gemini CLI is used but a local file path is not provided.
+
         """
         # Handle Rate limits
         self.request_limiter.try_acquire("rpm")
@@ -204,9 +205,7 @@ class RateLimitedAgentWrapper:
                 python_file = cast(Path, video)
                 data = await asyncio.to_thread(python_file.read_bytes)
                 user_prompt = [
-                    BinaryContent(
-                        data=data, media_type=f"video/{python_file.suffix[1:]}"
-                    ),
+                    BinaryContent(data=data, media_type=f"video/{python_file.suffix[1:]}"),
                     prompt,
                 ]
         elif self.is_gemini_cli():
@@ -237,8 +236,7 @@ class RateLimitedAgentWrapper:
         return result.output
 
     def _calculate_tokens(self, text: str, video_duration_ms: int) -> int:
-        """
-        Estimates the number of tokens for a given text and video duration.
+        """Estimates the number of tokens for a given text and video duration.
 
         This is a rough estimation used for rate limiting purposes. The actual
         token count may vary depending on the model and tokenizer.
@@ -253,6 +251,7 @@ class RateLimitedAgentWrapper:
 
         Returns:
             int: The estimated number of tokens.
+
         """
         # TODO: Make this more accurate. This is just a rough estimation
         return int(len(text) + (video_duration_ms / 1000) * 300)
