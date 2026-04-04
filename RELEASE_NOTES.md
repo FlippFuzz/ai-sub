@@ -1,5 +1,30 @@
 # AI Sub Release Notes
 
+## v2.7.0
+
+This release introduces a significant enhancement to the lyrics detection pipeline by replacing generic web search with a specialized lyrics database integration, improving accuracy and search efficiency.
+
+**New Features:**
+
+- **LyricsGenius Integration:** Replaced the DuckDuckGo web search backend with the LyricsGenius library, providing direct access to the Genius database for more accurate and comprehensive lyrics retrieval.
+  - **Specialized Search Tool:** Implemented `lyricsgenius_web_search_tool` as a dedicated search provider optimized for song and lyrics lookups.
+  - **Intelligent Query Cleaning:** Added automatic removal of common LLM suffixes (e.g., "lyrics", "歌詞", "訳") that hurt search accuracy, ensuring cleaner and more effective queries.
+  - **Structured Results:** Introduced new data models (`SearchResult`, `QueryResults`, `WebSearchResponse`) for better organization and type safety of search results.
+
+**Removals:**
+
+- **DuckDuckGo Search Removed:** Completely removed the DuckDuckGo web search option from the codebase. The `web_search_tool` configuration no longer supports `duckduckgo` as a provider, streamlining the search pipeline to focus exclusively on the superior LyricsGenius integration.
+
+**Prompt Engineering:**
+
+- **Lyrics Detection (v5):** Updated the lyrics prompt to reflect the new search capabilities and provide clearer instructions on query optimization for the LyricsGenius tool.
+- **Search Efficiency:** The prompt now explicitly instructs the AI to leverage the specialized search tool's capabilities without appending redundant keywords like "lyrics" to queries.
+
+**Internal Tooling:**
+
+- **Dependency Management:** Added `lyricsgenius` to project dependencies in `pyproject.toml`.
+- **Code Quality:** Maintained consistent Google-style docstrings and ruff formatting across all new modules.
+
 ## v2.6.1
 
 This release focuses on hardening the subtitle generation pipeline by implementing configurable timestamp validation and improving data hygiene when handling AI responses.

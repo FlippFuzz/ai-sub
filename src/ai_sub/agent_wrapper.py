@@ -21,7 +21,7 @@ from pyrate_limiter import Duration, Limiter, Rate
 
 from ai_sub.config import Settings
 from ai_sub.gemini_cli_model import GeminiCliModel
-from lyricsgenius_web_search import lyricsgenius_web_search_tool
+from ai_sub.lyricsgenius_web_search import lyricsgenius_web_search_tool
 
 T = TypeVar("T", bound=BaseModel)
 
