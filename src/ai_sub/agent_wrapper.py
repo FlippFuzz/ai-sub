@@ -82,7 +82,7 @@ class RateLimitedAgentWrapper:
         builtin_tools = []
         function_tools = []
         if self.use_web_search:
-            if self.settings.ai.web_search_tool == "lyricsgenius":
+            if self.settings.ai.web_search_tool == "genius":
                 function_tools.append(genius_web_search_tool)
             else:
                 builtin_tools.append(WebSearchTool())
