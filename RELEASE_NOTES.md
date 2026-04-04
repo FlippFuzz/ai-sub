@@ -1,5 +1,26 @@
 # AI Sub Release Notes
 
+## v2.7.1b1
+
+This release replaces the `lyricsgenius` library with a custom async scraping implementation to resolve anti-bot detection issues on VPS environments.
+
+**Refactoring:**
+
+- **Custom Genius Scraper:** Replaced the `lyricsgenius` library with a custom async implementation using Scrapling and Playwright.
+  - **Anti-Bot Bypass:** The new scraper uses `AsyncStealthySession` with Cloudflare solving to reliably access Genius from VPS environments where the original library fails.
+  - **Concurrent Fetching:** Implemented a three-phase concurrent fetching pipeline (search API → lyrics pages → parsing) for improved performance.
+  - **Unified Logging:** Added custom log routing to integrate Scrapling's logs with the application's `logfire` observability stack.
+
+**Removals:**
+
+- **lyricsgenius Dependency:** Removed the `lyricsgenius` library from project dependencies.
+
+**Internal Changes:**
+
+- **Dependency Updates:** Added `scrapling[fetchers]`, `beautifulsoup4`, and `install_playwright` to handle web scraping and browser automation.
+- **Configuration:** Renamed the `web_search_tool` option from `"lyricsgenius"` to `"genius"` to reflect the new implementation.
+- **Module Rename:** Renamed `lyricsgenius_web_search.py` to `genius_web_search.py` and converted the tool to an async function.
+
 ## v2.7.0
 
 This release introduces a significant enhancement to the lyrics detection pipeline by replacing generic web search with a specialized lyrics database integration, improving accuracy and search efficiency.
