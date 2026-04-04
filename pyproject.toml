@@ -15,7 +15,9 @@ dependencies = [
     "pydantic-settings",
     "json_repair",
     "pyrate-limiter",
-    "lyricsgenius"
+    "scrapling[fetchers]",
+    "beautifulsoup4",
+    "install_playwright"
 ]
 
 [project.urls]

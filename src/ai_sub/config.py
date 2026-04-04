@@ -117,11 +117,11 @@ class AiSettings(BaseSettings):
     )
     rpm: PositiveInt = Field(description="Maximum requests per minute for the AI model.", default=4)
     tpm: PositiveInt = Field(description="Maximum tokens per minute for the AI model.", default=250000)
-    web_search_tool: Literal["builtin", "lyricsgenius"] = Field(
+    web_search_tool: Literal["builtin", "genius"] = Field(
         description="The web search tool to use. "
-        "Options are 'builtin' (The provider's native search tool, e.g., Google Search for Gemini) or 'lyricsgenius'. "
-        "LyricsGenius is the default because it provides accurate lyric data from the Genius database.",
-        default="lyricsgenius",
+        "Options are 'builtin' (The provider's native search tool, e.g., Google Search for Gemini) or 'genius'. "
+        "Genius is the default because it provides accurate lyric data from the Genius database.",
+        default="genius",
     )
     google: GoogleAiSettings = Field(
         description="Settings that only apply to the Google AI model.",

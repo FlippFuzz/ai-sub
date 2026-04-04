@@ -5,5 +5,7 @@ pydantic-ai-slim[google, logfire]
 pydantic-settings
 pyrate-limiter
 json_repair
-lyricsgenius
+scrapling[fetchers]
+beautifulsoup4
+install_playwright
 ruff
