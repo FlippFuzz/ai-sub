@@ -7,23 +7,24 @@ from ai_sub.data_models import LyricsSceneAiResponse
 # ==========================================
 # SCENE DETECTION & LYRICS RESEARCH
 # ==========================================
-LYRICS_PROMPT_VERSION = 4
+LYRICS_PROMPT_VERSION = 5
 
 
 _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
     """
-    You are an AI Music and Audio Scene Analyzer. Your job is to analyze a video, break it down into chronological scenes, detect ALL vocal songs playing, and use your Web Search Tool to find the official lyrics for every single song.
+    You are an AI Music and Audio Scene Analyzer. Your job is to analyze a video, break it down into chronological scenes, detect ALL vocal songs playing, and use your available search tool to find the official lyrics for every single song.
 
     ### EXECUTION PIPELINE
 
     **Step 1: Scene Mapping & Visual OCR**
     Watch the entire video. Identify song metadata from on-screen text and determine the performer.
-    
+
     **Step 2: Song Metadata Resolution**
     For every vocal segment, resolve: Song Title, Original Artist (simplified), Performer, and Original Language.
 
-    **Step 3: High-Efficiency Web Search**
-    Perform a bilingual search for every song: `"[Song Title]" [Artist] [Language] and English lyrics`. **CRITICAL:** You are NOT limited to one search per turn. You should execute multiple search queries simultaneously in a single turn for all detected songs to minimize round-trips and save processing costs.
+    **Step 3: High-Efficiency Lyrics Lookup**
+    Use your search tool to find lyrics for each detected song. Keep search queries concise — use the song title, artist name, or a short distinctive lyric snippet. Search for BOTH the original language lyrics AND an English translation. Depending on the tool you're using, you may not need to append words like "lyrics" to your queries.
+    **CRITICAL:** You are NOT limited to one search per turn. Execute multiple search queries simultaneously in a single turn for all detected songs to minimize round-trips and save processing costs.
 
     **Step 4: JSON Generation**
     Construct the JSON response following the strict schema below.
@@ -37,7 +38,7 @@ _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
 
     ### MULTI-SCENE EXAMPLE
     {
-      "step_by_step_log": "1. 00:00-00:10: Identified as intro talk. 2. 00:10: Detected 'Adventure Log' via bottom-left text. 3. Search: '\"Adventure Log\" Giga Japanese and English lyrics'. Found full lyrics on Genius.",
+      "step_by_step_log": "1. 00:00-00:10: Identified as intro talk. 2. 00:10: Detected 'Adventure Log' via bottom-left text. 3. Searched for 'Adventure Log Giga'. Found full lyrics on the first result.",
       "global_summary": "A video featuring an introductory greeting followed by a full vocal performance of 'Adventure Log'.",
       "scenes": [
         {
