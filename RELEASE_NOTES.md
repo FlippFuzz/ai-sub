@@ -1,5 +1,13 @@
 # AI Sub Release Notes
 
+## v2.7.1b2
+
+This release fixes a configuration key mismatch in the agent wrapper.
+
+**Bug Fixes:**
+
+- **Configuration Key:** Updated the web search tool check in `agent_wrapper.py` to use the correct config key `"genius"` instead of the deprecated `"lyricsgenius"`.
+
 ## v2.7.1b1
 
 This release replaces the `lyricsgenius` library with a custom async scraping implementation to resolve anti-bot detection issues on VPS environments.
