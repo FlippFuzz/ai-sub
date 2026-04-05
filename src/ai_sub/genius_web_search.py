@@ -14,6 +14,48 @@ from scrapling.fetchers import AsyncStealthySession
 
 logger = logging.getLogger(__name__)
 
+# Words to strip from song titles before searching
+_CLEANUP_PATTERNS = [
+    # English
+    r"\blyrics?\b",
+    r"\btranslation?s?\b",
+    r"\btranslated?\b",
+    r"\beng sub\b",
+    r"\beng subs\b",
+    r"\bsubtitles?\b",
+    r"\bromanized?\b",
+    r"\bromaji\b",
+    # Japanese
+    r"\b歌詞\b",
+    r"\b訳\b",
+    r"\b翻訳\b",
+    r"\b日本語訳\b",
+    r"\b和訳\b",
+    r"\b英訳\b",
+    r"\b罗马字\b",
+    r"\bローマ字\b",
+]
+_CLEANUP_RE = re.compile("|".join(_CLEANUP_PATTERNS), re.IGNORECASE)
+
+
+def _clean_song_title(title: str) -> str:
+    """Removes common filler words like 'lyrics', 'translation', etc. from a song title.
+
+    Handles both English and Japanese terms.
+
+    Args:
+        title: The raw song title string, potentially containing filler words.
+
+    Returns:
+        The cleaned title with filler words removed.
+    """
+    cleaned = _CLEANUP_RE.sub("", title).strip()
+    # Remove leftover brackets/parentheses that may have surrounded the removed word
+    cleaned = re.sub(r"[\[\]（）()]", "", cleaned).strip()
+    # Collapse multiple spaces
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
+
 
 class LogfireHandler(logging.Handler):
     """Routes standard library log records to logfire."""
@@ -63,41 +105,26 @@ class SearchResult(BaseModel):
     lyrics: str = Field(description="The lyrics found.")
 
 
-class QueryResults(BaseModel):
-    """Groups multiple search results under the specific query that generated them.
+class QueryResultsList(RootModel):
+    """A collection of search outcomes for a single query.
 
     Attributes:
-        query: The search string used to perform the lookup.
-        results: The collection of findings associated with the query.
+        root: The underlying list of search results.
     """
 
-    query: str = Field(description="The original search string or keywords used to generate these results.")
-    results: list[SearchResult] = Field(description="The sequence of search results discovered for this query.")
-
-
-class WebSearchResponse(RootModel):
-    """A collection of search outcomes for one or more independent web queries.
-
-    Attributes:
-        root: The underlying list of query results, organized by search string.
-    """
-
-    root: list[QueryResults] = Field(
+    root: list[SearchResult] = Field(
         default_factory=list,
-        description="A list containing the search results grouped by their respective queries.",
+        description="A list containing the search results for the query.",
     )
 
 
 @logfire.instrument("Starting Genius lyrics search")
-async def genius_web_search_tool(queries: list[tuple[str, str]]) -> WebSearchResponse:
-    """Searches for songs and retrieves full lyrics using the Genius database.
-
-    All searches run concurrently, and results are grouped by their original query.
+async def genius_web_search_tool(song_title: str, language: str) -> QueryResultsList:
+    """Searches for a song and retrieves full lyrics using the Genius database.
 
     When to use:
-    - You need accurate, full lyrics for known song titles
-    - You have specific songs identified and want their complete lyrics
-    - You need lyrics in multiple languages for the same song
+    - You need accurate, full lyrics for a known song title
+    - You have a specific song identified and want its complete lyrics
 
     When NOT to use:
     - Searching by partial or unknown lyrics (this tool searches by title only)
@@ -105,68 +132,64 @@ async def genius_web_search_tool(queries: list[tuple[str, str]]) -> WebSearchRes
     - Finding songs by genre, mood, or topic (use a general web search instead)
 
     Args:
-        queries: A list of [song_title, language] pairs.
-            - `song_title`: The exact or approximate title of the song to search for.
-            - `language`: The language of the lyrics (e.g., "Japanese", "English", "Korean").
-              This helps narrow down results when songs share titles across languages.
-            Each pair is processed independently and runs concurrently.
+        song_title: The exact or approximate title of the song to search for.
+        language: The language of the lyrics (e.g., "Japanese", "English", "Korean").
+            This helps narrow down results when songs share titles across languages.
 
     Returns:
-        A WebSearchResponse containing QueryResults for each query. Each QueryResults
-        includes up to 5 SearchResult items with the song title and full lyrics text.
+        A QueryResultsList containing up to 5 SearchResult items with the song title
+        and full lyrics text.
 
     Example:
-        >>> # Get lyrics for a Japanese song and its English version
-        >>> genius_web_search_tool([
-        ...     ["ジェヘナ", "Japanese"],
-        ...     ["ジェヘナ", "English"],
-        ...     ["Shiny Smily Story", "Japanese"],
-        ... ])
-        WebSearchResponse(root=[
-            QueryResults(query='ジェヘナ Japanese', results=[SearchResult(title='...', lyrics='...'), ...]),
-            QueryResults(query='ジェヘナ English', results=[...]),
-            QueryResults(query='Shiny Smily Story Japanese', results=[...]),
+        >>> # Get lyrics for a Japanese song
+        >>> await genius_web_search_tool("ジェヘナ", "Japanese")
+        QueryResultsList(root=[
+            SearchResult(title='...', lyrics='...'),
+            ...
         ])
 
     """
+    # Clean the song title by removing filler words
+    cleaned_title = _clean_song_title(song_title)
+    logfire.debug("Cleaned song title", original=song_title, cleaned=cleaned_title)
+
     # Install playwright
     with logfire.span("Install Playwright"):
         async with async_playwright() as p:
             install([p.firefox])
 
-    # Build search queries from [title, language] pairs
-    clean_queries = [f"{title} {language}" for title, language in queries]
-    search_urls = [
-        f"https://genius.com/api/search?{urllib.parse.urlencode({'q': q, 'per_page': 5})}" for q in clean_queries
-    ]
-    logfire.debug("Clean queries and URLs", clean_queries=clean_queries, urls=search_urls)
+    # Build search query from title and language
+    clean_query = f"{cleaned_title} {language}"
+    search_url = f"https://genius.com/api/search?{urllib.parse.urlencode({'q': clean_query, 'per_page': 5})}"
+    logfire.debug("Search query and URL", query=clean_query, url=search_url)
 
     async with AsyncStealthySession(headless=True, solve_cloudflare=True, max_pages=5) as session:
-        # Phase 1: Fetch all search API results concurrently
-        # Reference: https://github.com/johnwmillr/LyricsGenius/blob/cae66181ac2614c5b3faff96f973dec8b18c0416/lyricsgenius/api/public_methods/search.py#L13
+        # Phase 1: Fetch search API results
         with logfire.span("Phase 1: Fetch search API results"):
-            search_responses = await asyncio.gather(*(session.fetch(url) for url in search_urls))
-            logfire.debug("Fetched search responses", search_responses=search_responses)
+            response = await session.fetch(search_url)
+            logfire.debug("Fetched search response", status=response.status)
 
         # Parse search results and collect song URLs
-        all_songs: list[tuple[int, dict]] = []  # (query_index, song_info)
-        for query_idx, response in enumerate(search_responses):
-            data = response.json().get("response", {}) if response.status == 200 else {}
-            for hit in data.get("hits", []):
-                song = hit.get("result", {})
-                if song.get("url"):
-                    all_songs.append((query_idx, song))
+        data = response.json().get("response", {}) if response.status == 200 else {}
+        songs = []
+        for hit in data.get("hits", []):
+            song = hit.get("result", {})
+            if song.get("url"):
+                songs.append(song)
+
+        if not songs:
+            logfire.warn("No songs found", query=clean_query)
+            return QueryResultsList(root=[])
 
         # Phase 2: Fetch all lyrics pages concurrently
-        # Reference: https://github.com/johnwmillr/LyricsGenius/blob/cae66181ac2614c5b3faff96f973dec8b18c0416/lyricsgenius/genius.py#L151
         with logfire.span("Phase 2: Fetch lyrics pages"):
-            lyrics_responses = await asyncio.gather(*(session.fetch(song["url"]) for _, song in all_songs))
-            logfire.debug("Fetched lyrics pages", lyrics_responses=lyrics_responses)
+            lyrics_responses = await asyncio.gather(*(session.fetch(song["url"]) for song in songs))
+            logfire.debug("Fetched lyrics pages", count=len(lyrics_responses))
 
-        # Phase 3: Parse lyrics and build results grouped by query
+        # Phase 3: Parse lyrics and build results
         with logfire.span("Phase 3: Parse lyrics and build results"):
-            query_results_map: dict[int, list[SearchResult]] = {i: [] for i in range(len(queries))}
-            for (query_idx, song), lyrics_response in zip(all_songs, lyrics_responses):
+            results: list[SearchResult] = []
+            for song, lyrics_response in zip(songs, lyrics_responses):
                 if lyrics_response.status != 200:
                     logfire.warn(
                         "Failed to fetch lyrics",
@@ -200,27 +223,19 @@ async def genius_web_search_tool(queries: list[tuple[str, str]]) -> WebSearchRes
                         elif element.get("data-exclude-from-selection") != "true":
                             lyrics_text += element.get_text(separator="\n")
 
-                # # Remove [Verse], [Bridge], etc.
+                # Remove [Verse], [Bridge], etc.
                 lyrics_text = re.sub(r"(\[.*?\])*", "", lyrics_text)
                 lyrics_text = re.sub(r"\n{2}", "\n", lyrics_text)
                 lyrics = lyrics_text.strip("\n") if lyrics_text else None
 
                 if lyrics:
-                    query_results_map[query_idx].append(
+                    results.append(
                         SearchResult(
                             title=song.get("full_title", "Unknown"),
                             lyrics=lyrics,
                         )
                     )
 
-        all_query_results = [
-            QueryResults(
-                query=clean_query,
-                results=query_results_map[i],
-            )
-            for i, clean_query in enumerate(clean_queries)
-        ]
-
-    response = WebSearchResponse(root=all_query_results)
+    response = QueryResultsList(root=results)
     logfire.debug("Search complete", response=response)
     return response
