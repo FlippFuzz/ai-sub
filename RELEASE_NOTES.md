@@ -1,5 +1,27 @@
 # AI Sub Release Notes
 
+## v2.7.1b4
+
+This release simplifies the Genius web search tool API by changing from a batch query interface to a single-song lookup, improving ease of use and reducing unnecessary complexity.
+
+**Breaking Changes:**
+
+- **Genius Search Tool Signature:** The `genius_web_search_tool` function now accepts individual `song_title` and `language` string arguments instead of a list of `[song_title, language]` pairs.
+  - **Simplified API:** The function now performs a single song lookup per call (e.g., `await genius_web_search_tool("ジェヘナ", "Japanese")`), making it more intuitive and easier to use.
+  - **Response Model Change:** The return type changed from `WebSearchResponse` to `QueryResultsList`, which directly contains a flat list of `SearchResult` items without the intermediate query grouping layer.
+  - **Removed QueryResults Model:** The `QueryResults` class has been removed as results are no longer grouped by query string.
+
+**Improvements:**
+
+- **Song Title Cleaning:** Reintroduced automatic query cleaning to strip common filler words (e.g., "lyrics", "translation", "歌詞", "訳") from song titles before searching, improving search accuracy on Genius.
+- **Logging Enhancement:** Added debug logging for the cleaned song title to help troubleshoot search queries.
+- **Log Message Matching:** Improved the Cloudflare challenge log message matching to handle trailing periods by stripping whitespace before comparison.
+
+**Internal Changes:**
+
+- **Simplified Execution Pipeline:** Removed the concurrent batch fetching architecture (Phase 1 concurrent API calls, Phase 2 concurrent lyrics fetching) in favor of a simpler single-request flow.
+- **Code Cleanup:** Removed the `QueryResults` and `WebSearchResponse` models, replacing them with the simpler `QueryResultsList` model.
+
 ## v2.7.1b3
 
 This release refines the Genius web search tool's API to improve search accuracy and reduce log noise.
