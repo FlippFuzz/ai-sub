@@ -1,5 +1,20 @@
 # AI Sub Release Notes
 
+## v2.7.1b5
+
+This release optimizes the Genius web search tool by implementing session reuse with automatic cleanup, reducing overhead and improving performance for batch lyrics lookups.
+
+**Improvements:**
+
+- **Shared Session Management:** Introduced a shared `AsyncStealthySession` with a 5-minute idle timeout for the `genius_web_search_tool`.
+  - **Reduced Overhead:** Sessions are now reused across multiple calls instead of creating a new browser/captcha setup for each request, significantly improving performance for batch operations.
+  - **Automatic Cleanup:** Implemented an idle timer that automatically closes sessions after 5 minutes of inactivity, freeing resources without manual intervention.
+
+**Internal Changes:**
+
+- **Logger Initialization:** Moved `LogfireHandler` and logger setup to module level for earlier initialization, ensuring better integration with the application's observability stack.
+- **Span Attribution:** Replaced nested `logfire.span` contexts with explicit `span.set_attribute()` calls for cleaner and more efficient logging.
+
 ## v2.7.1b4
 
 This release simplifies the Genius web search tool API by changing from a batch query interface to a single-song lookup, improving ease of use and reducing unnecessary complexity.
