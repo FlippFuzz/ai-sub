@@ -53,64 +53,113 @@ def _route_scrapling_logs_to_logfire() -> None:
 _route_scrapling_logs_to_logfire()
 
 
-# Shared session with idle timeout to avoid expensive browser/captcha setup per call
-_shared_session: AsyncStealthySession | None = None
-_session_lock = asyncio.Lock()
-_last_used: float = 0
-_cleanup_timer: TimerHandle | None = None
-_IDLE_TIMEOUT = 300  # 5 minutes
+class _SessionManager:
+    """Manages a shared AsyncStealthySession with a serial queue to avoid concurrent Cloudflare solve conflicts."""
+
+    def __init__(self) -> None:
+        self._session: AsyncStealthySession | None = None
+        self._lock = asyncio.Lock()
+        self._queue: asyncio.Queue[asyncio.Future] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._last_used: float = 0
+        self._IDLE_TIMEOUT = 300  # 5 minutes
+        self._cleanup_timer: TimerHandle | None = None
+
+    async def _worker(self):
+        """Process queued fetch requests one at a time."""
+        while True:
+            future: asyncio.Future = await self._queue.get()
+            if future.cancelled():
+                self._queue.task_done()
+                continue
+            try:
+                url, done_event = future.result()
+                if self._session and not getattr(self._session, "_closed", False):
+                    result = await self._session.fetch(url)
+                else:
+                    result = None
+                done_event.set_result(result)
+            except Exception as exc:
+                if not done_event.done():
+                    done_event.set_exception(exc)
+            finally:
+                self._queue.task_done()
+                self._last_used = time.monotonic()
+                self._schedule_cleanup()
+
+    def _close_if_idle(self):
+        """Close the session if it hasn't been used recently."""
+        if time.monotonic() - self._last_used >= self._IDLE_TIMEOUT:
+            if self._session and not getattr(self._session, "_closed", False):
+                asyncio.create_task(self._session.__aexit__(None, None, None))
+                logfire.debug("Closed idle shared session")
+            self._session = None
+        self._cleanup_timer = None
+
+    def _schedule_cleanup(self):
+        """Schedule session cleanup after idle timeout."""
+        if self._cleanup_timer:
+            self._cleanup_timer.cancel()
+        loop = asyncio.get_event_loop()
+        self._cleanup_timer = loop.call_later(self._IDLE_TIMEOUT, self._close_if_idle)
+
+    async def _ensure_session(self):
+        """Create the session and worker if needed."""
+        async with self._lock:
+            if self._session is None or getattr(self._session, "_closed", False):
+                async with async_playwright() as p:
+                    install([p.firefox])
+                self._session = AsyncStealthySession(
+                    headless=True, disable_resources=True, solve_cloudflare=True, max_pages=5
+                )
+                await self._session.__aenter__()
+                logfire.debug("Created new shared session")
+                # Start the worker (only once per session lifecycle)
+                if self._worker_task is None or self._worker_task.done():
+                    self._worker_task = asyncio.create_task(self._worker(), name="genius-session-worker")
+
+    async def fetch(self, url: str):
+        """Queue a fetch request and wait for the result (processed serially).
+
+        Args:
+            url: The URL to fetch.
+
+        Returns:
+            The fetch response from the session.
+        """
+        await self._ensure_session()
+        done_event: asyncio.Future = asyncio.get_event_loop().create_future()
+        future_result: asyncio.Future = asyncio.get_event_loop().create_future()
+        future_result.set_result((url, done_event))
+        await self._queue.put(future_result)
+        return await done_event
+
+    async def close(self):
+        """Shutdown the worker and close the session."""
+        if self._cleanup_timer:
+            self._cleanup_timer.cancel()
+        # Drain the queue
+        while not self._queue.empty():
+            try:
+                f = self._queue.get_nowait()
+                if not f.done():
+                    f.set_result((None, asyncio.get_event_loop().create_future()))
+            except asyncio.QueueEmpty:
+                break
+        if self._worker_task and not self._worker_task.done():
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+        if self._session and not getattr(self._session, "_closed", False):
+            await self._session.__aexit__(None, None, None)
+            logfire.debug("Closed session on shutdown")
+        self._session = None
 
 
-def _close_if_idle():
-    """Close the session if it hasn't been used recently."""
-    global _shared_session, _cleanup_timer
-    if time.monotonic() - _last_used >= _IDLE_TIMEOUT:
-        if _shared_session and not getattr(_shared_session, "_closed", False):
-            asyncio.create_task(_shared_session.__aexit__(None, None, None))
-            logfire.debug("Closed idle shared session")
-        _shared_session = None
-    _cleanup_timer = None
-
-
-def _schedule_cleanup():
-    """Schedule session cleanup after idle timeout."""
-    global _cleanup_timer
-    if _cleanup_timer:
-        _cleanup_timer.cancel()
-
-    loop = asyncio.get_event_loop()
-    _cleanup_timer = loop.call_later(_IDLE_TIMEOUT, _close_if_idle)
-
-
-async def _get_shared_session() -> AsyncStealthySession:
-    """Get or create a shared AsyncStealthySession instance with idle timeout.
-
-    Returns:
-        An AsyncStealthySession instance that can be reused across calls.
-    """
-    global _shared_session, _last_used
-
-    async with _session_lock:
-        now = time.monotonic()
-        _last_used = now
-
-        if _shared_session is None or getattr(_shared_session, "_closed", False):
-            # Install Playwright browsers (only needed once per process)
-            async with async_playwright() as p:
-                install([p.firefox])
-
-            _shared_session = AsyncStealthySession(
-                headless=True, disable_resources=True, solve_cloudflare=True, max_pages=5
-            )
-            await _shared_session.__aenter__()
-            logfire.debug("Created new shared session")
-        else:
-            logfire.debug("Reusing existing session")
-
-        # Reset the cleanup timer since we're using the session
-        _schedule_cleanup()
-
-        return _shared_session
+# Module-level singleton
+_session_manager = _SessionManager()
 
 
 # Words to strip from song titles before searching
@@ -220,13 +269,11 @@ async def genius_web_search_tool(song_title: str, language: str) -> QueryResults
     clean_query = f"{cleaned_title} {language}"
     search_url = f"https://genius.com/api/search?{urllib.parse.urlencode({'q': clean_query, 'per_page': 5})}"
 
-    session = await _get_shared_session()
-
-    # Phase 1: Fetch search API results
+    # Phase 1: Fetch search API results (queued serially through shared session)
     with logfire.span("Phase 1: Fetch search API results") as span:
         span.set_attribute("query", clean_query)
         span.set_attribute("url", search_url)
-        response = await session.fetch(search_url)
+        response = await _session_manager.fetch(search_url)
         span.set_attribute("status", response.status)
 
     # Parse search results and collect song URLs
@@ -241,9 +288,9 @@ async def genius_web_search_tool(song_title: str, language: str) -> QueryResults
         logfire.warn("No songs found", query=clean_query)
         return QueryResultsList(root=[])
 
-    # Phase 2: Fetch all lyrics pages concurrently
+    # Phase 2: Fetch all lyrics pages (queued serially through shared session)
     with logfire.span("Phase 2: Fetch lyrics pages") as span:
-        lyrics_responses = await asyncio.gather(*(session.fetch(song["url"]) for song in songs))
+        lyrics_responses = await asyncio.gather(*(_session_manager.fetch(song["url"]) for song in songs))
         span.set_attribute("count", len(lyrics_responses))
 
     # Phase 3: Parse lyrics and build results
