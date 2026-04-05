@@ -50,9 +50,6 @@ def _route_scrapling_logs_to_logfire() -> None:
 
 _route_scrapling_logs_to_logfire()
 
-# Common suffix words that LLMs append but hurt Genius search accuracy.
-_QUERY_CLEAN_RE = re.compile(r"\b(lyrics?|歌詞|訳歌詞?|翻訳)\b", re.IGNORECASE)
-
 
 class SearchResult(BaseModel):
     """Represents a single search result from the Genius API.
@@ -92,29 +89,44 @@ class WebSearchResponse(RootModel):
 
 
 @logfire.instrument("Starting Genius lyrics search")
-async def genius_web_search_tool(queries: list[str]) -> WebSearchResponse:
-    """Searches the web across multiple queries using the Genius database.
+async def genius_web_search_tool(queries: list[tuple[str, str]]) -> WebSearchResponse:
+    """Searches for songs and retrieves full lyrics using the Genius database.
 
-    This tool can search by song title or partial lyrics. It retrieves
-     full lyrics from the Genius database.
+    All searches run concurrently, and results are grouped by their original query.
 
-    Example Searches:
-    * `["ジェヘナ Japanese", "ジェヘナ English"]`
-    * `["Shiny Smily Story Japanese", "聖槍爆裂ボーイ English"]`
-    * `["遠く手を伸ばしても", "君について行っても"]`
+    When to use:
+    - You need accurate, full lyrics for known song titles
+    - You have specific songs identified and want their complete lyrics
+    - You need lyrics in multiple languages for the same song
+
+    When NOT to use:
+    - Searching by partial or unknown lyrics (this tool searches by title only)
+    - Looking up artist discographies (provide specific song titles instead)
+    - Finding songs by genre, mood, or topic (use a general web search instead)
 
     Args:
-        queries: A list of search strings or keywords to execute. Each query is
-            processed independently, and results are grouped by their originating
-            query.
+        queries: A list of [song_title, language] pairs.
+            - `song_title`: The exact or approximate title of the song to search for.
+            - `language`: The language of the lyrics (e.g., "Japanese", "English", "Korean").
+              This helps narrow down results when songs share titles across languages.
+            Each pair is processed independently and runs concurrently.
 
     Returns:
-        A structured response containing the combined results for all provided
-        queries, organized by search string.
+        A WebSearchResponse containing QueryResults for each query. Each QueryResults
+        includes up to 5 SearchResult items with the song title and full lyrics text.
 
     Example:
-        >>> lyricsgenius_web_search_tool(["ジェヘナ Japanese", "ジェヘナ English"])
-        WebSearchResponse(root=[QueryResults(query='ジェヘナ Japanese', results=[...]), ...])
+        >>> # Get lyrics for a Japanese song and its English version
+        >>> genius_web_search_tool([
+        ...     ["ジェヘナ", "Japanese"],
+        ...     ["ジェヘナ", "English"],
+        ...     ["Shiny Smily Story", "Japanese"],
+        ... ])
+        WebSearchResponse(root=[
+            QueryResults(query='ジェヘナ Japanese', results=[SearchResult(title='...', lyrics='...'), ...]),
+            QueryResults(query='ジェヘナ English', results=[...]),
+            QueryResults(query='Shiny Smily Story Japanese', results=[...]),
+        ])
 
     """
     # Install playwright
@@ -122,7 +134,8 @@ async def genius_web_search_tool(queries: list[str]) -> WebSearchResponse:
         async with async_playwright() as p:
             install([p.firefox])
 
-    clean_queries = [_QUERY_CLEAN_RE.sub("", q).strip() for q in queries]
+    # Build search queries from [title, language] pairs
+    clean_queries = [f"{title} {language}" for title, language in queries]
     search_urls = [
         f"https://genius.com/api/search?{urllib.parse.urlencode({'q': q, 'per_page': 5})}" for q in clean_queries
     ]
@@ -202,10 +215,10 @@ async def genius_web_search_tool(queries: list[str]) -> WebSearchResponse:
 
         all_query_results = [
             QueryResults(
-                query=query,
+                query=clean_query,
                 results=query_results_map[i],
             )
-            for i, query in enumerate(queries)
+            for i, clean_query in enumerate(clean_queries)
         ]
 
     response = WebSearchResponse(root=all_query_results)
