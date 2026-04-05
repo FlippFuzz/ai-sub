@@ -1,5 +1,23 @@
 # AI Sub Release Notes
 
+## v2.7.1b3
+
+This release refines the Genius web search tool's API to improve search accuracy and reduce log noise.
+
+**Breaking Changes:**
+
+- **Genius Search Tool API:** The `genius_web_search_tool` function signature has changed from accepting a list of strings (`list[str]`) to a list of `[song_title, language]` pairs (`list[tuple[str, str]]`).
+  - **Improved Search Accuracy:** Queries are now structured as explicit title-language pairs (e.g., `["ジェヘナ", "Japanese"]`), allowing the tool to narrow down results more effectively when songs share titles across languages.
+  - **Enhanced Documentation:** Updated the docstring with clearer guidance on when to use (known song titles) and when not to use (partial/unknown lyrics) this specialized tool.
+
+**Improvements:**
+
+- **Logging:** Downgraded the "no cloudflare challenge found" message from INFO/WARNING to DEBUG to reduce noise in log output during normal operation.
+
+**Internal Changes:**
+
+- **Query Construction:** Removed the automatic query cleaning regex (`_QUERY_CLEAN_RE`) that stripped common suffix words. The tool now relies on structured `[title, language]` pairs for better control over search behavior.
+
 ## v2.7.1b2
 
 This release fixes a configuration key mismatch in the agent wrapper.
