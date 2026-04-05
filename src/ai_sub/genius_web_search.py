@@ -61,7 +61,7 @@ class LogfireHandler(logging.Handler):
     """Routes standard library log records to logfire."""
 
     # Messages to downgrade to DEBUG level to reduce noise
-    _DOWNGRADE_MESSAGES = {"no cloudflare challenge found"}
+    _DOWNGRADE_MESSAGES = {"no cloudflare challenge found."}
 
     def emit(self, record: logging.LogRecord) -> None:
         """Process a log record by routing it to logfire.
@@ -73,7 +73,7 @@ class LogfireHandler(logging.Handler):
         message = self.format(record)
 
         # Downgrade specific noisy messages to DEBUG
-        if message.lower() in self._DOWNGRADE_MESSAGES:
+        if message.lower().strip() in self._DOWNGRADE_MESSAGES:
             level = "debug"
 
         logfire_attr = getattr(logfire, level, logfire.info)
