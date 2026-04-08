@@ -93,6 +93,25 @@ class GoogleAiSettings(BaseSettings):
         return values
 
 
+class GeniusSearchSettings(BaseSettings):
+    """Configuration for Genius search and scraping operations."""
+
+    model_config = {
+        "env_prefix": "AISUB_AI_GENIUS_",
+        **_BASE_CONFIG,
+    }
+
+    max_concurrent: PositiveInt = Field(
+        description="The maximum number of concurrent requests for Genius search operations.",
+        default=5,
+    )
+    proxy: Optional[str] = Field(
+        description="Proxy URL for Genius search requests. "
+        "Set to `None` for no proxy (default), or provide a proxy URL (e.g., `'http://127.0.0.1:40000'`).",
+        default=None,
+    )
+
+
 class AiSettings(BaseSettings):
     """Global AI model configuration and rate limits."""
 
@@ -117,12 +136,6 @@ class AiSettings(BaseSettings):
     )
     rpm: PositiveInt = Field(description="Maximum requests per minute for the AI model.", default=4)
     tpm: PositiveInt = Field(description="Maximum tokens per minute for the AI model.", default=250000)
-    web_search_tool: Literal["builtin", "genius"] = Field(
-        description="The web search tool to use. "
-        "Options are 'builtin' (The provider's native search tool, e.g., Google Search for Gemini) or 'genius'. "
-        "Genius is the default because it provides accurate lyric data from the Genius database.",
-        default="genius",
-    )
     google: GoogleAiSettings = Field(
         description="Settings that only apply to the Google AI model.",
         default_factory=GoogleAiSettings,
@@ -134,6 +147,16 @@ class AiSettings(BaseSettings):
     validation_buffer_ms: NonNegativeInt = Field(
         description="The allowed buffer in milliseconds for AI-generated timestamps to exceed the video duration.",
         default=1000,
+    )
+    web_search_tool: Literal["builtin", "genius"] = Field(
+        description="The web search tool to use for AI agents. "
+        "Options are 'builtin' (The provider's native search tool, e.g., Google Search for Gemini) or 'genius'. "
+        "Genius is the default because it provides accurate lyric data from the Genius database.",
+        default="genius",
+    )
+    genius_search: GeniusSearchSettings = Field(
+        description="Settings for Genius search and scraping operations.",
+        default_factory=GeniusSearchSettings,
     )
 
     @model_validator(mode="after")

@@ -9,6 +9,7 @@ import asyncio
 import json
 import socket
 import sys
+from contextlib import AsyncExitStack
 from functools import partial
 from importlib.metadata import version
 from pathlib import Path
@@ -31,6 +32,7 @@ from ai_sub.data_models import (
     UploadFileJob,
 )
 from ai_sub.gemini_file_uploader import GeminiFileUploader
+from ai_sub.genius_web_search import AsyncGeniusWebSearchSession, redirect_scrapling_logs_to_logfire
 from ai_sub.job_runner import JobRunner
 from ai_sub.prompt import (
     LYRICS_PROMPT_VERSION,
@@ -152,6 +154,7 @@ class LyricsSceneJobRunner(JobRunner):
         agent: RateLimitedAgentWrapper,
         on_complete: Callable[[SegmentJobs, Any], Awaitable[None]],
         name: str = "lyrics",
+        session: AsyncGeniusWebSearchSession | None = None,
     ):
         """Initializes the LyricsSceneJobRunner.
 
@@ -162,10 +165,12 @@ class LyricsSceneJobRunner(JobRunner):
             on_complete (Callable[[SegmentJobs, Any], Awaitable[None]]): Callback executed
                 upon successful completion of a job.
             name (str): The name of the runner.
+            session (AsyncStealthySession | None): Shared web session for tools.
 
         """
         super().__init__(settings, max_workers, on_complete, name=name)
         self.agent = agent
+        self.session = session
         self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(self.agent.model_name)
 
     async def process(self, job: SegmentJobs) -> None:
@@ -186,6 +191,7 @@ class LyricsSceneJobRunner(JobRunner):
             lyrics_job.file,
             lyrics_job.video_duration_ms,
             LyricsSceneAiResponse,
+            deps=self.session,
         )
         if lyrics_job.response:
             lyrics_job.response.validate_against_duration(
@@ -497,278 +503,293 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                 f"{initial_offset_ms}ms) due to start_offset_min={settings.split.start_offset_min}"
             )
 
-        # Step 2: Configure the job processing pipeline.
-
-        use_reencode = settings.split.re_encode.enabled
-        is_google_sub = agent_subtitles.is_google()
-        is_google_scene = agent_scene.is_google() if agent_scene else False
-        use_upload = (is_google_sub or is_google_scene) and settings.ai.google.use_files_api
-
-        reencode_runner: ReEncodeJobRunner | None = None
-        upload_runner: UploadJobRunner | None = None
-        scene_detection_runner: LyricsSceneJobRunner | None = None
-        subtitle_runner: SubtitleJobRunner | None = None
-
-        # Define callbacks
-        # These functions handle the transition between pipeline stages.
-        # When a job completes, the next required job is created and queued.
-        async def on_stage_complete(stage: str, job: SegmentJobs, result: Any) -> None:
-            """Handles the transition between pipeline stages."""
-            file_handle: Any = result
-            duration_ms: int = 0
-            name: str = ""
-
-            # Extract data based on the completed stage
-            if stage == "reencode":
-                assert job.reencode is not None
-                name = job.reencode.name
-                file_handle = job.reencode.output_file
-                duration_ms = await get_video_duration_ms(file_handle)
-            elif stage == "upload":
-                assert job.upload is not None
-                name = job.upload.name
-                # file_handle is already the result (the uploaded file object)
-                duration_ms = job.upload.video_duration_ms
-            elif stage == "lyrics":
-                assert job.lyrics is not None
-                if not job.lyrics.response:
-                    return  # Should not happen if on_complete is called after success
-                name = job.lyrics.name
-                file_handle = job.lyrics.file
-                duration_ms = job.lyrics.video_duration_ms
-
-                # Logic for Subtitles file source:
-                # If we are using a non-Google model for subtitles, but we uploaded the file
-                # (e.g. for Google Lyrics), we might need to fallback to the local file.
-                if not agent_subtitles.is_google() and job.upload:
-                    file_handle = job.upload.python_file
-
-            # Determine next stage
-            next_stage = None
-            if stage == "reencode":
-                if use_upload:
-                    next_stage = "upload"
-                elif use_lyrics:
-                    next_stage = "lyrics"
-                else:
-                    next_stage = "subtitles"
-            elif stage == "upload":
-                if use_lyrics:
-                    next_stage = "lyrics"
-                else:
-                    next_stage = "subtitles"
-            elif stage == "lyrics":
-                next_stage = "subtitles"
-
-            if not next_stage:
-                return
-
-            # Queue next job
-            if next_stage == "upload":
-                job.upload = UploadFileJob(
-                    name=name,
-                    python_file=file_handle,
-                    video_duration_ms=duration_ms,
-                )
-                if upload_runner:
-                    await upload_runner.add_job(job)
-
-            elif next_stage == "lyrics":
-                existing_lyrics = job.lyrics
-                new_lyrics_job = LyricsSceneJob(name=name, file=file_handle, video_duration_ms=duration_ms)
-                if existing_lyrics:
-                    new_lyrics_job.total_num_retries = existing_lyrics.total_num_retries
-                    if existing_lyrics.response:
-                        new_lyrics_job.response = existing_lyrics.response
-                        new_lyrics_job.lyrics_prompt_version = existing_lyrics.lyrics_prompt_version
-
-                job.lyrics = new_lyrics_job
-                if scene_detection_runner:
-                    await scene_detection_runner.add_job(job)
-
-            elif next_stage == "subtitles":
-                existing_subs = job.subtitles
-                new_subs_job = SubtitleJob(name=name, file=file_handle, video_duration_ms=duration_ms)
-                if existing_subs:
-                    new_subs_job.total_num_retries = existing_subs.total_num_retries
-                    if existing_subs.response:
-                        new_subs_job.response = existing_subs.response
-                        new_subs_job.subtitles_prompt_version = existing_subs.subtitles_prompt_version
-
-                job.subtitles = new_subs_job
-                if subtitle_runner:
-                    await subtitle_runner.add_job(job)
-
-        # Setup reencode_runner
-        if use_reencode:
-            reencode_runner = ReEncodeJobRunner(
-                settings,
-                settings.thread.re_encode,
-                on_complete=partial(on_stage_complete, "reencode"),
-            )
-
-        # Setup upload_runner
-        if use_upload:
-            upload_runner = UploadJobRunner(
-                settings,
-                settings.thread.uploads,
-                uploader=GeminiFileUploader(settings),
-                on_complete=partial(on_stage_complete, "upload"),
-            )
-
-        # Setup scene_detection_runner
-        if use_lyrics:
-            assert agent_scene is not None
-            scene_detection_runner = LyricsSceneJobRunner(
-                settings,
-                settings.thread.lyrics,
-                agent_scene,
-                on_complete=partial(on_stage_complete, "lyrics"),
-            )
-
-        # Setup subtitle_runner
-        subtitle_runner = SubtitleJobRunner(
-            settings,
-            settings.thread.subtitles,
-            agent_subtitles,
-            on_complete=None,
-        )
-
-        # Step 3: Populate the job queues.
-
-        # Create a directory for re-encoded files to avoid name collisions
-        # and preserve the file stem for stitching.
-        reencode_dir = settings.dir.tmp / "reencoded"
-        if use_reencode:
-            reencode_dir.mkdir(exist_ok=True)
-
-        # Iterate through all video segments to determine their starting point in the pipeline.
-        for split, duration in splits_to_process:
-            job_state = SegmentJobs()
-
-            # Load jobs if they exist and populate the in-memory JobState
-            lyrics_job_path = settings.dir.tmp / f"{split.stem}.lyrics.{sanitized_lyrics_model}.json"
-            lyrics_job = await asyncio.to_thread(LyricsSceneJob.load, lyrics_job_path, settings.ai.validation_buffer_ms)
-            if lyrics_job:
-                job_state.lyrics = lyrics_job
-
-            subtitle_job_path = settings.dir.tmp / f"{split.stem}.subtitles.{sanitized_subtitles_model}.json"
-            subtitle_job = await asyncio.to_thread(
-                SubtitleJob.load, subtitle_job_path, settings.ai.validation_buffer_ms
-            )
-            if subtitle_job:
-                job_state.subtitles = subtitle_job
-
-            # Check if the final stage (Subtitles) is already complete.
-            if subtitle_job and subtitle_job.response:
-                continue
-
-            # Determine the entry point for this segment.
-            # We check requirements in order: Re-encode -> Upload -> Lyrics -> Subtitles.
-            # If a step is required, we queue the job and 'continue' to the next segment.
-            # The completion of that job will trigger the subsequent steps via the
-            # callbacks defined above.
-
-            # 1. Check Re-encode
-            should_reencode = False
-            if use_reencode:
-                if settings.split.re_encode.threshold_mb == 0:
-                    should_reencode = True
-                else:
-                    file_size_mb = split.stat().st_size / (1024 * 1024)
-                    should_reencode = file_size_mb >= settings.split.re_encode.threshold_mb
-
-            if should_reencode:
-                output_file = reencode_dir / split.with_suffix(".mov").name
-                job_state.reencode = ReEncodingJob(
-                    name=split.stem,
-                    input_file=split,
-                    output_file=output_file,
-                    fps=settings.split.re_encode.fps,
-                    height=settings.split.re_encode.height,
-                    bitrate_kb=settings.split.re_encode.bitrate_kb,
-                    duration_tolerance_ms=settings.split.re_encode.duration_tolerance_ms,
-                )
-                if reencode_runner:
-                    await reencode_runner.add_job(job_state)
-                continue
-
-            # 2. Check Upload
-            if use_upload:
-                job_state.upload = UploadFileJob(
-                    name=split.stem,
-                    python_file=split,
-                    video_duration_ms=duration,
-                )
-                if upload_runner:
-                    await upload_runner.add_job(job_state)
-                continue
-
-            # 3. Check Lyrics
+        async with AsyncExitStack() as stack:
+            # Initialize the shared web session if lyrics detection is enabled.
+            session = None
             if use_lyrics:
-                if not job_state.lyrics:
+                # Redirect internal Scrapling logs to Logfire for better observability.
+                redirect_scrapling_logs_to_logfire()
+                session = await stack.enter_async_context(
+                    AsyncGeniusWebSearchSession(
+                        config=settings.ai.genius_search,
+                    )
+                )
+
+            # Step 2: Configure the job processing pipeline.
+
+            use_reencode = settings.split.re_encode.enabled
+            is_google_sub = agent_subtitles.is_google()
+            is_google_scene = agent_scene.is_google() if agent_scene else False
+            use_upload = (is_google_sub or is_google_scene) and settings.ai.google.use_files_api
+
+            reencode_runner: ReEncodeJobRunner | None = None
+            upload_runner: UploadJobRunner | None = None
+            scene_detection_runner: LyricsSceneJobRunner | None = None
+            subtitle_runner: SubtitleJobRunner | None = None
+
+            # Define callbacks
+            # These functions handle the transition between pipeline stages.
+            # When a job completes, the next required job is created and queued.
+            async def on_stage_complete(stage: str, job: SegmentJobs, result: Any) -> None:
+                """Handles the transition between pipeline stages."""
+                file_handle: Any = result
+                duration_ms: int = 0
+                name: str = ""
+
+                # Extract data based on the completed stage
+                if stage == "reencode":
+                    assert job.reencode is not None
+                    name = job.reencode.name
+                    file_handle = job.reencode.output_file
+                    duration_ms = await get_video_duration_ms(file_handle)
+                elif stage == "upload":
+                    assert job.upload is not None
+                    name = job.upload.name
+                    # file_handle is already the result (the uploaded file object)
+                    duration_ms = job.upload.video_duration_ms
+                elif stage == "lyrics":
+                    assert job.lyrics is not None
+                    if not job.lyrics.response:
+                        return  # Should not happen if on_complete is called after success
+                    name = job.lyrics.name
+                    file_handle = job.lyrics.file
+                    duration_ms = job.lyrics.video_duration_ms
+
+                    # Logic for Subtitles file source:
+                    # If we are using a non-Google model for subtitles, but we uploaded the file
+                    # (e.g. for Google Lyrics), we might need to fallback to the local file.
+                    if not agent_subtitles.is_google() and job.upload:
+                        file_handle = job.upload.python_file
+
+                # Determine next stage
+                next_stage = None
+                if stage == "reencode":
+                    if use_upload:
+                        next_stage = "upload"
+                    elif use_lyrics:
+                        next_stage = "lyrics"
+                    else:
+                        next_stage = "subtitles"
+                elif stage == "upload":
+                    if use_lyrics:
+                        next_stage = "lyrics"
+                    else:
+                        next_stage = "subtitles"
+                elif stage == "lyrics":
+                    next_stage = "subtitles"
+
+                if not next_stage:
+                    return
+
+                # Queue next job
+                if next_stage == "upload":
+                    job.upload = UploadFileJob(
+                        name=name,
+                        python_file=file_handle,
+                        video_duration_ms=duration_ms,
+                    )
+                    if upload_runner:
+                        await upload_runner.add_job(job)
+
+                elif next_stage == "lyrics":
+                    existing_lyrics = job.lyrics
+                    new_lyrics_job = LyricsSceneJob(name=name, file=file_handle, video_duration_ms=duration_ms)
+                    if existing_lyrics:
+                        new_lyrics_job.total_num_retries = existing_lyrics.total_num_retries
+                        if existing_lyrics.response:
+                            new_lyrics_job.response = existing_lyrics.response
+                            new_lyrics_job.lyrics_prompt_version = existing_lyrics.lyrics_prompt_version
+
+                    job.lyrics = new_lyrics_job
+                    if scene_detection_runner:
+                        await scene_detection_runner.add_job(job)
+
+                elif next_stage == "subtitles":
+                    existing_subs = job.subtitles
+                    new_subs_job = SubtitleJob(name=name, file=file_handle, video_duration_ms=duration_ms)
+                    if existing_subs:
+                        new_subs_job.total_num_retries = existing_subs.total_num_retries
+                        if existing_subs.response:
+                            new_subs_job.response = existing_subs.response
+                            new_subs_job.subtitles_prompt_version = existing_subs.subtitles_prompt_version
+
+                    job.subtitles = new_subs_job
+                    if subtitle_runner:
+                        await subtitle_runner.add_job(job)
+
+            # Setup reencode_runner
+            if use_reencode:
+                reencode_runner = ReEncodeJobRunner(
+                    settings,
+                    settings.thread.re_encode,
+                    on_complete=partial(on_stage_complete, "reencode"),
+                )
+
+            # Setup upload_runner
+            if use_upload:
+                upload_runner = UploadJobRunner(
+                    settings,
+                    settings.thread.uploads,
+                    uploader=GeminiFileUploader(settings),
+                    on_complete=partial(on_stage_complete, "upload"),
+                )
+
+            # Setup scene_detection_runner
+            if use_lyrics:
+                assert agent_scene is not None
+                scene_detection_runner = LyricsSceneJobRunner(
+                    settings,
+                    settings.thread.lyrics,
+                    agent_scene,
+                    on_complete=partial(on_stage_complete, "lyrics"),
+                    session=session,
+                )
+
+            # Setup subtitle_runner
+            subtitle_runner = SubtitleJobRunner(
+                settings,
+                settings.thread.subtitles,
+                agent_subtitles,
+                on_complete=None,
+            )
+
+            # Step 3: Populate the job queues.
+
+            # Create a directory for re-encoded files to avoid name collisions
+            # and preserve the file stem for stitching.
+            reencode_dir = settings.dir.tmp / "reencoded"
+            if use_reencode:
+                reencode_dir.mkdir(exist_ok=True)
+
+            # Iterate through all video segments to determine their starting point in the pipeline.
+            for split, duration in splits_to_process:
+                job_state = SegmentJobs()
+
+                # Load jobs if they exist and populate the in-memory JobState
+                lyrics_job_path = settings.dir.tmp / f"{split.stem}.lyrics.{sanitized_lyrics_model}.json"
+                lyrics_job = await asyncio.to_thread(
+                    LyricsSceneJob.load, lyrics_job_path, settings.ai.validation_buffer_ms
+                )
+                if lyrics_job:
+                    job_state.lyrics = lyrics_job
+
+                subtitle_job_path = settings.dir.tmp / f"{split.stem}.subtitles.{sanitized_subtitles_model}.json"
+                subtitle_job = await asyncio.to_thread(
+                    SubtitleJob.load, subtitle_job_path, settings.ai.validation_buffer_ms
+                )
+                if subtitle_job:
+                    job_state.subtitles = subtitle_job
+
+                # Check if the final stage (Subtitles) is already complete.
+                if subtitle_job and subtitle_job.response:
+                    continue
+
+                # Determine the entry point for this segment.
+                # We check requirements in order: Re-encode -> Upload -> Lyrics -> Subtitles.
+                # If a step is required, we queue the job and 'continue' to the next segment.
+                # The completion of that job will trigger the subsequent steps via the
+                # callbacks defined above.
+
+                # 1. Check Re-encode
+                should_reencode = False
+                if use_reencode:
+                    if settings.split.re_encode.threshold_mb == 0:
+                        should_reencode = True
+                    else:
+                        file_size_mb = split.stat().st_size / (1024 * 1024)
+                        should_reencode = file_size_mb >= settings.split.re_encode.threshold_mb
+
+                if should_reencode:
+                    output_file = reencode_dir / split.with_suffix(".mov").name
+                    job_state.reencode = ReEncodingJob(
+                        name=split.stem,
+                        input_file=split,
+                        output_file=output_file,
+                        fps=settings.split.re_encode.fps,
+                        height=settings.split.re_encode.height,
+                        bitrate_kb=settings.split.re_encode.bitrate_kb,
+                        duration_tolerance_ms=settings.split.re_encode.duration_tolerance_ms,
+                    )
+                    if reencode_runner:
+                        await reencode_runner.add_job(job_state)
+                    continue
+
+                # 2. Check Upload
+                if use_upload:
+                    job_state.upload = UploadFileJob(
+                        name=split.stem,
+                        python_file=split,
+                        video_duration_ms=duration,
+                    )
+                    if upload_runner:
+                        await upload_runner.add_job(job_state)
+                    continue
+
+                # 3. Check Lyrics
+                if use_lyrics:
+                    if not job_state.lyrics:
+                        # Fall-through: If execution reaches here, it means previous stages (Re-encode/Upload)
+                        # were either disabled or skipped (e.g. file size < threshold).
+                        # Therefore, we use the original local split file as the input.
+                        job_state.lyrics = LyricsSceneJob(
+                            name=split.stem,
+                            file=split,
+                            video_duration_ms=duration,
+                        )
+                        if scene_detection_runner:
+                            await scene_detection_runner.add_job(job_state)
+                        continue
+                    elif job_state.lyrics.file is None:
+                        # Resumption: 'file' is excluded from JSON save. Restore local split path.
+                        job_state.lyrics.file = split
+                        if not job_state.lyrics.response:
+                            if scene_detection_runner:
+                                await scene_detection_runner.add_job(job_state)
+                            continue
+
+                # 4. Subtitles
+                if not job_state.subtitles:
                     # Fall-through: If execution reaches here, it means previous stages (Re-encode/Upload)
                     # were either disabled or skipped (e.g. file size < threshold).
                     # Therefore, we use the original local split file as the input.
-                    job_state.lyrics = LyricsSceneJob(
+                    job_state.subtitles = SubtitleJob(
                         name=split.stem,
                         file=split,
                         video_duration_ms=duration,
                     )
-                    if scene_detection_runner:
-                        await scene_detection_runner.add_job(job_state)
-                    continue
-                elif job_state.lyrics.file is None:
+                    if subtitle_runner:
+                        await subtitle_runner.add_job(job_state)
+                elif job_state.subtitles.file is None:
                     # Resumption: 'file' is excluded from JSON save. Restore local split path.
-                    job_state.lyrics.file = split
-                    if not job_state.lyrics.response:
-                        if scene_detection_runner:
-                            await scene_detection_runner.add_job(job_state)
-                        continue
+                    job_state.subtitles.file = split
+                    if subtitle_runner:
+                        await subtitle_runner.add_job(job_state)
 
-            # 4. Subtitles
-            if not job_state.subtitles:
-                # Fall-through: If execution reaches here, it means previous stages (Re-encode/Upload)
-                # were either disabled or skipped (e.g. file size < threshold).
-                # Therefore, we use the original local split file as the input.
-                job_state.subtitles = SubtitleJob(
-                    name=split.stem,
-                    file=split,
-                    video_duration_ms=duration,
-                )
-                if subtitle_runner:
-                    await subtitle_runner.add_job(job_state)
-            elif job_state.subtitles.file is None:
-                # Resumption: 'file' is excluded from JSON save. Restore local split path.
-                job_state.subtitles.file = split
-                if subtitle_runner:
-                    await subtitle_runner.add_job(job_state)
+            # Step 4: Start all runners and wait for them to complete
+            # Start runners
+            if reencode_runner:
+                await reencode_runner.start()
+            if upload_runner:
+                await upload_runner.start()
+            if scene_detection_runner:
+                await scene_detection_runner.start()
+            await subtitle_runner.start()
 
-        # Step 4: Start all runners and wait for them to complete
-        # Start runners
-        if reencode_runner:
-            await reencode_runner.start()
-        if upload_runner:
-            await upload_runner.start()
-        if scene_detection_runner:
-            await scene_detection_runner.start()
-        await subtitle_runner.start()
+            # Wait for runners to complete and signal as needed
+            if reencode_runner:
+                await reencode_runner.join()
+                await reencode_runner.shutdown()
 
-        # Wait for runners to complete and signal as needed
-        if reencode_runner:
-            await reencode_runner.join()
-            await reencode_runner.shutdown()
+            if upload_runner:
+                await upload_runner.join()
+                await upload_runner.shutdown()
 
-        if upload_runner:
-            await upload_runner.join()
-            await upload_runner.shutdown()
+            if scene_detection_runner:
+                await scene_detection_runner.join()
+                await scene_detection_runner.shutdown()
 
-        if scene_detection_runner:
-            await scene_detection_runner.join()
-            await scene_detection_runner.shutdown()
-
-        await subtitle_runner.join()
-        await subtitle_runner.shutdown()
+            await subtitle_runner.join()
+            await subtitle_runner.shutdown()
 
         # Step 5: Assemble the final subtitle file.
         result = await asyncio.to_thread(stitch_subtitles, video_splits, settings)

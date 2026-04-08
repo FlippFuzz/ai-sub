@@ -4,7 +4,7 @@ from __future__ import annotations as _annotations
 
 import asyncio
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from google import genai as genai
 from google.genai.types import (
@@ -168,6 +168,7 @@ class RateLimitedAgentWrapper:
         video: genai.types.File | Path,
         video_duration_ms: int,
         response_type: type[T],
+        deps: Any | None = None,
     ) -> T:
         """Runs the AI agent to generate subtitles for the given video.
 
@@ -176,6 +177,7 @@ class RateLimitedAgentWrapper:
             video (genai.types.File | Path): The video file (either a Google File object or a local Path).
             video_duration_ms (int): The duration of the video in milliseconds (used for token estimation).
             response_type (type[T]): The expected Pydantic model for the response.
+            deps (Any | None): Optional dependencies to pass to the AI agent (e.g., shared sessions).
 
         Returns:
             T: The structured response containing subtitles or scene data.
@@ -230,7 +232,7 @@ class RateLimitedAgentWrapper:
             ]
 
         # Execute the AI agent to generate subtitles and get a structured response.
-        result = await self.agent.run(user_prompt, output_type=response_type)
+        result = await self.agent.run(user_prompt, output_type=response_type, deps=deps)
 
         return result.output
 
