@@ -11,7 +11,7 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | `--ai.model-lyrics <model>`    | The AI model for lyrics research and scene detection.                                                                                                   | `google-gla:gemini-3-flash-preview` |
 | `--ai.rpm <int>`               | Maximum requests per minute for the AI model.                                                                                                           | `4`                                 |
 | `--ai.tpm <int>`               | Maximum tokens per minute for the AI model.                                                                                                             | `250000`                            |
-| `--ai.web-search-tool <tool>`  | The web search tool to use. Options: 'builtin', 'lyricsgenius'.                                                                                         | `lyricsgenius`                      |
+| `--ai.web-search-tool <tool>`  | The web search tool to use. Options: 'builtin', 'duckduckgo'.                                                                                           | `duckduckgo`                        |
 
 ### Google AI Settings (`--ai.google.*`)
 
