@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from typing import TypeVar, cast
 
+import logfire
 from google import genai as genai
 from google.genai.types import (
     HarmBlockThreshold,
@@ -147,7 +148,14 @@ class RateLimitedAgentWrapper:
             else:
                 return Agent(model, model_settings=google_model_settings)
         elif self.is_gemini_cli():
-            # Note: No support for custom tools.
+            # Gemini CLI model does not support external tools / builtin_tools.
+            if self.use_web_search:
+                logfire.warn(
+                    f"Web search is enabled (settings.ai.web_search_tool='{self.settings.ai.web_search_tool}'), "
+                    f"but the Gemini CLI model ({self.model_name!r}) does not support external tools. "
+                    f"The WebSearchTool/duckduckgo_search_tool will be skipped. "
+                    f"Agent(model=model) will be created without web search capabilities."
+                )
             model_str = self.model_name.split(":", 1)[-1]
             model = GeminiCliModel(model_str, self.settings.ai.gemini_cli)
             return Agent(model=model)
