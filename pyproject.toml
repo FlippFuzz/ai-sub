@@ -11,11 +11,10 @@ dependencies = [
     "pysubs2",
     "static-ffmpeg",
     "pydantic",
-    "pydantic-ai-slim[google, logfire]",
+    "pydantic-ai-slim[google, logfire, duckduckgo]",
     "pydantic-settings",
     "json_repair",
     "pyrate-limiter",
-    "lyricsgenius"
 ]
 
 [project.urls]

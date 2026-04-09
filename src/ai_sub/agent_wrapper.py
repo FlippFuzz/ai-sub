@@ -21,7 +21,6 @@ from pyrate_limiter import Duration, Limiter, Rate
 
 from ai_sub.config import Settings
 from ai_sub.gemini_cli_model import GeminiCliModel
-from ai_sub.lyricsgenius_web_search import lyricsgenius_web_search_tool
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -82,8 +81,10 @@ class RateLimitedAgentWrapper:
         builtin_tools = []
         function_tools = []
         if self.use_web_search:
-            if self.settings.ai.web_search_tool == "lyricsgenius":
-                function_tools.append(lyricsgenius_web_search_tool)
+            if self.settings.ai.web_search_tool == "duckduckgo":
+                from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
+
+                function_tools.append(duckduckgo_search_tool())
             else:
                 builtin_tools.append(WebSearchTool())
 
