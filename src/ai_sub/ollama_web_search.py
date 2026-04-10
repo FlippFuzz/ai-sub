@@ -5,6 +5,7 @@ using Ollama's web search endpoint.
 """
 
 import asyncio
+import string
 from typing import Any, Self
 
 import logfire
@@ -39,6 +40,7 @@ class OllamaWebSearchDeps:
 
     _settings: OllamaSearchSettings
     _client: AsyncClient
+    _cache: dict[str, list[OllamaSearchResult]]
 
     def __init__(self, settings: OllamaSearchSettings):
         """Initializes the OllamaWebSearchDeps.
@@ -47,6 +49,19 @@ class OllamaWebSearchDeps:
             settings: An OllamaSearchSettings instance containing the API key.
         """
         self._settings = settings
+        self._cache = {}
+
+    def _normalize_query(self, query: str) -> str:
+        """Normalize a query by removing punctuation and case-folding.
+
+        Args:
+            query: The raw search query string.
+
+        Returns:
+            A normalized version of the query suitable cache-key comparison.
+        """
+        translator = str.maketrans("", "", string.punctuation)
+        return query.translate(translator).casefold()
 
     async def __aenter__(self) -> Self:
         """Initialize the underlying httpx.AsyncClient and enter its context.
@@ -94,11 +109,16 @@ async def ollama_web_search_single(ctx: RunContext[OllamaWebSearchDeps], query: 
         A list of OllamaSearchResult objects containing the search results.
     """
     deps = ctx.deps
+    cache_key = deps._normalize_query(query)
+    if cache_key in deps._cache:
+        logfire.debug("Using cached query.")
+        return deps._cache[cache_key]
     response = await deps.post("https://ollama.com/api/web_search", json={"query": query})
     response.raise_for_status()
     data = response.json()
-    results = data.get("results") or []
-    return [OllamaSearchResult.model_validate(result) for result in results]
+    results = [OllamaSearchResult.model_validate(result) for result in (data.get("results") or [])]
+    deps._cache[cache_key] = results
+    return results
 
 
 async def ollama_web_search_multi(ctx: RunContext[OllamaWebSearchDeps], queries: list[str]) -> list[QueryResult]:
