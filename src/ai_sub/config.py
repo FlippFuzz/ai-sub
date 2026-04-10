@@ -93,6 +93,42 @@ class GoogleAiSettings(BaseSettings):
         return values
 
 
+class OllamaSearchSettings(BaseSettings):
+    """Configuration for Ollama web search operations."""
+
+    model_config = {
+        "env_prefix": "AISUB_AI_SEARCH_OLLAMA_",
+        **_BASE_CONFIG,
+    }
+
+    key: Optional[SecretStr] = Field(
+        description="The API key for Ollama's web search API. "
+        "If not provided, it will fall back to the OLLAMA_API_KEY environment variable.",
+        default=None,
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def load_api_key_from_env(cls, values):
+        """Loads the API key from environment variables if it's not provided directly.
+
+        Args:
+            values (dict): The raw input values to validate.
+
+        Returns:
+            dict: The updated values dictionary including the API key if found.
+        """
+        if values.get("key") is None:
+            key = os.getenv("OLLAMA_API_KEY")
+            if key:
+                values["key"] = key
+
+        if values.get("key") and isinstance(values["key"], str):
+            values["key"] = values["key"].strip().strip('"').strip("'")
+
+        return values
+
+
 class AiSettings(BaseSettings):
     """Global AI model configuration and rate limits."""
 
@@ -117,12 +153,6 @@ class AiSettings(BaseSettings):
     )
     rpm: PositiveInt = Field(description="Maximum requests per minute for the AI model.", default=4)
     tpm: PositiveInt = Field(description="Maximum tokens per minute for the AI model.", default=250000)
-    web_search_tool: Literal["builtin", "duckduckgo"] = Field(
-        description="The web search tool to use. "
-        "Options are 'builtin' (The provider's native search tool, e.g., Google Search for Gemini) or 'duckduckgo'. "
-        "DuckDuckGo is the default because Gemini's built-in search does not have a free tier.",
-        default="duckduckgo",
-    )
     google: GoogleAiSettings = Field(
         description="Settings that only apply to the Google AI model.",
         default_factory=GoogleAiSettings,
@@ -130,6 +160,17 @@ class AiSettings(BaseSettings):
     gemini_cli: GeminiCliSettings = Field(
         description="Settings that only apply to the Gemini CLI.",
         default_factory=GeminiCliSettings,
+    )
+    ollama_search: OllamaSearchSettings = Field(
+        description="Settings that only apply to the Ollama web search tool.",
+        default_factory=OllamaSearchSettings,
+    )
+    web_search_tool: Literal["builtin", "duckduckgo", "ollama"] = Field(
+        description="The web search tool to use. "
+        "Options are 'builtin' (The provider's native search tool, e.g., Google Search for Gemini), "
+        "'duckduckgo', or 'ollama' (Use Ollama's web search API). "
+        "DuckDuckGo is the default because Gemini's built-in search does not have a free tier.",
+        default="duckduckgo",
     )
     validation_buffer_ms: NonNegativeInt = Field(
         description="The allowed buffer in milliseconds for AI-generated timestamps to exceed the video duration.",
@@ -351,13 +392,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_api_keys(self):
-        """Validates that a Google AI API key is provided if a Google model is selected.
+        """Validates that required API keys are provided for the selected models and tools.
 
         Returns:
             Settings: The validated settings instance.
 
         Raises:
-            ValueError: If a Google model is used without an API key.
+            ValueError: If a required API key is missing.
         """
         is_google_subtitles = self.ai.model_subtitles.lower().startswith("google-gla")
         # Only check lyrics model if lyrics threads are > 0 (i.e. enabled)
@@ -368,6 +409,14 @@ class Settings(BaseSettings):
                 "A Google AI API key must be provided either via the 'key' field, "
                 "GOOGLE_API_KEY, GEMINI_API_KEY or AISUB_AI_GOOGLE_KEY environment variables."
             )
+
+        if self.ai.web_search_tool == "ollama" and self.ai.ollama_search.key is None:
+            raise ValueError(
+                "An Ollama web search API key must be provided either via the 'key' field, "
+                "OLLAMA_API_KEY or AISUB_AI_SEARCH_OLLAMA_KEY environment variables "
+                "when using 'ollama' as the web search tool."
+            )
+
         return self
 
     @model_validator(mode="after")

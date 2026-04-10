@@ -106,7 +106,18 @@ class GeminiCliModel(Model):
 
     @property
     def system(self) -> str | None:
-        """Returns the system prompt (not supported by CLI currently)."""
+        """Returns the system prompt.
+
+        Note:
+            The Gemini CLI handles system prompts differently. When
+            ``overwrite_system_prompt`` is enabled, the system prompt is set
+            via the ``GEMINI_SYSTEM_MD`` environment variable. Otherwise,
+            instructions are passed as part of the user prompt.
+
+        Returns:
+            An empty string, as system prompts are handled via environment
+            variables or user prompt injection.
+        """
         return ""
 
     @property
@@ -288,7 +299,7 @@ class GeminiCliModel(Model):
                     # If repair fails, pass raw response to Agent to handle/fail
                     json_str = cli_response.response
 
-                # Sort out the statistics
+                # Parse and extract token statistics from the CLI response
                 if cli_response.stats and cli_response.stats.models and cli_response.stats.models.get(self._model_name):
                     model_stats = cli_response.stats.models[self._model_name]
                     input_tokens = model_stats.tokens.get("input", 0)

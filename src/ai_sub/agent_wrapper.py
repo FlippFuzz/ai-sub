@@ -4,7 +4,7 @@ from __future__ import annotations as _annotations
 
 import asyncio
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 import logfire
 from google import genai as genai
@@ -22,6 +22,7 @@ from pyrate_limiter import Duration, Limiter, Rate
 
 from ai_sub.config import Settings
 from ai_sub.gemini_cli_model import GeminiCliModel
+from ai_sub.ollama_web_search import ollama_web_search_multi
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -56,18 +57,26 @@ class RateLimitedAgentWrapper:
         """
         return self.model_name.lower().startswith("gemini-cli")
 
-    def __init__(self, settings: Settings, model_name: str, use_web_search: bool = False):
+    def __init__(
+        self,
+        settings: Settings,
+        model_name: str,
+        use_web_search: bool = False,
+        deps: Any = None,
+    ):
         """Initializes the agent wrapper with settings.
 
         Args:
             settings (Settings): The application configuration settings.
             model_name (str): The name of the model to use.
             use_web_search (bool): Whether to enable the web search tool.
+            deps: Optional dependencies to pass to the agent (e.g., OllamaWebSearchDeps).
 
         """
         self.settings = settings
         self.model_name = model_name
         self.use_web_search = use_web_search
+        self.deps = deps
 
         self.request_limiter = Limiter(Rate(self.settings.ai.rpm, Duration.MINUTE))
         self.token_limiter = Limiter(Rate(self.settings.ai.tpm, Duration.MINUTE))
@@ -82,7 +91,9 @@ class RateLimitedAgentWrapper:
         builtin_tools = []
         function_tools = []
         if self.use_web_search:
-            if self.settings.ai.web_search_tool == "duckduckgo":
+            if self.settings.ai.web_search_tool == "ollama":
+                function_tools.append(ollama_web_search_multi)
+            elif self.settings.ai.web_search_tool == "duckduckgo":
                 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 
                 function_tools.append(duckduckgo_search_tool())
@@ -90,7 +101,8 @@ class RateLimitedAgentWrapper:
                 builtin_tools.append(WebSearchTool())
 
         if self.is_google():
-            model_str = self.model_name.split(":", 1)[-1]  # Configure Max thinking possible
+            model_str = self.model_name.split(":", 1)[-1]
+            # Configure thinking levels for Google models
             # https://ai.google.dev/gemini-api/docs/thinking
             thinking_config: ThinkingConfigDict
             if model_str.lower().startswith("gemini-3"):
@@ -239,7 +251,7 @@ class RateLimitedAgentWrapper:
             ]
 
         # Execute the AI agent to generate subtitles and get a structured response.
-        result = await self.agent.run(user_prompt, output_type=response_type)
+        result = await self.agent.run(user_prompt, output_type=response_type, deps=self.deps)
 
         return result.output
 

@@ -207,7 +207,7 @@ class SubtitleAiResponse(BaseModel):
             english_norm = english_text.casefold().translate(translator)
             original_norm = original_text.casefold().translate(translator)
 
-            # If Gemini returns the similar text for En and Original, just use the Original
+            # If Gemini returns similar text for both En and Original, just use the Original
             if english_norm == original_norm:
                 text = original_text
             else:
@@ -455,7 +455,7 @@ class LyricsSceneJob(Job):
 class SubtitleJob(Job):
     """Represents a job to generate subtitles (Transcription).
 
-    Uses scene/lyrics data from a `SceneResponse` as a reference.
+    Uses scene/lyrics data from a `LyricsSceneAiResponse` as a reference.
     """
 
     file: Optional[File | Path] = Field(default=None, exclude=True)
