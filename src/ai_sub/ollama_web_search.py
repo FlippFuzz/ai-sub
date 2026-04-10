@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, HttpUrl
 from pydantic_ai import RunContext
 
 from ai_sub.config import OllamaSearchSettings
+from ai_sub.data_models import AgentDeps
 
 
 class OllamaSearchResult(BaseModel):
@@ -98,17 +99,18 @@ class OllamaWebSearchDeps:
 
 
 @logfire.instrument("ollama_web_search: {query=}")
-async def ollama_web_search_single(ctx: RunContext[OllamaWebSearchDeps], query: str) -> list[OllamaSearchResult]:
+async def ollama_web_search_single(ctx: RunContext[AgentDeps], query: str) -> list[OllamaSearchResult]:
     """Perform a single web search query against Ollama's web search API.
 
     Args:
-        ctx: The run context containing the OllamaWebSearchDeps.
+        ctx: The run context containing AgentDeps with ollama_search dependency.
         query: The search query string.
 
     Returns:
         A list of OllamaSearchResult objects containing the search results.
     """
-    deps = ctx.deps
+    deps = ctx.deps.ollama_search
+    assert deps is not None
     cache_key = deps._normalize_query(query)
     if cache_key in deps._cache:
         logfire.debug("Using cached query.")
@@ -121,11 +123,11 @@ async def ollama_web_search_single(ctx: RunContext[OllamaWebSearchDeps], query: 
     return results
 
 
-async def ollama_web_search_multi(ctx: RunContext[OllamaWebSearchDeps], queries: list[str]) -> list[QueryResult]:
+async def ollama_web_search_multi(ctx: RunContext[AgentDeps], queries: list[str]) -> list[QueryResult]:
     """Perform multiple web search queries against Ollama's web search API.
 
     Args:
-        ctx: The run context containing the OllamaWebSearchDeps.
+        ctx: The run context containing AgentDeps with ollama_search dependency.
         queries: A list of search query strings.
 
     Returns:

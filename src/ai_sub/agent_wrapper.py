@@ -4,7 +4,7 @@ from __future__ import annotations as _annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import TypeVar, cast
 
 import logfire
 from google import genai as genai
@@ -21,6 +21,7 @@ from pydantic_ai.providers.google import GoogleProvider
 from pyrate_limiter import Duration, Limiter, Rate
 
 from ai_sub.config import Settings
+from ai_sub.data_models import AgentDeps
 from ai_sub.gemini_cli_model import GeminiCliModel
 from ai_sub.ollama_web_search import ollama_web_search_multi
 
@@ -61,28 +62,28 @@ class RateLimitedAgentWrapper:
         self,
         settings: Settings,
         model_name: str,
+        deps: AgentDeps | None = None,
         use_web_search: bool = False,
-        deps: Any = None,
     ):
         """Initializes the agent wrapper with settings.
 
         Args:
             settings (Settings): The application configuration settings.
             model_name (str): The name of the model to use.
+            deps: Optional dependencies to pass to the agent. Defaults to a new ``AgentDeps`` instance.
             use_web_search (bool): Whether to enable the web search tool.
-            deps: Optional dependencies to pass to the agent (e.g., OllamaWebSearchDeps).
 
         """
         self.settings = settings
         self.model_name = model_name
         self.use_web_search = use_web_search
-        self.deps = deps
+        self.deps = deps or AgentDeps()
 
         self.request_limiter = Limiter(Rate(self.settings.ai.rpm, Duration.MINUTE))
         self.token_limiter = Limiter(Rate(self.settings.ai.tpm, Duration.MINUTE))
         self.agent = self._create_agent()
 
-    def _create_agent(self) -> Agent:
+    def _create_agent(self) -> Agent[AgentDeps]:
         """Creates and configures the Pydantic AI Agent based on the model type.
 
         Returns:
@@ -251,7 +252,7 @@ class RateLimitedAgentWrapper:
             ]
 
         # Execute the AI agent to generate subtitles and get a structured response.
-        result = await self.agent.run(user_prompt, output_type=response_type, deps=self.deps)
+        result = await self.agent.run(user_prompt=user_prompt, output_type=response_type, deps=self.deps)
 
         return result.output
 

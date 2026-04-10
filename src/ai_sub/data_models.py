@@ -20,6 +20,8 @@ from pydantic import (
 )
 from pysubs2 import SSAEvent, SSAFile
 
+from ai_sub.ollama_web_search import OllamaWebSearchDeps
+
 # ==============================================================================
 # Core Enums & Final Result
 # ==============================================================================
@@ -118,6 +120,26 @@ def _parse_timestamp_string_ms(timestamp_string: str) -> int:
 # ==============================================================================
 # AI Response Models
 # ==============================================================================
+
+
+class AgentDeps(BaseModel):
+    """Container for agent dependencies passed to Pydantic AI's RunContext.
+
+    Provides a centralized, extensible way to store and access multiple
+    dependencies (e.g., web search clients, databases, etc.) for use by
+    agent tools.  Add new fields here as the pipeline grows.
+
+    Example::
+
+        deps = AgentDeps(ollama_search=OllamaWebSearchDeps(settings))
+        # In a tool: ctx.deps.ollama_search
+    """
+
+    video_duration_ms: int = 0
+    """Duration of the video in milliseconds, used for token estimation in rate limiting."""
+
+    ollama_search: OllamaWebSearchDeps | None = None
+    """Ollama web-search dependency (:class:`OllamaWebSearchDeps`), or ``None``."""
 
 
 class Subtitles(BaseModel):

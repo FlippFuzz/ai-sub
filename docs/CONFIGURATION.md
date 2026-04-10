@@ -11,7 +11,7 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | `--ai.model-lyrics <model>`    | The AI model for lyrics research and scene detection.                                                                                                   | `google-gla:gemini-3-flash-preview` |
 | `--ai.rpm <int>`               | Maximum requests per minute for the AI model.                                                                                                           | `4`                                 |
 | `--ai.tpm <int>`               | Maximum tokens per minute for the AI model.                                                                                                             | `250000`                            |
-| `--ai.web-search-tool <tool>`  | The web search tool to use. Options: 'builtin', 'duckduckgo'.                                                                                           | `duckduckgo`                        |
+| `--ai.web-search-tool <tool>`  | The web search tool to use. Options: 'builtin', 'duckduckgo', 'ollama'.                                                                                 | `duckduckgo`                        |
 
 ### Google AI Settings (`--ai.google.*`)
 
@@ -28,6 +28,12 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | ------------------------------------------------ | ---------------------------------------------------------------- | ------- |
 | `--ai.gemini-cli.timeout <seconds>`              | The timeout in seconds for Gemini CLI operations.                | `600`   |
 | `--ai.gemini-cli.overwrite-system-prompt <bool>` | Whether to overwrite the system prompt using `GEMINI_SYSTEM_MD`. | `False` |
+
+### Ollama Search Settings (`--ai.ollama-search.*`)
+
+| Argument                       | Description                              | Default                              |
+| ------------------------------ | ---------------------------------------- | ------------------------------------ |
+| `--ai.search.ollama.key <key>` | The API key for Ollama's web search API. | `None` (loads from `OLLAMA_API_KEY`) |
 
 ## Splitting Settings (`--split.*`)
 

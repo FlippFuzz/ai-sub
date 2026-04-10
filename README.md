@@ -215,7 +215,7 @@ For the latest updates and bug fixes, please refer to [RELEASE_NOTES.md](https:/
 
 ## Known Limitations
 
-1.  **Timestamp Accuracy:** Subtitle timestamps may occasionally be inaccurate due to limitations of the Gemini AI model. Shorter video segments generally yield better accuracy. Experiment with the `--split.max_minutes` setting.
+1.  **Timestamp Accuracy:** Subtitle timestamps may occasionally be inaccurate due to limitations of the Gemini AI model. Shorter video segments generally yield better accuracy. Experiment with the `--split.max-seconds` setting.
 2.  **AI Hallucinations:** Like all LLMs, Gemini may occasionally produce "hallucinations" or inaccurate information.
 
 If you encounter issues, consider re-processing specific video segments as detailed below.

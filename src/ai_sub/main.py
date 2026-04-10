@@ -22,6 +22,7 @@ from pysubs2 import SSAEvent, SSAFile
 from ai_sub.agent_wrapper import RateLimitedAgentWrapper
 from ai_sub.config import Settings
 from ai_sub.data_models import (
+    AgentDeps,
     AiSubResult,
     LyricsSceneAiResponse,
     LyricsSceneJob,
@@ -452,16 +453,17 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
     use_ollama_search = settings.ai.web_search_tool == "ollama" and use_lyrics
 
     async with AsyncExitStack() as stack:
-        ollama_deps = None
+        agent_deps = AgentDeps()
         if use_ollama_search:
             from ai_sub.ollama_web_search import OllamaWebSearchDeps
 
             ollama_deps = OllamaWebSearchDeps(settings.ai.ollama_search)
             await stack.enter_async_context(ollama_deps)
+            agent_deps.ollama_search = ollama_deps
 
         agent_subtitles = RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
         agent_scene = (
-            RateLimitedAgentWrapper(settings, settings.ai.model_lyrics, use_web_search=True, deps=ollama_deps)
+            RateLimitedAgentWrapper(settings, settings.ai.model_lyrics, use_web_search=True, deps=agent_deps)
             if use_lyrics
             else None
         )
