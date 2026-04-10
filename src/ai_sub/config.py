@@ -414,7 +414,8 @@ class Settings(BaseSettings):
             raise ValueError(
                 "An Ollama web search API key must be provided either via the 'key' field, "
                 "OLLAMA_API_KEY or AISUB_AI_SEARCH_OLLAMA_KEY environment variables "
-                "when using 'ollama' as the web search tool."
+                "when using 'ollama' as the web search tool. "
+                "Register a free key at: https://ollama.com/settings/keys"
             )
 
         return self
