@@ -7,7 +7,7 @@ from ai_sub.data_models import LyricsSceneAiResponse
 # ==========================================
 # SCENE DETECTION & LYRICS RESEARCH
 # ==========================================
-LYRICS_PROMPT_VERSION = 5
+LYRICS_PROMPT_VERSION = 6
 
 
 _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
@@ -23,8 +23,12 @@ _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
     For every vocal segment, resolve: Song Title, Original Artist (simplified), Performer, and Original Language.
 
     **Step 3: High-Efficiency Lyrics Lookup**
-    Use your search tool to find lyrics for each detected song. Keep search queries concise — use the song title, artist name, or a short distinctive lyric snippet. Search for BOTH the original language lyrics AND an English translation. Depending on the tool you're using, you may not need to append words like "lyrics" to your queries.
-    **CRITICAL:** You are NOT limited to one search per turn. Execute multiple search queries simultaneously in a single turn for all detected songs to minimize round-trips and save processing costs.
+        Use your search tool to find lyrics for each detected song. 
+        **CRITICAL SEARCH RULES:**
+        1. **NO QUERY SPAMMING:** Do NOT execute dozens of search variations for the same song. Limit yourself to 1 or 2 high-quality queries per song.
+        2. **NO RESTRICTIVE QUOTES:** Do NOT use quotation marks around artist names or song titles in your search queries. Quotation marks force exact matches and cause searches to fail. Use natural, space-separated keywords.
+        3. **NATIVE TITLES WORK BEST:** If you translated a title from on-screen text (e.g., "Gaming Song"), try to search using the original native title (e.g., Romaji/Kanji) combined with the artist's name and the word "lyrics" or "translation". 
+        4. **BATCHING:** You may execute queries for *different* songs in the same turn, but never spam variations for a single song.
 
     **Step 4: JSON Generation**
     Construct the JSON response following the strict schema below.
