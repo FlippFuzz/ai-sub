@@ -1,5 +1,30 @@
 # AI Sub Release Notes
 
+## v2.8.0b1
+
+This release reverts the LyricsGenius integration introduced in v2.7.0 due to persistent bot detection issues, and introduces a new Ollama web search tool as an alternative search provider.
+
+**Reverts:**
+
+- **LyricsGenius Integration Removed:** Completely removed the LyricsGenius library and all associated code.
+  - Removed `lyricsgenius_web_search.py` module and all Genius API integration.
+  - Reverted `agent_wrapper.py` to use the DuckDuckGo search tool.
+  - Updated configuration to support `'duckduckgo'` as the default `web_search_tool`.
+  - Removed `lyricsgenius` dependency and restored `duckduckgo` in `pydantic-ai-slim`.
+  - **Reason:** The LyricsGenius integration (v2.7.0) proved unreliable due to Genius and DuckDuckGo actively detecting and blocking automated requests, making lyrics retrieval consistently fail.
+
+**New Features:**
+
+- **Ollama Web Search Tool:** Added support for Ollama as a web search provider, expanding the available search options beyond DuckDuckGo and builtin provider tools.
+  - Introduced `OllamaWebSearchDeps` and `ollama_web_search_multi` function for web search.
+  - Added `OllamaSearchSettings` configuration class with API key validation.
+  - Updated `web_search_tool` option to include `'ollama'` alongside `'builtin'` and `'duckduckgo'`.
+  - Refactored agent initialization to use `AsyncExitStack` for proper resource cleanup.
+
+**Fixes & Improvements:**
+
+- **Gemini CLI Web Search Warning:** Previously, the Gemini CLI branch silently discarded `builtin_tools` and `function_tools` when `use_web_search` was `True`, meaning the configured `web_search_tool` was silently ignored. Now a `logfire.warn()` is emitted explaining that the tool will be skipped, and the agent is created without web search.
+
 ## v2.7.0
 
 This release introduces a significant enhancement to the lyrics detection pipeline by replacing generic web search with a specialized lyrics database integration, improving accuracy and search efficiency.
