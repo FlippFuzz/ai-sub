@@ -184,16 +184,15 @@ class LyricsSceneJobRunner(JobRunner):
             return
 
         assert lyrics_job.file is not None
-        lyrics_job.response = await self.agent.run(
+        response = await self.agent.run(
             get_lyrics_scenes_prompt(),
             lyrics_job.file,
             lyrics_job.video_duration_ms,
             LyricsSceneAiResponse,
         )
-        if lyrics_job.response:
-            lyrics_job.response.validate_against_duration(
-                lyrics_job.video_duration_ms, self.settings.ai.validation_buffer_ms
-            )
+        if response:
+            response.validate_against_duration(lyrics_job.video_duration_ms, self.settings.ai.validation_buffer_ms)
+            lyrics_job.response = response
 
     async def post_process(self, job: SegmentJobs) -> None:
         """Saves the result of the lyrics detection to disk.
@@ -252,16 +251,15 @@ class SubtitleJobRunner(JobRunner):
 
         prompt = get_subtitle_prompt(scene_response)
         assert subtitle_job.file is not None
-        subtitle_job.response = await self.agent.run(
+        response = await self.agent.run(
             prompt,
             subtitle_job.file,
             subtitle_job.video_duration_ms,
             SubtitleAiResponse,
         )
-        if subtitle_job.response:
-            subtitle_job.response.validate_against_duration(
-                subtitle_job.video_duration_ms, self.settings.ai.validation_buffer_ms
-            )
+        if response:
+            response.validate_against_duration(subtitle_job.video_duration_ms, self.settings.ai.validation_buffer_ms)
+            subtitle_job.response = response
 
     async def post_process(self, job: SegmentJobs) -> None:
         """Saves the result (or partial state) to disk.
