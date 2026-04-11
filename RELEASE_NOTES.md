@@ -1,5 +1,31 @@
 # AI Sub Release Notes
 
+## v2.8.0b2
+
+This release focuses on refactoring and hardening the Ollama web search integration introduced in v2.8.0b1, with improvements to rate limiting, dependency management, and prompt quality.
+
+**New Features:**
+
+- **In-Memory Caching for Ollama Search:** Added a cache to `OllamaWebSearchDeps` that stores search results keyed by a normalized query string (punctuation removed, case-folded). This avoids redundant API calls for equivalent queries like `"Hello, world!"` and `"hello world"`, reducing latency and API costs.
+
+**Refactoring & Improvements:**
+
+- **AgentDeps Architecture:** Introduced a new `AgentDeps` data model to centralize dependencies passed to Pydantic AI agents. This replaces the loose `Any` type with a typed, extensible container holding `video_duration_ms` and optional `ollama_search` fields.
+  - Updated `RateLimitedAgentWrapper` to use typed `AgentDeps` instead of `Any`.
+  - Refactored `ollama_web_search` functions to extract dependencies from `ctx.deps`.
+  - Updated `main.py` to create and configure `AgentDeps` with Ollama search dependencies.
+- **Rate Limiting Migration:** Migrated from `pyrate-limiter` v4 to v5, implementing hook-based rate limiting.
+  - Moved rate limiting logic from the `run()` method to model request hooks via a `_rate_limit` hook function.
+  - Added token calculation helper `_calculate_tokens()` for accurate rate limit tracking.
+  - Improved error message formatting to show human-readable durations.
+- **Deferred Response Validation:** Refactored response handling to store AI responses in a local variable, validate against video duration, and only assign to `job.response` if validation passes. This prevents storing potentially invalid responses on the job object.
+
+**Fixes & Improvements:**
+
+- **Ollama Search Prompt:** Updated `LYRICS_PROMPT_VERSION` to 6 with refined instructions to prevent excessive search queries. Added explicit rules against query spamming, restrictive quotation marks, and guidance to use native titles for better search results.
+- **Developer Experience:** Added the Ollama API key registration link (`https://ollama.com/settings/keys`) to validation error messages, making it easier for users to configure their API keys.
+- **Documentation:** Fixed README to reference the correct split setting (`max-seconds` vs `max_minutes`).
+
 ## v2.8.0b1
 
 This release reverts the LyricsGenius integration introduced in v2.7.0 due to persistent bot detection issues, and introduces a new Ollama web search tool as an alternative search provider.
