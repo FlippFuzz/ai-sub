@@ -14,7 +14,7 @@ This release focuses on refactoring and hardening the Ollama web search integrat
   - Updated `RateLimitedAgentWrapper` to use typed `AgentDeps` instead of `Any`.
   - Refactored `ollama_web_search` functions to extract dependencies from `ctx.deps`.
   - Updated `main.py` to create and configure `AgentDeps` with Ollama search dependencies.
-- **Rate Limiting Migration:** Migrated from `pyrate-limiter` v4 to v5, implementing hook-based rate limiting.
+- **Rate Limiting Migration:** Implemented hook-based rate limiting.
   - Moved rate limiting logic from the `run()` method to model request hooks via a `_rate_limit` hook function.
   - Added token calculation helper `_calculate_tokens()` for accurate rate limit tracking.
   - Improved error message formatting to show human-readable durations.
