@@ -34,6 +34,10 @@ from ai_sub.data_models import (
 )
 from ai_sub.gemini_file_uploader import GeminiFileUploader
 from ai_sub.job_runner import JobRunner
+
+# Resolve forward references in AgentDeps now that all modules are loaded.
+# This prevents PydanticUserError when AgentDeps is instantiated.
+from ai_sub.ollama_web_search import OllamaWebSearchDeps
 from ai_sub.prompt import (
     LYRICS_PROMPT_VERSION,
     SUBTITLES_PROMPT_VERSION,
@@ -46,6 +50,8 @@ from ai_sub.video import (
     reencode_video,
     split_video,
 )
+
+AgentDeps.model_rebuild(_types_namespace={"OllamaWebSearchDeps": OllamaWebSearchDeps})
 
 
 class ReEncodeJobRunner(JobRunner):
@@ -455,8 +461,6 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
     async with AsyncExitStack() as stack:
         agent_deps = AgentDeps()
         if use_ollama_search:
-            from ai_sub.ollama_web_search import OllamaWebSearchDeps
-
             ollama_deps = OllamaWebSearchDeps(settings.ai.ollama_search)
             await stack.enter_async_context(ollama_deps)
             agent_deps.ollama_search = ollama_deps

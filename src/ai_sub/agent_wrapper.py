@@ -4,7 +4,7 @@ from __future__ import annotations as _annotations
 
 import asyncio
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Sequence, TypeVar, cast
 
 import logfire
 from google import genai as genai
@@ -14,11 +14,12 @@ from google.genai.types import (
     ThinkingConfigDict,
 )
 from pydantic import BaseModel
-from pydantic_ai import Agent, BinaryContent, WebSearchTool
+from pydantic_ai import Agent, BinaryContent, ModelRequestContext, RunContext, WebSearchTool
+from pydantic_ai.capabilities import AbstractCapability, Hooks
 from pydantic_ai.messages import DocumentUrl
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.providers.google import GoogleProvider
-from pyrate_limiter import Duration, Limiter, Rate
+from pyrate_limiter import Duration, limiter_factory
 
 from ai_sub.config import Settings
 from ai_sub.data_models import AgentDeps
@@ -28,6 +29,43 @@ from ai_sub.ollama_web_search import ollama_web_search_multi
 T = TypeVar("T", bound=BaseModel)
 
 
+def _calculate_tokens(text: str, video_duration_ms: int) -> int:
+    """Estimates the number of tokens for a given text and video duration.
+
+    This is a rough estimation used for rate limiting purposes. The actual
+    token count may vary depending on the model and tokenizer.
+
+    The estimation is based on:
+    - Text: A simple character count.
+    - Video: A fixed rate of tokens per second of video.
+
+    Args:
+        text (str): The text prompt.
+        video_duration_ms (int): The duration of the video in milliseconds.
+
+    Returns:
+        int: The estimated number of tokens.
+
+    """
+    # TODO: Make this more accurate. This is just a rough estimation
+    return int(len(text) + (video_duration_ms / 1000) * 300)
+
+
+async def _rate_limit(ctx: RunContext[AgentDeps], request_context: ModelRequestContext) -> ModelRequestContext:
+    deps = ctx.deps
+
+    request_limiter = deps.request_limiter
+    token_limiter = deps.token_limiter
+
+    if request_limiter:
+        await request_limiter.try_acquire_async("rpm")
+
+    if token_limiter:
+        await token_limiter.try_acquire_async("tpm", weight=deps.request_tokens)
+
+    return request_context
+
+
 class RateLimitedAgentWrapper:
     """A wrapper around the Pydantic AI Agent.
 
@@ -35,8 +73,6 @@ class RateLimitedAgentWrapper:
     (e.g., Google vs CLI).
     """
 
-    rpm: int
-    tpm: int
     settings: Settings
     model_name: str
 
@@ -79,8 +115,12 @@ class RateLimitedAgentWrapper:
         self.use_web_search = use_web_search
         self.deps = deps or AgentDeps()
 
-        self.request_limiter = Limiter(Rate(self.settings.ai.rpm, Duration.MINUTE))
-        self.token_limiter = Limiter(Rate(self.settings.ai.tpm, Duration.MINUTE))
+        self.request_limiter = limiter_factory.create_inmemory_limiter(
+            rate_per_duration=self.settings.ai.rpm, duration=Duration.MINUTE
+        )
+        self.token_limiter = limiter_factory.create_inmemory_limiter(
+            rate_per_duration=self.settings.ai.tpm, duration=Duration.MINUTE
+        )
         self.agent = self._create_agent()
 
     def _create_agent(self) -> Agent[AgentDeps]:
@@ -91,6 +131,10 @@ class RateLimitedAgentWrapper:
         """
         builtin_tools = []
         function_tools = []
+
+        agent: Agent[AgentDeps]
+        hooks: Sequence[AbstractCapability[AgentDeps]] = [Hooks(before_model_request=_rate_limit)]
+
         if self.use_web_search:
             if self.settings.ai.web_search_tool == "ollama":
                 function_tools.append(ollama_web_search_multi)
@@ -151,15 +195,25 @@ class RateLimitedAgentWrapper:
                     },
                 ],
             )
+
             if builtin_tools or function_tools:
-                return Agent(
-                    model,
+                agent = Agent(
+                    model=model,
                     model_settings=google_model_settings,
+                    deps_type=AgentDeps,
                     builtin_tools=builtin_tools,
                     tools=function_tools,
+                    capabilities=hooks,
                 )
             else:
-                return Agent(model, model_settings=google_model_settings)
+                agent = Agent(
+                    model,
+                    model_settings=google_model_settings,
+                    capabilities=hooks,
+                    deps_type=AgentDeps,
+                )
+
+            return agent
         elif self.is_gemini_cli():
             # Gemini CLI model does not support external tools / builtin_tools.
             if self.use_web_search:
@@ -206,12 +260,6 @@ class RateLimitedAgentWrapper:
             ValueError: If Gemini CLI is used but a local file path is not provided.
 
         """
-        # Handle Rate limits
-        self.request_limiter.try_acquire("rpm")
-
-        tokens = self._calculate_tokens(prompt, video_duration_ms)
-        self.token_limiter.try_acquire("tpm", weight=tokens)
-
         # Prepare the prompt
         # Each model provider requires a different input format for video.
         if self.is_google():
@@ -251,28 +299,16 @@ class RateLimitedAgentWrapper:
                 prompt,
             ]
 
+        # Create sort out dependencies for handling rate limiting
+        tokens = _calculate_tokens(prompt, video_duration_ms)
+        deps = AgentDeps(
+            request_limiter=self.request_limiter,
+            token_limiter=self.token_limiter,
+            request_tokens=tokens,
+            ollama_search=self.deps.ollama_search,
+        )
+
         # Execute the AI agent to generate subtitles and get a structured response.
-        result = await self.agent.run(user_prompt=user_prompt, output_type=response_type, deps=self.deps)
+        result = await self.agent.run(user_prompt=user_prompt, output_type=response_type, deps=deps)
 
         return result.output
-
-    def _calculate_tokens(self, text: str, video_duration_ms: int) -> int:
-        """Estimates the number of tokens for a given text and video duration.
-
-        This is a rough estimation used for rate limiting purposes. The actual
-        token count may vary depending on the model and tokenizer.
-
-        The estimation is based on:
-        - Text: A simple character count.
-        - Video: A fixed rate of tokens per second of video.
-
-        Args:
-            text (str): The text prompt.
-            video_duration_ms (int): The duration of the video in milliseconds.
-
-        Returns:
-            int: The estimated number of tokens.
-
-        """
-        # TODO: Make this more accurate. This is just a rough estimation
-        return int(len(text) + (video_duration_ms / 1000) * 300)
