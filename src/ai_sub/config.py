@@ -410,7 +410,7 @@ class Settings(BaseSettings):
                 "GOOGLE_API_KEY, GEMINI_API_KEY or AISUB_AI_GOOGLE_KEY environment variables."
             )
 
-        if self.ai.web_search_tool == "ollama" and self.ai.ollama_search.key is None:
+        if self.ai.web_search_tool == "ollama" and self.thread.lyrics > 0 and self.ai.ollama_search.key is None:
             raise ValueError(
                 "An Ollama web search API key must be provided either via the 'key' field, "
                 "OLLAMA_API_KEY or AISUB_AI_SEARCH_OLLAMA_KEY environment variables "
