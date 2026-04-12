@@ -1,5 +1,45 @@
 # AI Sub Release Notes
 
+## v2.8.0
+
+This release promotes the Ollama web search integration to production, with significant improvements to prompt quality, dependency management, and validation flexibility.
+
+**New Features:**
+
+- **Ollama Web Search Tool:** Added support for Ollama as a web search provider, expanding the available search options beyond DuckDuckGo and builtin provider tools.
+  - Introduced `OllamaWebSearchDeps` and `ollama_web_search_multi` function for web search.
+  - Added `OllamaSearchSettings` configuration class with API key validation.
+  - Updated `web_search_tool` option to include `'ollama'` alongside `'builtin'` and `'duckduckgo'`.
+  - Refactored agent initialization to use `AsyncExitStack` for proper resource cleanup.
+
+**Refactoring & Improvements:**
+
+- **AgentDeps Architecture:** Introduced a new `AgentDeps` data model to centralize dependencies passed to Pydantic AI agents. This replaces the loose `Any` type with a typed, extensible container holding `video_duration_ms` and optional `ollama_search` fields.
+  - Updated `RateLimitedAgentWrapper` to use typed `AgentDeps` instead of `Any`.
+  - Refactored `ollama_web_search` functions to extract dependencies from `ctx.deps`.
+  - Updated `main.py` to create and configure `AgentDeps` with Ollama search dependencies.
+- **Rate Limiting Migration:** Implemented hook-based rate limiting.
+  - Moved rate limiting logic from the `run()` method to model request hooks via a `_rate_limit` hook function.
+  - Added token calculation helper `_calculate_tokens()` for accurate rate limit tracking.
+  - Improved error message formatting to show human-readable durations.
+- **Agent Constructor Updates:** Refactored both Gemini-cli and default Agent initialization to include capabilities (hooks) and `deps_type` (AgentDeps) to ensure that rate limits are enforced across all execution paths.
+- **Deferred Response Validation:** Refactored response handling to store AI responses in a local variable, validate against video duration, and only assign to `job.response` if validation passes. This prevents storing potentially invalid responses on the job object.
+- **In-Memory Caching for Ollama Search:** Added a cache to `OllamaWebSearchDeps` that stores search results keyed by a normalized query string (punctuation removed, case-folded). This avoids redundant API calls for equivalent queries like `"Hello, world!"` and `"hello world"`, reducing latency and API costs.
+
+**Prompt Engineering:**
+
+- **Lyrics Detection (v7):** Updated `LYRICS_PROMPT_VERSION` to 7 with refined search rules that prioritize original composer names and native titles. Added concrete search query examples for Japanese covers, English covers, and original songs to improve search accuracy.
+- **Ollama Search Prompt (v6):** Updated `LYRICS_PROMPT_VERSION` to 6 with refined instructions to prevent excessive search queries. Added explicit rules against query spamming, restrictive quotation marks, and guidance to use native titles for better search results.
+
+**Fixes & Improvements:**
+
+- **Configuration Validation:** Updated config validation to only enforce an Ollama API key when the `web_search_tool` is set to `"ollama"` AND the thread lyrics flag is enabled (lyrics > 0). This allows for flexible configurations where Ollama search is configured but not actively used.
+- **Gemini CLI Web Search Warning:** Previously, the Gemini CLI branch silently discarded `builtin_tools` and `function_tools` when `use_web_search` was `True`, meaning the configured `web_search_tool` was silently ignored. Now a `logfire.warn()` is emitted explaining that the tool will be skipped, and the agent is created without web search.
+- **Developer Experience:** Added the Ollama API key registration link (`https://ollama.com/settings/keys`) to validation error messages, making it easier for users to configure their API keys.
+- **Documentation:** Improved docstring clarity and type annotations across config, data models, models, job runner, main, ollama web search, prompt, and video modules. Updated to use modern Google-style format without redundant type hints in Args/Returns sections.
+- **Documentation:** Fixed README to reference the correct split setting (`max-seconds` vs `max_minutes`).
+- **Type Safety:** Added proper type annotations to validator methods and fixed field descriptions for rate limiters.
+
 ## v2.8.0b2
 
 This release focuses on refactoring and hardening the Ollama web search integration introduced in v2.8.0b1, with improvements to rate limiting, dependency management, and prompt quality.
