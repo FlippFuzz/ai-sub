@@ -225,7 +225,11 @@ class RateLimitedAgentWrapper:
                 )
             model_str = self.model_name.split(":", 1)[-1]
             model = GeminiCliModel(model_str, self.settings.ai.gemini_cli)
-            return Agent(model=model)
+            return Agent(
+                model=model,
+                capabilities=hooks,
+                deps_type=AgentDeps,
+            )
         else:
             # TODO: Do we need to enable thinking, etc for other models?
             # For now, this is only tested to work against Google
@@ -234,6 +238,8 @@ class RateLimitedAgentWrapper:
                     model=self.model_name,
                     builtin_tools=builtin_tools,
                     tools=function_tools,
+                    capabilities=hooks,
+                    deps_type=AgentDeps,
                 )
             else:
                 return Agent(model=self.model_name)
