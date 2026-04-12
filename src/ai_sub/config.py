@@ -68,17 +68,17 @@ class GoogleAiSettings(BaseSettings):
 
     @model_validator(mode="before")
     @classmethod
-    def load_api_key_from_env(cls, values):
+    def load_api_key_from_env(cls, values: dict[str, Any]) -> dict[str, Any]:
         """Loads the API key from environment variables if it's not provided directly.
 
         Pydantic-settings handles the prefixed env var (AISUB_AI_GOOGLE_KEY),
         but we also want to check for GOOGLE_API_KEY and GEMINI_API_KEY.
 
         Args:
-            values (dict): The raw input values to validate.
+            values: The raw input values to validate.
 
         Returns:
-            dict: The updated values dictionary including the API key if found.
+            The updated values dictionary including the API key if found.
         """
         # If 'key' is not provided directly, try to load it from standard env vars.
         if values.get("key") is None:
@@ -109,14 +109,14 @@ class OllamaSearchSettings(BaseSettings):
 
     @model_validator(mode="before")
     @classmethod
-    def load_api_key_from_env(cls, values):
+    def load_api_key_from_env(cls, values: dict[str, Any]) -> dict[str, Any]:
         """Loads the API key from environment variables if it's not provided directly.
 
         Args:
-            values (dict): The raw input values to validate.
+            values: The raw input values to validate.
 
         Returns:
-            dict: The updated values dictionary including the API key if found.
+            The updated values dictionary including the API key if found.
         """
         if values.get("key") is None:
             key = os.getenv("OLLAMA_API_KEY")
@@ -178,11 +178,11 @@ class AiSettings(BaseSettings):
     )
 
     @model_validator(mode="after")
-    def validate_models(self):
+    def validate_models(self) -> "AiSettings":
         """Overrides model-specific settings if the global shorthand is set.
 
         Returns:
-            AiSettings: The updated settings instance.
+            The updated settings instance.
         """
         if self.model:
             self.model_subtitles = self.model
@@ -391,11 +391,11 @@ class Settings(BaseSettings):
     )
 
     @model_validator(mode="after")
-    def validate_api_keys(self):
+    def validate_api_keys(self) -> "Settings":
         """Validates that required API keys are provided for the selected models and tools.
 
         Returns:
-            Settings: The validated settings instance.
+            The validated settings instance.
 
         Raises:
             ValueError: If a required API key is missing.
@@ -421,7 +421,7 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def setup_file_locations(self):
+    def setup_file_locations(self) -> "Settings":
         """Sets up default file locations for output and temporary directories.
 
         Calculates absolute paths for the input file, output directory, and
@@ -429,7 +429,7 @@ class Settings(BaseSettings):
         the temporary directory.
 
         Returns:
-            Settings: The validated settings instance.
+            The validated settings instance.
         """
         # Resolve input video file to an absolute path first
         input_video_path = cast(Path, self.input_video_file).resolve()

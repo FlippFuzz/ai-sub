@@ -81,7 +81,13 @@ class OllamaWebSearchDeps:
         return self
 
     async def __aexit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: Any) -> None:
-        """Close the underlying httpx.AsyncClient when exiting the context."""
+        """Close the underlying httpx.AsyncClient when exiting the context.
+
+        Args:
+            exc_type: The exception type, if an exception was raised.
+            exc_val: The exception value, if an exception was raised.
+            exc_tb: The traceback, if an exception was raised.
+        """
         if self._client:
             await self._client.__aexit__(exc_type, exc_val, exc_tb)
 

@@ -84,13 +84,13 @@ def _parse_timestamp_string_ms(timestamp_string: str) -> int:
     Supports "MM:SS.mmm", "MM:SS:mmm", and "MM:SS" formats.
 
     Args:
-        timestamp_string (str): The timestamp string to parse.
+        timestamp_string: The timestamp string to parse.
 
     Returns:
-        int: The parsed timestamp in milliseconds.
+        The parsed timestamp in milliseconds.
 
     Raises:
-        ValueError: If the timestamp string is None or in an invalid format.
+        ValueError: If the timestamp string is in an invalid format.
 
     """
     ts = timestamp_string
@@ -141,8 +141,8 @@ class AgentDeps(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    request_limiter: Limiter | None = Field(description="XXX", default=None)
-    token_limiter: Limiter | None = Field(description="XXX", default=None)
+    request_limiter: Limiter | None = Field(description="Rate limiter for API requests.", default=None)
+    token_limiter: Limiter | None = Field(description="Rate limiter for API tokens.", default=None)
     request_tokens: int = 0
 
     ollama_search: OllamaWebSearchDeps | None = None

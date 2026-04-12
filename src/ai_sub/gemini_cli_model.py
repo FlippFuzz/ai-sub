@@ -105,7 +105,7 @@ class GeminiCliModel(Model):
         return self._model_name
 
     @property
-    def system(self) -> str | None:
+    def system(self) -> str:
         """Returns the system prompt.
 
         Note:
@@ -349,6 +349,8 @@ class GeminiCliModel(Model):
 
         Note:
             Streaming is not currently supported by the Gemini CLI wrapper.
+            The `Yields` section is present for type compatibility only;
+            the method always raises ``NotImplementedError`` before yielding.
 
         Args:
             messages (list[ModelMessage]): The list of messages in the conversation.
@@ -356,7 +358,7 @@ class GeminiCliModel(Model):
             model_request_parameters (ModelRequestParameters | None): Optional request parameters.
 
         Yields:
-            StreamedResponse: The response stream.
+            StreamedResponse: The response stream (unreachable).
 
         Raises:
             NotImplementedError: Always raised as streaming is not supported.

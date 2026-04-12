@@ -133,8 +133,11 @@ class UploadJobRunner(JobRunner):
     async def process(self, job: SegmentJobs) -> Any:
         """Uploads the specified file using the GeminiFileUploader.
 
+        Args:
+            job: The segment job container containing file upload details.
+
         Returns:
-            Any: The uploaded file metadata object.
+            The uploaded file metadata object.
         """
         upload_job = job.upload
         assert upload_job is not None

@@ -72,8 +72,7 @@ async def get_working_encoder() -> str:
     """Checks for available hardware acceleration for H.264 encoding.
 
     Returns:
-        str: The name of the encoder to use (e.g., 'h264_nvenc', 'libx264').
-
+        The name of the encoder to use (e.g., 'h264_nvenc', 'libx264').
     """
     static_ffmpeg.add_paths(weak=True)
     # List of hardware encoders to check in order of preference
