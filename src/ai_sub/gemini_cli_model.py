@@ -105,8 +105,19 @@ class GeminiCliModel(Model):
         return self._model_name
 
     @property
-    def system(self) -> str | None:
-        """Returns the system prompt (not supported by CLI currently)."""
+    def system(self) -> str:
+        """Returns the system prompt.
+
+        Note:
+            The Gemini CLI handles system prompts differently. When
+            ``overwrite_system_prompt`` is enabled, the system prompt is set
+            via the ``GEMINI_SYSTEM_MD`` environment variable. Otherwise,
+            instructions are passed as part of the user prompt.
+
+        Returns:
+            An empty string, as system prompts are handled via environment
+            variables or user prompt injection.
+        """
         return ""
 
     @property
@@ -288,7 +299,7 @@ class GeminiCliModel(Model):
                     # If repair fails, pass raw response to Agent to handle/fail
                     json_str = cli_response.response
 
-                # Sort out the statistics
+                # Parse and extract token statistics from the CLI response
                 if cli_response.stats and cli_response.stats.models and cli_response.stats.models.get(self._model_name):
                     model_stats = cli_response.stats.models[self._model_name]
                     input_tokens = model_stats.tokens.get("input", 0)
@@ -338,6 +349,8 @@ class GeminiCliModel(Model):
 
         Note:
             Streaming is not currently supported by the Gemini CLI wrapper.
+            The `Yields` section is present for type compatibility only;
+            the method always raises ``NotImplementedError`` before yielding.
 
         Args:
             messages (list[ModelMessage]): The list of messages in the conversation.
@@ -345,7 +358,7 @@ class GeminiCliModel(Model):
             model_request_parameters (ModelRequestParameters | None): Optional request parameters.
 
         Yields:
-            StreamedResponse: The response stream.
+            StreamedResponse: The response stream (unreachable).
 
         Raises:
             NotImplementedError: Always raised as streaming is not supported.

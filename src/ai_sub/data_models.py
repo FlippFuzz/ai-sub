@@ -1,10 +1,12 @@
 """Data models for the AI subtitle generation pipeline."""
 
+from __future__ import annotations
+
 import re
 import string
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import logfire
 from google.genai.types import File
@@ -18,7 +20,11 @@ from pydantic import (
     ValidationInfo,
     model_validator,
 )
+from pyrate_limiter import Limiter
 from pysubs2 import SSAEvent, SSAFile
+
+if TYPE_CHECKING:
+    from ai_sub.ollama_web_search import OllamaWebSearchDeps
 
 # ==============================================================================
 # Core Enums & Final Result
@@ -78,13 +84,13 @@ def _parse_timestamp_string_ms(timestamp_string: str) -> int:
     Supports "MM:SS.mmm", "MM:SS:mmm", and "MM:SS" formats.
 
     Args:
-        timestamp_string (str): The timestamp string to parse.
+        timestamp_string: The timestamp string to parse.
 
     Returns:
-        int: The parsed timestamp in milliseconds.
+        The parsed timestamp in milliseconds.
 
     Raises:
-        ValueError: If the timestamp string is None or in an invalid format.
+        ValueError: If the timestamp string is in an invalid format.
 
     """
     ts = timestamp_string
@@ -118,6 +124,29 @@ def _parse_timestamp_string_ms(timestamp_string: str) -> int:
 # ==============================================================================
 # AI Response Models
 # ==============================================================================
+
+
+class AgentDeps(BaseModel):
+    """Container for agent dependencies passed to Pydantic AI's RunContext.
+
+    Provides a centralized, extensible way to store and access multiple
+    dependencies (e.g., web search clients, databases, etc.) for use by
+    agent tools.  Add new fields here as the pipeline grows.
+
+    Example::
+
+        deps = AgentDeps(ollama_search=OllamaWebSearchDeps(settings))
+        # In a tool: ctx.deps.ollama_search
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    request_limiter: Limiter | None = Field(description="Rate limiter for API requests.", default=None)
+    token_limiter: Limiter | None = Field(description="Rate limiter for API tokens.", default=None)
+    request_tokens: int = 0
+
+    ollama_search: OllamaWebSearchDeps | None = None
+    """Ollama web-search dependency (:class:`OllamaWebSearchDeps`), or ``None``."""
 
 
 class Subtitles(BaseModel):
@@ -207,7 +236,7 @@ class SubtitleAiResponse(BaseModel):
             english_norm = english_text.casefold().translate(translator)
             original_norm = original_text.casefold().translate(translator)
 
-            # If Gemini returns the similar text for En and Original, just use the Original
+            # If Gemini returns similar text for both En and Original, just use the Original
             if english_norm == original_norm:
                 text = original_text
             else:
@@ -327,8 +356,12 @@ class LyricsSceneAiResponse(BaseModel):
         for i, scene in enumerate(self.scenes):
             end_ms = _parse_timestamp_string_ms(scene.end)
             if end_ms > limit_ms:
+                duration_minutes = video_duration_ms // 60000
+                duration_seconds = (video_duration_ms % 60000) // 1000
+                duration_remaining_ms = video_duration_ms % 1000
+                duration_formatted = f"{duration_minutes:02d}:{duration_seconds:02d}.{duration_remaining_ms:03d}"
                 raise ValueError(
-                    f"Scene {i} end time ({scene.end}) exceeds video duration ({video_duration_ms}ms) "
+                    f"Scene {i} end time ({scene.end}) exceeds video duration ({duration_formatted}) "
                     f"by more than {buffer_ms}ms."
                 )
 
@@ -455,7 +488,7 @@ class LyricsSceneJob(Job):
 class SubtitleJob(Job):
     """Represents a job to generate subtitles (Transcription).
 
-    Uses scene/lyrics data from a `SceneResponse` as a reference.
+    Uses scene/lyrics data from a `LyricsSceneAiResponse` as a reference.
     """
 
     file: Optional[File | Path] = Field(default=None, exclude=True)

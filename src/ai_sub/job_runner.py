@@ -50,7 +50,11 @@ class JobRunner:
         self.tasks: list[asyncio.Task] = []
 
     async def add_job(self, job: SegmentJobs) -> None:
-        """Adds a job to the runner's queue."""
+        """Adds a job to the runner's queue.
+
+        Args:
+            job: The job container to add to the queue.
+        """
         await self.queue.put(job)
 
     async def join(self) -> None:
@@ -62,7 +66,6 @@ class JobRunner:
 
         Raises:
             ValueError: If max_workers is less than or equal to 0.
-
         """
         if self.max_workers <= 0:
             raise ValueError(f"max_workers must be > 0, got {self.max_workers}")

@@ -7,7 +7,7 @@ from ai_sub.data_models import LyricsSceneAiResponse
 # ==========================================
 # SCENE DETECTION & LYRICS RESEARCH
 # ==========================================
-LYRICS_PROMPT_VERSION = 5
+LYRICS_PROMPT_VERSION = 7
 
 
 _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
@@ -23,8 +23,29 @@ _LYRICS_SCENES_PROMPT_TEMPLATE = dedent(
     For every vocal segment, resolve: Song Title, Original Artist (simplified), Performer, and Original Language.
 
     **Step 3: High-Efficiency Lyrics Lookup**
-    Use your search tool to find lyrics for each detected song. Keep search queries concise — use the song title, artist name, or a short distinctive lyric snippet. Search for BOTH the original language lyrics AND an English translation. Depending on the tool you're using, you may not need to append words like "lyrics" to your queries.
-    **CRITICAL:** You are NOT limited to one search per turn. Execute multiple search queries simultaneously in a single turn for all detected songs to minimize round-trips and save processing costs.
+        Use your search tool to find lyrics for each detected song. 
+        
+        **CRITICAL SEARCH RULES:**
+        1. **USE ORIGINAL COMPOSER, NOT PERFORMER:** Search using the Original Artist/Composer's name (often credited on-screen as "Music:", "Original:", or "Composer:"). Do NOT include the names of the video performers (e.g., VTubers singing a cover) in your search query.
+        2. **DO NOT TRANSLATE TITLES FOR SEARCHES:** If a song title appears on screen in Japanese (Kanji/Kana), search using the ORIGINAL Japanese characters or Romaji. NEVER translate a Japanese title into English for a search query. 
+        3. **NEVER USE QUOTATION MARKS:** Do NOT use quotes (`""`) anywhere in your search query. Quotes force exact matches and break the search tool. Use plain, space-separated keywords.
+        4. **NO QUERY SPAMMING:** Limit yourself to exactly 1 or 2 queries per song. Append keywords like "lyrics", "romaji", or "english translation".
+
+        ### SEARCH QUERY EXAMPLES
+
+        **Example 1 (Japanese Cover Song):** Mori Calliope covers "神っぽいな" (God-ish) originally by PinocchioP.
+        * ❌ BAD: `"God-ish" Mori Calliope lyrics` *(Translates title, uses quotes, uses performer)*
+        * ❌ BAD: `God-like Mori Calliope song translation` *(Translates title, uses performer)*
+        * ✅ GOOD: `神っぽいな ピノキオピー lyrics english translation` *(Original Japanese title, original composer, no quotes)*
+        * ✅ GOOD: `Kamippoi na PinocchioP lyrics` *(Romaji title, original composer, no quotes)*
+
+        **Example 2 (English Cover Song):** Gawr Gura covers "Treasure" originally by Bruno Mars.
+        * ❌ BAD: `"Treasure" Gawr Gura cover lyrics` *(Uses quotes, uses performer)*
+        * ✅ GOOD: `Treasure Bruno Mars lyrics` *(Original artist, no quotes)*
+
+        **Example 3 (Original Song):** Tokino Sora sings her own original song "Dawn Blue".
+        * ❌ BAD: `"Dawn Blue" Tokino Sora official lyrics` *(Uses quotes)*
+        * ✅ GOOD: `Dawn Blue Tokino Sora lyrics` *(No quotes, performer is actually the original artist here)*
 
     **Step 4: JSON Generation**
     Construct the JSON response following the strict schema below.
@@ -286,11 +307,11 @@ def get_subtitle_prompt(scene_response: LyricsSceneAiResponse | None) -> str:
     """Generates the prompt for subtitle generation.
 
     Args:
-        scene_response (SceneResponse | None): The scene detection data.
+        scene_response: The scene detection data.
             Can be None if lyrics/scene detection is disabled.
 
     Returns:
-        str: The full prompt string.
+        The full prompt string.
 
     """
     scene_json = scene_response.model_dump_json(indent=2) if scene_response else "null"
