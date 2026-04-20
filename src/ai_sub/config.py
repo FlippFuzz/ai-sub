@@ -174,7 +174,7 @@ class AiSettings(BaseSettings):
     )
     validation_buffer_ms: NonNegativeInt = Field(
         description="The allowed buffer in milliseconds for AI-generated timestamps to exceed the video duration.",
-        default=1000,
+        default=2000,
     )
 
     @model_validator(mode="after")
