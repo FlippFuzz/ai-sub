@@ -1,5 +1,13 @@
 # AI Sub Release Notes
 
+## v2.8.1
+
+This release improves the stability of the subtitle generation pipeline by relaxing the timestamp validation constraints.
+
+**Fixes & Improvements:**
+
+- **Increased Validation Buffer:** Adjusted the default `validation_buffer_ms` from 1000ms to 2000ms in `AiSettings`. This provides additional headroom for AI models that frequently generate timestamps slightly exceeding the actual video segment duration, significantly reducing false-positive validation failures and redundant job retries.
+
 ## v2.8.0
 
 This release promotes the Ollama web search integration to production, with significant improvements to prompt quality, dependency management, and validation flexibility.
