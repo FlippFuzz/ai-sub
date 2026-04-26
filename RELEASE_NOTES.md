@@ -1,5 +1,13 @@
 # AI Sub Release Notes
 
+## v2.8.2
+
+This release ensures compatibility with the latest Gemini CLI tool for automated environments.
+
+**Fixes & Improvements:**
+
+- **Gemini CLI Compatibility:** Added the `--skip-trust` flag to the Gemini CLI execution command. This ensures compatibility with the latest version of the tool, which requires explicit trust acknowledgement for non-interactive execution environments, preventing the pipeline from stalling.
+
 ## v2.8.1
 
 This release improves the stability of the subtitle generation pipeline by relaxing the timestamp validation constraints.
