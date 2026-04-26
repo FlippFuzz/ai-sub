@@ -219,6 +219,7 @@ class GeminiCliModel(Model):
                 self._model_name,
                 "--output-format",
                 "json",
+                "--skip-trust",
             ]
             try:
                 # On Windows, shell=True is required to execute batch files/scripts (like npm binaries).
