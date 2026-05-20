@@ -15,7 +15,7 @@ from google.genai.types import (
 )
 from pydantic import BaseModel
 from pydantic_ai import Agent, BinaryContent, ModelRequestContext, RunContext, WebSearchTool
-from pydantic_ai.capabilities import AbstractCapability, Hooks
+from pydantic_ai.capabilities import AbstractCapability, Hooks, NativeTool
 from pydantic_ai.messages import DocumentUrl
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.providers.google import GoogleProvider
@@ -143,7 +143,8 @@ class RateLimitedAgentWrapper:
         function_tools = []
 
         agent: Agent[AgentDeps]
-        hooks: Sequence[AbstractCapability[AgentDeps]] = [Hooks(before_model_request=_rate_limit)]
+        capabilities: Sequence[AbstractCapability[AgentDeps]] = []
+        capabilities.append(Hooks(before_model_request=_rate_limit))
 
         if self.use_web_search:
             if self.settings.ai.search.web_search_tool == "ollama":
@@ -155,7 +156,7 @@ class RateLimitedAgentWrapper:
 
                 function_tools.append(duckduckgo_search_tool())
             else:
-                builtin_tools.append(WebSearchTool())
+                capabilities.append(NativeTool(WebSearchTool()))
 
         if self.is_google():
             model_str = self.model_name.split(":", 1)[-1]
@@ -213,15 +214,14 @@ class RateLimitedAgentWrapper:
                     model=model,
                     model_settings=google_model_settings,
                     deps_type=AgentDeps,
-                    builtin_tools=builtin_tools,
                     tools=function_tools,
-                    capabilities=hooks,
+                    capabilities=capabilities,
                 )
             else:
                 agent = Agent(
                     model,
                     model_settings=google_model_settings,
-                    capabilities=hooks,
+                    capabilities=capabilities,
                     deps_type=AgentDeps,
                 )
 
@@ -240,7 +240,7 @@ class RateLimitedAgentWrapper:
             model = GeminiCliModel(model_str, self.settings.ai.gemini_cli)
             return Agent(
                 model=model,
-                capabilities=hooks,
+                capabilities=capabilities,
                 deps_type=AgentDeps,
             )
         else:
@@ -249,9 +249,8 @@ class RateLimitedAgentWrapper:
             if builtin_tools or function_tools:
                 return Agent(
                     model=self.model_name,
-                    builtin_tools=builtin_tools,
                     tools=function_tools,
-                    capabilities=hooks,
+                    capabilities=capabilities,
                     deps_type=AgentDeps,
                 )
             else:
