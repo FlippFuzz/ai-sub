@@ -37,7 +37,6 @@ from ai_sub.job_runner import JobRunner
 
 # Resolve forward references in AgentDeps now that all modules are loaded.
 # This prevents PydanticUserError when AgentDeps is instantiated.
-from ai_sub.ollama_web_search import OllamaWebSearchDeps
 from ai_sub.prompt import (
     LYRICS_PROMPT_VERSION,
     SUBTITLES_PROMPT_VERSION,
@@ -50,8 +49,7 @@ from ai_sub.video import (
     reencode_video,
     split_video,
 )
-
-AgentDeps.model_rebuild(_types_namespace={"OllamaWebSearchDeps": OllamaWebSearchDeps})
+from ai_sub.web_search import WebSearchDeps
 
 
 class ReEncodeJobRunner(JobRunner):
@@ -457,14 +455,16 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
     # Initialize the AI Agent.
     # A custom wrapper is used to make handling rate limits and differences in models more cleanly
     use_lyrics = settings.thread.lyrics > 0
-    use_ollama_search = settings.ai.web_search_tool == "ollama" and use_lyrics
+    use_ollama_search = settings.ai.search.web_search_tool == "ollama" and use_lyrics
+    use_langsearch = settings.ai.search.web_search_tool == "langsearch" and use_lyrics
 
     async with AsyncExitStack() as stack:
         agent_deps = AgentDeps()
-        if use_ollama_search:
-            ollama_deps = OllamaWebSearchDeps(settings.ai.ollama_search)
-            await stack.enter_async_context(ollama_deps)
-            agent_deps.ollama_search = ollama_deps
+        if use_ollama_search or use_langsearch:
+            provider = "ollama" if use_ollama_search else "langsearch"
+            search_deps = WebSearchDeps(settings.ai.search, provider=provider)
+            await stack.enter_async_context(search_deps)
+            agent_deps.web_search = search_deps
 
         agent_subtitles = RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
         agent_scene = (

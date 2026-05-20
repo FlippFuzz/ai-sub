@@ -6,7 +6,7 @@ import re
 import string
 from enum import IntEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 import logfire
 from google.genai.types import File
@@ -23,8 +23,7 @@ from pydantic import (
 from pyrate_limiter import Limiter
 from pysubs2 import SSAEvent, SSAFile
 
-if TYPE_CHECKING:
-    from ai_sub.ollama_web_search import OllamaWebSearchDeps
+from ai_sub.web_search import WebSearchDeps
 
 # ==============================================================================
 # Core Enums & Final Result
@@ -145,8 +144,8 @@ class AgentDeps(BaseModel):
     token_limiter: Limiter | None = Field(description="Rate limiter for API tokens.", default=None)
     request_tokens: int = 0
 
-    ollama_search: OllamaWebSearchDeps | None = None
-    """Ollama web-search dependency (:class:`OllamaWebSearchDeps`), or ``None``."""
+    web_search: WebSearchDeps | None = None
+    """Web-search dependency (:class:`WebSearchDeps`), or ``None``."""
 
 
 class Subtitles(BaseModel):

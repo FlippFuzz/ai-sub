@@ -126,7 +126,12 @@ class GeminiCliModel(Model):
         return self._provider
 
     def _write_prompt_file(self, path: Path, content: str) -> None:
-        """Writes the prompt to a file synchronously (to be used in a thread)."""
+        """Writes the prompt to a file synchronously (to be used in a thread).
+
+        Args:
+            path: The path where the file should be written.
+            content: The string content to write.
+        """
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 
