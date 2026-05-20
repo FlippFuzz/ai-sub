@@ -1,5 +1,21 @@
 # AI Sub Release Notes
 
+## v2.9.0
+
+This release promotes the Langsearch integration and the Pydantic AI capabilities migration to production, while significantly improving pipeline resilience against API instability and enhancing data hygiene.
+
+**New Features:**
+
+- **Promoted Langsearch Integration:** Langsearch is now fully supported as a production-ready web search provider for lyrics and scene detection.
+- **Updated Default AI Models:** Default models have been updated to the latest Gemini versions: `gemini-3.5-flash` for subtitles and `gemini-3.1-flash-lite` for lyrics research.
+
+**Fixes & Improvements:**
+
+- **Improved Pipeline Resilience:** Increased default retry limits (`run` increased to 5, `max` to 15) to allow the pipeline more attempts to recover from transient "server unavailable" responses frequently encountered with the Gemini API.
+- **Enhanced Data Hygiene:** Updated the subtitle stitching logic to explicitly exclude web search API keys from the metadata header embedded in final SRT files, ensuring cleaner output.
+- **Pydantic AI Compatibility:** Finalized the transition of the agent architecture to the new `capabilities` API, ensuring long-term compatibility with the `pydantic-ai` ecosystem.
+- **Dependency Management:** Updated minimum requirements for `pydantic-ai-slim` to `>= 1.99.0` to support the updated agent initialization logic.
+
 ## v2.9.0b1
 
 This release introduces support for the Langsearch web search provider and updates the underlying Pydantic AI agent initialization to align with the latest `pydantic-ai` capabilities API. Default AI models have also been updated to the latest Gemini Flash versions.
