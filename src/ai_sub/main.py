@@ -366,7 +366,10 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
             exclude={
                 "input_video_file": True,
                 "dir": True,
-                "ai": {"google": {"key": True, "base_url": True}},
+                "ai": {
+                    "google": {"key": True, "base_url": True},
+                    "search": {"key": True},
+                },
             },
         )
         state_info = {
