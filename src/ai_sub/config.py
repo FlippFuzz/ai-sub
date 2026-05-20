@@ -172,11 +172,11 @@ class AiSettings(BaseSettings):
     model_subtitles: str = Field(
         description="The AI model for subtitle generation. Use 'google-gla:<model>' for Google models, "
         "'openai:<model>' for OpenAI, or 'custom:<url>' for a custom endpoint.",
-        default="google-gla:gemini-3-flash-preview",
+        default="google-gla:gemini-3.5-flash",
     )
     model_lyrics: str = Field(
         description="The AI model for lyrics research and scene detection.",
-        default="google-gla:gemini-3-flash-preview",
+        default="google-gla:gemini-3.1-flash-lite",
     )
     rpm: PositiveInt = Field(description="Maximum requests per minute for the AI model.", default=4)
     tpm: PositiveInt = Field(description="Maximum tokens per minute for the AI model.", default=250000)
