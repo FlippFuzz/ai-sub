@@ -64,8 +64,6 @@ class WebSearchDeps:
             rate = int(self._settings.qps)
             duration = Duration.SECOND
 
-        print(f"\n\n\n##### DURATION: {duration}\n\n\n")
-
         self._limiter = limiter_factory.create_inmemory_limiter(
             rate_per_duration=rate,
             duration=duration,
