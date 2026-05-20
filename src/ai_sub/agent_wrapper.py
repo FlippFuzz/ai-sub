@@ -139,7 +139,6 @@ class RateLimitedAgentWrapper:
         Returns:
             Agent: The configured Pydantic AI Agent.
         """
-        builtin_tools = []
         function_tools = []
 
         agent: Agent[AgentDeps]
@@ -209,7 +208,7 @@ class RateLimitedAgentWrapper:
                 ],
             )
 
-            if builtin_tools or function_tools:
+            if function_tools:
                 agent = Agent(
                     model=model,
                     model_settings=google_model_settings,
@@ -246,7 +245,7 @@ class RateLimitedAgentWrapper:
         else:
             # TODO: Do we need to enable thinking, etc for other models?
             # For now, this is only tested to work against Google
-            if builtin_tools or function_tools:
+            if function_tools:
                 return Agent(
                     model=self.model_name,
                     tools=function_tools,
