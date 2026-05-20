@@ -11,6 +11,7 @@ from pydantic import (
     FilePath,
     HttpUrl,
     NonNegativeInt,
+    PositiveFloat,
     PositiveInt,
     SecretStr,
     model_validator,
@@ -106,9 +107,9 @@ class WebSearchSettings(BaseSettings):
         "Falls back to OLLAMA_API_KEY or LANGSEARCH_API_KEY environment variables.",
         default=None,
     )
-    qps: PositiveInt = Field(
+    qps: PositiveFloat = Field(
         description="Maximum queries per second for the web search API.",
-        default=1,
+        default=0.3,
     )
     max_length: PositiveInt = Field(
         description="Discard search responses that are longer than this number of characters.",
@@ -134,7 +135,18 @@ class WebSearchSettings(BaseSettings):
             The updated values dictionary including the API key if found.
         """
         if values.get("key") is None:
-            key = os.getenv("OLLAMA_API_KEY") or os.getenv("LANGSEARCH_API_KEY")
+            # Determine which tool is selected to avoid loading the wrong key.
+            # We check both the provided values and the environment directly.
+            tool = values.get("web_search_tool")
+            if tool is None:
+                tool = os.getenv("AISUB_AI_SEARCH_WEB_SEARCH_TOOL") or "duckduckgo"
+
+            key = None
+            if tool == "ollama":
+                key = os.getenv("OLLAMA_API_KEY")
+            elif tool == "langsearch":
+                key = os.getenv("LANGSEARCH_API_KEY")
+
             if key:
                 values["key"] = key
 
