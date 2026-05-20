@@ -1,5 +1,16 @@
 # AI Sub Release Notes
 
+## v2.9.1
+
+Urgent patch to fix a critical dependency mismatch that broke new installations from PyPI.
+
+The v2.9.0 release introduced a breaking architectural change by migrating to the new `pydantic-ai` `capabilities` API. While `requirements.txt` was correctly updated to `>= 1.99.0`, the package metadata in `pyproject.toml` was accidentally missed. As a result, users performing a fresh `pip install ai-sub` could receive an older, incompatible version of `pydantic-ai-slim`, leading to immediate runtime crashes during agent initialization. This patch synchronizes the metadata to ensure all installation methods enforce the correct version.
+
+**Fixes & Improvements:**
+
+- **Critical Dependency Alignment:** Enforced `pydantic-ai-slim >= 1.99.0` in `pyproject.toml` to strictly match project requirements and `requirements.txt`.
+- **Metadata Synchronization:** Bumped project version to `2.9.1` to ensure PyPI correctly distributes the fixed metadata.
+
 ## v2.9.0
 
 This release promotes the Langsearch integration and the Pydantic AI capabilities migration to production, while significantly improving pipeline resilience against API instability and enhancing data hygiene.
