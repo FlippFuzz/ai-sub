@@ -347,11 +347,11 @@ class RetrySettings(BaseSettings):
 
     run: NonNegativeInt = Field(
         description="The maximum number of times to retry a failed job in this run of the program.",
-        default=3,
+        default=5,
     )
     max: NonNegativeInt = Field(
         description="The absolute maximum number of times a job can be retried in total.",
-        default=9,
+        default=15,
     )
     delay: NonNegativeInt = Field(
         description="The number of seconds to wait between retries.",
