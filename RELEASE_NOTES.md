@@ -1,5 +1,19 @@
 # AI Sub Release Notes
 
+## v2.9.0b1
+
+This release introduces support for the Langsearch web search provider and updates the underlying Pydantic AI agent initialization to align with the latest `pydantic-ai` capabilities API. Default AI models have also been updated to the latest Gemini Flash versions.
+
+**New Features:**
+
+- **Langsearch Integration:** Added support for `langsearch` as a web search provider for lyrics and scene detection. This can be configured via the `web_search_tool` setting and requires a `LANGSEARCH_API_KEY`.
+- **Pydantic AI Capabilities Update:** Updated agent initialization to use the new `capabilities` API for `pydantic-ai`, replacing the deprecated `builtin_tools` argument. This ensures compatibility with newer versions of `pydantic-ai` and aligns with recommended practices for agent configuration.
+- **Updated Default AI Models:** The default models for `model_subtitles` and `model_lyrics` have been updated to `gemini-3.5-flash` and `gemini-3.1-flash-lite` respectively.
+
+**Fixes & Improvements:**
+
+- **Unified Web Search Architecture:** Refactored the web search infrastructure to support multiple providers (Ollama, Langsearch) using a unified configuration (`WebSearchSettings`) and dependency model (`WebSearchDeps`). This centralizes HTTP client management, in-memory caching, and rate limiting.
+
 ## v2.8.2
 
 This release ensures compatibility with the latest Gemini CLI tool for automated environments.
