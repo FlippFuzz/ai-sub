@@ -24,7 +24,8 @@ from pyrate_limiter import Duration, limiter_factory
 from ai_sub.config import Settings
 from ai_sub.data_models import AgentDeps
 from ai_sub.gemini_cli_model import GeminiCliModel
-from ai_sub.ollama_web_search import ollama_web_search_multi
+from ai_sub.web_search_langsearch import web_search_langsearch_multi
+from ai_sub.web_search_ollama import web_search_ollama_multi
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -52,6 +53,15 @@ def _calculate_tokens(text: str, video_duration_ms: int) -> int:
 
 
 async def _rate_limit(ctx: RunContext[AgentDeps], request_context: ModelRequestContext) -> ModelRequestContext:
+    """Hook for enforcing rate limits before making a model request.
+
+    Args:
+        ctx: The run context containing agent dependencies.
+        request_context: The context for the current model request.
+
+    Returns:
+        The unmodified request context.
+    """
     deps = ctx.deps
 
     request_limiter = deps.request_limiter
@@ -136,9 +146,11 @@ class RateLimitedAgentWrapper:
         hooks: Sequence[AbstractCapability[AgentDeps]] = [Hooks(before_model_request=_rate_limit)]
 
         if self.use_web_search:
-            if self.settings.ai.web_search_tool == "ollama":
-                function_tools.append(ollama_web_search_multi)
-            elif self.settings.ai.web_search_tool == "duckduckgo":
+            if self.settings.ai.search.web_search_tool == "ollama":
+                function_tools.append(web_search_ollama_multi)
+            elif self.settings.ai.search.web_search_tool == "langsearch":
+                function_tools.append(web_search_langsearch_multi)
+            elif self.settings.ai.search.web_search_tool == "duckduckgo":
                 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
 
                 function_tools.append(duckduckgo_search_tool())
@@ -218,7 +230,8 @@ class RateLimitedAgentWrapper:
             # Gemini CLI model does not support external tools / builtin_tools.
             if self.use_web_search:
                 logfire.warn(
-                    f"Web search is enabled (settings.ai.web_search_tool='{self.settings.ai.web_search_tool}'), "
+                    f"Web search is enabled "
+                    f"(settings.ai.search.web_search_tool='{self.settings.ai.search.web_search_tool}'), "
                     f"but the Gemini CLI model ({self.model_name!r}) does not support external tools. "
                     f"The WebSearchTool/duckduckgo_search_tool will be skipped. "
                     f"Agent(model=model) will be created without web search capabilities."
@@ -311,7 +324,7 @@ class RateLimitedAgentWrapper:
             request_limiter=self.request_limiter,
             token_limiter=self.token_limiter,
             request_tokens=tokens,
-            ollama_search=self.deps.ollama_search,
+            web_search=self.deps.web_search,
         )
 
         # Execute the AI agent to generate subtitles and get a structured response.

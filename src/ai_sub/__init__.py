@@ -11,6 +11,7 @@ from .config import (
     Settings,
     SplittingSettings,
     ThreadSettings,
+    WebSearchSettings,
 )
 from .data_models import AiSubResult
 from .main import ai_sub
@@ -27,6 +28,7 @@ __all__ = [
     "Settings",
     "SplittingSettings",
     "ThreadSettings",
+    "WebSearchSettings",
     "AiSubResult",
     "ai_sub",
     "LYRICS_PROMPT_VERSION",

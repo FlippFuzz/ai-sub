@@ -93,18 +93,33 @@ class GoogleAiSettings(BaseSettings):
         return values
 
 
-class OllamaSearchSettings(BaseSettings):
-    """Configuration for Ollama web search operations."""
+class WebSearchSettings(BaseSettings):
+    """Unified configuration for web search operations."""
 
     model_config = {
-        "env_prefix": "AISUB_AI_SEARCH_OLLAMA_",
+        "env_prefix": "AISUB_AI_SEARCH_",
         **_BASE_CONFIG,
     }
 
     key: Optional[SecretStr] = Field(
-        description="The API key for Ollama's web search API. "
-        "If not provided, it will fall back to the OLLAMA_API_KEY environment variable.",
+        description="The API key for the web search API (Ollama or Langsearch). "
+        "Falls back to OLLAMA_API_KEY or LANGSEARCH_API_KEY environment variables.",
         default=None,
+    )
+    qps: PositiveInt = Field(
+        description="Maximum queries per second for the web search API.",
+        default=1,
+    )
+    max_length: PositiveInt = Field(
+        description="Discard search responses that are longer than this number of characters.",
+        default=4096,
+    )
+    web_search_tool: Literal["builtin", "duckduckgo", "ollama", "langsearch"] = Field(
+        description="The web search tool to use. "
+        "Options are 'builtin' (The provider's native search tool, e.g., Google Search for Gemini), "
+        "'duckduckgo', 'ollama', or 'langsearch'. "
+        "DuckDuckGo is the default because Gemini's built-in search does not have a free tier.",
+        default="duckduckgo",
     )
 
     @model_validator(mode="before")
@@ -119,7 +134,7 @@ class OllamaSearchSettings(BaseSettings):
             The updated values dictionary including the API key if found.
         """
         if values.get("key") is None:
-            key = os.getenv("OLLAMA_API_KEY")
+            key = os.getenv("OLLAMA_API_KEY") or os.getenv("LANGSEARCH_API_KEY")
             if key:
                 values["key"] = key
 
@@ -161,16 +176,9 @@ class AiSettings(BaseSettings):
         description="Settings that only apply to the Gemini CLI.",
         default_factory=GeminiCliSettings,
     )
-    ollama_search: OllamaSearchSettings = Field(
-        description="Settings that only apply to the Ollama web search tool.",
-        default_factory=OllamaSearchSettings,
-    )
-    web_search_tool: Literal["builtin", "duckduckgo", "ollama"] = Field(
-        description="The web search tool to use. "
-        "Options are 'builtin' (The provider's native search tool, e.g., Google Search for Gemini), "
-        "'duckduckgo', or 'ollama' (Use Ollama's web search API). "
-        "DuckDuckGo is the default because Gemini's built-in search does not have a free tier.",
-        default="duckduckgo",
+    search: WebSearchSettings = Field(
+        description="Settings for web search operations.",
+        default_factory=WebSearchSettings,
     )
     validation_buffer_ms: NonNegativeInt = Field(
         description="The allowed buffer in milliseconds for AI-generated timestamps to exceed the video duration.",
@@ -410,12 +418,19 @@ class Settings(BaseSettings):
                 "GOOGLE_API_KEY, GEMINI_API_KEY or AISUB_AI_GOOGLE_KEY environment variables."
             )
 
-        if self.ai.web_search_tool == "ollama" and self.thread.lyrics > 0 and self.ai.ollama_search.key is None:
+        if self.ai.search.web_search_tool == "ollama" and self.thread.lyrics > 0 and self.ai.search.key is None:
             raise ValueError(
                 "An Ollama web search API key must be provided either via the 'key' field, "
-                "OLLAMA_API_KEY or AISUB_AI_SEARCH_OLLAMA_KEY environment variables "
+                "OLLAMA_API_KEY or AISUB_AI_SEARCH_KEY environment variables "
                 "when using 'ollama' as the web search tool. "
                 "Register a free key at: https://ollama.com/settings/keys"
+            )
+
+        if self.ai.search.web_search_tool == "langsearch" and self.thread.lyrics > 0 and self.ai.search.key is None:
+            raise ValueError(
+                "A Langsearch web search API key must be provided either via the 'key' field, "
+                "LANGSEARCH_API_KEY or AISUB_AI_SEARCH_KEY environment variables "
+                "when using 'langsearch' as the web search tool."
             )
 
         return self
