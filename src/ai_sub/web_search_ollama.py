@@ -22,7 +22,7 @@ async def web_search_ollama_single(ctx: RunContext[AgentDeps], query: str) -> li
         query: The search query string.
 
     Returns:
-        A list of OllamaSearchResult objects containing the search results.
+        A list of WebSearchResult objects containing the search results.
     """
     deps = ctx.deps.web_search
     assert deps is not None
