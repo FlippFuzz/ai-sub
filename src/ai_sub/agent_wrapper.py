@@ -6,7 +6,6 @@ import asyncio
 from pathlib import Path
 from typing import Sequence, TypeVar, cast
 
-import logfire
 from google import genai as genai
 from google.genai.types import (
     HarmBlockThreshold,
@@ -23,7 +22,6 @@ from pyrate_limiter import Duration, limiter_factory
 
 from ai_sub.config import Settings
 from ai_sub.data_models import AgentDeps
-from ai_sub.gemini_cli_model import GeminiCliModel
 from ai_sub.web_search_langsearch import web_search_langsearch_multi
 from ai_sub.web_search_ollama import web_search_ollama_multi
 
@@ -80,7 +78,7 @@ class RateLimitedAgentWrapper:
     """A wrapper around the Pydantic AI Agent.
 
     Handles rate limiting, token usage tracking, and model-specific configurations
-    (e.g., Google vs CLI).
+    (e.g., Google).
     """
 
     settings: Settings
@@ -94,15 +92,6 @@ class RateLimitedAgentWrapper:
 
         """
         return self.model_name.lower().startswith("google-gla")
-
-    def is_gemini_cli(self) -> bool:
-        """Checks if the model is a Gemini CLI model.
-
-        Returns:
-            bool: True if the model is a Gemini CLI model, False otherwise.
-
-        """
-        return self.model_name.lower().startswith("gemini-cli")
 
     def __init__(
         self,
@@ -225,23 +214,6 @@ class RateLimitedAgentWrapper:
                 )
 
             return agent
-        elif self.is_gemini_cli():
-            # Gemini CLI model does not support external tools / builtin_tools.
-            if self.use_web_search:
-                logfire.warn(
-                    f"Web search is enabled "
-                    f"(settings.ai.search.web_search_tool='{self.settings.ai.search.web_search_tool}'), "
-                    f"but the Gemini CLI model ({self.model_name!r}) does not support external tools. "
-                    f"The WebSearchTool/duckduckgo_search_tool will be skipped. "
-                    f"Agent(model=model) will be created without web search capabilities."
-                )
-            model_str = self.model_name.split(":", 1)[-1]
-            model = GeminiCliModel(model_str, self.settings.ai.gemini_cli)
-            return Agent(
-                model=model,
-                capabilities=capabilities,
-                deps_type=AgentDeps,
-            )
         else:
             # TODO: Do we need to enable thinking, etc for other models?
             # For now, this is only tested to work against Google
@@ -273,9 +245,6 @@ class RateLimitedAgentWrapper:
         Returns:
             T: The structured response containing subtitles or scene data.
 
-        Raises:
-            ValueError: If Gemini CLI is used but a local file path is not provided.
-
         """
         # Prepare the prompt
         # Each model provider requires a different input format for video.
@@ -294,17 +263,6 @@ class RateLimitedAgentWrapper:
                     BinaryContent(data=data, media_type=f"video/{python_file.suffix[1:]}"),
                     prompt,
                 ]
-        elif self.is_gemini_cli():
-            if isinstance(video, Path):
-                python_file = cast(Path, video)
-                # Pass file path as a DocumentUrl with file:// scheme
-                user_prompt = [
-                    DocumentUrl(url=python_file.as_uri()),
-                    prompt,
-                ]
-            else:
-                raise ValueError("Gemini CLI requires a local file path.")
-
         else:
             # For other models (e.g., OpenAI), we read the file into memory
             # and send it as binary content.
