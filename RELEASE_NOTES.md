@@ -1,5 +1,20 @@
 # AI Sub Release Notes
 
+## v2.10.0b1
+
+This release removes support for the `gemini-cli` backend due to upcoming service changes by Google and includes a fix for millisecond timestamp parsing to improve timing accuracy.
+
+**Breaking Changes:**
+
+- **Removed `gemini-cli` Support:** Support for the `gemini-cli` backend has been dropped. This is because the service will stop serving requests for Google One and unpaid tiers starting June 18th, 2026. Users should transition to using the standard Google AI API keys.
+
+**Fixes & Improvements:**
+
+- **Timestamp Parsing Correction:** Fixed a bug in the `_parse_timestamp_string_ms` utility where single-digit fractional seconds (e.g., `.4`) were incorrectly interpreted as 4ms instead of 400ms. The parser now correctly pads and truncates millisecond strings.
+- **Documentation Updates:** Refreshed the README and configuration documentation to reflect the removal of the CLI backend and focus on the Gemini API integration.
+
+---
+
 ## v2.9.1
 
 Urgent patch to fix a critical dependency mismatch that broke new installations from PyPI.
