@@ -225,7 +225,11 @@ class RateLimitedAgentWrapper:
                     deps_type=AgentDeps,
                 )
             else:
-                return Agent(model=self.model_name)
+                return Agent(
+                    model=self.model_name,
+                    capabilities=capabilities,
+                    deps_type=AgentDeps,
+                )
 
     async def run(
         self,

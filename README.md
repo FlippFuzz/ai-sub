@@ -164,7 +164,7 @@ We can use duckduckgo to try to lookup lyrics, but it is not as reliable.
 
 For a detailed list of all configuration options, including AI models, re-encoding settings, and concurrency controls, please refer to [CONFIGURATION.md](https://github.com/FlippFuzz/ai-sub/blob/main/docs/CONFIGURATION.md).
 
-All settings can be configured via command-line arguments (e.g., `--ai.model=google-gla:gemini-3.0-flash-preview`) or environment variables with the `AISUB_` prefix (e.g., `AISUB_AI_MODEL=gemini-cli:gemini-3.0-flash-preview`).
+All settings can be configured via command-line arguments (e.g., `--ai.model=google-gla:gemini-3.5-flash`) or environment variables with the `AISUB_` prefix (e.g., `AISUB_AI_MODEL=google-gla:gemini-3.5-flash`).
 
 ---
 
@@ -194,7 +194,7 @@ File naming format: `part_XXX.<stage>.<model_name>.json`
 **Example: To re-run subtitle generation for the third segment:**
 
 1.  Navigate to the temporary directory.
-2.  Identify the model name used for subtitles (e.g., `gemini-3-5-flash`).
+2.  Identify the model name used for subtitles (e.g., `gemini-3.5-flash`).
 3.  Delete the corresponding state file (e.g., `part_002.subtitles.gemini-3-5-flash.json`).
 4.  Re-run the script. It will detect the missing subtitle job state and re-process only that segment, using any existing lyrics data.
 
