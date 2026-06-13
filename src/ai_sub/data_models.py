@@ -100,14 +100,14 @@ def _parse_timestamp_string_ms(timestamp_string: str) -> int:
         split2 = split1[0].split(":")
         minutes = int(split2[0])
         seconds = int(split2[1])
-        milliseconds = int(split1[1])
+        milliseconds = int(split1[1].ljust(3, "0")[:3])
         timestamp = minutes * 60000 + seconds * 1000 + milliseconds
     elif ts.count(":") == 2:
         # Handles "MM:SS:mmm"
         split = ts.split(":")
         minutes = int(split[0])
         seconds = int(split[1])
-        milliseconds = int(split[2])
+        milliseconds = int(split[2].ljust(3, "0")[:3])
         timestamp = minutes * 60000 + seconds * 1000 + milliseconds
     elif ts.count(":") == 1:
         # Handles "MM:SS"

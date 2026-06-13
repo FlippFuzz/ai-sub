@@ -25,22 +25,6 @@ _BASE_CONFIG: SettingsConfigDict = {
 }
 
 
-class GeminiCliSettings(BaseSettings):
-    """Settings for the Gemini CLI tool integration."""
-
-    model_config = {
-        "env_prefix": "AISUB_AI_GEMINI_CLI_",
-        **_BASE_CONFIG,
-    }
-
-    timeout: PositiveInt = Field(description="The timeout in seconds for Gemini CLI operations.", default=600)
-    overwrite_system_prompt: bool = Field(
-        description="Whether to overwrite the system prompt using GEMINI_SYSTEM_MD. "
-        "If False, the prompt is passed as a regular file argument.",
-        default=False,
-    )
-
-
 class GoogleAiSettings(BaseSettings):
     """Configuration for Google Generative AI (GLA) integration."""
 
@@ -56,11 +40,14 @@ class GoogleAiSettings(BaseSettings):
     )
     key: Optional[SecretStr] = Field(
         description="The API key for Google's generative language models. "
-        "If not provided, it will fall back to the GOOGLE_API_KEY or GEMINI_API_KEY environment variables.",
+        "Falls back to the GOOGLE_API_KEY or GEMINI_API_KEY environment variables if not set.",
         # We handle default loading from env in the validator
         default=None,
     )
-    use_files_api: bool = Field(description="Whether to use the Gemini Files API.", default=True)
+    use_files_api: bool = Field(
+        description="Enable the Gemini Files API for cloud-based multimodal processing.",
+        default=True,
+    )
     base_url: Optional[HttpUrl] = Field(
         description="The base URL for the Google AI API. This can be used to override the default endpoint, "
         "for instance, to use a proxy. If not provided, Google's default URL will be used.",
@@ -104,7 +91,7 @@ class WebSearchSettings(BaseSettings):
 
     key: Optional[SecretStr] = Field(
         description="The API key for the web search API (Ollama or Langsearch). "
-        "Falls back to OLLAMA_API_KEY or LANGSEARCH_API_KEY environment variables.",
+        "Falls back to the OLLAMA_API_KEY or LANGSEARCH_API_KEY environment variables.",
         default=None,
     )
     qps: PositiveFloat = Field(
@@ -178,15 +165,11 @@ class AiSettings(BaseSettings):
         description="The AI model for lyrics research and scene detection.",
         default="google-gla:gemini-3.1-flash-lite",
     )
-    rpm: PositiveInt = Field(description="Maximum requests per minute for the AI model.", default=4)
-    tpm: PositiveInt = Field(description="Maximum tokens per minute for the AI model.", default=250000)
+    rpm: PositiveInt = Field(description="Maximum Requests Per Minute (RPM) for the AI model provider.", default=4)
+    tpm: PositiveInt = Field(description="Maximum Tokens Per Minute (TPM) for the AI model provider.", default=250000)
     google: GoogleAiSettings = Field(
         description="Settings that only apply to the Google AI model.",
         default_factory=GoogleAiSettings,
-    )
-    gemini_cli: GeminiCliSettings = Field(
-        description="Settings that only apply to the Gemini CLI.",
-        default_factory=GeminiCliSettings,
     )
     search: WebSearchSettings = Field(
         description="Settings for web search operations.",
@@ -238,15 +221,15 @@ class ReEncodeSettings(BaseSettings):
         default=False,
     )
     fps: PositiveInt = Field(
-        description="The framerate to re-encode the video to.",
+        description="The target framerate (FPS) to re-encode the video segments to.",
         default=1,
     )
     height: PositiveInt = Field(
-        description="The height (resolution) to re-encode the video to. Width is scaled automatically.",
+        description="The target height (resolution) to re-encode to. Aspect ratio is preserved.",
         default=360,
     )
     bitrate_kb: PositiveInt = Field(
-        description="The bitrate in KB/s (Kilobytes per second) to re-encode the video to.",
+        description="The target bitrate in Kilobytes per second (KB/s) for the re-encoded video.",
         default=35,
     )
     threshold_mb: NonNegativeInt = Field(
@@ -255,8 +238,8 @@ class ReEncodeSettings(BaseSettings):
         default=20,
     )
     duration_tolerance_ms: NonNegativeInt = Field(
-        description="The allowed difference in milliseconds between input and output video duration to "
-        "consider a re-encode valid.",
+        description="Maximum allowed duration difference (ms) between original and re-encoded segments "
+        "to consider the output valid.",
         default=100,
     )
     encoder: Optional[str] = Field(
@@ -318,21 +301,19 @@ class ThreadSettings(BaseSettings):
     }
 
     uploads: PositiveInt = Field(
-        description="The number of concurrent threads for uploading video segments. "
-        "This is only used for Gemini (google-gla) models.",
+        description="Number of concurrent uploads to the Gemini Files API.",
         default=4,
     )
     re_encode: PositiveInt = Field(
-        description="The number of concurrent threads for re-encoding video chunks.",
+        description="Number of concurrent FFmpeg re-encoding processes.",
         default=2,
     )
     lyrics: NonNegativeInt = Field(
-        description="The number of concurrent threads to use for Lyrics/Scene Detection. "
-        "Set to 0 to disable Lyrics/Scene detection.",
+        description="Number of concurrent AI tasks for lyrics and scene detection. Set to 0 to skip this stage.",
         default=4,
     )
     subtitles: PositiveInt = Field(
-        description="The number of concurrent threads to use for Subtitle Generation (Transcription).",
+        description="Number of concurrent AI tasks for subtitle generation (transcription and translation).",
         default=4,
     )
 

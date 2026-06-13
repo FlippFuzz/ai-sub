@@ -3,7 +3,6 @@
 from .config import (
     AiSettings,
     DirectorySettings,
-    GeminiCliSettings,
     GoogleAiSettings,
     LoggingSettings,
     ReEncodeSettings,
@@ -20,7 +19,6 @@ from .prompt import LYRICS_PROMPT_VERSION, SUBTITLES_PROMPT_VERSION
 __all__ = [
     "AiSettings",
     "DirectorySettings",
-    "GeminiCliSettings",
     "GoogleAiSettings",
     "LoggingSettings",
     "ReEncodeSettings",
