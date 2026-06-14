@@ -4,7 +4,7 @@ from __future__ import annotations as _annotations
 
 import asyncio
 from pathlib import Path
-from typing import Sequence, TypeVar, cast
+from typing import Any, Sequence, TypeVar, cast
 
 import logfire
 from google import genai as genai
@@ -110,6 +110,7 @@ class RateLimitedAgentWrapper:
 
     settings: Settings
     model_name: str
+    _http_client: AsyncClient | None = None
 
     def is_google(self) -> bool:
         """Checks if the model is a Google model.
@@ -148,7 +149,21 @@ class RateLimitedAgentWrapper:
         self.token_limiter = limiter_factory.create_inmemory_limiter(
             rate_per_duration=self.settings.ai.tpm, duration=Duration.MINUTE
         )
+        self._http_client = self._create_http_client() if self.is_google() else None
         self.agent = self._create_agent()
+
+    async def __aenter__(self) -> RateLimitedAgentWrapper:
+        """Enter the async context manager.
+
+        Returns:
+            RateLimitedAgentWrapper: The agent wrapper instance.
+        """
+        return self
+
+    async def __aexit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: Any) -> None:
+        """Exit the async context manager and close the HTTP client."""
+        if self._http_client:
+            await self._http_client.aclose()
 
     def _create_http_client(self) -> AsyncClient:
         """Creates an HTTP client with robust retry logic using Tenacity.
@@ -266,7 +281,7 @@ class RateLimitedAgentWrapper:
                 model_str,
                 provider=GoogleProvider(
                     api_key=(self.settings.ai.google.key.get_secret_value() if self.settings.ai.google.key else None),
-                    http_client=self._create_http_client(),
+                    http_client=self._http_client,
                     base_url=(str(self.settings.ai.google.base_url) if self.settings.ai.google.base_url else None),
                 ),
             )

@@ -469,9 +469,13 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
             await stack.enter_async_context(search_deps)
             agent_deps.web_search = search_deps
 
-        agent_subtitles = RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
+        agent_subtitles = await stack.enter_async_context(
+            RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
+        )
         agent_scene = (
-            RateLimitedAgentWrapper(settings, settings.ai.model_lyrics, use_web_search=True, deps=agent_deps)
+            await stack.enter_async_context(
+                RateLimitedAgentWrapper(settings, settings.ai.model_lyrics, use_web_search=True, deps=agent_deps)
+            )
             if use_lyrics
             else None
         )
