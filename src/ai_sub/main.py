@@ -205,8 +205,9 @@ class LyricsSceneJobRunner(JobRunner):
         assert lyrics_job is not None
         if lyrics_job.response:
             lyrics_job.lyrics_prompt_version = LYRICS_PROMPT_VERSION
-            job_state_path = self.settings.dir.tmp / f"{lyrics_job.name}.lyrics.{self.sanitized_model_name}.json"
-            await asyncio.to_thread(lyrics_job.save, job_state_path)
+
+        job_state_path = self.settings.dir.tmp / f"{lyrics_job.name}.lyrics.{self.sanitized_model_name}.json"
+        await asyncio.to_thread(lyrics_job.save, job_state_path)
 
 
 class SubtitleJobRunner(JobRunner):
@@ -275,11 +276,15 @@ class SubtitleJobRunner(JobRunner):
         subtitle_job = job.subtitles
         assert subtitle_job is not None
 
-        # Also generate a subtitle file for this job for the user to view.
         if subtitle_job.response is not None:
             subtitle_job.subtitles_prompt_version = SUBTITLES_PROMPT_VERSION
-            job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.sanitized_model_name}.json"
-            await asyncio.to_thread(subtitle_job.save, job_state_path)
+
+        # Always save the job state to persist retry counts across runs.
+        job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.sanitized_model_name}.json"
+        await asyncio.to_thread(subtitle_job.save, job_state_path)
+
+        # Also generate a subtitle file for this job for the user to view.
+        if subtitle_job.response is not None:
             sanitized_model = self.settings.ai.get_sanitized_model_name(self.settings.ai.model_subtitles)
 
             def _save_ssa(response: SubtitleAiResponse, path: str) -> None:
@@ -343,20 +348,15 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
             # Add the duration of the current segment to the offset for the next one.
             offset_ms += video_duration_ms
 
-            # Sort out max retries exceeded
-            # The latest job file will have the highest retry count.
-            # We can check in reverse order of stages.
-            final_job_retry_count = 0
-            if job:  # subtitle job
-                final_job_retry_count = job.total_num_retries
-            else:
-                lyrics_job_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{sanitized_lyrics_model}.json"
-                lyrics_job = LyricsSceneJob.load(lyrics_job_path, settings.ai.validation_buffer_ms)
-                if lyrics_job:
-                    final_job_retry_count = lyrics_job.total_num_retries
+            # Check if this segment is incomplete specifically because it hit the retry limit.
+            if not job or not job.response:
+                sub_attempts = job.total_attempts if job else 0
+                lyrics_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{sanitized_lyrics_model}.json"
+                lyrics_job = LyricsSceneJob.load(lyrics_path, settings.ai.validation_buffer_ms)
+                lyrics_attempts = lyrics_job.total_attempts if lyrics_job else 0
 
-            if final_job_retry_count >= settings.retry.max:
-                max_retries_exceeded = True
+                if sub_attempts >= settings.retry.max_runs or lyrics_attempts >= settings.retry.max_runs:
+                    max_retries_exceeded = True
 
         # Insert version and config, as a single SSAEvent at the beginning (0-1ms)
         # JSON curly braces {} are treated as formatting codes in SRT, so replace them.
@@ -469,9 +469,13 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
             await stack.enter_async_context(search_deps)
             agent_deps.web_search = search_deps
 
-        agent_subtitles = RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
+        agent_subtitles = await stack.enter_async_context(
+            RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
+        )
         agent_scene = (
-            RateLimitedAgentWrapper(settings, settings.ai.model_lyrics, use_web_search=True, deps=agent_deps)
+            await stack.enter_async_context(
+                RateLimitedAgentWrapper(settings, settings.ai.model_lyrics, use_web_search=True, deps=agent_deps)
+            )
             if use_lyrics
             else None
         )
@@ -582,6 +586,8 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
                 # Queue next job
                 if next_stage == "upload":
+                    # Retries are tracked per-stage. Re-encoding and uploading are
+                    # idempotent, so resetting the counter has no adverse effect.
                     job.upload = UploadFileJob(
                         name=name,
                         python_file=file_handle,
@@ -592,9 +598,14 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
                 elif next_stage == "lyrics":
                     existing_lyrics = job.lyrics
-                    new_lyrics_job = LyricsSceneJob(name=name, file=file_handle, video_duration_ms=duration_ms)
+                    # Retries are tracked per-stage.
+                    new_lyrics_job = LyricsSceneJob(
+                        name=name,
+                        file=file_handle,
+                        video_duration_ms=duration_ms,
+                        total_attempts=existing_lyrics.total_attempts if existing_lyrics else 0,
+                    )
                     if existing_lyrics:
-                        new_lyrics_job.total_num_retries = existing_lyrics.total_num_retries
                         if existing_lyrics.response:
                             new_lyrics_job.response = existing_lyrics.response
                             new_lyrics_job.lyrics_prompt_version = existing_lyrics.lyrics_prompt_version
@@ -605,9 +616,14 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
                 elif next_stage == "subtitles":
                     existing_subs = job.subtitles
-                    new_subs_job = SubtitleJob(name=name, file=file_handle, video_duration_ms=duration_ms)
+                    # Retries are tracked per-stage.
+                    new_subs_job = SubtitleJob(
+                        name=name,
+                        file=file_handle,
+                        video_duration_ms=duration_ms,
+                        total_attempts=existing_subs.total_attempts if existing_subs else 0,
+                    )
                     if existing_subs:
-                        new_subs_job.total_num_retries = existing_subs.total_num_retries
                         if existing_subs.response:
                             new_subs_job.response = existing_subs.response
                             new_subs_job.subtitles_prompt_version = existing_subs.subtitles_prompt_version
@@ -699,6 +715,8 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
                 if should_reencode:
                     output_file = reencode_dir / split.with_suffix(".mov").name
+                    # Retries are tracked per-stage. Re-encoding is idempotent,
+                    # so resetting the counter has no adverse effect.
                     job_state.reencode = ReEncodingJob(
                         name=split.stem,
                         input_file=split,
@@ -714,6 +732,8 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
                 # 2. Check Upload
                 if use_upload:
+                    # Retries are tracked per-stage. Uploading is idempotent,
+                    # so resetting the counter has no adverse effect.
                     job_state.upload = UploadFileJob(
                         name=split.stem,
                         python_file=split,
@@ -730,6 +750,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                         # were either disabled or skipped (e.g. file size < threshold).
                         # Therefore, we use the original local split file as the input.
                         job_state.lyrics = LyricsSceneJob(
+                            # Retries are tracked per-stage.
                             name=split.stem,
                             file=split,
                             video_duration_ms=duration,
@@ -751,6 +772,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     # were either disabled or skipped (e.g. file size < threshold).
                     # Therefore, we use the original local split file as the input.
                     job_state.subtitles = SubtitleJob(
+                        # Retries are tracked per-stage.
                         name=split.stem,
                         file=split,
                         video_duration_ms=duration,

@@ -11,7 +11,7 @@ dependencies = [
     "pysubs2",
     "static-ffmpeg",
     "pydantic",
-    "pydantic-ai-slim[google, logfire, duckduckgo] >= 1.99.0",
+    "pydantic-ai-slim[google, logfire, duckduckgo, retries] >= 1.99.0",
     "pydantic-settings",
     "json_repair",
     "pyrate-limiter",

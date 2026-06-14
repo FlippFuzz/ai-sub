@@ -8,7 +8,7 @@ from typing import Any, Awaitable, Callable
 import logfire
 
 from ai_sub.config import Settings
-from ai_sub.data_models import Job, SegmentJobs
+from ai_sub.data_models import Job, QuotaExceededError, SegmentJobs
 
 
 class JobRunner:
@@ -17,6 +17,22 @@ class JobRunner:
     This class provides a framework for processing `SegmentJobs` objects from an
     asyncio.Queue in a concurrent manner using `asyncio.Task`. It handles job
     acquisition, retries on failure, and graceful shutdown.
+
+    **Retry Logic (Persistence Layer):**
+    This runner manages retries that survive application restarts:
+    1. **Persistence:** The `total_attempts` field on the `Job` object is
+       updated after a failed or successful attempt and saved to disk in `post_process`.
+    2. **Gatekeeping:** `add_job` checks if a job has already exceeded
+       `settings.retry.max_runs`. If so, it is never queued.
+    3. **Resilience:** If the process is interrupted (e.g. cancellation) or
+       hits a provider quota limit (`QuotaExceededError`), the counter is NOT incremented.
+       This is because the failure was due to provider limits, not the content
+       of the video segment. This ensures we don't 'waste' a segment's retry
+       attempts when we just need to wait for a daily reset.
+    4. **Failure Handling:** Generic exceptions are caught and logged, leaving
+       the job in an incomplete state. Because the counter was incremented,
+       re-running the application will attempt the job again until `max_runs`
+       is hit.
 
     Subclasses must implement the `process` method to define the actual work.
     The `on_complete` callback can be used to chain dependent jobs by creating the next job in the pipeline.
@@ -55,7 +71,13 @@ class JobRunner:
         Args:
             job: The job container to add to the queue.
         """
-        await self.queue.put(job)
+        current_job = self.get_job(job)
+        if current_job.total_attempts < self.settings.retry.max_runs:
+            await self.queue.put(job)
+        else:
+            logfire.warning(
+                f"Skipping {self.name} job for {current_job.name}: Max attempts reached ({current_job.total_attempts})"
+            )
 
     async def join(self) -> None:
         """Waits until all items in the queue have been processed."""
@@ -89,7 +111,7 @@ class JobRunner:
         2. Increments the job's retry counters.
         3. Calls the `process()` method to perform the work (async).
         4. On success, calls the `on_complete` callback if it exists.
-        5. On failure, calls `_handle_retry()` to potentially re-queue the job.
+        5. On failure, logs the exception; the job remains incomplete for this execution.
         6. Always calls `post_process()` for any cleanup tasks (async).
         """
         while True:
@@ -108,10 +130,6 @@ class JobRunner:
                     # Get the specific job for this runner from the SegmentJobs container.
                     current_job = self.get_job(job_state)
 
-                    # Increment retry counters for the specific job.
-                    current_job.run_num_retries += 1
-                    current_job.total_num_retries += 1
-
                 except Exception:
                     logfire.exception(f"Unexpected error in {self.name} runner loop")
                     continue
@@ -122,11 +140,16 @@ class JobRunner:
                         if self.on_complete:
                             await self.on_complete(job_state, result)
 
+                        # Success: increment the attempt counter
+                        current_job.total_attempts += 1
+
+                    except QuotaExceededError:
+                        logfire.warning(f"Quota exceeded for {self.name} job '{current_job.name}'.")
+
                     except Exception:
-                        job_name = f"'{current_job.name}'" if current_job else "unknown"
-                        logfire.exception(f"Exception while running {self.name} job {job_name}")
-                        if job_state is not None and current_job is not None:
-                            await self._handle_retry(job_state, current_job)
+                        # Failure: increment the attempt counter
+                        current_job.total_attempts += 1
+                        logfire.exception(f"Exception while running {self.name} job '{current_job.name}'")
 
                     finally:
                         if job_state is not None:
@@ -191,24 +214,3 @@ class JobRunner:
 
         """
         pass
-
-    async def _handle_retry(self, job_state: SegmentJobs, job: Job) -> None:
-        """Handles the logic for re-queuing a failed job.
-
-        It checks if the job's retry counts (`run_num_retries` for the current
-        application execution and `total_num_retries` across all executions)
-        are within the configured limits. If they are, it waits for a delay
-        and puts the `SegmentJobs` back into the queue.
-
-        Args:
-            job_state (SegmentJobs): The `SegmentJobs` container of the failed job.
-            job (Job): The specific `Job` instance that failed.
-
-        """
-        can_retry_run = job.run_num_retries < self.settings.retry.run
-        can_retry_total = job.total_num_retries < self.settings.retry.max
-
-        if can_retry_run and can_retry_total:
-            await asyncio.sleep(self.settings.retry.delay)
-            # Put back into the queue. Note: asyncio.Queue is FIFO, so it goes to the back.
-            await self.add_job(job_state)
