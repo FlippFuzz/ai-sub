@@ -14,7 +14,7 @@ from contextlib import AsyncExitStack
 from functools import partial
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Awaitable, Callable, cast
+from typing import Any, Awaitable, Callable, TextIO, cast
 
 import logfire
 from pydantic_settings import CliApp
@@ -54,7 +54,7 @@ from ai_sub.video import (
 from ai_sub.web_search import WebSearchDeps
 
 
-class TqdmWriteWrapper(io.StringIO):
+class TqdmWriteWrapper(io.TextIOBase):
     """Redirects writes to tqdm.write to prevent progress bar interference."""
 
     def write(self, message: str) -> int:
@@ -449,7 +449,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         # without sending their logs to the console.
         logfire.configure(
             console=logfire.ConsoleOptions(
-                output=TqdmWriteWrapper(),
+                output=cast(TextIO, TqdmWriteWrapper()),
                 min_log_level=settings.log.level,
                 include_timestamps=settings.log.timestamps,
             ),
