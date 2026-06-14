@@ -514,9 +514,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
             """Periodically refreshes bars to handle window resizing during long waits."""
             try:
                 while True:
-                    # In VS Code, frequent refreshes during resize often cause layout drift.
-                    # We throttle this and use the lock to prevent clashing with logs.
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(settings.log.progress_bar_refresh_seconds)
                     with tqdm.get_lock():
                         for bar in list(bars.values()):
                             bar.refresh()
@@ -543,12 +541,12 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                 "leave": True,
                 "dynamic_ncols": False,
                 "ncols": settings.log.progress_bar_width,
-                "bar_format": "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}",
+                "bar_format": "{desc:<9}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}",
             }
             if use_reencode:
-                bars["reencode"] = tqdm(desc="Re-encoding", position=len(bars), **common_kwargs)
+                bars["reencode"] = tqdm(desc="Reencodes", position=len(bars), **common_kwargs)
             if use_upload:
-                bars["upload"] = tqdm(desc="Uploading", position=len(bars), **common_kwargs)
+                bars["upload"] = tqdm(desc="Uploads", position=len(bars), **common_kwargs)
             if use_lyrics:
                 bars["lyrics"] = tqdm(desc="Lyrics", position=len(bars), **common_kwargs)
             bars["subtitles"] = tqdm(desc="Subtitles", position=len(bars), **common_kwargs)
@@ -787,6 +785,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
                 # Check if the final stage (Subtitles) is already complete.
                 if subtitle_job and subtitle_job.response:
+                    sync_progress("done")
                     continue
 
                 # Determine the entry point for this segment.

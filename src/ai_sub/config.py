@@ -380,6 +380,10 @@ class LoggingSettings(BaseSettings):
         description="Fixed width for progress bars (in characters).",
         default=80,
     )
+    progress_bar_refresh_seconds: PositiveFloat = Field(
+        description="Interval in seconds to refresh progress bars to handle terminal resizing.",
+        default=1.0,
+    )
 
 
 class Settings(BaseSettings):
