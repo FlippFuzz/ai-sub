@@ -42,10 +42,16 @@ class AiSubResult(IntEnum):
     """All segments were processed successfully."""
 
     INCOMPLETE = -1
-    """One or more segments failed to process and exhausted RetrySettings.run."""
+    """One or more segments failed to process."""
 
     MAX_RETRIES_EXHAUSTED = -2
-    """One or more segments failed to process and exhausted RetrySettings.max."""
+    """One or more segments failed to process and exhausted RetrySettings.max_runs."""
+
+
+class QuotaExceededError(Exception):
+    """Raised when the AI model provider's quota is exhausted."""
+
+    pass
 
 
 # ==============================================================================
@@ -378,13 +384,11 @@ class Job(BaseModel):
     name: str = Field(
         description="The unique name of the job, typically derived from the video segment filename (e.g., 'part_001')."
     )
-    run_num_retries: NonNegativeInt = Field(
+    total_attempts: NonNegativeInt = Field(
         default=0,
-        description="The number of retries for this job within the current execution of the application.",
-    )
-    total_num_retries: NonNegativeInt = Field(
-        default=0,
-        description="The total number of retries for this job across all executions, loaded from the saved state.",
+        description="The total number of attempts for this specific job stage across all executions, "
+        "loaded from the saved stage-specific state file. "
+        "Attempts are tracked independently per stage (e.g., lyrics failures do not affect subtitle attempt counts).",
     )
 
     def save(self, filename: Path):

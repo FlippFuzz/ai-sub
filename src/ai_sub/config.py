@@ -109,6 +109,11 @@ class WebSearchSettings(BaseSettings):
         "DuckDuckGo is the default because Gemini's built-in search does not have a free tier.",
         default="duckduckgo",
     )
+    timeout: PositiveFloat = Field(
+        description="The timeout in seconds for web search HTTP requests. "
+        "Search queries can occasionally be slow depending on the provider.",
+        default=60.0,
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -167,6 +172,11 @@ class AiSettings(BaseSettings):
     )
     rpm: PositiveInt = Field(description="Maximum Requests Per Minute (RPM) for the AI model provider.", default=4)
     tpm: PositiveInt = Field(description="Maximum Tokens Per Minute (TPM) for the AI model provider.", default=250000)
+    timeout: PositiveFloat = Field(
+        description="The timeout in seconds for AI model HTTP requests. "
+        "This must be at least 10s for Google Gemini models to avoid 'deadline too short' errors.",
+        default=300.0,
+    )
     google: GoogleAiSettings = Field(
         description="Settings that only apply to the Google AI model.",
         default_factory=GoogleAiSettings,
@@ -326,17 +336,26 @@ class RetrySettings(BaseSettings):
         **_BASE_CONFIG,
     }
 
-    run: NonNegativeInt = Field(
-        description="The maximum number of times to retry a failed job in this run of the program.",
+    per_run: NonNegativeInt = Field(
+        description="Maximum internal retries by the AI agent per request. "
+        "This handles transient API errors and validation failures within a single job execution.",
         default=5,
     )
-    max: NonNegativeInt = Field(
-        description="The absolute maximum number of times a job can be retried in total.",
-        default=15,
+    max_runs: NonNegativeInt = Field(
+        description="Total attempt limit for a single segment stage (e.g. lyrics detection or subtitle generation) "
+        "across all application runs. "
+        "This value is persisted in stage-specific state files to prevent infinite retries on problematic segments. "
+        "Note that attempts are tracked independently per stage; "
+        "failures in one stage do not count against the attempt limit of subsequent stages.",
+        default=3,
     )
-    delay: NonNegativeInt = Field(
-        description="The number of seconds to wait between retries.",
-        default=30,
+    multiplier: PositiveFloat = Field(
+        description="The multiplier for exponential backoff between retries.",
+        default=1.0,
+    )
+    max_wait_seconds: PositiveInt = Field(
+        description="The maximum wait time in seconds (upper bound) for a single retry attempt.",
+        default=60,
     )
 
 

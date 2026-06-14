@@ -93,7 +93,7 @@ class WebSearchDeps:
         if self._settings.key is None:
             raise ValueError(f"{self._provider.capitalize()} API key is not configured")
         headers = {"Authorization": f"Bearer {self._settings.key.get_secret_value()}"}
-        self._client = AsyncClient(headers=headers)
+        self._client = AsyncClient(headers=headers, timeout=self._settings.timeout)
         await self._client.__aenter__()
         return self
 

@@ -11,6 +11,7 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | `--ai.model-lyrics <model>`       | The AI model for lyrics research and scene detection.                                                                                                   | `google-gla:gemini-3.1-flash-lite` |
 | `--ai.rpm <int>`                  | Maximum Requests Per Minute (RPM) for the AI model provider.                                                                                            | `4`                                |
 | `--ai.tpm <int>`                  | Maximum Tokens Per Minute (TPM) for the AI model provider.                                                                                              | `250000`                           |
+| `--ai.timeout <float>`            | The timeout in seconds for AI model HTTP requests. Must be at least 10s for Google Gemini models.                                                       | `300.0`                            |
 | `--ai.validation-buffer-ms <int>` | The allowed buffer in milliseconds for AI-generated timestamps to exceed the video duration.                                                            | `2000`                             |
 
 ### Google AI Settings (`--ai.google.*`)
@@ -24,12 +25,13 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ### Web Search Settings (`--ai.search.*`)
 
-| Argument                             | Description                                                                                        | Default      |
-| ------------------------------------ | -------------------------------------------------------------------------------------------------- | ------------ |
-| `--ai.search.key <key>`              | API key for the search tool. Falls back to `LANGSEARCH_API_KEY` or `OLLAMA_API_KEY` based on tool. | `None`       |
-| `--ai.search.web-search-tool <tool>` | The tool used for lyrics research. Options: 'builtin', 'duckduckgo', 'ollama', 'langsearch'.       | `duckduckgo` |
-| `--ai.search.qps <float>`            | Maximum Queries Per Second (QPS) for the web search API.                                           | `0.3`        |
-| `--ai.search.max-length <int>`       | Discard search responses longer than this number of characters.                                    | `4096`       |
+| Argument                             | Description                                                                                                   | Default      |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------- | ------------ |
+| `--ai.search.key <key>`              | API key for the search tool. Falls back to `LANGSEARCH_API_KEY` or `OLLAMA_API_KEY` based on tool.            | `None`       |
+| `--ai.search.web-search-tool <tool>` | The web search tool to use. Options are 'builtin' (Provider native), 'duckduckgo', 'ollama', or 'langsearch'. | `duckduckgo` |
+| `--ai.search.qps <float>`            | Maximum Queries Per Second (QPS) for the web search API.                                                      | `0.3`        |
+| `--ai.search.max-length <int>`       | Discard search responses longer than this number of characters.                                               | `4096`       |
+| `--ai.search.timeout <float>`        | The timeout in seconds for web search HTTP requests.                                                          | `60.0`       |
 
 ## Splitting Settings (`--split.*`)
 
@@ -68,11 +70,12 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ## Retry Settings (`--retry.*`)
 
-| Argument                  | Description                                                                   | Default |
-| ------------------------- | ----------------------------------------------------------------------------- | ------- |
-| `--retry.run <int>`       | The maximum number of times to retry a failed job in this run of the program. | `5`     |
-| `--retry.max <int>`       | The absolute maximum number of times a job can be retried in total.           | `15`    |
-| `--retry.delay <seconds>` | The number of seconds to wait between retries.                                | `30`    |
+| Argument                         | Description                                                                          | Default |
+| -------------------------------- | ------------------------------------------------------------------------------------ | ------- |
+| `--retry.per-run <int>`          | Maximum internal retries by the AI agent per request to handle transient API errors. | `5`     |
+| `--retry.max-runs <int>`         | Total attempt limit for a segment stage across all application runs.                 | `3`     |
+| `--retry.max-wait-seconds <int>` | The maximum wait time in seconds (upper bound) for a single retry attempt.           | `60`    |
+| `--retry.multiplier <float>`     | The multiplier for exponential backoff between retries.                              | `1.0`   |
 
 ## Logging Settings (`--log.*`)
 
