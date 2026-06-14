@@ -69,13 +69,12 @@ class GoogleAiSettings(BaseSettings):
             The updated values dictionary including the API key if found.
         """
         # If 'key' is not provided directly, try to load it from standard env vars.
-        if values.get("key") is None:
-            key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-            if key:
-                values["key"] = key
+        if (key := values.get("key")) is None:
+            if env_key := (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
+                values["key"] = key = env_key
 
         # Sanitize the key to remove accidental surrounding quotes or whitespace
-        if values.get("key") and isinstance(values["key"], str):
+        if isinstance(key, str):
             values["key"] = values["key"].strip().strip('"').strip("'")
 
         return values
@@ -126,23 +125,21 @@ class WebSearchSettings(BaseSettings):
         Returns:
             The updated values dictionary including the API key if found.
         """
-        if values.get("key") is None:
+        if (key := values.get("key")) is None:
             # Determine which tool is selected to avoid loading the wrong key.
             # We check both the provided values and the environment directly.
-            tool = values.get("web_search_tool")
-            if tool is None:
-                tool = os.getenv("AISUB_AI_SEARCH_WEB_SEARCH_TOOL") or "duckduckgo"
+            tool = values.get("web_search_tool") or os.getenv("AISUB_AI_SEARCH_WEB_SEARCH_TOOL") or "duckduckgo"
 
-            key = None
+            env_key = None
             if tool == "ollama":
-                key = os.getenv("OLLAMA_API_KEY")
+                env_key = os.getenv("OLLAMA_API_KEY")
             elif tool == "langsearch":
-                key = os.getenv("LANGSEARCH_API_KEY")
+                env_key = os.getenv("LANGSEARCH_API_KEY")
 
-            if key:
-                values["key"] = key
+            if env_key:
+                values["key"] = key = env_key
 
-        if values.get("key") and isinstance(values["key"], str):
+        if isinstance(key, str):
             values["key"] = values["key"].strip().strip('"').strip("'")
 
         return values
