@@ -74,8 +74,8 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | -------------------------------- | ------------------------------------------------------------------------------------ | ------- |
 | `--retry.per-run <int>`          | Maximum internal retries by the AI agent per request to handle transient API errors. | `5`     |
 | `--retry.max-runs <int>`         | Total attempt limit for a segment stage across all application runs.                 | `3`     |
-| `--retry.max-wait-seconds <int>` | The maximum wait time in seconds (upper bound) for a single retry attempt.           | `60`    |
-| `--retry.multiplier <float>`     | The multiplier for exponential backoff between retries.                              | `1.0`   |
+| `--retry.max-wait-seconds <int>` | The maximum wait time in seconds (upper bound) for a single retry attempt.           | `300`   |
+| `--retry.multiplier <float>`     | The multiplier for exponential backoff between retries.                              | `2.0`   |
 
 ## Logging Settings (`--log.*`)
 

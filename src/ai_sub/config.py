@@ -355,7 +355,7 @@ class RetrySettings(BaseSettings):
     )
     max_wait_seconds: PositiveInt = Field(
         description="The maximum wait time in seconds (upper bound) for a single retry attempt.",
-        default=60,
+        default=300,
     )
 
 
