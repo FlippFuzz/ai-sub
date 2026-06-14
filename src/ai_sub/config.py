@@ -351,7 +351,7 @@ class RetrySettings(BaseSettings):
     )
     multiplier: PositiveFloat = Field(
         description="The multiplier for exponential backoff between retries.",
-        default=1.0,
+        default=2.0,
     )
     max_wait_seconds: PositiveInt = Field(
         description="The maximum wait time in seconds (upper bound) for a single retry attempt.",
