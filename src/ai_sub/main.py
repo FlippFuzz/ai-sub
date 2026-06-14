@@ -6,6 +6,7 @@ Orchestrates video splitting, re-encoding, uploading, and AI transcription.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import socket
 import sys
@@ -18,6 +19,7 @@ from typing import Any, Awaitable, Callable, cast
 import logfire
 from pydantic_settings import CliApp
 from pysubs2 import SSAEvent, SSAFile
+from tqdm.auto import tqdm
 
 from ai_sub.agent_wrapper import RateLimitedAgentWrapper
 from ai_sub.config import Settings
@@ -50,6 +52,29 @@ from ai_sub.video import (
     split_video,
 )
 from ai_sub.web_search import WebSearchDeps
+
+
+class TqdmWriteWrapper(io.StringIO):
+    """Redirects writes to tqdm.write to prevent progress bar interference."""
+
+    def write(self, message: str) -> int:
+        """Writes a message to the tqdm console, avoiding empty lines.
+
+        Args:
+            message: The string message to write.
+
+        Returns:
+            The length of the message.
+        """
+        # tqdm.write handles clearing and redrawing bars automatically.
+        # We remove trailing newlines because tqdm.write appends its own.
+        if cleaned := message.rstrip("\r\n"):
+            tqdm.write(cleaned)
+        return len(message)
+
+    def flush(self) -> None:
+        """Flushes the writer. This is a no-op for tqdm."""
+        pass
 
 
 class ReEncodeJobRunner(JobRunner):
@@ -431,6 +456,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         # without sending their logs to the console.
         logfire.configure(
             console=logfire.ConsoleOptions(
+                output=TqdmWriteWrapper(),
                 min_log_level=settings.log.level,
                 include_timestamps=settings.log.timestamps,
             ),
@@ -474,7 +500,12 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         )
         agent_scene = (
             await stack.enter_async_context(
-                RateLimitedAgentWrapper(settings, settings.ai.model_lyrics, use_web_search=True, deps=agent_deps)
+                RateLimitedAgentWrapper(
+                    settings,
+                    settings.ai.model_lyrics,
+                    use_web_search=True,
+                    deps=agent_deps,
+                )
             )
             if use_lyrics
             else None
@@ -482,6 +513,59 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
         sanitized_lyrics_model = settings.ai.get_sanitized_model_name(settings.ai.model_lyrics)
         sanitized_subtitles_model = settings.ai.get_sanitized_model_name(settings.ai.model_subtitles)
+
+        # Initialize progress bars and a background task to handle UI refreshes (resizing)
+        bars: dict[str, Any] = {}
+
+        async def refresh_bars_loop():
+            """Periodically refreshes bars to handle window resizing during long waits."""
+            try:
+                while True:
+                    # In VS Code, frequent refreshes during resize often cause layout drift.
+                    # We throttle this and use the lock to prevent clashing with logs.
+                    await asyncio.sleep(10)
+                    with tqdm.get_lock():
+                        for bar in list(bars.values()):
+                            bar.refresh()
+            except asyncio.CancelledError:
+                pass
+
+        def mark_done(stage: str):
+            if stage in bars:
+                bars[stage].update(1)
+
+        # Determine stage visibility
+        use_reencode = settings.split.re_encode.enabled
+        is_google_sub = agent_subtitles.is_google()
+        is_google_scene = agent_scene.is_google() if agent_scene else False
+        use_upload = (is_google_sub or is_google_scene) and settings.ai.google.use_files_api
+
+        def create_bars(total: int):
+            # leave=True ensures bars stay in place when finished, preventing vertical shifts.
+            # dynamic_ncols is set to False to prevent layout corruption in VS Code/PuTTY;
+            # we use a fixed ncols value defined in the configuration instead.
+            common_kwargs: dict[str, Any] = {
+                "total": total,
+                "unit": "part",
+                "leave": True,
+                "dynamic_ncols": False,
+                "ncols": settings.log.progress_bar_width,
+                "bar_format": "{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}",
+            }
+            if use_reencode:
+                bars["reencode"] = tqdm(desc="Re-encoding", position=len(bars), **common_kwargs)
+            if use_upload:
+                bars["upload"] = tqdm(desc="Uploading", position=len(bars), **common_kwargs)
+            if use_lyrics:
+                bars["lyrics"] = tqdm(desc="Lyrics", position=len(bars), **common_kwargs)
+            bars["subtitles"] = tqdm(desc="Subtitles", position=len(bars), **common_kwargs)
+
+        # Helper to sync progress when skipping stages
+        def sync_progress(entry_stage: str):
+            for s in ["reencode", "upload", "lyrics", "subtitles"]:
+                if s == entry_stage:
+                    break
+                mark_done(s)
 
         input_video_path = cast(Path, settings.input_video_file)
 
@@ -518,12 +602,12 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     f"{initial_offset_ms}ms) due to start_offset_min={settings.split.start_offset_min}"
                 )
 
-            # Step 2: Configure the job processing pipeline.
+            create_bars(len(video_splits))
+            # Mark segments that are completely skipped (already finished) as done for all bars
+            for _ in range(len(video_splits) - len(splits_to_process)):
+                sync_progress("done")  # Matches no stage, updates everything
 
-            use_reencode = settings.split.re_encode.enabled
-            is_google_sub = agent_subtitles.is_google()
-            is_google_scene = agent_scene.is_google() if agent_scene else False
-            use_upload = (is_google_sub or is_google_scene) and settings.ai.google.use_files_api
+            # Step 2: Configure the job processing pipeline.
 
             reencode_runner: ReEncodeJobRunner | None = None
             upload_runner: UploadJobRunner | None = None
@@ -535,6 +619,8 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
             # When a job completes, the next required job is created and queued.
             async def on_stage_complete(stage: str, job: SegmentJobs, result: Any) -> None:
                 """Handles the transition between pipeline stages."""
+                mark_done(stage)
+
                 file_handle: Any = result
                 duration_ms: int = 0
                 name: str = ""
@@ -555,7 +641,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     if not job.lyrics.response:
                         return  # Should not happen if on_complete is called after success
                     name = job.lyrics.name
-                    file_handle = job.lyrics.file
+                    file_handle = file_handle or job.lyrics.file
                     duration_ms = job.lyrics.video_duration_ms
 
                     # Logic for Subtitles file source:
@@ -582,6 +668,17 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     next_stage = "subtitles"
 
                 if not next_stage:
+                    return
+
+                # Skip stages that are already complete to avoid incrementing retry counters.
+                if next_stage == "lyrics" and job.lyrics and job.lyrics.response:
+                    # Transition immediately to the stage following lyrics
+                    await on_stage_complete("lyrics", job, file_handle)
+                    return
+
+                if next_stage == "subtitles" and job.subtitles and job.subtitles.response:
+                    # Subtitles already done for this segment
+                    mark_done("subtitles")
                     return
 
                 # Queue next job
@@ -659,12 +756,15 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     on_complete=partial(on_stage_complete, "lyrics"),
                 )
 
+            async def on_subtitles_complete(job: SegmentJobs, result: Any) -> None:
+                mark_done("subtitles")
+
             # Setup subtitle_runner
             subtitle_runner = SubtitleJobRunner(
                 settings,
                 settings.thread.subtitles,
                 agent_subtitles,
-                on_complete=None,
+                on_complete=on_subtitles_complete,
             )
 
             # Step 3: Populate the job queues.
@@ -713,10 +813,10 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                         file_size_mb = split.stat().st_size / (1024 * 1024)
                         should_reencode = file_size_mb >= settings.split.re_encode.threshold_mb
 
+                # Determine entry point and sync progress bars for skipped stages
                 if should_reencode:
+                    sync_progress("reencode")
                     output_file = reencode_dir / split.with_suffix(".mov").name
-                    # Retries are tracked per-stage. Re-encoding is idempotent,
-                    # so resetting the counter has no adverse effect.
                     job_state.reencode = ReEncodingJob(
                         name=split.stem,
                         input_file=split,
@@ -730,10 +830,8 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                         await reencode_runner.add_job(job_state)
                     continue
 
-                # 2. Check Upload
                 if use_upload:
-                    # Retries are tracked per-stage. Uploading is idempotent,
-                    # so resetting the counter has no adverse effect.
+                    sync_progress("upload")
                     job_state.upload = UploadFileJob(
                         name=split.stem,
                         python_file=split,
@@ -743,79 +841,52 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                         await upload_runner.add_job(job_state)
                     continue
 
-                # 3. Check Lyrics
                 if use_lyrics:
-                    if not job_state.lyrics:
-                        # Fall-through: If execution reaches here, it means previous stages (Re-encode/Upload)
-                        # were either disabled or skipped (e.g. file size < threshold).
-                        # Therefore, we use the original local split file as the input.
-                        job_state.lyrics = LyricsSceneJob(
-                            # Retries are tracked per-stage.
+                    if not job_state.lyrics or not job_state.lyrics.response:
+                        sync_progress("lyrics")
+                        job_state.lyrics = job_state.lyrics or LyricsSceneJob(
                             name=split.stem,
                             file=split,
                             video_duration_ms=duration,
                         )
+                        job_state.lyrics.file = split
                         if scene_detection_runner:
                             await scene_detection_runner.add_job(job_state)
                         continue
-                    elif job_state.lyrics.file is None:
-                        # Resumption: 'file' is excluded from JSON save. Restore local split path.
-                        job_state.lyrics.file = split
-                        if not job_state.lyrics.response:
-                            if scene_detection_runner:
-                                await scene_detection_runner.add_job(job_state)
-                            continue
 
-                # 4. Subtitles
-                if not job_state.subtitles:
-                    # Fall-through: If execution reaches here, it means previous stages (Re-encode/Upload)
-                    # were either disabled or skipped (e.g. file size < threshold).
-                    # Therefore, we use the original local split file as the input.
-                    job_state.subtitles = SubtitleJob(
-                        # Retries are tracked per-stage.
-                        name=split.stem,
-                        file=split,
-                        video_duration_ms=duration,
-                    )
-                    if subtitle_runner:
-                        await subtitle_runner.add_job(job_state)
-                elif job_state.subtitles.file is None:
-                    # Resumption: 'file' is excluded from JSON save. Restore local split path.
-                    job_state.subtitles.file = split
-                    if subtitle_runner:
-                        await subtitle_runner.add_job(job_state)
+                sync_progress("subtitles")
+                job_state.subtitles = job_state.subtitles or SubtitleJob(
+                    name=split.stem,
+                    file=split,
+                    video_duration_ms=duration,
+                )
+                job_state.subtitles.file = split
+                if subtitle_runner:
+                    await subtitle_runner.add_job(job_state)
 
             # Step 4: Start all runners and wait for them to complete
-            # Start runners
-            if reencode_runner:
-                await reencode_runner.start()
-            if upload_runner:
-                await upload_runner.start()
-            if scene_detection_runner:
-                await scene_detection_runner.start()
-            await subtitle_runner.start()
+            refresh_task = asyncio.create_task(refresh_bars_loop())
+            runners = [r for r in [reencode_runner, upload_runner, scene_detection_runner, subtitle_runner] if r]
+            try:
+                # Start all runners
+                for runner in runners:
+                    await runner.start()
 
-            # Wait for runners to complete and signal as needed
-            if reencode_runner:
-                await reencode_runner.join()
-                await reencode_runner.shutdown()
+                # Wait for all runners to complete their respective queues
+                for runner in runners:
+                    await runner.join()
 
-            if upload_runner:
-                await upload_runner.join()
-                await upload_runner.shutdown()
-
-            if scene_detection_runner:
-                await scene_detection_runner.join()
-                await scene_detection_runner.shutdown()
-
-            await subtitle_runner.join()
-            await subtitle_runner.shutdown()
-
-            # Step 5: Assemble the final subtitle file.
-            result = await asyncio.to_thread(stitch_subtitles, video_splits, settings)
-
-            logfire.info(f"Done - {result.name}")
-            return result
+                # Step 5: Assemble the final subtitle file.
+                result = await asyncio.to_thread(stitch_subtitles, video_splits, settings)
+                logfire.info(f"Done - {result.name}")
+                return result
+            finally:
+                # Ensure all runners are shut down, even on cancellation
+                for runner in runners:
+                    await runner.shutdown()
+                refresh_task.cancel()
+                for b in bars.values():
+                    b.close()
 
 
 def main() -> None:
