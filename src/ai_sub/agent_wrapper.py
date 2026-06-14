@@ -314,6 +314,10 @@ class RateLimitedAgentWrapper:
                     deps_type=AgentDeps,
                     tools=function_tools,
                     capabilities=capabilities,
+                    validation_context=lambda ctx: {
+                        "video_duration_ms": ctx.deps.video_duration_ms,
+                        "validation_buffer_ms": ctx.deps.validation_buffer_ms,
+                    },
                     retries=self.settings.retry.per_run,
                 )
             else:
@@ -322,6 +326,10 @@ class RateLimitedAgentWrapper:
                     model_settings=google_model_settings,
                     capabilities=capabilities,
                     deps_type=AgentDeps,
+                    validation_context=lambda ctx: {
+                        "video_duration_ms": ctx.deps.video_duration_ms,
+                        "validation_buffer_ms": ctx.deps.validation_buffer_ms,
+                    },
                     retries=self.settings.retry.per_run,
                 )
 
@@ -335,6 +343,10 @@ class RateLimitedAgentWrapper:
                     tools=function_tools,
                     capabilities=capabilities,
                     deps_type=AgentDeps,
+                    validation_context=lambda ctx: {
+                        "video_duration_ms": ctx.deps.video_duration_ms,
+                        "validation_buffer_ms": ctx.deps.validation_buffer_ms,
+                    },
                     retries=self.settings.retry.per_run,
                 )
             else:
@@ -342,6 +354,10 @@ class RateLimitedAgentWrapper:
                     model=self.model_name,
                     capabilities=capabilities,
                     deps_type=AgentDeps,
+                    validation_context=lambda ctx: {
+                        "video_duration_ms": ctx.deps.video_duration_ms,
+                        "validation_buffer_ms": ctx.deps.validation_buffer_ms,
+                    },
                     retries=self.settings.retry.per_run,
                 )
 
@@ -405,6 +421,8 @@ class RateLimitedAgentWrapper:
             request_limiter=self.request_limiter,
             token_limiter=self.token_limiter,
             request_tokens=tokens,
+            video_duration_ms=video_duration_ms,
+            validation_buffer_ms=self.settings.ai.validation_buffer_ms,
             web_search=self.deps.web_search,
         )
 

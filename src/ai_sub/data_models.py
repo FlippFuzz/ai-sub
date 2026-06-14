@@ -126,6 +126,51 @@ def _parse_timestamp_string_ms(timestamp_string: str) -> int:
     return timestamp
 
 
+def _format_ms_timestamp(ms: int) -> str:
+    """Formats milliseconds into a 'MM:SS.mmm' string.
+
+    Args:
+        ms: The duration in milliseconds.
+
+    Returns:
+        The formatted timestamp string.
+    """
+    minutes, ms = divmod(ms, 60000)
+    seconds, ms = divmod(ms, 1000)
+    return f"{minutes:02d}:{seconds:02d}.{ms:03d}"
+
+
+def _get_default_lyrics_version() -> int:
+    """Retrieves the current lyrics prompt version for use as a Pydantic default.
+
+    This uses a local import to avoid a circular dependency between `data_models.py`
+    (which defines structures used by prompts) and `prompt.py` (which defines the
+    version constants). By importing inside the function, the version is only
+    accessed at runtime during object instantiation.
+
+    Returns:
+        int: The current LYRICS_PROMPT_VERSION.
+    """
+    from ai_sub.prompt import LYRICS_PROMPT_VERSION
+
+    return LYRICS_PROMPT_VERSION
+
+
+def _get_default_subtitles_version() -> int:
+    """Retrieves the current subtitles prompt version for use as a Pydantic default.
+
+    This uses a local import to avoid a circular dependency between `data_models.py`
+    and `prompt.py`. This ensures that the version number is available as soon
+    as a job object is created, even if it hasn't been processed yet.
+
+    Returns:
+        int: The current SUBTITLES_PROMPT_VERSION.
+    """
+    from ai_sub.prompt import SUBTITLES_PROMPT_VERSION
+
+    return SUBTITLES_PROMPT_VERSION
+
+
 # ==============================================================================
 # AI Response Models
 # ==============================================================================
@@ -149,6 +194,9 @@ class AgentDeps(BaseModel):
     request_limiter: Limiter | None = Field(description="Rate limiter for API requests.", default=None)
     token_limiter: Limiter | None = Field(description="Rate limiter for API tokens.", default=None)
     request_tokens: int = 0
+
+    video_duration_ms: NonNegativeInt = 0
+    validation_buffer_ms: NonNegativeInt = 2000
 
     web_search: WebSearchDeps | None = None
     """Web-search dependency (:class:`WebSearchDeps`), or ``None``."""
@@ -251,24 +299,45 @@ class SubtitleAiResponse(BaseModel):
 
         return subtitles
 
-    def validate_against_duration(self, video_duration_ms: int, buffer_ms: int = 1000) -> None:
+    @model_validator(mode="after")
+    def _validate_against_duration_validator(self, info: ValidationInfo) -> "SubtitleAiResponse":
+        """Internal validator to trigger duration checks via Pydantic AI context.
+
+        Args:
+            info (ValidationInfo): The validation context.
+
+        Returns:
+            SubtitleAiResponse: The validated instance.
+        """
+        context = info.context or {}
+        duration_ms = context.get("video_duration_ms")
+        if duration_ms is not None:
+            buffer_ms = context.get("validation_buffer_ms", 2000)
+            self.validate_against_duration(duration_ms, buffer_ms)
+        return self
+
+    def validate_against_duration(self, duration_ms: int, buffer_ms: int = 2000) -> "SubtitleAiResponse":
         """Validates that no subtitle end timestamp exceeds the video duration + buffer.
 
         Args:
-            video_duration_ms (int): The duration of the video in milliseconds.
+            duration_ms (int): The duration of the video in milliseconds.
             buffer_ms (int): The allowed buffer in milliseconds.
+
+        Returns:
+            SubtitleAiResponse: The validated instance.
 
         Raises:
             ValueError: If a subtitle end timestamp is too far beyond the duration.
         """
-        limit_ms = video_duration_ms + buffer_ms
+        limit_ms = duration_ms + buffer_ms
         for i, sub in enumerate(self.subtitles):
             end_ms = _parse_timestamp_string_ms(sub.end)
             if end_ms > limit_ms:
                 raise ValueError(
-                    f"Subtitle {i} end time ({sub.end}) exceeds video duration ({video_duration_ms}ms) "
-                    f"by more than {buffer_ms}ms."
+                    f"Subtitle {i} end time ({sub.end}) exceeds video duration "
+                    f"({_format_ms_timestamp(duration_ms)}) by more than {buffer_ms}ms."
                 )
+        return self
 
 
 class Scene(BaseModel):
@@ -347,28 +416,45 @@ class LyricsSceneAiResponse(BaseModel):
     global_summary: str
     scenes: list[Scene] = Field(description="A list of chronological scenes detected in the video segment.")
 
-    def validate_against_duration(self, video_duration_ms: int, buffer_ms: int = 1000) -> None:
+    @model_validator(mode="after")
+    def _validate_against_duration_validator(self, info: ValidationInfo) -> "LyricsSceneAiResponse":
+        """Internal validator to trigger duration checks via Pydantic AI context.
+
+        Args:
+            info (ValidationInfo): The validation context.
+
+        Returns:
+            LyricsSceneAiResponse: The validated instance.
+        """
+        context = info.context or {}
+        duration_ms = context.get("video_duration_ms")
+        if duration_ms is not None:
+            buffer_ms = context.get("validation_buffer_ms", 2000)
+            self.validate_against_duration(duration_ms, buffer_ms)
+        return self
+
+    def validate_against_duration(self, duration_ms: int, buffer_ms: int = 2000) -> "LyricsSceneAiResponse":
         """Validates that no scene end timestamp exceeds the video duration + buffer.
 
         Args:
-            video_duration_ms (int): The duration of the video in milliseconds.
+            duration_ms (int): The duration of the video in milliseconds.
             buffer_ms (int): The allowed buffer in milliseconds.
+
+        Returns:
+            LyricsSceneAiResponse: The validated instance.
 
         Raises:
             ValueError: If a scene end timestamp is too far beyond the duration.
         """
-        limit_ms = video_duration_ms + buffer_ms
+        limit_ms = duration_ms + buffer_ms
         for i, scene in enumerate(self.scenes):
             end_ms = _parse_timestamp_string_ms(scene.end)
             if end_ms > limit_ms:
-                duration_minutes = video_duration_ms // 60000
-                duration_seconds = (video_duration_ms % 60000) // 1000
-                duration_remaining_ms = video_duration_ms % 1000
-                duration_formatted = f"{duration_minutes:02d}:{duration_seconds:02d}.{duration_remaining_ms:03d}"
                 raise ValueError(
-                    f"Scene {i} end time ({scene.end}) exceeds video duration ({duration_formatted}) "
-                    f"by more than {buffer_ms}ms."
+                    f"Scene {i} end time ({scene.end}) exceeds video duration "
+                    f"({_format_ms_timestamp(duration_ms)}) by more than {buffer_ms}ms."
                 )
+        return self
 
 
 # ==============================================================================
@@ -433,7 +519,7 @@ class LyricsSceneJob(Job):
         description="The structured AI response after successful processing.",
     )
     lyrics_prompt_version: Optional[int] = Field(
-        default=None,
+        default_factory=_get_default_lyrics_version,
         description="The version of the prompt used to generate the response, for cache validation.",
     )
 
@@ -448,7 +534,7 @@ class LyricsSceneJob(Job):
             LyricsSceneJob: The validated job instance.
         """
         if self.response:
-            buffer_ms = info.context.get("validation_buffer_ms", 1000) if info.context else 1000
+            buffer_ms = info.context.get("validation_buffer_ms", 2000) if info.context else 2000
             self.response.validate_against_duration(self.video_duration_ms, buffer_ms)
         return self
 
@@ -501,7 +587,7 @@ class SubtitleJob(Job):
         description="The structured AI response after successful processing.",
     )
     subtitles_prompt_version: Optional[int] = Field(
-        default=None,
+        default_factory=_get_default_subtitles_version,
         description="The version of the prompt used to generate the response, for cache validation.",
     )
 
@@ -516,7 +602,7 @@ class SubtitleJob(Job):
             SubtitleJob: The validated job instance.
         """
         if self.response:
-            buffer_ms = info.context.get("validation_buffer_ms", 1000) if info.context else 1000
+            buffer_ms = info.context.get("validation_buffer_ms", 2000) if info.context else 2000
             self.response.validate_against_duration(self.video_duration_ms, buffer_ms)
         return self
 

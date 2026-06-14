@@ -217,7 +217,6 @@ class LyricsSceneJobRunner(JobRunner):
             LyricsSceneAiResponse,
         )
         if response:
-            response.validate_against_duration(lyrics_job.video_duration_ms, self.settings.ai.validation_buffer_ms)
             lyrics_job.response = response
 
     async def post_process(self, job: SegmentJobs) -> None:
@@ -228,8 +227,6 @@ class LyricsSceneJobRunner(JobRunner):
         """
         lyrics_job = job.lyrics
         assert lyrics_job is not None
-        if lyrics_job.response:
-            lyrics_job.lyrics_prompt_version = LYRICS_PROMPT_VERSION
 
         job_state_path = self.settings.dir.tmp / f"{lyrics_job.name}.lyrics.{self.sanitized_model_name}.json"
         await asyncio.to_thread(lyrics_job.save, job_state_path)
@@ -285,7 +282,6 @@ class SubtitleJobRunner(JobRunner):
             SubtitleAiResponse,
         )
         if response:
-            response.validate_against_duration(subtitle_job.video_duration_ms, self.settings.ai.validation_buffer_ms)
             subtitle_job.response = response
 
     async def post_process(self, job: SegmentJobs) -> None:
@@ -300,9 +296,6 @@ class SubtitleJobRunner(JobRunner):
         # Save the completed job state to a JSON file for persistence.
         subtitle_job = job.subtitles
         assert subtitle_job is not None
-
-        if subtitle_job.response is not None:
-            subtitle_job.subtitles_prompt_version = SUBTITLES_PROMPT_VERSION
 
         # Always save the job state to persist retry counts across runs.
         job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.sanitized_model_name}.json"
@@ -705,7 +698,6 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     if existing_lyrics:
                         if existing_lyrics.response:
                             new_lyrics_job.response = existing_lyrics.response
-                            new_lyrics_job.lyrics_prompt_version = existing_lyrics.lyrics_prompt_version
 
                     job.lyrics = new_lyrics_job
                     if scene_detection_runner:
@@ -723,7 +715,6 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     if existing_subs:
                         if existing_subs.response:
                             new_subs_job.response = existing_subs.response
-                            new_subs_job.subtitles_prompt_version = existing_subs.subtitles_prompt_version
 
                     job.subtitles = new_subs_job
                     if subtitle_runner:
