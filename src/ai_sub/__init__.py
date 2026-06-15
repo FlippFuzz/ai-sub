@@ -13,7 +13,7 @@ from .config import (
     WebSearchSettings,
 )
 from .data_models import AiSubResult
-from .main import ai_sub
+from .main import TqdmWriteWrapper, ai_sub
 from .prompt import LYRICS_PROMPT_VERSION, SUBTITLES_PROMPT_VERSION
 
 __all__ = [
@@ -28,6 +28,7 @@ __all__ = [
     "ThreadSettings",
     "WebSearchSettings",
     "AiSubResult",
+    "TqdmWriteWrapper",
     "ai_sub",
     "LYRICS_PROMPT_VERSION",
     "SUBTITLES_PROMPT_VERSION",

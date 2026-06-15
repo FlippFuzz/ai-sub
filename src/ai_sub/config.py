@@ -373,6 +373,10 @@ class LoggingSettings(BaseSettings):
         description="Whether to scrub sensitive data from logs.",
         default=True,
     )
+    progress_bars: bool = Field(
+        description="Whether to display progress bars in the console.",
+        default=True,
+    )
     progress_bar_width: PositiveInt = Field(
         description="Fixed width for progress bars (in characters).",
         default=80,

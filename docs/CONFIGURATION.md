@@ -84,5 +84,6 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | `--log.level <level>`                        | The minimum log level to display.                                         | `info`  |
 | `--log.timestamps <bool>`                    | Whether to include timestamps in the console output.                      | `False` |
 | `--log.scrub <bool>`                         | Whether to scrub sensitive data from logs.                                | `True`  |
+| `--log.progress-bars <bool>`                 | Whether to display progress bars in the console.                          | `True`  |
 | `--log.progress-bar-width <int>`             | Fixed width for progress bars (in characters).                            | `80`    |
 | `--log.progress-bar-refresh-seconds <float>` | Interval in seconds to refresh progress bars to handle terminal resizing. | `1.0`   |

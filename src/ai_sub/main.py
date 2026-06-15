@@ -444,30 +444,54 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
     """
     if configure_logging:
-        # Configure Logfire for observability. This setup includes a console logger
-        # and another configuration to instrument libraries like Pydantic AI and HTTPX
-        # without sending their logs to the console.
-        logfire.configure(
-            console=logfire.ConsoleOptions(
-                output=cast(TextIO, TqdmWriteWrapper()),
-                min_log_level=settings.log.level,
-                include_timestamps=settings.log.timestamps,
-            ),
-            service_name=socket.gethostname(),
-            service_version=version("ai-sub"),
-            send_to_logfire="if-token-present",
-            # Logfire scrubs by default (None). We pass False to disable it if configured.
-            scrubbing=None if settings.log.scrub else False,
-        )
-        no_console_logfire = logfire.configure(
-            local=True,
-            console=False,
-            send_to_logfire="if-token-present",
-            # Logfire scrubs by default (None). We pass False to disable it if configured.
-            scrubbing=None if settings.log.scrub else False,
-        )
-        no_console_logfire.instrument_pydantic_ai()
-        no_console_logfire.instrument_httpx(capture_all=True)
+        _setup_internal_logging(settings)
+
+    input_video_path = cast(Path, settings.input_video_file)
+
+    with logfire.span(
+        "ai_sub_pipeline",
+        video_file=input_video_path.name,
+        lyrics_enabled=settings.thread.lyrics > 0,
+    ):
+        return await _run_ai_sub_pipeline(settings)
+
+
+def _setup_internal_logging(settings: Settings) -> None:
+    """Sets up default Logfire configuration for standalone execution."""
+    # Use TqdmWriteWrapper only if bars are enabled to prevent unnecessary interception
+    output = cast(TextIO, TqdmWriteWrapper()) if settings.log.progress_bars else None
+    logfire.configure(
+        console=logfire.ConsoleOptions(
+            output=output,
+            min_log_level=settings.log.level,
+            include_timestamps=settings.log.timestamps,
+        ),
+        service_name=socket.gethostname(),
+        service_version=version("ai-sub"),
+        send_to_logfire="if-token-present",
+        scrubbing=None if settings.log.scrub else False,
+    )
+    no_console_logfire = logfire.configure(
+        local=True,
+        console=False,
+        send_to_logfire="if-token-present",
+        scrubbing=None if settings.log.scrub else False,
+    )
+    no_console_logfire.instrument_pydantic_ai()
+    no_console_logfire.instrument_httpx(capture_all=True)
+
+
+async def _run_ai_sub_pipeline(settings: Settings) -> AiSubResult:
+    """Internal logic for the subtitle generation pipeline.
+
+    Args:
+        settings (Settings): The application configuration.
+
+    Returns:
+        AiSubResult: An enum indicating the final status (COMPLETE, INCOMPLETE, etc.).
+    """
+    # Move the bulk of the logic from the old ai_sub function here
+    # (Initializers, Agents, splitting, and the main splitting loop)
 
     if settings.split.re_encode.enabled and not settings.split.re_encode.encoder:
         with logfire.span("Detecting hardware encoder"):
@@ -512,6 +536,8 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
         async def refresh_bars_loop():
             """Periodically refreshes bars to handle window resizing during long waits."""
+            if not settings.log.progress_bars:
+                return
             try:
                 while True:
                     await asyncio.sleep(settings.log.progress_bar_refresh_seconds)
@@ -522,7 +548,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                 pass
 
         def mark_done(stage: str):
-            if stage in bars:
+            if settings.log.progress_bars and stage in bars:
                 bars[stage].update(1)
 
         # Determine stage visibility
@@ -532,6 +558,8 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
         use_upload = (is_google_sub or is_google_scene) and settings.ai.google.use_files_api
 
         def create_bars(total: int):
+            if not settings.log.progress_bars:
+                return
             # leave=True ensures bars stay in place when finished, preventing vertical shifts.
             # dynamic_ncols is set to False to prevent layout corruption in VS Code/PuTTY;
             # we use a fixed ncols value defined in the configuration instead.
