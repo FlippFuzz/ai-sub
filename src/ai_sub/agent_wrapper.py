@@ -141,7 +141,7 @@ class RateLimitedAgentWrapper:
         self.model_name = model_name
         self.use_web_search = use_web_search
         self._quota_exceeded = False
-        self.deps = deps or AgentDeps()
+        self.deps = deps or AgentDeps(validation_buffer_ms=settings.ai.validation_buffer_ms)
 
         self.request_limiter = limiter_factory.create_inmemory_limiter(
             rate_per_duration=self.settings.ai.rpm, duration=Duration.MINUTE

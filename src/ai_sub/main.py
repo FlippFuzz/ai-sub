@@ -481,7 +481,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
     use_langsearch = settings.ai.search.web_search_tool == "langsearch" and use_lyrics
 
     async with AsyncExitStack() as stack:
-        agent_deps = AgentDeps()
+        agent_deps = AgentDeps(validation_buffer_ms=settings.ai.validation_buffer_ms)
         if use_ollama_search or use_langsearch:
             provider = "ollama" if use_ollama_search else "langsearch"
             search_deps = WebSearchDeps(settings.ai.search, provider=provider)

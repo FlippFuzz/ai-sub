@@ -196,7 +196,7 @@ class AgentDeps(BaseModel):
     request_tokens: int = 0
 
     video_duration_ms: NonNegativeInt = 0
-    validation_buffer_ms: NonNegativeInt = 2000
+    validation_buffer_ms: NonNegativeInt
 
     web_search: WebSearchDeps | None = None
     """Web-search dependency (:class:`WebSearchDeps`), or ``None``."""
@@ -311,12 +311,12 @@ class SubtitleAiResponse(BaseModel):
         """
         context = info.context or {}
         duration_ms = context.get("video_duration_ms")
-        if duration_ms is not None:
-            buffer_ms = context.get("validation_buffer_ms", 2000)
+        if duration_ms is not None and "validation_buffer_ms" in context:
+            buffer_ms = context["validation_buffer_ms"]
             self.validate_against_duration(duration_ms, buffer_ms)
         return self
 
-    def validate_against_duration(self, duration_ms: int, buffer_ms: int = 2000) -> "SubtitleAiResponse":
+    def validate_against_duration(self, duration_ms: int, buffer_ms: int) -> "SubtitleAiResponse":
         """Validates that no subtitle end timestamp exceeds the video duration + buffer.
 
         Args:
@@ -428,12 +428,12 @@ class LyricsSceneAiResponse(BaseModel):
         """
         context = info.context or {}
         duration_ms = context.get("video_duration_ms")
-        if duration_ms is not None:
-            buffer_ms = context.get("validation_buffer_ms", 2000)
+        if duration_ms is not None and "validation_buffer_ms" in context:
+            buffer_ms = context["validation_buffer_ms"]
             self.validate_against_duration(duration_ms, buffer_ms)
         return self
 
-    def validate_against_duration(self, duration_ms: int, buffer_ms: int = 2000) -> "LyricsSceneAiResponse":
+    def validate_against_duration(self, duration_ms: int, buffer_ms: int) -> "LyricsSceneAiResponse":
         """Validates that no scene end timestamp exceeds the video duration + buffer.
 
         Args:
@@ -533,13 +533,13 @@ class LyricsSceneJob(Job):
         Returns:
             LyricsSceneJob: The validated job instance.
         """
-        if self.response:
-            buffer_ms = info.context.get("validation_buffer_ms", 2000) if info.context else 2000
+        if self.response and info.context and "validation_buffer_ms" in info.context:
+            buffer_ms = info.context["validation_buffer_ms"]
             self.response.validate_against_duration(self.video_duration_ms, buffer_ms)
         return self
 
     @classmethod
-    def load(cls, save_path: Path, validation_buffer_ms: int = 1000) -> Optional["LyricsSceneJob"]:
+    def load(cls, save_path: Path, validation_buffer_ms: int) -> Optional["LyricsSceneJob"]:
         """Loads the job from a JSON file, checking for prompt version mismatch.
 
         Args:
@@ -601,13 +601,13 @@ class SubtitleJob(Job):
         Returns:
             SubtitleJob: The validated job instance.
         """
-        if self.response:
-            buffer_ms = info.context.get("validation_buffer_ms", 2000) if info.context else 2000
+        if self.response and info.context and "validation_buffer_ms" in info.context:
+            buffer_ms = info.context["validation_buffer_ms"]
             self.response.validate_against_duration(self.video_duration_ms, buffer_ms)
         return self
 
     @classmethod
-    def load(cls, save_path: Path, validation_buffer_ms: int = 1000) -> Optional["SubtitleJob"]:
+    def load(cls, save_path: Path, validation_buffer_ms: int) -> Optional["SubtitleJob"]:
         """Loads the job from a JSON file, checking for prompt version mismatch.
 
         Args:
