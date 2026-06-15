@@ -415,6 +415,31 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
         return AiSubResult.COMPLETE
 
 
+def _setup_internal_logging(settings: Settings) -> None:
+    """Sets up default Logfire configuration for standalone execution."""
+    # Use TqdmWriteWrapper only if bars are enabled to prevent unnecessary interception
+    output = cast(TextIO, TqdmWriteWrapper()) if settings.log.progress_bars else None
+    logfire.configure(
+        console=logfire.ConsoleOptions(
+            output=output,
+            min_log_level=settings.log.level,
+            include_timestamps=settings.log.timestamps,
+        ),
+        service_name=socket.gethostname(),
+        service_version=version("ai-sub"),
+        send_to_logfire="if-token-present",
+        scrubbing=None if settings.log.scrub else False,
+    )
+    no_console_logfire = logfire.configure(
+        local=True,
+        console=False,
+        send_to_logfire="if-token-present",
+        scrubbing=None if settings.log.scrub else False,
+    )
+    no_console_logfire.instrument_pydantic_ai()
+    no_console_logfire.instrument_httpx(capture_all=True)
+
+
 async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubResult:
     """Orchestrates the subtitle generation pipeline.
 
@@ -448,148 +473,101 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
     input_video_path = cast(Path, settings.input_video_file)
 
-    with logfire.span(
-        "ai_sub_pipeline",
-        video_file=input_video_path.name,
-        lyrics_enabled=settings.thread.lyrics > 0,
-    ):
-        return await _run_ai_sub_pipeline(settings)
+    # Start the main application logic within a Logfire span for better tracing.
+    with logfire.span("Generating subtitles for {video_file}", video_file=input_video_path.name):
+        if settings.split.re_encode.enabled and not settings.split.re_encode.encoder:
+            with logfire.span("Detecting hardware encoder"):
+                settings.split.re_encode.encoder = await get_working_encoder()
+                logfire.info(f"Using encoder: {settings.split.re_encode.encoder}")
 
+        # Initialize the AI Agent.
+        # A custom wrapper is used to make handling rate limits and differences in models more cleanly
+        use_lyrics = settings.thread.lyrics > 0
+        use_ollama_search = settings.ai.search.web_search_tool == "ollama" and use_lyrics
+        use_langsearch = settings.ai.search.web_search_tool == "langsearch" and use_lyrics
 
-def _setup_internal_logging(settings: Settings) -> None:
-    """Sets up default Logfire configuration for standalone execution."""
-    # Use TqdmWriteWrapper only if bars are enabled to prevent unnecessary interception
-    output = cast(TextIO, TqdmWriteWrapper()) if settings.log.progress_bars else None
-    logfire.configure(
-        console=logfire.ConsoleOptions(
-            output=output,
-            min_log_level=settings.log.level,
-            include_timestamps=settings.log.timestamps,
-        ),
-        service_name=socket.gethostname(),
-        service_version=version("ai-sub"),
-        send_to_logfire="if-token-present",
-        scrubbing=None if settings.log.scrub else False,
-    )
-    no_console_logfire = logfire.configure(
-        local=True,
-        console=False,
-        send_to_logfire="if-token-present",
-        scrubbing=None if settings.log.scrub else False,
-    )
-    no_console_logfire.instrument_pydantic_ai()
-    no_console_logfire.instrument_httpx(capture_all=True)
+        async with AsyncExitStack() as stack:
+            agent_deps = AgentDeps(validation_buffer_ms=settings.ai.validation_buffer_ms)
+            if use_ollama_search or use_langsearch:
+                provider = "ollama" if use_ollama_search else "langsearch"
+                search_deps = WebSearchDeps(settings.ai.search, provider=provider)
+                await stack.enter_async_context(search_deps)
+                agent_deps.web_search = search_deps
 
-
-async def _run_ai_sub_pipeline(settings: Settings) -> AiSubResult:
-    """Internal logic for the subtitle generation pipeline.
-
-    Args:
-        settings (Settings): The application configuration.
-
-    Returns:
-        AiSubResult: An enum indicating the final status (COMPLETE, INCOMPLETE, etc.).
-    """
-    # Move the bulk of the logic from the old ai_sub function here
-    # (Initializers, Agents, splitting, and the main splitting loop)
-
-    if settings.split.re_encode.enabled and not settings.split.re_encode.encoder:
-        with logfire.span("Detecting hardware encoder"):
-            settings.split.re_encode.encoder = await get_working_encoder()
-            logfire.info(f"Using encoder: {settings.split.re_encode.encoder}")
-
-    # Initialize the AI Agent.
-    # A custom wrapper is used to make handling rate limits and differences in models more cleanly
-    use_lyrics = settings.thread.lyrics > 0
-    use_ollama_search = settings.ai.search.web_search_tool == "ollama" and use_lyrics
-    use_langsearch = settings.ai.search.web_search_tool == "langsearch" and use_lyrics
-
-    async with AsyncExitStack() as stack:
-        agent_deps = AgentDeps(validation_buffer_ms=settings.ai.validation_buffer_ms)
-        if use_ollama_search or use_langsearch:
-            provider = "ollama" if use_ollama_search else "langsearch"
-            search_deps = WebSearchDeps(settings.ai.search, provider=provider)
-            await stack.enter_async_context(search_deps)
-            agent_deps.web_search = search_deps
-
-        agent_subtitles = await stack.enter_async_context(
-            RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
-        )
-        agent_scene = (
-            await stack.enter_async_context(
-                RateLimitedAgentWrapper(
-                    settings,
-                    settings.ai.model_lyrics,
-                    use_web_search=True,
-                    deps=agent_deps,
-                )
+            agent_subtitles = await stack.enter_async_context(
+                RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
             )
-            if use_lyrics
-            else None
-        )
+            agent_scene = (
+                await stack.enter_async_context(
+                    RateLimitedAgentWrapper(
+                        settings,
+                        settings.ai.model_lyrics,
+                        use_web_search=True,
+                        deps=agent_deps,
+                    )
+                )
+                if use_lyrics
+                else None
+            )
 
-        sanitized_lyrics_model = settings.ai.get_sanitized_model_name(settings.ai.model_lyrics)
-        sanitized_subtitles_model = settings.ai.get_sanitized_model_name(settings.ai.model_subtitles)
+            sanitized_lyrics_model = settings.ai.get_sanitized_model_name(settings.ai.model_lyrics)
+            sanitized_subtitles_model = settings.ai.get_sanitized_model_name(settings.ai.model_subtitles)
 
-        # Initialize progress bars and a background task to handle UI refreshes (resizing)
-        bars: dict[str, Any] = {}
+            # Initialize progress bars and a background task to handle UI refreshes (resizing)
+            bars: dict[str, Any] = {}
 
-        async def refresh_bars_loop():
-            """Periodically refreshes bars to handle window resizing during long waits."""
-            if not settings.log.progress_bars:
-                return
-            try:
-                while True:
-                    await asyncio.sleep(settings.log.progress_bar_refresh_seconds)
-                    with tqdm.get_lock():
-                        for bar in list(bars.values()):
-                            bar.refresh()
-            except asyncio.CancelledError:
-                pass
+            async def refresh_bars_loop():
+                """Periodically refreshes bars to handle window resizing during long waits."""
+                if not settings.log.progress_bars:
+                    return
+                try:
+                    while True:
+                        await asyncio.sleep(settings.log.progress_bar_refresh_seconds)
+                        with tqdm.get_lock():
+                            for bar in list(bars.values()):
+                                bar.refresh()
+                except asyncio.CancelledError:
+                    pass
 
-        def mark_done(stage: str):
-            if settings.log.progress_bars and stage in bars:
-                bars[stage].update(1)
+            def mark_done(stage: str):
+                if settings.log.progress_bars and stage in bars:
+                    bars[stage].update(1)
 
-        # Determine stage visibility
-        use_reencode = settings.split.re_encode.enabled
-        is_google_sub = agent_subtitles.is_google()
-        is_google_scene = agent_scene.is_google() if agent_scene else False
-        use_upload = (is_google_sub or is_google_scene) and settings.ai.google.use_files_api
+            # Determine stage visibility
+            use_reencode = settings.split.re_encode.enabled
+            is_google_sub = agent_subtitles.is_google()
+            is_google_scene = agent_scene.is_google() if agent_scene else False
+            use_upload = (is_google_sub or is_google_scene) and settings.ai.google.use_files_api
 
-        def create_bars(total: int):
-            if not settings.log.progress_bars:
-                return
-            # leave=True ensures bars stay in place when finished, preventing vertical shifts.
-            # dynamic_ncols is set to False to prevent layout corruption in VS Code/PuTTY;
-            # we use a fixed ncols value defined in the configuration instead.
-            common_kwargs: dict[str, Any] = {
-                "total": total,
-                "unit": "part",
-                "leave": True,
-                "dynamic_ncols": False,
-                "ncols": settings.log.progress_bar_width,
-                "bar_format": "{desc:<9}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}",
-            }
-            if use_reencode:
-                bars["reencode"] = tqdm(desc="Reencodes", position=len(bars), **common_kwargs)
-            if use_upload:
-                bars["upload"] = tqdm(desc="Uploads", position=len(bars), **common_kwargs)
-            if use_lyrics:
-                bars["lyrics"] = tqdm(desc="Lyrics", position=len(bars), **common_kwargs)
-            bars["subtitles"] = tqdm(desc="Subtitles", position=len(bars), **common_kwargs)
+            def create_bars(total: int):
+                if not settings.log.progress_bars:
+                    return
+                # leave=True ensures bars stay in place when finished, preventing vertical shifts.
+                # dynamic_ncols is set to False to prevent layout corruption in VS Code/PuTTY;
+                # we use a fixed ncols value defined in the configuration instead.
+                common_kwargs: dict[str, Any] = {
+                    "total": total,
+                    "unit": "part",
+                    "leave": True,
+                    "dynamic_ncols": False,
+                    "ncols": settings.log.progress_bar_width,
+                    "bar_format": "{desc:<9}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}",
+                }
+                if use_reencode:
+                    bars["reencode"] = tqdm(desc="Reencodes", position=len(bars), **common_kwargs)
+                if use_upload:
+                    bars["upload"] = tqdm(desc="Uploads", position=len(bars), **common_kwargs)
+                if use_lyrics:
+                    bars["lyrics"] = tqdm(desc="Lyrics", position=len(bars), **common_kwargs)
+                bars["subtitles"] = tqdm(desc="Subtitles", position=len(bars), **common_kwargs)
 
-        # Helper to sync progress when skipping stages
-        def sync_progress(entry_stage: str):
-            for s in ["reencode", "upload", "lyrics", "subtitles"]:
-                if s == entry_stage:
-                    break
-                mark_done(s)
+            # Helper to sync progress when skipping stages
+            def sync_progress(entry_stage: str):
+                for s in ["reencode", "upload", "lyrics", "subtitles"]:
+                    if s == entry_stage:
+                        break
+                    mark_done(s)
 
-        input_video_path = cast(Path, settings.input_video_file)
-
-        # Start the main application logic within a Logfire span for better tracing.
-        with logfire.span(f"Generating subtitles for {input_video_path.name}"):
             # Step 1: Split the input video into smaller segments.
             video_splits_paths = await split_video(
                 input_video_path,
