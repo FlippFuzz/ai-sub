@@ -6,3 +6,4 @@ pydantic-settings
 pyrate-limiter
 json_repair
 ruff
+tqdm
