@@ -14,7 +14,7 @@ from google.genai.types import (
     HarmCategory,
     ThinkingConfigDict,
 )
-from httpx import HTTPStatusError
+from httpx import HTTPStatusError, TransportError
 from pydantic import BaseModel
 from pydantic_ai import Agent, BinaryContent, ModelRequestContext, RunContext, WebSearchTool
 from pydantic_ai.capabilities import AbstractCapability, Hooks, NativeTool
@@ -362,7 +362,13 @@ class RateLimitedAgentWrapper:
             try:
                 result = await self.agent.run(user_prompt=user_prompt, output_type=response_type, deps=deps)
                 return result.output
-            except (ModelHTTPError, ConnectionError, asyncio.TimeoutError) as e:
+            except (
+                ModelHTTPError,
+                HTTPStatusError,
+                TransportError,
+                ConnectionError,
+                asyncio.TimeoutError,
+            ) as e:
                 # 1. Check for hard daily quota (terminal)
                 if _is_free_tier_quota_exceeded(e):
                     self._quota_exceeded = True
@@ -371,9 +377,10 @@ class RateLimitedAgentWrapper:
 
                 # 2. Determine if the error is retryable (transient)
                 is_retryable = False
-                if isinstance(e, ModelHTTPError):
+                if isinstance(e, (ModelHTTPError, HTTPStatusError)):
+                    status_code = e.status_code if isinstance(e, ModelHTTPError) else e.response.status_code
                     # Transient status codes
-                    is_retryable = e.status_code in (429, 502, 503, 504)
+                    is_retryable = status_code in (429, 502, 503, 504)
                 else:
                     # Network level errors (Connection, Timeout)
                     is_retryable = True
