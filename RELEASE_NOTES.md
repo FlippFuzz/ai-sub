@@ -1,5 +1,26 @@
 # AI Sub Release Notes
 
+## v3.0.0
+
+This major release introduces a completely overhauled retry engine for improved resilience, interactive progress bars for better visibility into long-running tasks, and enhanced library integration for developers.
+
+**New Features:**
+
+- **Interactive Progress Bars:** Integrated `tqdm` to provide real-time status for re-encoding, file uploads, lyrics research, and subtitle generation. Includes new settings to toggle bars (`--log.progress-bars`) and adjust UI refresh rates.
+- **Advanced Resilience & Retry Engine:**
+  - **Multi-Layered Logic:** Re-engineered the retry system to differentiate between transient network errors (using exponential backoff with jitter) and terminal errors like Google Free Tier quota exhaustion.
+  - **Persisted Attempt Tracking:** Job attempts are now tracked independently per stage and saved to disk. This ensures that retry limits are strictly enforced across application restarts, preventing infinite loops on problematic segments.
+- **Enhanced Library Integration:**
+  - Exposed `setup_logging` as part of the public API for programmatic configuration of telemetry and console output.
+  - Exported `TqdmWriteWrapper` to allow external applications to correctly route logs while progress bars are active.
+
+**Fixes & Improvements:**
+
+- **Improved Stage Independence:** Fixed a bug where a "max retries exceeded" state in the lyrics stage would block subtitle generation even if lyrics processing was disabled.
+- **Documentation Alignment:** Synchronized `CONFIGURATION.md` and `README.md` with the latest configuration flags and model naming conventions (e.g., transitioning examples to `gemini-3.5-flash`).
+
+---
+
 ## v2.10.0b1
 
 This release removes support for the `gemini-cli` backend due to upcoming service changes by Google and includes a fix for millisecond timestamp parsing to improve timing accuracy.

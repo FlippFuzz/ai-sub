@@ -11,6 +11,7 @@ import json
 import socket
 import sys
 from contextlib import AsyncExitStack
+from datetime import datetime
 from functools import partial
 from importlib.metadata import version
 from pathlib import Path
@@ -40,7 +41,6 @@ from ai_sub.job_runner import JobRunner
 # Resolve forward references in AgentDeps now that all modules are loaded.
 # This prevents PydanticUserError when AgentDeps is instantiated.
 from ai_sub.prompt import (
-    LYRICS_PROMPT_VERSION,
     SUBTITLES_PROMPT_VERSION,
     get_lyrics_scenes_prompt,
     get_subtitle_prompt,
@@ -396,7 +396,7 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
         )
         state_info = {
             "ai_sub_version": version("ai-sub"),
-            "lyrics_prompt_version": LYRICS_PROMPT_VERSION,
+            "generated_at": datetime.now().isoformat(),
             "subtitles_prompt_version": SUBTITLES_PROMPT_VERSION,
             "complete": complete,
             "max_retries_exceeded": max_retries_exceeded,
