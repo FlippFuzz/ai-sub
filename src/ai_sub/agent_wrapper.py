@@ -358,7 +358,7 @@ class RateLimitedAgentWrapper:
         )
 
         # Execute the AI agent to generate subtitles and get a structured response.
-        for attempt in range(self.settings.retry.per_run):
+        for attempt in range(self.settings.retry.per_run + 1):
             try:
                 result = await self.agent.run(user_prompt=user_prompt, output_type=response_type, deps=deps)
                 return result.output
@@ -378,13 +378,10 @@ class RateLimitedAgentWrapper:
                     # Network level errors (Connection, Timeout)
                     is_retryable = True
 
-                if is_retryable and attempt < self.settings.retry.per_run - 1:
+                if is_retryable and attempt < self.settings.retry.per_run:
                     backoff = min(
                         self.settings.retry.max_wait_seconds,
-                        max(
-                            self.settings.retry.min_wait_seconds,
-                            self.settings.retry.multiplier**attempt,
-                        )
+                        (self.settings.retry.min_wait_seconds * (self.settings.retry.multiplier**attempt))
                         + random.uniform(0, 1),
                     )
                     logfire.info(
