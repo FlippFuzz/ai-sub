@@ -23,7 +23,7 @@ from pysubs2 import SSAEvent, SSAFile
 from tqdm.auto import tqdm
 
 from ai_sub.agent_wrapper import RateLimitedAgentWrapper
-from ai_sub.config import Settings
+from ai_sub.config import LoggingSettings, Settings
 from ai_sub.data_models import (
     AgentDeps,
     AiSubResult,
@@ -420,26 +420,28 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
         return AiSubResult.COMPLETE
 
 
-def setup_logging(settings: Settings) -> None:
+def setup_logging(settings: Settings | LoggingSettings) -> None:
     """Sets up default Logfire configuration for standalone execution."""
+    log_settings = settings.log if isinstance(settings, Settings) else settings
+
     # Use TqdmWriteWrapper only if bars are enabled to prevent unnecessary interception
-    output = cast(TextIO, TqdmWriteWrapper()) if settings.log.progress_bars else None
+    output = cast(TextIO, TqdmWriteWrapper()) if log_settings.progress_bars else None
     logfire.configure(
         console=logfire.ConsoleOptions(
             output=output,
-            min_log_level=settings.log.level,
-            include_timestamps=settings.log.timestamps,
+            min_log_level=log_settings.level,
+            include_timestamps=log_settings.timestamps,
         ),
         service_name=socket.gethostname(),
         service_version=version("ai-sub"),
         send_to_logfire="if-token-present",
-        scrubbing=None if settings.log.scrub else False,
+        scrubbing=None if log_settings.scrub else False,
     )
     no_console_logfire = logfire.configure(
         local=True,
         console=False,
         send_to_logfire="if-token-present",
-        scrubbing=None if settings.log.scrub else False,
+        scrubbing=None if log_settings.scrub else False,
     )
     no_console_logfire.instrument_pydantic_ai()
     no_console_logfire.instrument_httpx(capture_all=True)
