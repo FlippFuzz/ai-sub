@@ -169,11 +169,6 @@ class AiSettings(BaseSettings):
     )
     rpm: PositiveInt = Field(description="Maximum Requests Per Minute (RPM) for the AI model provider.", default=4)
     tpm: PositiveInt = Field(description="Maximum Tokens Per Minute (TPM) for the AI model provider.", default=250000)
-    timeout: PositiveFloat = Field(
-        description="The timeout in seconds for AI model HTTP requests. "
-        "This must be at least 10s for Google Gemini models to avoid 'deadline too short' errors.",
-        default=300.0,
-    )
     google: GoogleAiSettings = Field(
         description="Settings that only apply to the Google AI model.",
         default_factory=GoogleAiSettings,
@@ -349,6 +344,10 @@ class RetrySettings(BaseSettings):
     multiplier: PositiveFloat = Field(
         description="The multiplier for exponential backoff between retries.",
         default=2.0,
+    )
+    min_wait_seconds: PositiveFloat = Field(
+        description="The minimum wait time in seconds (lower bound) for a retry attempt.",
+        default=30.0,
     )
     max_wait_seconds: PositiveInt = Field(
         description="The maximum wait time in seconds (upper bound) for a single retry attempt.",
