@@ -366,9 +366,11 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
 
                 # Check status
                 sub_attempts = job.total_attempts if job else 0
-                lyrics_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{sanitized_lyrics_model}.json"
-                lyrics_job = LyricsSceneJob.load(lyrics_path, settings.ai.validation_buffer_ms)
-                lyrics_attempts = lyrics_job.total_attempts if lyrics_job else 0
+                lyrics_attempts = 0
+                if settings.thread.lyrics > 0:
+                    lyrics_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{sanitized_lyrics_model}.json"
+                    lyrics_job = LyricsSceneJob.load(lyrics_path, settings.ai.validation_buffer_ms)
+                    lyrics_attempts = lyrics_job.total_attempts if lyrics_job else 0
 
                 if sub_attempts >= settings.retry.max_runs or lyrics_attempts >= settings.retry.max_runs:
                     max_retries_exceeded = True
