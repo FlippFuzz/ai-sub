@@ -420,7 +420,7 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
         return AiSubResult.COMPLETE
 
 
-def _setup_internal_logging(settings: Settings) -> None:
+def setup_logging(settings: Settings) -> None:
     """Sets up default Logfire configuration for standalone execution."""
     # Use TqdmWriteWrapper only if bars are enabled to prevent unnecessary interception
     output = cast(TextIO, TqdmWriteWrapper()) if settings.log.progress_bars else None
@@ -474,7 +474,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
 
     """
     if configure_logging:
-        _setup_internal_logging(settings)
+        setup_logging(settings)
 
     input_video_path = cast(Path, settings.input_video_file)
 
