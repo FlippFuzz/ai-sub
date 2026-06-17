@@ -1,5 +1,15 @@
 # AI Sub Release Notes
 
+## v3.0.1
+
+This patch release improves the flexibility of the logging configuration for developers.
+
+**Fixes & Improvements:**
+
+- **Flexible Logging Configuration:** Updated `setup_logging` to accept either the full `Settings` object or just the `LoggingSettings` sub-model. This makes it easier to configure logging programmatically when not using the full CLI configuration suite.
+
+---
+
 ## v3.0.0
 
 This major release introduces a completely overhauled retry engine for improved resilience, interactive progress bars for better visibility into long-running tasks, and enhanced library integration for developers.
