@@ -144,7 +144,7 @@ class JobRunner:
                         current_job.total_attempts += 1
 
                     except QuotaExceededError:
-                        logfire.warning(f"Quota exceeded for {self.name} job '{current_job.name}'.")
+                        logfire.warning(f"Free tier daily quota exceeded for {self.name} job '{current_job.name}'.")
 
                     except Exception:
                         # Failure: increment the attempt counter

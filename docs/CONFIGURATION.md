@@ -11,7 +11,6 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | `--ai.model-lyrics <model>`       | The AI model for lyrics research and scene detection.                                                                                                   | `google-gla:gemini-3.1-flash-lite` |
 | `--ai.rpm <int>`                  | Maximum Requests Per Minute (RPM) for the AI model provider.                                                                                            | `4`                                |
 | `--ai.tpm <int>`                  | Maximum Tokens Per Minute (TPM) for the AI model provider.                                                                                              | `250000`                           |
-| `--ai.timeout <float>`            | The timeout in seconds for AI model HTTP requests. Must be at least 10s for Google Gemini models.                                                       | `300.0`                            |
 | `--ai.validation-buffer-ms <int>` | The allowed buffer in milliseconds for AI-generated timestamps to exceed the video duration.                                                            | `2000`                             |
 
 ### Google AI Settings (`--ai.google.*`)
@@ -70,12 +69,13 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ## Retry Settings (`--retry.*`)
 
-| Argument                         | Description                                                                                          | Default |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------- | ------- |
-| `--retry.per-run <int>`          | Maximum internal retries by the AI agent per request to handle transient API errors.                 | `5`     |
-| `--retry.multiplier <float>`     | The multiplier for exponential backoff between retries.                                              | `2.0`   |
-| `--retry.max-runs <int>`         | Total attempt limit for a segment stage across all application runs. Attempts are tracked per stage. | `3`     |
-| `--retry.max-wait-seconds <int>` | The maximum wait time in seconds (upper bound) for a single retry attempt.                           | `300`   |
+| Argument                           | Description                                                                                          | Default |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------- | ------- |
+| `--retry.per-run <int>`            | Maximum internal retries by the AI agent per request to handle transient API errors.                 | `5`     |
+| `--retry.multiplier <float>`       | The multiplier for exponential backoff between retries.                                              | `2.0`   |
+| `--retry.max-runs <int>`           | Total attempt limit for a segment stage across all application runs. Attempts are tracked per stage. | `3`     |
+| `--retry.min-wait-seconds <float>` | The minimum wait time in seconds (lower bound) for a retry attempt.                                  | `30.0`  |
+| `--retry.max-wait-seconds <int>`   | The maximum wait time in seconds (upper bound) for a single retry attempt.                           | `300`   |
 
 ## Logging Settings (`--log.*`)
 

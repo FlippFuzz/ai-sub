@@ -340,6 +340,7 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
 
         complete = True
         max_retries_exceeded = False
+        any_pending = False
 
         for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
             # Load the job result from the temporary JSON file.
@@ -363,11 +364,7 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
                 )
                 complete = False
 
-            # Add the duration of the current segment to the offset for the next one.
-            offset_ms += video_duration_ms
-
-            # Check if this segment is incomplete specifically because it hit the retry limit.
-            if not job or not job.response:
+                # Check status
                 sub_attempts = job.total_attempts if job else 0
                 lyrics_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{sanitized_lyrics_model}.json"
                 lyrics_job = LyricsSceneJob.load(lyrics_path, settings.ai.validation_buffer_ms)
@@ -375,6 +372,11 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
 
                 if sub_attempts >= settings.retry.max_runs or lyrics_attempts >= settings.retry.max_runs:
                     max_retries_exceeded = True
+                else:
+                    any_pending = True
+
+            # Add the duration of the current segment to the offset for the next one.
+            offset_ms += video_duration_ms
 
         # Insert version and config, as a single SSAEvent at the beginning (0-1ms)
         # JSON curly braces {} are treated as formatting codes in SRT, so replace them.
@@ -396,6 +398,7 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
             "subtitles_prompt_version": SUBTITLES_PROMPT_VERSION,
             "complete": complete,
             "max_retries_exceeded": max_retries_exceeded,
+            "any_pending": any_pending,
             "settings": settings_dict,
         }
         info_text = json.dumps(state_info, indent=2).replace("{", "(").replace("}", ")")
@@ -408,10 +411,10 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
         input_video_path = cast(Path, settings.input_video_file)
         all_subtitles.save(str(settings.dir.out / f"{input_video_path.stem}.{sanitized_subtitles_model}.srt"))
 
+        if any_pending:
+            return AiSubResult.INCOMPLETE
         if max_retries_exceeded:
             return AiSubResult.MAX_RETRIES_EXHAUSTED
-        elif not complete:
-            return AiSubResult.INCOMPLETE
         return AiSubResult.COMPLETE
 
 
@@ -494,17 +497,13 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                 await stack.enter_async_context(search_deps)
                 agent_deps.web_search = search_deps
 
-            agent_subtitles = await stack.enter_async_context(
-                RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
-            )
+            agent_subtitles = RateLimitedAgentWrapper(settings, settings.ai.model_subtitles)
             agent_scene = (
-                await stack.enter_async_context(
-                    RateLimitedAgentWrapper(
-                        settings,
-                        settings.ai.model_lyrics,
-                        use_web_search=True,
-                        deps=agent_deps,
-                    )
+                RateLimitedAgentWrapper(
+                    settings,
+                    settings.ai.model_lyrics,
+                    use_web_search=True,
+                    deps=agent_deps,
                 )
                 if use_lyrics
                 else None
