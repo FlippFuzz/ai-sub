@@ -310,6 +310,8 @@ class RateLimitedAgentWrapper:
         Raises:
             QuotaExceededError: If the model's quota has been exhausted.
             ModelHTTPError: If the AI provider returns an HTTP error other than quota exhaustion.
+            HTTPStatusError: If the HTTP request fails with a status error.
+            TransportError: If a transport error occurs during the HTTP request.
             ConnectionError: If a network connection error occurs.
             asyncio.TimeoutError: If the request times out.
             RuntimeError: If the retry limit is reached or the agent fails to execute the loop.
