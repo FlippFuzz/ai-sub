@@ -1,5 +1,21 @@
 # AI Sub Release Notes
 
+## v3.0.2
+
+This release enhances the video re-encoding process with stricter FPS verification and improves configuration flexibility for video processing.
+
+**New Features:**
+
+- **FPS Verification:** Added `get_video_fps` to retrieve video framerate using `ffprobe` and updated `reencode_video` to validate both duration and FPS for existing output files, including tolerance logic for low FPS files.
+- **Decimal FPS Support:** Updated `ReEncodeSettings.fps` and `ReEncodingJob.fps` to support `PositiveFloat` values. `reencode_video` was updated to handle float FPS and ensure GOP size calculation remains compatible. Updated `docs/CONFIGURATION.md` to reflect the new float type and updated the default value to `1.0`.
+
+**Fixes & Improvements:**
+
+- **Improved Validation Logging:** Enhanced error logging when existing file validation fails.
+- **Documentation:** Added `HTTPStatusError` and `TransportError` to the 'Raises' section of the `RateLimitedAgentWrapper.run` docstring to resolve Ruff linting warnings.
+
+---
+
 ## v3.0.1
 
 This patch release improves the flexibility of the logging configuration for developers.
