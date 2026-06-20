@@ -68,6 +68,41 @@ async def get_video_duration_ms(video_path: Path) -> int:
         raise RuntimeError(f"Could not determine duration for video file: {video_path.name}") from e
 
 
+async def get_video_fps(video_path: Path) -> float:
+    """Retrieves the frame rate of a video file.
+
+    Args:
+        video_path (Path): The path to the video file.
+
+    Returns:
+        float: The frame rate of the video.
+
+    Raises:
+        RuntimeError: If the fps cannot be determined.
+    """
+    static_ffmpeg.add_paths(weak=True)
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ]
+        stdout = await _run_ffmpeg(cmd)
+        # Parse "numerator/denominator"
+        num, den = map(int, stdout.strip().split("/"))
+        return num / den
+    except (subprocess.CalledProcessError, ValueError, ZeroDivisionError) as e:
+        logfire.exception(f"Could not determine FPS for {video_path.name}")
+        raise RuntimeError(f"Could not determine FPS for video file: {video_path.name}") from e
+
+
 async def get_working_encoder() -> str:
     """Checks for available hardware acceleration for H.264 encoding.
 
@@ -226,8 +261,9 @@ async def reencode_video(
 ) -> None:
     """Re-encodes a video file to a specific format.
 
-    If the output file already exists, its duration is compared to the input file.
-    If the difference is within the specified tolerance, re-encoding is skipped.
+    If the output file already exists, its duration and FPS are compared to the input file
+    and target requirements. If the differences are within the specified tolerance,
+    re-encoding is skipped.
 
     Args:
         input_path (Path): The path to the input video file.
@@ -244,29 +280,41 @@ async def reencode_video(
         subprocess.CalledProcessError: If the FFmpeg re-encode command fails.
 
     """
-    # If output file already exists, verify validity by comparing duration with input
+    # If output file already exists, verify validity by comparing duration and fps with input
     if output_path.exists():
         try:
-            input_duration, output_duration = await asyncio.gather(
+            input_duration, output_duration, output_fps = await asyncio.gather(
                 get_video_duration_ms(input_path),
                 get_video_duration_ms(output_path),
+                get_video_fps(output_path),
             )
 
             # Allow tolerance for container overhead/frame rounding
-            if abs(input_duration - output_duration) < duration_tolerance_ms:
+            # If FPS is very low, increase tolerance because FFmpeg pads to GOP
+            effective_tolerance = duration_tolerance_ms
+            if fps < 1.0:
+                effective_tolerance += int(1000 / fps)
+
+            duration_match = abs(input_duration - output_duration) < effective_tolerance
+            # Small tolerance for float fps comparison
+            fps_match = abs(fps - output_fps) < 0.01
+
+            if duration_match and fps_match:
                 logfire.info(
                     f"Skipping re-encode for {input_path.name} as {output_path.name} "
-                    "already exists and has a valid duration."
+                    "already exists and has valid duration and fps."
                 )
                 return
 
             logfire.info(
                 f"Re-encoding {input_path.name}. "
-                f"Existing output duration ({output_duration}ms) mismatches input ({input_duration}ms)."
+                f"Existing output duration ({output_duration}ms) mismatches input ({input_duration}ms) "
+                f"or fps ({output_fps}) mismatches target ({fps})."
             )
-        except Exception:
+        except Exception as e:
             logfire.warning(
-                f"Re-encoding {input_path.name}. Could not verify duration of existing output file {output_path.name}."
+                f"Re-encoding {input_path.name}. "
+                f"Could not verify duration or fps of existing output file {output_path.name}: {e}"
             )
 
     static_ffmpeg.add_paths(weak=True)
