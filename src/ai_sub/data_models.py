@@ -15,6 +15,7 @@ from pydantic import (
     ConfigDict,
     Field,
     NonNegativeInt,
+    PositiveFloat,
     PositiveInt,
     ValidationError,
     ValidationInfo,
@@ -494,7 +495,7 @@ class ReEncodingJob(Job):
 
     input_file: Path = Field(description="Path to the original video segment.")
     output_file: Path = Field(description="Path where the re-encoded video will be saved.")
-    fps: PositiveInt = Field(description="Target frames per second for the re-encoded video.")
+    fps: PositiveFloat = Field(description="Target frames per second for the re-encoded video.")
     height: PositiveInt = Field(description="Target height (resolution) for the re-encoded video.")
     bitrate_kb: PositiveInt = Field(description="Target bitrate in kilobytes per second.")
     duration_tolerance_ms: NonNegativeInt = Field(

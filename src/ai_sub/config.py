@@ -222,9 +222,9 @@ class ReEncodeSettings(BaseSettings):
         description="Re-encode the video chunks to save bandwidth.",
         default=False,
     )
-    fps: PositiveInt = Field(
+    fps: PositiveFloat = Field(
         description="The target framerate (FPS) to re-encode the video segments to.",
-        default=1,
+        default=1.0,
     )
     height: PositiveInt = Field(
         description="The target height (resolution) to re-encode to. Aspect ratio is preserved.",

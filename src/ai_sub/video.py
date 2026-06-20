@@ -218,7 +218,7 @@ async def split_video(
 async def reencode_video(
     input_path: Path,
     output_path: Path,
-    fps: int,
+    fps: float,
     height: int,
     bitrate_kb: int,
     encoder: str,
@@ -232,7 +232,7 @@ async def reencode_video(
     Args:
         input_path (Path): The path to the input video file.
         output_path (Path): The path where the re-encoded video will be saved.
-        fps (int): The target framerate.
+        fps (float): The target framerate.
         height (int): The target height (resolution).
         bitrate_kb (int): The target bitrate in KB/s.
         encoder (str): The encoder to use.
@@ -282,7 +282,7 @@ async def reencode_video(
         "-c:v",
         encoder,
         "-g",
-        str(fps * 10),
+        str(int(fps * 10)),
         "-b:v",
         str(video_bytes_per_sec * 8),
         "-maxrate",

@@ -44,7 +44,7 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | Argument                                        | Description                                                                                                            | Default                |
 | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- | ---------------------- |
 | `--split.re-encode.enabled <bool>`              | Re-encode the video chunks to save bandwidth.                                                                          | `False`                |
-| `--split.re-encode.fps <int>`                   | The target framerate (FPS) to re-encode the video segments to.                                                         | `1`                    |
+| `--split.re-encode.fps <float>`                 | The target framerate (FPS) to re-encode the video segments to.                                                         | `1.0`                  |
 | `--split.re-encode.height <int>`                | The target height (resolution) to re-encode to. Aspect ratio is preserved.                                             | `360`                  |
 | `--split.re-encode.bitrate-kb <int>`            | The target bitrate in Kilobytes per second (KB/s) for the re-encoded video.                                            | `35`                   |
 | `--split.re-encode.threshold-mb <int>`          | The threshold in MB for re-encoding. Files smaller than this will not be re-encoded. Set to 0 to re-encode everything. | `20`                   |
