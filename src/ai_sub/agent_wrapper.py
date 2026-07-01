@@ -165,6 +165,9 @@ class RateLimitedAgentWrapper:
 
         Returns:
             Agent: The configured Pydantic AI Agent.
+
+        Raises:
+            ValueError: If the Google AI API key is missing.
         """
         function_tools = []
 
@@ -205,10 +208,13 @@ class RateLimitedAgentWrapper:
                     "thinking_budget": 24576,
                 }
 
+            if self.settings.ai.google.key is None:
+                raise ValueError("Google AI API key is missing.")
+
             model = GoogleModel(
                 model_str,
                 provider=GoogleProvider(
-                    api_key=(self.settings.ai.google.key.get_secret_value() if self.settings.ai.google.key else None),
+                    api_key=self.settings.ai.google.key.get_secret_value(),
                     http_client=None,
                     base_url=(str(self.settings.ai.google.base_url) if self.settings.ai.google.base_url else None),
                 ),
