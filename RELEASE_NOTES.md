@@ -1,5 +1,16 @@
 # AI Sub Release Notes
 
+## v3.0.3
+
+This release refines the subtitle generation prompt for strict audio grounding and adds essential API key validation for improved runtime safety.
+
+**Fixes & Improvements:**
+
+- **Strict Audio Grounding:** Bumped [`SUBTITLES_PROMPT_VERSION`](src/ai_sub/prompt.py) to 16. The prompt now enforces strict audio grounding, prioritizing audio as the supreme source of truth, replacing "timestamp" with "timecode" throughout, and strengthening anti-hallucination rules regarding reference JSON mismatches.
+- **Google AI API Key Validation:** Added missing validation to ensure the Google AI API key is present before creating the `GoogleModel` provider, improving runtime safety. Updated `_create_agent` docstring to include the raised `ValueError`.
+
+---
+
 ## v3.0.2
 
 This release enhances the video re-encoding process with stricter FPS verification and improves configuration flexibility for video processing.
