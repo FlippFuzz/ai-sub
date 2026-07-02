@@ -132,7 +132,7 @@ def get_lyrics_scenes_prompt() -> str:
 # ==========================================
 # SUBTITLES GENERATION
 # ==========================================
-SUBTITLES_PROMPT_VERSION = 15
+SUBTITLES_PROMPT_VERSION = 16
 
 _SUBTITLES_PROMPT_TEMPLATE = dedent(
     """
@@ -142,31 +142,30 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
     
     ### THE GOLDEN RULE: TWO SUBTITLE TRIGGERS (AUDIO & VISUAL)
     You must strictly separate the task of *timing* from the task of *transcription*. A subtitle block is triggered by ONLY two things:
-    1. **VOCAL EVENTS (The Audio Rule):** The vocal audio waveform is your absolute ground truth for spoken dialogue. The exact millisecond a vocal cord activates dictates the `s` (start) timestamp. NEVER output dialogue text if there is no vocal audio driving it.
+    1. **VOCAL EVENTS (The Audio Rule):** The vocal audio waveform is your absolute ground truth for spoken dialogue. The exact millisecond a vocal cord activates dictates the `s` (start) timecode. NEVER output dialogue text if there is no vocal audio driving it.
     2. **VISUAL EVENTS (The On-Screen Text Exception):** If prominent, relevant text (e.g., Chapter Titles, Location Signs, Letters) appears on screen, subtitle it for the duration it is clearly visible, **even if there is no audio.**
 
     ### DECODING HIERARCHY (FOR VOCAL EVENTS)
     When transcribing spoken audio (Trigger 1), if the vocals are slurred, fast, or ambiguous, use this fallback hierarchy to determine the correct intended words:
     1. **Primary Fallback (Burnt-in Subs/Lyrics):** Hardcoded subtitles or on-screen lyrics that correspond to the audio are your most reliable guide for correct spelling and strictly override everything else.
     2. **Secondary Fallback (Scene Context):** Visual actions, character emotions, and environments (e.g., rain, night) provide powerful context clues.
-    3. **Tertiary Fallback (Reference JSON):** Use the provided Reference JSON to figure out the intended word. 
-    4. **The Manual Transcription Mandate:** If the Reference JSON is null, incomplete, or deviates from the audio, YOU ARE NOT EXEMPT. You MUST manually transcribe and translate the remaining vocals using your native audio perception. 
+    3. **Tertiary Fallback (Auxiliary Reference JSON):** Use the provided Reference JSON ONLY as an auxiliary spelling reference.
+    4. **The Manual Transcription Mandate:** If the Auxiliary Reference is null, incomplete, or deviates from the audio, YOU ARE NOT EXEMPT. You MUST manually transcribe and translate the remaining vocals using your native audio perception. 
 
-    ### HANDLING THE LYRICS REFERENCE (ANTI-HALLUCINATION)
-    The Reference JSON is web-scraped and may be incomplete or incorrect. Apply these strict safety rules:
-    *   **The Disambiguation Rule:** If audio sounds like phonetic fragments (e.g., "pa-re..."), but the JSON/Text says "パレード" (parade), output the full intended word, NOT the fragments.
-    *   **Strict Boundaries:** Respect the `start` and `end` times of the scenes in the Reference JSON. Do not apply Scene 2's lyrics to Scene 1's audio.
-    *   **Mismatch / Wrong Song:** If the audio clearly differs from the JSON, ignore the JSON entirely.
-    *   **JSON is Longer than Video:** Stop subtitling exactly when the vocals in the video stop. Do not hallucinate the rest of the song.
-    *   **Video is Longer than JSON:** Do not stop subtitling. Switch to 100% manual transcription for the remainder of the video. Subtitle 100% of the audible vocals.
-    *   **Ghost Subtitles:** Remain SILENT during pure instrumental music, long pauses, or sound effects. Output nothing if no vocals are present (unless triggered by a prominent Visual Event).
+    ### STRICT GROUNDING: HANDLING AUXILIARY REFERENCE LYRICS (ANTI-HALLUCINATION MANDATE)
+    The provided Reference JSON contains web-scraped lyrics meant solely as an auxiliary guide for song spelling and composition. **It is NOT a script.**
+    *   **AUDIO IS SUPREME:** If the performer stops singing to talk, if the background music goes silent, or if they sing a different verse, melody, or song, YOU MUST IGNORE the reference JSON entirely for that duration.
+    *   **NO PRE-EMPTIVE PASTING:** Never blindly copy, paste, or assume reference lyrics. If the vocal audio does not match the reference lyrics, do not force them into the subtitles.
+    *   **Mismatch / Wrong Song:** If the audio clearly differs from the reference JSON, ignore the JSON entirely and perform 100% manual transcription of what is actually heard.
+    *   **Zero Ghost Subtitles:** Remain SILENT during pure instrumental music, long pauses, or sound effects. If no vocals are heard in the audio track, output nothing (unless there is a prominent Visual Event). Do not use reference lyrics to fill silent gaps.
+    *   **Video is Longer than Reference:** Switch immediately to 100% manual transcription for the remainder of the video. Subtitle 100% of the audible vocals.
 
-    ### TIMESTAMPS & SOLVING "CASCADING DELAYS"
+    ### TIMECODES & SOLVING "CASCADING DELAYS"
     AI models frequently suffer from "Cascading Delays" (subtitles falling behind audio). **OVERRIDE THIS BIAS USING THESE STRICT MECHANICAL RULES:**
-    *   **Rule 1 - The Sacred Start Time:** The `s` (start) timestamp is immutable. It MUST trigger the exact millisecond the word is spoken. Never delay a start time to accommodate a previous long subtitle.
-    *   **Rule 2 - Truncation Over Extension:** If Line 1 is spoken, and Line 2 begins immediately after, Line 1's `e` timestamp MUST be aggressively truncated to make room for Line 2's `s` timestamp. 
+    *   **Rule 1 - The Sacred Start Timecode:** The `s` (start) timecode is immutable. It MUST trigger the exact millisecond the word is spoken in the audio track. Never delay a start timecode to accommodate a previous long subtitle block.
+    *   **Rule 2 - Truncation Over Extension:** If Line 1 is spoken, and Line 2 begins immediately after, Line 1's `e` timecode MUST be aggressively truncated to make room for Line 2's `s` timecode. 
     *   **Rule 3 - Instantaneous Transitions:** In rapid speech with no breaths, Line 1's `e` MUST EXACTLY EQUAL Line 2's `s` (e.g., Line 1 `e`: 01:05.500 -> Line 2 `s`: 01:05.500). 
-    *   **Rule 4 - Timecode Format:** MUST strictly adhere to `MM:SS.mmm` (e.g., `01:05.300`). Always pad with zeros.
+    *   **Rule 4 - Timecode Format:** MUST strictly adhere to `MM:SS.mmm` (e.g., `01:05.300`). Always pad with zeros. Always ensure timecodes represent the actual time of occurrence in the audio.
 
     ### SEGMENTATION, PAUSES & TRANSLATION
     *   **Max Length:** Limit each subtitle block to 50 characters per line. Group phrases logically.
@@ -181,7 +180,7 @@ _SUBTITLES_PROMPT_TEMPLATE = dedent(
     **Example 1: Resolving Ambiguous Audio with Text/JSON**
     ```json
     {
-      "global_analysis": "1. JSON Match: Audio phonetics ('pa-re') were ambiguous but matched JSON intended word ('パレード'). 2. JSON Usage: Fully utilized for disambiguation. 3. Timing & Pacing: Normal pacing, timing strictly anchored to audio vocalizations.",
+      "global_analysis": "1. JSON Match: Audio phonetics ('pa-re') were ambiguous but matched JSON intended word ('パレード'). 2. JSON Usage: Fully utilized for disambiguation. 3. Timing & Pacing: Normal pacing, timecodes strictly anchored to audio vocalizations.",
       "subs": [
         {
           "s": "00:10.000",
