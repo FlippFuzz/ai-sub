@@ -322,16 +322,17 @@ class SubtitleAiResponse(BaseModel):
         if first_start >= gap_threshold_ms:
             return True
 
-        # 2. Check gaps between consecutive subtitles
+        # 2. Check gaps between consecutive subtitles tracking max_end
+        max_end_ms = _parse_timestamp_string_ms(self.subtitles[0].end)
         for i in range(1, len(self.subtitles)):
-            prev_end = _parse_timestamp_string_ms(self.subtitles[i - 1].end)
             curr_start = _parse_timestamp_string_ms(self.subtitles[i].start)
-            if (curr_start - prev_end) >= gap_threshold_ms:
+            # A gap exists if the next start time is greater than the furthest end time seen so far
+            if (curr_start - max_end_ms) >= gap_threshold_ms:
                 return True
+            max_end_ms = max(max_end_ms, _parse_timestamp_string_ms(self.subtitles[i].end))
 
         # 3. Check gap at the very end (last subtitle end to video end)
-        last_end = _parse_timestamp_string_ms(self.subtitles[-1].end)
-        if (video_duration_ms - last_end) >= gap_threshold_ms:
+        if (video_duration_ms - max_end_ms) >= gap_threshold_ms:
             return True
 
         return False

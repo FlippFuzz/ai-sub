@@ -289,13 +289,14 @@ class SubtitleJobRunner(JobRunner):
                 )
                 await asyncio.to_thread(subtitle_job.save, job_state_path)
 
-        # 2. Check for ANY large gap and trigger a verification run if needed
+        # 2. Check for ANY large gap and trigger verification runs as needed
         gap_threshold_s = self.settings.ai.verification_gap_seconds
         gap_verification_retries = self.settings.ai.gap_verification_retries
-        if gap_verification_retries > 0 and not subtitle_job.is_complete(gap_threshold_s, gap_verification_retries):
+        while gap_verification_retries > 0 and not subtitle_job.is_complete(gap_threshold_s, gap_verification_retries):
+            attempt_num = len(subtitle_job.responses)
             logfire.warning(
                 f"Large gap(s) (>= {gap_threshold_s}s) detected in '{subtitle_job.name}'. "
-                f"Triggering verification re-run..."
+                f"Triggering verification re-run (attempt {attempt_num})..."
             )
 
             verification_prompt = get_verification_prompt(base_prompt, subtitle_job.video_duration_ms)
@@ -310,6 +311,14 @@ class SubtitleJobRunner(JobRunner):
             if new_response:
                 subtitle_job.response = new_response
                 logfire.info(f"Verification re-run completed for {subtitle_job.name}.")
+
+                # Checkpoint after each successful verification pass
+                job_state_path = (
+                    self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.sanitized_model_name}.json"
+                )
+                await asyncio.to_thread(subtitle_job.save, job_state_path)
+            else:
+                break
 
     async def post_process(self, job: SegmentJobs) -> None:
         """Saves the result (or partial state) to disk.
