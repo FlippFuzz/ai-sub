@@ -839,7 +839,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     sync_progress("done")
                     continue
 
-                if subtitle_job is not None and not is_complete:
+                if subtitle_job is not None:
                     if subtitle_job.response:
                         logfire.warning(
                             f"Large gap(s) (>= {settings.ai.verification_gap_seconds}s) detected in "
