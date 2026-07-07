@@ -1,5 +1,26 @@
 # AI Sub Release Notes
 
+### v3.1.0
+
+This release introduces a robust subtitle gap verification and multi-attempt tracking engine, significantly reducing the occurrence of large, untranscribed gaps in AI-generated subtitles.
+
+**New Features:**
+
+- **Dynamic Subtitle Gap Verification:** Introduced automated gap verification to detect and resolve unacceptably large gaps in AI-generated subtitles.
+  - Added [`verification_gap_seconds`](src/ai_sub/config.py) and [`gap_verification_retries`](src/ai_sub/config.py) settings to configure the gap threshold and the number of verification passes.
+  - The pipeline now automatically triggers re-generation attempts if gaps exceed the defined threshold.
+  - Added [`get_verification_prompt`](src/ai_sub/prompt.py) to guide the model through entire-segment regeneration during verification runs.
+- **Multi-Attempt Tracking:** [`SubtitleJob`](src/ai_sub/data_models.py) now stores a chronological list of responses (`responses`) to support sequential verification passes, while maintaining backwards compatibility via a property getter.
+
+**Fixes & Improvements:**
+
+- **Improved Gap Detection:** Refactored `SubtitleAiResponse.has_large_gaps` to track maximum end timestamps, preventing false-positive gap detections on overlapping segments.
+- **Robustness:** Added checkpointing after the initial generation and each subsequent verification pass to protect progress.
+- **Legacy Migration:** Added a model validator to automatically migrate legacy `response` fields to the new `responses` list format upon loading.
+- **Documentation:** Updated [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) with new verification settings.
+
+---
+
 ## v3.0.3
 
 This release refines the subtitle generation prompt for strict audio grounding and adds essential API key validation for improved runtime safety.
