@@ -300,6 +300,42 @@ class SubtitleAiResponse(BaseModel):
 
         return subtitles
 
+    def has_large_gaps(self, video_duration_ms: int, gap_threshold_s: int) -> bool:
+        """Checks if there are any gaps larger than the threshold in the subtitles.
+
+        Checks the gap between the segment start and the first subtitle, between all
+        consecutive subtitles, and between the last subtitle and the segment end.
+
+        Args:
+            video_duration_ms: The duration of the video in milliseconds.
+            gap_threshold_s: The threshold in seconds to consider a gap "large".
+
+        Returns:
+            True if a large gap is detected, False otherwise.
+        """
+        gap_threshold_ms = gap_threshold_s * 1000
+        if not self.subtitles:
+            return video_duration_ms >= gap_threshold_ms
+
+        # 1. Check gap at the very beginning (0 to first subtitle start)
+        first_start = _parse_timestamp_string_ms(self.subtitles[0].start)
+        if first_start >= gap_threshold_ms:
+            return True
+
+        # 2. Check gaps between consecutive subtitles
+        for i in range(1, len(self.subtitles)):
+            prev_end = _parse_timestamp_string_ms(self.subtitles[i - 1].end)
+            curr_start = _parse_timestamp_string_ms(self.subtitles[i].start)
+            if (curr_start - prev_end) >= gap_threshold_ms:
+                return True
+
+        # 3. Check gap at the very end (last subtitle end to video end)
+        last_end = _parse_timestamp_string_ms(self.subtitles[-1].end)
+        if (video_duration_ms - last_end) >= gap_threshold_ms:
+            return True
+
+        return False
+
     @model_validator(mode="after")
     def _validate_against_duration_validator(self, info: ValidationInfo) -> "SubtitleAiResponse":
         """Internal validator to trigger duration checks via Pydantic AI context.
@@ -583,14 +619,70 @@ class SubtitleJob(Job):
 
     file: Optional[File | Path] = Field(default=None, exclude=True)
     video_duration_ms: PositiveInt
-    response: Optional[SubtitleAiResponse] = Field(
-        default=None,
-        description="The structured AI response after successful processing.",
+    responses: list[SubtitleAiResponse] = Field(
+        default_factory=list,
+        description="The chronological list of subtitle responses generated during processing.",
     )
     subtitles_prompt_version: Optional[int] = Field(
         default_factory=_get_default_subtitles_version,
         description="The version of the prompt used to generate the response, for cache validation.",
     )
+
+    @property
+    def response(self) -> Optional[SubtitleAiResponse]:
+        """The active subtitle response (the last attempt)."""
+        return self.responses[-1] if self.responses else None
+
+    @response.setter
+    def response(self, value: Optional[SubtitleAiResponse]) -> None:
+        """Appends a new response to the attempt history."""
+        if value is not None:
+            self.responses.append(value)
+
+    def is_complete(self, gap_threshold_s: int, gap_verification_retries: int) -> bool:
+        """Checks if the subtitle job is complete and verified.
+
+        Args:
+            gap_threshold_s: The gap threshold in seconds.
+            gap_verification_retries: The maximum allowed verification attempts.
+
+        Returns:
+            True if complete and verified, False otherwise.
+        """
+        # If we don't even have an initial response, it's not complete.
+        if not self.response:
+            return False
+
+        # If gap verification is disabled (retries == 0), the first response makes it complete.
+        if gap_verification_retries <= 0:
+            return True
+
+        # If we have exceeded our allowed verification runs, it is complete.
+        if len(self.responses) > gap_verification_retries:
+            return True
+
+        # Otherwise, it's complete if it has no large gaps.
+        return not self.response.has_large_gaps(self.video_duration_ms, gap_threshold_s)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_fields(cls, data: Any) -> Any:
+        """Migrates legacy response field from older files.
+
+        Args:
+            data: The raw dictionary loaded from JSON.
+
+        Returns:
+            The updated dictionary with migrated keys.
+        """
+        if isinstance(data, dict):
+            # 1. Migrate legacy "response" to "responses" list
+            if "response" in data:
+                legacy_resp = data.pop("response")
+                if "responses" not in data:
+                    data["responses"] = [legacy_resp]
+
+        return data
 
     @model_validator(mode="after")
     def validate_response_timestamps(self, info: ValidationInfo) -> "SubtitleJob":

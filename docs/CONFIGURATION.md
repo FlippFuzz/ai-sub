@@ -4,14 +4,16 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ## AI Settings (`--ai.*`)
 
-| Argument                          | Description                                                                                                                                             | Default                            |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
-| `--ai.model <model>`              | A shorthand to set both `model_subtitles` and `model_lyrics` to the same value.                                                                         | `None`                             |
-| `--ai.model-subtitles <model>`    | The AI model for subtitle generation. Use 'google-gla:<model>' for Google models, 'openai:<model>' for OpenAI, or 'custom:<url>' for a custom endpoint. | `google-gla:gemini-3.5-flash`      |
-| `--ai.model-lyrics <model>`       | The AI model for lyrics research and scene detection.                                                                                                   | `google-gla:gemini-3.1-flash-lite` |
-| `--ai.rpm <int>`                  | Maximum Requests Per Minute (RPM) for the AI model provider.                                                                                            | `4`                                |
-| `--ai.tpm <int>`                  | Maximum Tokens Per Minute (TPM) for the AI model provider.                                                                                              | `250000`                           |
-| `--ai.validation-buffer-ms <int>` | The allowed buffer in milliseconds for AI-generated timestamps to exceed the video duration.                                                            | `2000`                             |
+| Argument                              | Description                                                                                                                                                                    | Default                            |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------- |
+| `--ai.model <model>`                  | A shorthand to set both `model_subtitles` and `model_lyrics` to the same value.                                                                                                | `None`                             |
+| `--ai.model-subtitles <model>`        | The AI model for subtitle generation. Use 'google-gla:<model>' for Google models, 'openai:<model>' for OpenAI, or 'custom:<url>' for a custom endpoint.                        | `google-gla:gemini-3.5-flash`      |
+| `--ai.model-lyrics <model>`           | The AI model for lyrics research and scene detection.                                                                                                                          | `google-gla:gemini-3.1-flash-lite` |
+| `--ai.rpm <int>`                      | Maximum Requests Per Minute (RPM) for the AI model provider.                                                                                                                   | `4`                                |
+| `--ai.tpm <int>`                      | Maximum Tokens Per Minute (TPM) for the AI model provider.                                                                                                                     | `250000`                           |
+| `--ai.validation-buffer-ms <int>`     | The allowed buffer in milliseconds for AI-generated timestamps to exceed the video duration.                                                                                   | `2000`                             |
+| `--ai.verification-gap-seconds <int>` | The maximum allowed gap duration in seconds between consecutive subtitles, or between the segment boundaries and the first/last subtitle, that triggers a verification re-run. | `60`                               |
+| `--ai.gap-verification-retries <int>` | The maximum number of verification passes/attempts to run for segments with large gaps. Set to 0 to disable gap verification entirely.                                         | `1`                                |
 
 ### Google AI Settings (`--ai.google.*`)
 

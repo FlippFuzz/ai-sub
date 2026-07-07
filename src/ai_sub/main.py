@@ -44,6 +44,7 @@ from ai_sub.prompt import (
     SUBTITLES_PROMPT_VERSION,
     get_lyrics_scenes_prompt,
     get_subtitle_prompt,
+    get_verification_prompt,
 )
 from ai_sub.video import (
     get_video_duration_ms,
@@ -266,23 +267,49 @@ class SubtitleJobRunner(JobRunner):
         """
         subtitle_job = job.subtitles
         assert subtitle_job is not None
-        if subtitle_job.response:
-            logfire.info(f"Skipping subtitle generation for {subtitle_job.name} as valid response exists.")
-            return
 
         lyrics_job = job.lyrics
         scene_response = lyrics_job.response if lyrics_job else None
+        base_prompt = get_subtitle_prompt(scene_response)
 
-        prompt = get_subtitle_prompt(scene_response)
-        assert subtitle_job.file is not None
-        response = await self.agent.run(
-            prompt,
-            subtitle_job.file,
-            subtitle_job.video_duration_ms,
-            SubtitleAiResponse,
-        )
-        if response:
-            subtitle_job.response = response
+        # 1. Run the initial subtitle generation if no response exists
+        if subtitle_job.response is None:
+            assert subtitle_job.file is not None
+            response = await self.agent.run(
+                base_prompt,
+                subtitle_job.file,
+                subtitle_job.video_duration_ms,
+                SubtitleAiResponse,
+            )
+            if response:
+                subtitle_job.response = response
+                # Explicitly checkpoint the initial pass before entering the verification block
+                job_state_path = (
+                    self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.sanitized_model_name}.json"
+                )
+                await asyncio.to_thread(subtitle_job.save, job_state_path)
+
+        # 2. Check for ANY large gap and trigger a verification run if needed
+        gap_threshold_s = self.settings.ai.verification_gap_seconds
+        gap_verification_retries = self.settings.ai.gap_verification_retries
+        if gap_verification_retries > 0 and not subtitle_job.is_complete(gap_threshold_s, gap_verification_retries):
+            logfire.warning(
+                f"Large gap(s) (>= {gap_threshold_s}s) detected in '{subtitle_job.name}'. "
+                f"Triggering verification re-run..."
+            )
+
+            verification_prompt = get_verification_prompt(base_prompt, subtitle_job.video_duration_ms)
+            assert subtitle_job.file is not None
+
+            new_response = await self.agent.run(
+                verification_prompt,
+                subtitle_job.file,
+                subtitle_job.video_duration_ms,
+                SubtitleAiResponse,
+            )
+            if new_response:
+                subtitle_job.response = new_response
+                logfire.info(f"Verification re-run completed for {subtitle_job.name}.")
 
     async def post_process(self, job: SegmentJobs) -> None:
         """Saves the result (or partial state) to disk.
@@ -677,9 +704,12 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     return
 
                 if next_stage == "subtitles" and job.subtitles and job.subtitles.response:
-                    # Subtitles already done for this segment
-                    mark_done("subtitles")
-                    return
+                    if job.subtitles.is_complete(
+                        settings.ai.verification_gap_seconds,
+                        settings.ai.gap_verification_retries,
+                    ):
+                        mark_done("subtitles")
+                        return
 
                 # Queue next job
                 if next_stage == "upload":
@@ -720,8 +750,7 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                         total_attempts=existing_subs.total_attempts if existing_subs else 0,
                     )
                     if existing_subs:
-                        if existing_subs.response:
-                            new_subs_job.response = existing_subs.response
+                        new_subs_job.responses = list(existing_subs.responses)
 
                     job.subtitles = new_subs_job
                     if subtitle_runner:
@@ -793,9 +822,20 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     job_state.subtitles = subtitle_job
 
                 # Check if the final stage (Subtitles) is already complete.
-                if subtitle_job and subtitle_job.response:
+                is_complete = subtitle_job is not None and subtitle_job.is_complete(
+                    settings.ai.verification_gap_seconds,
+                    settings.ai.gap_verification_retries,
+                )
+                if is_complete:
                     sync_progress("done")
                     continue
+
+                if subtitle_job is not None and not is_complete:
+                    if subtitle_job.response:
+                        logfire.warning(
+                            f"Large gap(s) (>= {settings.ai.verification_gap_seconds}s) detected in "
+                            f"'{split.stem}' from previous run. Triggering verification re-run..."
+                        )
 
                 # Determine the entry point for this segment.
                 # We check requirements in order: Re-encode -> Upload -> Lyrics -> Subtitles.
