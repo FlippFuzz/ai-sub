@@ -315,3 +315,25 @@ def get_subtitle_prompt(scene_response: LyricsSceneAiResponse | None) -> str:
     """
     scene_json = scene_response.model_dump_json(indent=2) if scene_response else "null"
     return f"{_SUBTITLES_PROMPT_TEMPLATE}\n{scene_json}\n```"
+
+
+def get_verification_prompt(base_prompt: str, video_duration_ms: int) -> str:
+    """Wraps the base subtitle prompt with strict verification instructions.
+
+    Args:
+        base_prompt: The original subtitle prompt.
+        video_duration_ms: The duration of the video segment in milliseconds.
+
+    Returns:
+        The full verification prompt.
+
+    """
+    duration_s = video_duration_ms / 1000.0
+    return (
+        f"{base_prompt}\n\n"
+        f"### CRITICAL REQUIREMENT (VERIFICATION RUN):\n"
+        f"In a previous attempt, your output contained unacceptably large gaps where audio was not transcribed. "  # noqa: E501
+        f"The quality of the previous generation is suspect.\n\n"
+        f"You MUST completely regenerate the subtitles for the ENTIRE video segment (total duration: {duration_s:.1f} seconds).\n"  # noqa: E501
+        f"Do not be lazy. Do not skip sections. Ensure every single vocal event from the very beginning to the very end is accurately transcribed."  # noqa: E501
+    )

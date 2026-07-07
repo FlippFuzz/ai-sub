@@ -181,6 +181,16 @@ class AiSettings(BaseSettings):
         description="The allowed buffer in milliseconds for AI-generated timestamps to exceed the video duration.",
         default=2000,
     )
+    verification_gap_seconds: PositiveInt = Field(
+        description="The maximum allowed gap duration in seconds between consecutive subtitles, "
+        "or between the segment boundaries and the first/last subtitle, that triggers a verification re-run.",
+        default=60,
+    )
+    gap_verification_retries: NonNegativeInt = Field(
+        description="The maximum number of verification passes/attempts to run for segments "
+        "with large gaps. Set to 0 to disable gap verification entirely.",
+        default=1,
+    )
 
     @model_validator(mode="after")
     def validate_models(self) -> "AiSettings":
