@@ -634,10 +634,9 @@ class SubtitleJob(Job):
         return self.responses[-1] if self.responses else None
 
     @response.setter
-    def response(self, value: Optional[SubtitleAiResponse]) -> None:
+    def response(self, value: SubtitleAiResponse) -> None:
         """Appends a new response to the attempt history."""
-        if value is not None:
-            self.responses.append(value)
+        self.responses.append(value)
 
     def is_complete(self, gap_threshold_s: int, gap_verification_retries: int) -> bool:
         """Checks if the subtitle job is complete and verified.
@@ -679,7 +678,7 @@ class SubtitleJob(Job):
             # 1. Migrate legacy "response" to "responses" list
             if "response" in data:
                 legacy_resp = data.pop("response")
-                if "responses" not in data:
+                if legacy_resp is not None and "responses" not in data:
                     data["responses"] = [legacy_resp]
 
         return data
