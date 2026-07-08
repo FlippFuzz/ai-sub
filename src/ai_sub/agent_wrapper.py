@@ -188,6 +188,17 @@ class RateLimitedAgentWrapper:
             else:
                 capabilities.append(NativeTool(WebSearchTool()))
 
+        agent_kwargs = {
+            "deps_type": AgentDeps,
+            "tools": function_tools,
+            "capabilities": capabilities,
+            "validation_context": lambda ctx: {
+                "video_duration_ms": ctx.deps.video_duration_ms,
+                "validation_buffer_ms": ctx.deps.validation_buffer_ms,
+            },
+            "retries": self.settings.retry.per_run,
+        }
+
         if self.is_google():
             model_str = self.model_name.split(":", 1)[-1]
             # Configure thinking levels for Google models
@@ -245,27 +256,13 @@ class RateLimitedAgentWrapper:
             agent = Agent(
                 model=model,
                 model_settings=google_model_settings,
-                deps_type=AgentDeps,
-                tools=function_tools,
-                capabilities=capabilities,
-                validation_context=lambda ctx: {
-                    "video_duration_ms": ctx.deps.video_duration_ms,
-                    "validation_buffer_ms": ctx.deps.validation_buffer_ms,
-                },
-                retries=self.settings.retry.per_run,
+                **agent_kwargs,
             )
         else:
             # For non-Google models
             agent = Agent(
                 model=self.model_name,
-                tools=function_tools,
-                capabilities=capabilities,
-                deps_type=AgentDeps,
-                validation_context=lambda ctx: {
-                    "video_duration_ms": ctx.deps.video_duration_ms,
-                    "validation_buffer_ms": ctx.deps.validation_buffer_ms,
-                },
-                retries=self.settings.retry.per_run,
+                **agent_kwargs,
             )
 
         # Register dynamic system prompt to get the system prompt text from AgentDeps
