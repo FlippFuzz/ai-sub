@@ -269,6 +269,10 @@ class SubtitleAiResponse(BaseModel):
 
     global_analysis: str = Field(description="A high-level analysis or summary from the AI about its process.")
     subtitles: list[Subtitles] = Field(alias="subs", description="A list of individual subtitle entries.")
+    thoughts: Optional[str] = Field(
+        default=None,
+        description="The AI model's internal thinking/reasoning process.",
+    )
 
     def get_ssafile(self) -> SSAFile:
         """Converts the response's subtitles into an SSAFile object.
@@ -455,6 +459,10 @@ class LyricsSceneAiResponse(BaseModel):
     step_by_step_log: str
     global_summary: str
     scenes: list[Scene] = Field(description="A list of chronological scenes detected in the video segment.")
+    thoughts: Optional[str] = Field(
+        default=None,
+        description="The AI model's internal thinking/reasoning process.",
+    )
 
     @model_validator(mode="after")
     def _validate_against_duration_validator(self, info: ValidationInfo) -> "LyricsSceneAiResponse":

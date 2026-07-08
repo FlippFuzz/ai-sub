@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from pydantic_ai import Agent, BinaryContent, ModelRequestContext, RunContext, WebSearchTool
 from pydantic_ai.capabilities import AbstractCapability, Hooks, NativeTool
 from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import DocumentUrl
+from pydantic_ai.messages import DocumentUrl, ModelResponse, ThinkingPart
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.providers.google import GoogleProvider
 from pyrate_limiter import Duration, limiter_factory
@@ -350,7 +350,19 @@ class RateLimitedAgentWrapper:
         for attempt in range(self.settings.retry.per_run + 1):
             try:
                 result = await self.agent.run(user_prompt=user_prompt, output_type=response_type, deps=deps)
-                return result.output
+                output = result.output
+
+                if hasattr(output, "thoughts"):
+                    thinking_parts = []
+                    for msg in result.new_messages():
+                        if isinstance(msg, ModelResponse):
+                            for part in msg.parts:
+                                if isinstance(part, ThinkingPart) and part.content:
+                                    thinking_parts.append(part.content)
+                    if thinking_parts:
+                        setattr(output, "thoughts", "\n".join(thinking_parts))
+
+                return output
             except (
                 ModelHTTPError,
                 HTTPStatusError,
