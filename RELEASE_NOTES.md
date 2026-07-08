@@ -1,5 +1,26 @@
 # AI Sub Release Notes
 
+### v3.2.0
+
+This release introduces a major structural overhaul of the prompt system, utilizing XML-based tags to improve AI instruction clarity and flexibility. It also adds support for capturing and surfacing the model's internal reasoning ("thoughts").
+
+**New Features:**
+
+- **Structured XML-Tagged Prompts:** Refactored all system and user prompts to utilize a structured XML format. This improves instruction grounding, enhances AI capability in complex workflows, and makes it easier to maintain and update prompt templates.
+- **Model Reasoning ("Thoughts") Support:** Added support for capturing and returning the AI model's internal "thinking" or reasoning process. This is now available in [`SubtitleAiResponse`](src/ai_sub/data_models.py) and [`LyricsSceneAiResponse`](src/ai_sub/data_models.py) objects as an optional `thoughts` field.
+
+**Fixes & Improvements:**
+
+- **Enhanced Contextual Generation:** Improved subtitle and verification generation to preserve better context when processing scene references and video inputs.
+- **Reasoning Capture:** Output handling has been updated to parse and store model reasoning (`ThinkingPart`) when available.
+
+**Refactoring & Chores:**
+
+- **Prompt Class Implementation:** Introduced a dedicated [`Prompt`](src/ai_sub/prompt.py) data model to cleanly separate and manage dynamic system and user instructions.
+- **Prompt Versions:** Bumped [`LYRICS_PROMPT_VERSION`](src/ai_sub/prompt.py) to 8 and [`SUBTITLES_PROMPT_VERSION`](src/ai_sub/prompt.py) to 17.
+
+---
+
 ### v3.1.0
 
 This release introduces a robust subtitle gap verification and multi-attempt tracking engine, significantly reducing the occurrence of large, untranscribed gaps in AI-generated subtitles.
