@@ -26,14 +26,15 @@ from pyrate_limiter import Duration, limiter_factory
 
 from ai_sub.config import Settings
 from ai_sub.data_models import AgentDeps, QuotaExceededError
+from ai_sub.prompt import Prompt
 from ai_sub.web_search_langsearch import web_search_langsearch_multi
 from ai_sub.web_search_ollama import web_search_ollama_multi
 
 T = TypeVar("T", bound=BaseModel)
 
 
-def _calculate_tokens(text: str, video_duration_ms: int) -> int:
-    """Estimates the number of tokens for a given text and video duration.
+def _calculate_tokens(text_prompt: Prompt, video_duration_ms: int) -> int:
+    """Estimates the number of tokens for a given text prompt and video duration.
 
     This is a rough estimation used for rate limiting purposes. The actual
     token count may vary depending on the model and tokenizer.
@@ -43,7 +44,7 @@ def _calculate_tokens(text: str, video_duration_ms: int) -> int:
     - Video: A fixed rate of tokens per second of video.
 
     Args:
-        text (str): The text prompt.
+        text_prompt (Prompt): The text prompt.
         video_duration_ms (int): The duration of the video in milliseconds.
 
     Returns:
@@ -51,7 +52,7 @@ def _calculate_tokens(text: str, video_duration_ms: int) -> int:
 
     """
     # TODO: Make this more accurate. This is just a rough estimation
-    return int(len(text) + (video_duration_ms / 1000) * 300)
+    return int(len(text_prompt.system_prompt) + len(text_prompt.user_prompt) + (video_duration_ms / 1000) * 300)
 
 
 def _is_free_tier_quota_exceeded(e: Exception) -> bool:
@@ -241,63 +242,42 @@ class RateLimitedAgentWrapper:
                 ],
             )
 
-            if function_tools:
-                agent = Agent(
-                    model=model,
-                    model_settings=google_model_settings,
-                    deps_type=AgentDeps,
-                    tools=function_tools,
-                    capabilities=capabilities,
-                    validation_context=lambda ctx: {
-                        "video_duration_ms": ctx.deps.video_duration_ms,
-                        "validation_buffer_ms": ctx.deps.validation_buffer_ms,
-                    },
-                    retries=self.settings.retry.per_run,
-                )
-            else:
-                agent = Agent(
-                    model,
-                    model_settings=google_model_settings,
-                    capabilities=capabilities,
-                    deps_type=AgentDeps,
-                    validation_context=lambda ctx: {
-                        "video_duration_ms": ctx.deps.video_duration_ms,
-                        "validation_buffer_ms": ctx.deps.validation_buffer_ms,
-                    },
-                    retries=self.settings.retry.per_run,
-                )
-
-            return agent
+            agent = Agent(
+                model=model,
+                model_settings=google_model_settings,
+                deps_type=AgentDeps,
+                tools=function_tools,
+                capabilities=capabilities,
+                validation_context=lambda ctx: {
+                    "video_duration_ms": ctx.deps.video_duration_ms,
+                    "validation_buffer_ms": ctx.deps.validation_buffer_ms,
+                },
+                retries=self.settings.retry.per_run,
+            )
         else:
-            # TODO: Do we need to enable thinking, etc for other models?
-            # For now, this is only tested to work against Google
-            if function_tools:
-                return Agent(
-                    model=self.model_name,
-                    tools=function_tools,
-                    capabilities=capabilities,
-                    deps_type=AgentDeps,
-                    validation_context=lambda ctx: {
-                        "video_duration_ms": ctx.deps.video_duration_ms,
-                        "validation_buffer_ms": ctx.deps.validation_buffer_ms,
-                    },
-                    retries=self.settings.retry.per_run,
-                )
-            else:
-                return Agent(
-                    model=self.model_name,
-                    capabilities=capabilities,
-                    deps_type=AgentDeps,
-                    validation_context=lambda ctx: {
-                        "video_duration_ms": ctx.deps.video_duration_ms,
-                        "validation_buffer_ms": ctx.deps.validation_buffer_ms,
-                    },
-                    retries=self.settings.retry.per_run,
-                )
+            # For non-Google models
+            agent = Agent(
+                model=self.model_name,
+                tools=function_tools,
+                capabilities=capabilities,
+                deps_type=AgentDeps,
+                validation_context=lambda ctx: {
+                    "video_duration_ms": ctx.deps.video_duration_ms,
+                    "validation_buffer_ms": ctx.deps.validation_buffer_ms,
+                },
+                retries=self.settings.retry.per_run,
+            )
+
+        # Register dynamic system prompt to get the system prompt text from AgentDeps
+        @agent.system_prompt
+        def get_dynamic_system_prompt(ctx: RunContext[AgentDeps]) -> str:
+            return ctx.deps.system_prompt
+
+        return agent
 
     async def run(
         self,
-        prompt: str,
+        prompt: Prompt,
         video: genai.types.File | Path,
         video_duration_ms: int,
         response_type: type[T],
@@ -305,7 +285,7 @@ class RateLimitedAgentWrapper:
         """Runs the AI agent to generate subtitles for the given video.
 
         Args:
-            prompt (str): The system prompt to guide the AI.
+            prompt (Prompt): The Prompt object guiding the AI (with system and user prompt strings).
             video (genai.types.File | Path): The video file (either a Google File object or a local Path).
             video_duration_ms (int): The duration of the video in milliseconds (used for token estimation).
             response_type (type[T]): The expected Pydantic model for the response.
@@ -334,14 +314,14 @@ class RateLimitedAgentWrapper:
                 uri = str(file.uri)
                 user_prompt = [
                     DocumentUrl(url=uri, media_type=file.mime_type),
-                    prompt,
+                    prompt.user_prompt,
                 ]
             else:
                 python_file = cast(Path, video)
                 data = await asyncio.to_thread(python_file.read_bytes)
                 user_prompt = [
                     BinaryContent(data=data, media_type=f"video/{python_file.suffix[1:]}"),
-                    prompt,
+                    prompt.user_prompt,
                 ]
         else:
             # For other models (e.g., OpenAI), we read the file into memory
@@ -351,7 +331,7 @@ class RateLimitedAgentWrapper:
             data = await asyncio.to_thread(python_file.read_bytes)
             user_prompt = [
                 BinaryContent(data=data, media_type=f"video/{python_file.suffix[1:]}"),
-                prompt,
+                prompt.user_prompt,
             ]
 
         # Create sort out dependencies for handling rate limiting
@@ -363,6 +343,7 @@ class RateLimitedAgentWrapper:
             video_duration_ms=video_duration_ms,
             validation_buffer_ms=self.settings.ai.validation_buffer_ms,
             web_search=self.deps.web_search,
+            system_prompt=prompt.system_prompt,
         )
 
         # Execute the AI agent to generate subtitles and get a structured response.

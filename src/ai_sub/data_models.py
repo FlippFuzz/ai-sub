@@ -202,6 +202,8 @@ class AgentDeps(BaseModel):
     web_search: WebSearchDeps | None = None
     """Web-search dependency (:class:`WebSearchDeps`), or ``None``."""
 
+    system_prompt: str = Field(description="The dynamic system prompt text for the current run.", default="")
+
 
 class Subtitles(BaseModel):
     """Represents a single subtitle entry with start/end times and text."""
