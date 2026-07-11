@@ -296,7 +296,7 @@ class SubtitleAiResponse(BaseModel):
     )
 
     # Hide from LLM JSON Schema, but preserve in file serialization on disk
-    thoughts: Optional[SkipJsonSchema[str]] = Field(
+    thoughts: SkipJsonSchema[Optional[str]] = Field(
         default=None,
         description="The AI model's internal thinking/reasoning process.",
     )
@@ -523,7 +523,7 @@ class LyricsSceneAiResponse(BaseModel):
     )
 
     # Hide from LLM JSON Schema, but preserve in file serialization on disk
-    thoughts: Optional[SkipJsonSchema[str]] = Field(
+    thoughts: SkipJsonSchema[Optional[str]] = Field(
         default=None,
         description="The AI model's internal thinking/reasoning process.",
     )
