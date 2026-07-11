@@ -128,8 +128,8 @@ _LYRICS_SCENES_SYSTEM_TEMPLATE = dedent(
               "original_artist": "ピノキオピー",
               "performer_in_video": "Hoshimachi Suisei",
               "original_language": "Japanese",
-              "reference_lyrics_og": "愛の謳を歌おうぜ\\nそれは神っぽいな\\n（...Full Japanese lyrics here. Never truncate, omit, or write placeholder markers...）",
-              "reference_lyrics_en": "Let's sing a song of love\\nThat's very god-like\\n（...Full English translation here. Never truncate, omit, or write placeholder markers...）"
+              "reference_lyrics_og": "愛の謳を歌おうぜ\\nそれは神っぽいな\\n(...Full Japanese lyrics here. Never truncate, omit, or write placeholder markers...)",
+              "reference_lyrics_en": "Let's sing a song of love\\nThat's very god-like\\n(...Full English translation here. Never truncate, omit, or write placeholder markers...)"
             }
           ]
         }
