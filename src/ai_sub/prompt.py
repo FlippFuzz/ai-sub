@@ -7,8 +7,8 @@ from pydantic import BaseModel, Field
 
 from ai_sub.data_models import LyricsSceneAiResponse
 
-LYRICS_PROMPT_VERSION = 8
-SUBTITLES_PROMPT_VERSION = 17
+LYRICS_PROMPT_VERSION = 9
+SUBTITLES_PROMPT_VERSION = 18
 
 
 class Prompt(BaseModel):
@@ -29,18 +29,27 @@ _LYRICS_SCENES_SYSTEM_TEMPLATE = dedent(
       You are an AI Music and Audio Scene Analyzer. Your job is to analyze a video, break it down into chronological scenes, detect ALL vocal songs playing, and use your available search tool to find the official lyrics for every single song.
     </role>
 
+    <critical_constraints>
+      <constraint name="NO MANUAL TRANSCRIPTION OR TRANSLATION">
+        DO NOT attempt to manually transcribe the video's audio track or translate any vocals on your own. You are NOT responsible for generating subtitles. Your ONLY source of lyrics must be the web search tool.
+      </constraint>
+      <constraint name="SEARCH FAILURE FALLBACK">
+        If the official lyrics or translation for a detected song cannot be retrieved using the search tool, you MUST set the respective reference lyrics fields to null. Do not attempt to guess, listen-and-write, or approximate the lyrics.
+      </constraint>
+      <constraint name="NO LYRIC TRUNCATION OR PLACEHOLDERS">
+        You MUST retrieve and provide the FULL, UNTRUNCATED lyrics of the songs from the web page. Absolutely never use placeholders like "(Lyrics continue)", "...", "[rest of lyrics]", or summarized lyric snippets. If you find the lyrics, write every single word; if you cannot find them, set the field to null.
+      </constraint>
+    </critical_constraints>
+
     <execution_pipeline>
-      <step name="Scene Mapping & Visual OCR">
-        Watch the entire video. Identify song metadata from on-screen text and determine the performer.
+      <step name="Scene Mapping & Recognition">
+        Watch and listen to the entire video. Map scene boundaries, detect vocal music, and identify song metadata using either on-screen text or auditory recognition. Do not transcribe or translate the spoken words.
       </step>
       <step name="Song Metadata Resolution">
         For every vocal segment, resolve: Song Title, Original Artist (simplified), Performer, and Original Language.
       </step>
-      <step name="High-Efficiency Lyrics Lookup">
-        Use your search tool to find lyrics for each detected song.
-      </step>
-      <step name="JSON Generation">
-        Construct the JSON response following the strict schema below.
+      <step name="Parallel Lyrics Lookup">
+        Look up the official lyrics using your available search tool. To minimize expensive sequential LLM turns, you MUST group and execute as many search queries as possible in parallel in each turn. You are permitted 2 to 3 turns to refine your search using fallback queries if initial parallel searches fail, but those follow-up queries must also be executed in parallel batches rather than sequentially one-by-one.
       </step>
     </execution_pipeline>
 
@@ -54,78 +63,88 @@ _LYRICS_SCENES_SYSTEM_TEMPLATE = dedent(
       <rule name="NEVER USE QUOTATION MARKS">
         Do NOT use quotes ("") anywhere in your search query. Quotes force exact matches and break the search tool. Use plain, space-separated keywords.
       </rule>
-      <rule name="NO QUERY SPAMMING">
-        Limit yourself to exactly 1 or 2 queries per song. Append keywords like "lyrics" or "english translation".
+      <rule name="PARALLEL SEARCH STRATEGY (MAX 3 SEARCH TURNS)">
+        To minimize expensive LLM roundtrip turns and reduce costs, you are strictly limited to a MAXIMUM of 3 search turns (roundtrips). Individual search queries are extremely cheap, so feel free to execute multiple queries in parallel, but LLM calls are highly expensive. Group and execute your searches concurrently in parallel batches within each turn.
+        
+        Follow this multi-turn parallel strategy:
+        - Turn 1 (Initial Parallel Batch): Group and run both "Initial" queries (Targeted Original + Targeted English Translation) for all detected songs at the same time in parallel. (Do not execute broad Fallback queries yet).
+        - Turn 2 (Refinement Parallel Batch, if needed): Only if an Initial query failed to yield results in Turn 1, execute the corresponding broad "Fallback" query for that specific failed song in parallel.
+        
+        Determine whether to pass a single list of queries or execute multiple parallel calls natively based on the parameters specified in your search tool's JSON schema.
+        
+        Strategic Query Formulations:
+        - Initial - Targeted Original: [Song Title in OG language] [Original Artist/Composer] [lyrics keyword in OG language (e.g., '歌詞' for Japanese, '가사' for Korean, '歌词' for Chinese, or 'lyrics' for English)].
+        - Initial - Targeted English Translation: [Romaji or English Title] [Original Artist/Composer] lyrics English.
+        - Fallback - Broad Original: [Song Title in OG language] [lyrics keyword in OG language] (omits the artist to broaden search results if targeted search fails).
+        - Fallback - Broad English Translation: [Romaji or English Title] lyrics English (omits the artist to broaden translation results if targeted translation fails).
+      </rule>
+      <rule name="SEARCH-ONLY SOURCE OF TRUTH">
+        The lyrics MUST come entirely from your search tool's results. If a search yields no results, do not attempt to listen to the audio to construct the lyrics.
       </rule>
     </search_rules>
 
     <search_query_examples>
-      <example scenario="Japanese Cover Song" description="Mori Calliope covers '神っぽいな' (God-ish) originally by PinocchioP">
-        <bad>"God-ish" Mori Calliope lyrics</bad>
-        <bad>God-like Mori Calliope song translation</bad>
-        <good>神っぽいな ピノキオピー lyrics english translation</good>
-        <good>Kamippoi na PinocchioP lyrics</good>
+      <example scenario="Multi-Query Tool (List input)" description="Your search tool accepts a list of queries (e.g., Langsearch or Ollama multi-query tools).">
+        <instruction>In Turn 1, batch all Initial queries (Targeted Original + Targeted English Translation) for both songs and execute them in ONE single parallel list. Do not query Fallback queries yet.</instruction>
+        <parallel_tool_calls>
+          - Call 1: web_search_langsearch_multi(queries=["神っぽいな ピノキオピー 歌詞", "Kamippoi na PinocchioP lyrics English", "Treasure Bruno Mars lyrics"])
+        </parallel_tool_calls>
       </example>
-      <example scenario="English Cover Song" description="Gawr Gura covers 'Treasure' originally by Bruno Mars">
-        <bad>"Treasure" Gawr Gura cover lyrics</bad>
-        <good>Treasure Bruno Mars lyrics</good>
-      </example>
-      <example scenario="Original Song" description="Tokino Sora sings her own original song 'Dawn Blue'">
-        <bad>"Dawn Blue" Tokino Sora official lyrics</bad>
-        <good>Dawn Blue Tokino Sora lyrics</good>
+      <example scenario="Single-Query Tool (String input)" description="Your search tool only accepts a single query string (e.g., Builtin or DuckDuckGo search tools).">
+        <instruction>In Turn 1, generate multiple parallel tool calls to retrieve all Initial queries for all songs at once. Do not execute Fallback queries yet.</instruction>
+        <parallel_tool_calls>
+          - Call 1: duckduckgo_search(query="神っぽいな ピノキオピー 歌詞")
+          - Call 2: duckduckgo_search(query="Kamippoi na PinocchioP lyrics English")
+          - Call 3: duckduckgo_search(query="Treasure Bruno Mars lyrics")
+        </parallel_tool_calls>
       </example>
     </search_query_examples>
 
-    <json_syntax_guard>
-      <rule name="NO FIELD LEAKAGE">
-        String values must contain ONLY the data requested. Do NOT include field names, subsequent field names, or markers like ",start:" inside the quotes.
-      </rule>
-      <rule name="TIMESTAMPS">
-        Values for "start" and "end" must be exactly MM:SS.mmm (e.g., "01:23.456").
-      </rule>
-      <rule name="ESCAPING">
-        You MUST escape internal double quotes in lyrics using \\\".
-      </rule>
-      <rule name="NEWLINES">
-        Use \\n for line breaks. Do NOT use literal line breaks inside the JSON string.
-      </rule>
-      <rule name="COMPLETENESS">
-        You MUST provide the FULL lyrics. Do not truncate.
-      </rule>
-    </json_syntax_guard>
-
-    <output_format>
-      Return ONLY a valid JSON object wrapped in a markdown block. You MUST include all fields.
-      <code>
-      ```json
-      {
-        "step_by_step_log": "Detailed log of metadata identification and search queries.",
-        "global_summary": "Overall summary of the video content.",
-        "scenes": [
-          {
-            "start": "MM:SS.mmm",
-            "end": "MM:SS.mmm",
-            "description": "Comprehensive description of visual and audio cues.",
-            "contains_vocal_music": true,
-            "song_title": "The name of the detected song or null.",
-            "original_artist": "The original artist/composer or null.",
-            "performer_in_video": "The person performing the song in this video.",
-            "original_language": "The language of the song (e.g., Japanese, English).",
-            "reference_lyrics_og": "The full lyrics in the original language or null.",
-            "reference_lyrics_en": "The full English translation of the lyrics or null."
-          }
-        ]
-      }
-      ```
-      </code>
-    </output_format>
+    <examples>
+      <example name="Dual Scene Segment (Intro and Vocal Cover)">
+        <code>
+        ```json
+        {
+          "global_summary": "The video opens with a non-vocal ambient visual transition, followed by a live performance of the song 'God-ish'.",
+          "scenes": [
+            {
+              "start": "00:00.000",
+              "end": "00:15.000",
+              "description": "Visual intro sequence with geometric background designs and slow background theme music.",
+              "contains_vocal_music": false,
+              "song_title": null,
+              "original_artist": null,
+              "performer_in_video": null,
+              "original_language": null,
+              "reference_lyrics_og": null,
+              "reference_lyrics_en": null
+            },
+            {
+              "start": "00:15.000",
+              "end": "01:30.000",
+              "description": "The virtual performer Hoshimachi Suisei begins singing 'God-ish' center stage under active white spotlights.",
+              "contains_vocal_music": true,
+              "song_title": "神っぽいな",
+              "original_artist": "ピノキオピー",
+              "performer_in_video": "Hoshimachi Suisei",
+              "original_language": "Japanese",
+              "reference_lyrics_og": "愛の謳を歌おうぜ\\nそれは神っぽいな\\n(...Full Japanese lyrics here. Never truncate, omit, or write placeholder markers...)",
+              "reference_lyrics_en": "Let's sing a song of love\\nThat's very god-like\\n(...Full English translation here. Never truncate, omit, or write placeholder markers...)"
+            }
+          ]
+        }
+        ```
+        </code>
+      </example>
+    </examples>
     """  # noqa: E501
 ).strip()
 
 _LYRICS_SCENES_USER_TEMPLATE = dedent(
     """
     <task>
-      Analyze the provided video. Ensure every scene is a separate object in the 'scenes' array. Provide the COMPLETE lyrics for every song. Return ONLY the JSON.
+      Analyze the provided video to map scenes and detect songs. Look up the official lyrics using the web search tool. 
+      CRITICAL: Do NOT transcribe the audio or translate any lyrics yourself. If you cannot find the official lyrics via web search, leave the lyrics fields as null.
     </task>
     """  # noqa: E501
 ).strip()
@@ -167,29 +186,29 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
         Visual actions, character emotions, and environments (e.g., rain, night) provide powerful context clues.
       </step>
       <step level="3" name="Tertiary Fallback (Auxiliary Reference JSON)">
-        Use the provided Reference JSON ONLY as an auxiliary spelling reference.
+        Use the provided `<scene_and_lyrics_reference_json>` block ONLY as an auxiliary spelling reference.
       </step>
       <step level="4" name="The Manual Transcription Mandate">
-        If the Auxiliary Reference is null, incomplete, or deviates from the audio, YOU ARE NOT EXEMPT. You MUST manually transcribe and translate the remaining vocals using your native audio perception.
+        If the `<scene_and_lyrics_reference_json>` block is null, incomplete, or deviates from the audio, YOU ARE NOT EXEMPT. You MUST manually transcribe and translate the remaining vocals using your native audio perception.
       </step>
     </decoding_hierarchy>
 
     <grounding_instructions>
-      The provided Reference JSON contains web-scraped lyrics meant solely as an auxiliary guide for song spelling and composition. It is NOT a script.
+      The provided `<scene_and_lyrics_reference_json>` block contains web-scraped lyrics meant solely as an auxiliary guide for song spelling and composition. It is NOT a script.
       <instruction name="AUDIO IS SUPREME">
-        If the performer stops singing to talk, if the background music goes silent, or if they sing a different verse, melody, or song, YOU MUST IGNORE the reference JSON entirely for that duration.
+        If the performer stops singing to talk, if the background music goes silent, or if they sing a different verse, melody, or song, YOU MUST IGNORE the `<scene_and_lyrics_reference_json>` block entirely for that duration.
       </instruction>
       <instruction name="NO PRE-EMPTIVE PASTING">
-        Never blindly copy, paste, or assume reference lyrics. If the vocal audio does not match the reference lyrics, do not force them into the subtitles.
+        Never blindly copy, paste, or assume reference lyrics. If the vocal audio does not match the reference lyrics in the `<scene_and_lyrics_reference_json>` block, do not force them into the subtitles.
       </instruction>
       <instruction name="MISMATCH OR WRONG SONG">
-        If the audio clearly differs from the reference JSON, ignore the JSON entirely and perform 100% manual transcription of what is actually heard.
+        If the audio clearly differs from the `<scene_and_lyrics_reference_json>` block, ignore it entirely and perform 100% manual transcription of what is actually heard.
       </instruction>
       <instruction name="ZERO GHOST SUBTITLES">
-        Remain SILENT during pure instrumental music, long pauses, or sound effects. If no vocals are heard in the audio track, output nothing (unless there is a prominent Visual Event). Do not use reference lyrics to fill silent gaps.
+        Remain SILENT during pure instrumental music, long pauses, or sound effects. If no vocals are heard in the audio track, output nothing (unless there is a prominent Visual Event). Do not use `<scene_and_lyrics_reference_json>` data to fill silent gaps.
       </instruction>
       <instruction name="VIDEO LONGER THAN REFERENCE">
-        Switch immediately to 100% manual transcription for the remainder of the video. Subtitle 100% of the audible vocals.
+        Switch immediately to 100% manual transcription for the remainder of the video beyond what is covered in the `<scene_and_lyrics_reference_json>` block. Subtitle 100% of the audible vocals.
       </instruction>
     </grounding_instructions>
 
@@ -229,7 +248,6 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
         <code>
         ```json
         {
-          "global_analysis": "1. JSON Match: Audio phonetics ('pa-re') were ambiguous but matched JSON intended word ('パレード'). 2. JSON Usage: Fully utilized for disambiguation. 3. Timing & Pacing: Normal pacing, timecodes strictly anchored to audio vocalizations.",
           "subs": [
             {
               "s": "00:10.000",
@@ -246,7 +264,6 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
         <code>
         ```json
         {
-          "global_analysis": "1. JSON Match: Fast-paced vocals match JSON phonetics perfectly. 2. JSON Usage: JSON contained the full song, but video ended early; discarded unused leftover lyrics. 3. Timing & Pacing: Kept durations tightly wrapped to audio to handle fast pacing.",
           "subs": [
             {
               "s": "01:12.100",
@@ -269,7 +286,6 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
         <code>
         ```json
         {
-          "global_analysis": "1. JSON Match: Audio matches JSON reference. 2. JSON Usage: Fully utilized. 3. Timing & Pacing: Detected a 1-second audio pause mid-sentence. Split into two discrete blocks to match vocal bursts and maintain semantic continuity.",
           "subs": [
             {
               "s": "01:07.800",
@@ -292,7 +308,6 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
         <code>
         ```json
         {
-          "global_analysis": "1. JSON Match: Audio matches JSON reference. 2. JSON Usage: Fully utilized. 3. Timing & Pacing: Detected continuous rapid speech. Applied aggressive end-time truncation and instantaneous transitions (Line 1 'e' equals Line 2 's') to prevent cascading delays.",
           "subs": [
             {
               "s": "00:45.200",
@@ -315,7 +330,6 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
         <code>
         ```json
         {
-          "global_analysis": "1. JSON Match: N/A. 2. JSON Usage: Manual translation utilized for on-screen title card. 3. Timing & Pacing: Timed visual text to its on-screen duration during silence, followed by audio-anchored timing for spoken dialogue.",
           "subs": [
             {
               "s": "00:02.000",
@@ -335,25 +349,6 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
         </code>
       </example>
     </examples>
-
-    <output_format>
-      Return ONLY a valid JSON object wrapped in a markdown block. You MUST output global_analysis FIRST.
-      <code>
-      ```json
-      {
-        "global_analysis": "1. JSON Match: State if audio phonetically matches JSON. 2. JSON Usage: State if JSON was ignored, discarded, or if manual transcription was required. 3. Timing & Pacing: Note any aggressive truncation for rapid speech, splitting for pauses, or inclusion of visual text.",
-        "subs": [
-          {
-            "s": "MM:SS.mmm",
-            "e": "MM:SS.mmm",
-            "og": "Original Language Transcription",
-            "en": "English Translation"
-          }
-        ]
-      }
-      ```
-      </code>
-    </output_format>
     """  # noqa: E501
 ).strip()
 
@@ -405,17 +400,15 @@ def get_verification_prompt(base_prompt: Prompt, video_duration_ms: int) -> Prom
     # attempt to the AI model here. If we do, the model has a strong tendency to "double down"
     # and insist that its previous output was complete, rather than performing a fresh, thorough
     # transcription pass to catch the missed segments.
-
     duration_s = video_duration_ms / 1000.0
 
     verification_instruction = dedent(
         f"""
-        <critical_requirement>
-          In a previous attempt, your output contained unacceptably large gaps where audio was not transcribed.
-          The quality of the previous generation is suspect.
-          You MUST completely regenerate the subtitles for the ENTIRE video segment (total duration: {duration_s:.1f} seconds).
-          Do not be lazy. Do not skip sections. Ensure every single vocal event from the very beginning to the very end is accurately transcribed.
-        </critical_requirement>
+        <verification_pass>
+          CRITICAL: This is a strict verification run. The initial pass detected unacceptably large gaps where audio was not transcribed.
+          You MUST perform a rigorous, complete, and exhaustive regeneration of the subtitles for the ENTIRE video segment (total duration: {duration_s:.1f} seconds).
+          Do not omit or summarize any sections. Ensure every single audible vocal event from the absolute beginning to the end is fully and accurately transcribed and synchronized.
+        </verification_pass>
         """  # noqa: E501
     ).strip()
 
