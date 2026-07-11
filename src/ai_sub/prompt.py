@@ -7,8 +7,8 @@ from pydantic import BaseModel, Field
 
 from ai_sub.data_models import LyricsSceneAiResponse
 
-LYRICS_PROMPT_VERSION = 8
-SUBTITLES_PROMPT_VERSION = 17
+LYRICS_PROMPT_VERSION = 9
+SUBTITLES_PROMPT_VERSION = 18
 
 
 class Prompt(BaseModel):
@@ -63,8 +63,8 @@ _LYRICS_SCENES_SYSTEM_TEMPLATE = dedent(
       <rule name="NEVER USE QUOTATION MARKS">
         Do NOT use quotes ("") anywhere in your search query. Quotes force exact matches and break the search tool. Use plain, space-separated keywords.
       </rule>
-      <rule name="PARALLEL SEARCH STRATEGY (MAX 3 QUERIES PER SONG)">
-        To minimize LLM roundtrip turns and reduce costs, you are strictly limited to a MAXIMUM of 3 total search queries per song. Group and execute your searches concurrently in parallel batches within each turn.
+      <rule name="PARALLEL SEARCH STRATEGY (MAX 3 SEARCH TURNS)">
+        To minimize expensive LLM roundtrip turns and reduce costs, you are strictly limited to a MAXIMUM of 3 search turns (roundtrips). Individual search queries are extremely cheap, so feel free to execute multiple queries in parallel, but LLM calls are highly expensive. Group and execute your searches concurrently in parallel batches within each turn.
         
         Follow this multi-turn parallel strategy:
         - Turn 1 (Initial Parallel Batch): Group and run both "Initial" queries (Targeted Original + Targeted English Translation) for all detected songs at the same time in parallel. (Do not execute broad Fallback queries yet).
@@ -86,13 +86,9 @@ _LYRICS_SCENES_SYSTEM_TEMPLATE = dedent(
     <search_query_examples>
       <example scenario="Multi-Query Tool (List input)" description="Your search tool accepts a list of queries (e.g., Langsearch or Ollama multi-query tools).">
         <instruction>In Turn 1, batch all Initial queries (Targeted Original + Targeted English Translation) for both songs and execute them in ONE single parallel list. Do not query Fallback queries yet.</instruction>
-        <tool_call_input>
-          queries = [
-            "神っぽいな ピノキオピー 歌詞",
-            "Kamippoi na PinocchioP lyrics English",
-            "Treasure Bruno Mars lyrics"
-          ]
-        </tool_call_input>
+        <parallel_tool_calls>
+          - Call 1: web_search_langsearch_multi(queries=["神っぽいな ピノキオピー 歌詞", "Kamippoi na PinocchioP lyrics English", "Treasure Bruno Mars lyrics"])
+        </parallel_tool_calls>
       </example>
       <example scenario="Single-Query Tool (String input)" description="Your search tool only accepts a single query string (e.g., Builtin or DuckDuckGo search tools).">
         <instruction>In Turn 1, generate multiple parallel tool calls to retrieve all Initial queries for all songs at once. Do not execute Fallback queries yet.</instruction>
@@ -190,29 +186,29 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
         Visual actions, character emotions, and environments (e.g., rain, night) provide powerful context clues.
       </step>
       <step level="3" name="Tertiary Fallback (Auxiliary Reference JSON)">
-        Use the provided Reference JSON ONLY as an auxiliary spelling reference.
+        Use the provided <scene_and_lyrics_reference_json> ONLY as an auxiliary spelling reference.
       </step>
       <step level="4" name="The Manual Transcription Mandate">
-        If the Auxiliary Reference is null, incomplete, or deviates from the audio, YOU ARE NOT EXEMPT. You MUST manually transcribe and translate the remaining vocals using your native audio perception.
+        If the <scene_and_lyrics_reference_json> is null, incomplete, or deviates from the audio, YOU ARE NOT EXEMPT. You MUST manually transcribe and translate the remaining vocals using your native audio perception.
       </step>
     </decoding_hierarchy>
 
     <grounding_instructions>
-      The provided Reference JSON contains web-scraped lyrics meant solely as an auxiliary guide for song spelling and composition. It is NOT a script.
+      The provided <scene_and_lyrics_reference_json> contains web-scraped lyrics meant solely as an auxiliary guide for song spelling and composition. It is NOT a script.
       <instruction name="AUDIO IS SUPREME">
-        If the performer stops singing to talk, if the background music goes silent, or if they sing a different verse, melody, or song, YOU MUST IGNORE the reference JSON entirely for that duration.
+        If the performer stops singing to talk, if the background music goes silent, or if they sing a different verse, melody, or song, YOU MUST IGNORE the <scene_and_lyrics_reference_json> entirely for that duration.
       </instruction>
       <instruction name="NO PRE-EMPTIVE PASTING">
-        Never blindly copy, paste, or assume reference lyrics. If the vocal audio does not match the reference lyrics, do not force them into the subtitles.
+        Never blindly copy, paste, or assume reference lyrics. If the vocal audio does not match the reference lyrics in <scene_and_lyrics_reference_json>, do not force them into the subtitles.
       </instruction>
       <instruction name="MISMATCH OR WRONG SONG">
-        If the audio clearly differs from the reference JSON, ignore the JSON entirely and perform 100% manual transcription of what is actually heard.
+        If the audio clearly differs from the <scene_and_lyrics_reference_json>, ignore it entirely and perform 100% manual transcription of what is actually heard.
       </instruction>
       <instruction name="ZERO GHOST SUBTITLES">
-        Remain SILENT during pure instrumental music, long pauses, or sound effects. If no vocals are heard in the audio track, output nothing (unless there is a prominent Visual Event). Do not use reference lyrics to fill silent gaps.
+        Remain SILENT during pure instrumental music, long pauses, or sound effects. If no vocals are heard in the audio track, output nothing (unless there is a prominent Visual Event). Do not use <scene_and_lyrics_reference_json> to fill silent gaps.
       </instruction>
       <instruction name="VIDEO LONGER THAN REFERENCE">
-        Switch immediately to 100% manual transcription for the remainder of the video. Subtitle 100% of the audible vocals.
+        Switch immediately to 100% manual transcription for the remainder of the video beyond what is covered in <scene_and_lyrics_reference_json>. Subtitle 100% of the audible vocals.
       </instruction>
     </grounding_instructions>
 
@@ -404,17 +400,15 @@ def get_verification_prompt(base_prompt: Prompt, video_duration_ms: int) -> Prom
     # attempt to the AI model here. If we do, the model has a strong tendency to "double down"
     # and insist that its previous output was complete, rather than performing a fresh, thorough
     # transcription pass to catch the missed segments.
-
     duration_s = video_duration_ms / 1000.0
 
     verification_instruction = dedent(
         f"""
-        <critical_requirement>
-          In a previous attempt, your output contained unacceptably large gaps where audio was not transcribed.
-          The quality of the previous generation is suspect.
-          You MUST completely regenerate the subtitles for the ENTIRE video segment (total duration: {duration_s:.1f} seconds).
-          Do not be lazy. Do not skip sections. Ensure every single vocal event from the very beginning to the very end is accurately transcribed.
-        </critical_requirement>
+        <verification_pass>
+          CRITICAL: This is a strict verification run. The initial pass detected unacceptably large gaps where audio was not transcribed.
+          You MUST perform a rigorous, complete, and exhaustive regeneration of the subtitles for the ENTIRE video segment (total duration: {duration_s:.1f} seconds).
+          Do not omit or summarize any sections. Ensure every single audible vocal event from the absolute beginning to the end is fully and accurately transcribed and synchronized.
+        </verification_pass>
         """  # noqa: E501
     ).strip()
 
