@@ -21,6 +21,7 @@ from pydantic import (
     ValidationInfo,
     model_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 from pyrate_limiter import Limiter
 from pysubs2 import SSAEvent, SSAFile
 
@@ -212,11 +213,33 @@ class Subtitles(BaseModel):
 
     start: str = Field(
         alias="s",
-        description="The start timestamp of the subtitle (e.g., 'MM:SS.mmm').",
+        description=(
+            "The start timestamp of the subtitle in 'MM:SS.mmm' format (e.g., '01:23.456'). "
+            "It must trigger at the exact millisecond the vocal cord activates."
+        ),
     )
-    end: str = Field(alias="e", description="The end timestamp of the subtitle (e.g., 'MM:SS.mmm').")
-    original: str = Field(alias="og", description="The transcription/text in its original language.")
-    english: str = Field(alias="en", description="The English translation of the text.")
+    end: str = Field(
+        alias="e",
+        description=(
+            "The end timestamp of the subtitle in 'MM:SS.mmm' format (e.g., '01:23.789'). "
+            "This should represent when the spoken phrase ends, aggressively truncated to "
+            "prevent overlapping consecutive lines."
+        ),
+    )
+    original: str = Field(
+        alias="og",
+        description=(
+            "The transcription of the spoken audio or visual text in its original spoken "
+            "language (e.g., Japanese, Chinese, Spanish). Do not translate."
+        ),
+    )
+    english: str = Field(
+        alias="en",
+        description=(
+            "The natural, context-aware English translation of the transcription. "
+            "Ensure proper tenses, pronouns, and semantic continuity across subtitle blocks."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -267,9 +290,13 @@ class SubtitleAiResponse(BaseModel):
 
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
-    global_analysis: str = Field(description="A high-level analysis or summary from the AI about its process.")
-    subtitles: list[Subtitles] = Field(alias="subs", description="A list of individual subtitle entries.")
-    thoughts: Optional[str] = Field(
+    subtitles: list[Subtitles] = Field(
+        alias="subs",
+        description="A chronological list of individual synchronized subtitle entries.",
+    )
+
+    # Hide from LLM JSON Schema, but preserve in file serialization on disk
+    thoughts: Optional[SkipJsonSchema[str]] = Field(
         default=None,
         description="The AI model's internal thinking/reasoning process.",
     )
@@ -387,27 +414,57 @@ class SubtitleAiResponse(BaseModel):
 class Scene(BaseModel):
     """Represents a detected scene in the video."""
 
-    start: str = Field(description="The start timestamp of the scene (e.g., 'MM:SS.mmm').")
-    end: str = Field(description="The end timestamp of the scene (e.g., 'MM:SS.mmm').")
-    description: str = Field(description="A brief description of the visual and audio elements in the scene.")
-    contains_vocal_music: bool = Field(description="True if the scene contains music with vocals.")
-    song_title: Optional[str] = Field(default=None, description="The title of the song detected in the scene.")
-    original_artist: Optional[str] = Field(default=None, description="The original artist or composer of the song.")
+    start: str = Field(description="The start timestamp of the scene in 'MM:SS.mmm' format (e.g., '01:23.456').")
+    end: str = Field(description="The end timestamp of the scene in 'MM:SS.mmm' format (e.g., '01:23.789').")
+    description: str = Field(
+        description=("A comprehensive description of the visual environment and auditory cues happening in this scene.")
+    )
+    contains_vocal_music: bool = Field(
+        description="True if the scene contains active music with sung vocals, False otherwise."
+    )
+    song_title: Optional[str] = Field(
+        default=None,
+        description=(
+            "The title of the song detected in the scene, or null if no song or no title could be identified."
+        ),
+    )
+    original_artist: Optional[str] = Field(
+        default=None,
+        description=(
+            "The simplified name of the original artist, composer, or original creator of "
+            "the song, or null if not identified."
+        ),
+    )
     performer_in_video: Optional[str] = Field(
         default=None,
-        description="The performer singing in the video, if different from the original artist.",
+        description=(
+            "The person or character performing the song in this specific video clip, "
+            "if different from the original artist, or null."
+        ),
     )
     original_language: Optional[str] = Field(
         default=None,
-        description="The language the song is primarily sung in.",
+        description=("The primary language the song is sung in (e.g., Japanese, English, Chinese), or null."),
     )
     reference_lyrics_og: Optional[str] = Field(
         default=None,
-        description="The full lyrics of the song in the original language, found via web search.",
+        description=(
+            "The complete, official lyrics of the song in its original language, retrieved "
+            "EXCLUSIVELY using the web search tool. Set to null if the search failed, no song "
+            "was detected, or no original lyrics were found. MUST be the complete lyrics; "
+            "absolutely no truncation, placeholders like '(Lyrics continue)' or '...', "
+            "omissions, or summaries are allowed. NEVER transcribe manually."
+        ),
     )
     reference_lyrics_en: Optional[str] = Field(
         default=None,
-        description="The English translation of the lyrics, found via web search.",
+        description=(
+            "The complete English translation of the song's lyrics, retrieved EXCLUSIVELY "
+            "using the web search tool. Set to null if the search failed, no translation was "
+            "found online, or no song was detected. MUST be the complete translation; "
+            "absolutely no truncation, placeholders like '(Lyrics continue)' or '...', "
+            "omissions, or summaries are allowed. NEVER translate manually."
+        ),
     )
 
     @model_validator(mode="before")
@@ -456,10 +513,17 @@ class LyricsSceneAiResponse(BaseModel):
     This data is then used as context for the main subtitle generation pass.
     """
 
-    step_by_step_log: str
-    global_summary: str
-    scenes: list[Scene] = Field(description="A list of chronological scenes detected in the video segment.")
-    thoughts: Optional[str] = Field(
+    global_summary: str = Field(
+        description="An overall summary describing the video content, flow, and identified musical segments."
+    )
+    scenes: list[Scene] = Field(
+        description=(
+            "A list of chronological, non-overlapping scenes mapping the entire video segment from start to end."
+        )
+    )
+
+    # Hide from LLM JSON Schema, but preserve in file serialization on disk
+    thoughts: Optional[SkipJsonSchema[str]] = Field(
         default=None,
         description="The AI model's internal thinking/reasoning process.",
     )
@@ -516,13 +580,18 @@ class Job(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     name: str = Field(
-        description="The unique name of the job, typically derived from the video segment filename (e.g., 'part_001')."
+        description=(
+            "The unique name of the job, typically derived from the video segment filename (e.g., 'part_001')."
+        )
     )
     total_attempts: NonNegativeInt = Field(
         default=0,
-        description="The total number of attempts for this specific job stage across all executions, "
-        "loaded from the saved stage-specific state file. "
-        "Attempts are tracked independently per stage (e.g., lyrics failures do not affect subtitle attempt counts).",
+        description=(
+            "The total number of attempts for this specific job stage across all executions, "
+            "loaded from the saved stage-specific state file. "
+            "Attempts are tracked independently per stage "
+            "(e.g., lyrics failures do not affect subtitle attempt counts)."
+        ),
     )
 
     def save(self, filename: Path):
@@ -546,7 +615,7 @@ class ReEncodingJob(Job):
     height: PositiveInt = Field(description="Target height (resolution) for the re-encoded video.")
     bitrate_kb: PositiveInt = Field(description="Target bitrate in kilobytes per second.")
     duration_tolerance_ms: NonNegativeInt = Field(
-        description="Allowed duration difference in milliseconds to consider an existing re-encoded file valid."
+        description=("Allowed duration difference in milliseconds to consider an existing re-encoded file valid.")
     )
 
 
@@ -613,10 +682,12 @@ class LyricsSceneJob(Job):
                     return None
 
             if job.lyrics_prompt_version != LYRICS_PROMPT_VERSION:
-                logfire.info(
+                msg = (
                     f"Lyrics prompt version mismatch for {job.name} "
-                    f"(file: {job.lyrics_prompt_version}, current: {LYRICS_PROMPT_VERSION}). Re-processing."
+                    f"(file: {job.lyrics_prompt_version}, "
+                    f"current: {LYRICS_PROMPT_VERSION}). Re-processing."
                 )
+                logfire.info(msg)
                 return None
             return job
         return None
@@ -736,10 +807,12 @@ class SubtitleJob(Job):
                     return None
 
             if job.subtitles_prompt_version != SUBTITLES_PROMPT_VERSION:
-                logfire.info(
+                msg = (
                     f"Subtitles prompt version mismatch for {job.name} "
-                    f"(file: {job.subtitles_prompt_version}, current: {SUBTITLES_PROMPT_VERSION}). Re-processing."
+                    f"(file: {job.subtitles_prompt_version}, "
+                    f"current: {SUBTITLES_PROMPT_VERSION}). Re-processing."
                 )
+                logfire.info(msg)
                 return None
             return job
         return None
