@@ -1,5 +1,24 @@
 # AI Sub Release Notes
 
+### v3.3.0
+
+This release includes significant improvements to the subtitle generation prompt, optimizations for parallel web searches, and refinement of the data models for better AI interaction.
+
+**New Features & Improvements:**
+
+- **Enhanced Lyrics Research:**
+  - Updated [`LYRICS_PROMPT_VERSION`](src/ai_sub/prompt.py) to 9 and [`SUBTITLES_PROMPT_VERSION`](src/ai_sub/prompt.py) to 18.
+  - Implemented a stricter parallel search strategy (limited to 3 turns) to reduce costs and latency.
+  - Added critical constraints to prohibit manual transcription/translation and ensure official lyrics are retrieved via search.
+- **Data Model Refinement:**
+  - Optimized JSON schemas by hiding the `thoughts` field from the LLM using `SkipJsonSchema` in [`src/ai_sub/data_models.py`](src/ai_sub/data_models.py).
+  - Improved field descriptions for timestamps and scene content to enforce strict `'MM:SS.mmm'` formatting and prevent hallucinated content.
+- **Pipeline Stability:**
+  - Simplified the [`SubtitleAiResponse`](src/ai_sub/data_models.py) schema by removing the `global_analysis` field, streamlining the generation process.
+  - Refined log messaging for prompt version mismatches to improve debugging.
+
+---
+
 ### v3.2.0
 
 This release introduces a major structural overhaul of the prompt system, utilizing XML-based tags to improve AI instruction clarity and flexibility. It also adds support for capturing and surfacing the model's internal reasoning ("thoughts").
@@ -593,7 +612,7 @@ This release introduces significant improvements to prompt engineering for bette
   - **Improved Search:** Search queries have been optimized with specific templates to improve hit rates for lyrics.
 - **Subtitle Generation (v11):**
   - **The "Golden Rule":** Introduced strict logic where audio strictly dictates _timing_ ("When"), while visuals and context dictate _content_ ("What").
-  - **Anti-Hallucination:** Added strict rules to handle cases where the reference lyrics are for the wrong song or contain extra verses not present in the video segment.
+  - **Anti-Hallucination:** Added strict rules to handle cases where the reference lyrics are for the wrong song or extra verses not present in the video segment.
   - **Ambiguity Resolution:** Clarified the hierarchy for resolving ambiguous audio (On-screen text > Scene Context > JSON).
 
 **Fixes & Improvements:**
