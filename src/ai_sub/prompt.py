@@ -186,29 +186,29 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
         Visual actions, character emotions, and environments (e.g., rain, night) provide powerful context clues.
       </step>
       <step level="3" name="Tertiary Fallback (Auxiliary Reference JSON)">
-        Use the provided <scene_and_lyrics_reference_json> ONLY as an auxiliary spelling reference.
+        Use the provided `<scene_and_lyrics_reference_json>` block ONLY as an auxiliary spelling reference.
       </step>
       <step level="4" name="The Manual Transcription Mandate">
-        If the <scene_and_lyrics_reference_json> is null, incomplete, or deviates from the audio, YOU ARE NOT EXEMPT. You MUST manually transcribe and translate the remaining vocals using your native audio perception.
+        If the `<scene_and_lyrics_reference_json>` block is null, incomplete, or deviates from the audio, YOU ARE NOT EXEMPT. You MUST manually transcribe and translate the remaining vocals using your native audio perception.
       </step>
     </decoding_hierarchy>
 
     <grounding_instructions>
-      The provided <scene_and_lyrics_reference_json> contains web-scraped lyrics meant solely as an auxiliary guide for song spelling and composition. It is NOT a script.
+      The provided `<scene_and_lyrics_reference_json>` block contains web-scraped lyrics meant solely as an auxiliary guide for song spelling and composition. It is NOT a script.
       <instruction name="AUDIO IS SUPREME">
-        If the performer stops singing to talk, if the background music goes silent, or if they sing a different verse, melody, or song, YOU MUST IGNORE the <scene_and_lyrics_reference_json> entirely for that duration.
+        If the performer stops singing to talk, if the background music goes silent, or if they sing a different verse, melody, or song, YOU MUST IGNORE the `<scene_and_lyrics_reference_json>` block entirely for that duration.
       </instruction>
       <instruction name="NO PRE-EMPTIVE PASTING">
-        Never blindly copy, paste, or assume reference lyrics. If the vocal audio does not match the reference lyrics in <scene_and_lyrics_reference_json>, do not force them into the subtitles.
+        Never blindly copy, paste, or assume reference lyrics. If the vocal audio does not match the reference lyrics in the `<scene_and_lyrics_reference_json>` block, do not force them into the subtitles.
       </instruction>
       <instruction name="MISMATCH OR WRONG SONG">
-        If the audio clearly differs from the <scene_and_lyrics_reference_json>, ignore it entirely and perform 100% manual transcription of what is actually heard.
+        If the audio clearly differs from the `<scene_and_lyrics_reference_json>` block, ignore it entirely and perform 100% manual transcription of what is actually heard.
       </instruction>
       <instruction name="ZERO GHOST SUBTITLES">
-        Remain SILENT during pure instrumental music, long pauses, or sound effects. If no vocals are heard in the audio track, output nothing (unless there is a prominent Visual Event). Do not use <scene_and_lyrics_reference_json> to fill silent gaps.
+        Remain SILENT during pure instrumental music, long pauses, or sound effects. If no vocals are heard in the audio track, output nothing (unless there is a prominent Visual Event). Do not use `<scene_and_lyrics_reference_json>` data to fill silent gaps.
       </instruction>
       <instruction name="VIDEO LONGER THAN REFERENCE">
-        Switch immediately to 100% manual transcription for the remainder of the video beyond what is covered in <scene_and_lyrics_reference_json>. Subtitle 100% of the audible vocals.
+        Switch immediately to 100% manual transcription for the remainder of the video beyond what is covered in the `<scene_and_lyrics_reference_json>` block. Subtitle 100% of the audible vocals.
       </instruction>
     </grounding_instructions>
 
