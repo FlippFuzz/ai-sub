@@ -53,7 +53,8 @@ class GoogleAiSettings(BaseSettings):
         default=None,
     )
     max_storage_gb: PositiveFloat = Field(
-        description="Maximum allowed total storage usage in Gigabytes (GB) for Gemini Files API before triggering cleanup.",
+        description="Maximum allowed total storage usage in Gigabytes (GB) for Gemini Files API "
+        "before triggering cleanup.",
         default=18.0,
     )
 
