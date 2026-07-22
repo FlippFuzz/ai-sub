@@ -224,7 +224,7 @@ class GeminiFileUploader:
         }
 
         async with self._lock:
-            for file in self._state.values():
+            for file in list(self._state.values()):
                 if (
                     file.display_name in target_display_names
                     and file.size_bytes == file_size
