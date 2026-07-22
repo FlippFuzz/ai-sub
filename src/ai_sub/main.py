@@ -44,7 +44,7 @@ from ai_sub.prompt import (
     get_subtitle_prompt,
     get_verification_prompt,
 )
-from ai_sub.utils import generate_full_shortcode, generate_model_shortcode
+from ai_sub.shortcode import generate_full_shortcode, generate_model_shortcode
 from ai_sub.video import (
     get_video_duration_ms,
     get_working_encoder,
