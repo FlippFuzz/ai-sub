@@ -15,7 +15,8 @@ dependencies = [
     "pydantic-settings",
     "json_repair",
     "pyrate-limiter",
-    "tqdm"
+    "tqdm",
+    "pyyaml"
 ]
 
 [project.urls]

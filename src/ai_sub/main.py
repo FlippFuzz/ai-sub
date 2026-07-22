@@ -228,7 +228,7 @@ class LyricsSceneJobRunner(JobRunner):
         lyrics_job = job.lyrics
         assert lyrics_job is not None
 
-        job_state_path = self.settings.dir.tmp / f"{lyrics_job.name}.lyrics.{self.model_code}.json"
+        job_state_path = self.settings.dir.tmp / f"{lyrics_job.name}.lyrics.{self.model_code}.yaml"
         await asyncio.to_thread(lyrics_job.save, job_state_path)
 
 
@@ -283,7 +283,7 @@ class SubtitleJobRunner(JobRunner):
             if response:
                 subtitle_job.response = response
                 # Explicitly checkpoint the initial pass before entering the verification block
-                job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.model_code}.json"
+                job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.model_code}.yaml"
                 await asyncio.to_thread(subtitle_job.save, job_state_path)
 
         # 2. Check for ANY large gap and trigger verification runs as needed
@@ -310,7 +310,7 @@ class SubtitleJobRunner(JobRunner):
                 logfire.info(f"Verification re-run completed for {subtitle_job.name}.")
 
                 # Checkpoint after each successful verification pass
-                job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.model_code}.json"
+                job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.model_code}.yaml"
                 await asyncio.to_thread(subtitle_job.save, job_state_path)
             else:
                 break
@@ -324,12 +324,12 @@ class SubtitleJobRunner(JobRunner):
         Args:
             job (SegmentJobs): The segment job container with the processed subtitles.
         """
-        # Save the completed job state to a JSON file for persistence.
+        # Save the completed job state to a YAML file for persistence.
         subtitle_job = job.subtitles
         assert subtitle_job is not None
 
         # Always save the job state to persist retry counts across runs.
-        job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.model_code}.json"
+        job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.model_code}.yaml"
         await asyncio.to_thread(subtitle_job.save, job_state_path)
 
         # Also generate a subtitle file for this job for the user to view.
@@ -374,8 +374,8 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
         any_pending = False
 
         for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
-            # Load the job result from the temporary JSON file.
-            job_path = settings.dir.tmp / f"{video_path.stem}.subtitles.{subtitles_model_code}.json"
+            # Load the job result from the temporary YAML file.
+            job_path = settings.dir.tmp / f"{video_path.stem}.subtitles.{subtitles_model_code}.yaml"
             job = SubtitleJob.load(job_path, settings.ai.validation_buffer_ms)
             if job and job.response:
                 current_subtitles = job.response.get_ssafile()
@@ -399,7 +399,7 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
                 sub_attempts = job.total_attempts if job else 0
                 lyrics_attempts = 0
                 if settings.thread.lyrics > 0:
-                    lyrics_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{lyrics_model_code}.json"
+                    lyrics_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{lyrics_model_code}.yaml"
                     lyrics_job = LyricsSceneJob.load(lyrics_path, settings.ai.validation_buffer_ms)
                     lyrics_attempts = lyrics_job.total_attempts if lyrics_job else 0
 
@@ -813,14 +813,14 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                 job_state = SegmentJobs()
 
                 # Load jobs if they exist and populate the in-memory JobState
-                lyrics_job_path = settings.dir.tmp / f"{split.stem}.lyrics.{lyrics_model_code}.json"
+                lyrics_job_path = settings.dir.tmp / f"{split.stem}.lyrics.{lyrics_model_code}.yaml"
                 lyrics_job = await asyncio.to_thread(
                     LyricsSceneJob.load, lyrics_job_path, settings.ai.validation_buffer_ms
                 )
                 if lyrics_job:
                     job_state.lyrics = lyrics_job
 
-                subtitle_job_path = settings.dir.tmp / f"{split.stem}.subtitles.{subtitles_model_code}.json"
+                subtitle_job_path = settings.dir.tmp / f"{split.stem}.subtitles.{subtitles_model_code}.yaml"
                 subtitle_job = await asyncio.to_thread(
                     SubtitleJob.load, subtitle_job_path, settings.ai.validation_buffer_ms
                 )

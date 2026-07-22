@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import logfire
+import yaml
 from google.genai.types import File
 from pydantic import (
     BaseModel,
@@ -57,15 +58,37 @@ class QuotaExceededError(Exception):
 
 
 # ==============================================================================
-# Utility Functions
+# Utility Functions & YAML Serializer Setup
 # ==============================================================================
+
+
+class _YamlDumper(yaml.SafeDumper):
+    """Custom YAML Dumper that formats multiline strings as literal block scalars."""
+
+
+def _str_presenter(dumper: _YamlDumper, data: str) -> yaml.Node:
+    """Formats multiline strings using the literal block scalar style '|'.
+
+    Args:
+        dumper (_YamlDumper): The YAML dumper instance.
+        data (str): The string scalar to present.
+
+    Returns:
+        yaml.Node: The represented scalar node.
+    """
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_YamlDumper.add_representer(str, _str_presenter)
 
 
 def _clean_timestamp_string(ts_str: str) -> str:
     """Extracts a valid timestamp pattern from a potentially noisy LLM string.
 
-    LLMs occasionally suffer from "field leakage" where they include the subsequent
-    JSON key or structural markers inside a string value. This function uses
+    LLMs occasionally suffer from "field leakage" where they include subsequent
+    key or structural markers inside a string value. This function uses
     regex to isolate the actual timecode from such noise.
 
     Args:
@@ -281,7 +304,7 @@ class Subtitles(BaseModel):
 
 
 class SubtitleAiResponse(BaseModel):
-    """Represents the structured JSON response from the AI model for subtitle generation.
+    """Represents the structured response from the AI model for subtitle generation.
 
     This model is the expected output from the AI after it has processed a video
     segment for transcription and translation. It includes a high-level analysis
@@ -295,7 +318,7 @@ class SubtitleAiResponse(BaseModel):
         description="A chronological list of individual synchronized subtitle entries.",
     )
 
-    # Hide from LLM JSON Schema, but preserve in file serialization on disk
+    # Hide from LLM schema, but preserve in file serialization on disk
     thoughts: SkipJsonSchema[Optional[str]] = Field(
         default=None,
         description="The AI model's internal thinking/reasoning process.",
@@ -506,7 +529,7 @@ class Scene(BaseModel):
 
 
 class LyricsSceneAiResponse(BaseModel):
-    """Represents the structured JSON response from the AI for the lyrics/scene detection pass.
+    """Represents the structured response from the AI for the lyrics/scene detection pass.
 
     This model captures the AI's analysis of a video segment, including a breakdown
     of scenes, identification of music, and any lyrics found through web searches.
@@ -522,7 +545,7 @@ class LyricsSceneAiResponse(BaseModel):
         )
     )
 
-    # Hide from LLM JSON Schema, but preserve in file serialization on disk
+    # Hide from LLM schema, but preserve in file serialization on disk
     thoughts: SkipJsonSchema[Optional[str]] = Field(
         default=None,
         description="The AI model's internal thinking/reasoning process.",
@@ -594,16 +617,15 @@ class Job(BaseModel):
         ),
     )
 
-    def save(self, filename: Path):
-        """Saves the current object to a JSON file.
+    def save(self, filename: Path) -> None:
+        """Saves the current object to a YAML file.
 
         Args:
             filename (Path): The path to the file where the object should be saved.
-
         """
-        json_str = self.model_dump_json(indent=2)
+        data = self.model_dump(mode="json")
         with open(filename, "w", encoding="utf-8") as file:
-            file.write(json_str)
+            yaml.dump(data, file, Dumper=_YamlDumper, sort_keys=False, allow_unicode=True)
 
 
 class ReEncodingJob(Job):
@@ -657,7 +679,7 @@ class LyricsSceneJob(Job):
 
     @classmethod
     def load(cls, save_path: Path, validation_buffer_ms: int) -> Optional["LyricsSceneJob"]:
-        """Loads the job from a JSON file, checking for prompt version mismatch.
+        """Loads the job from a YAML file, checking for prompt version mismatch.
 
         Args:
             save_path (Path): The path to the saved job file.
@@ -673,11 +695,15 @@ class LyricsSceneJob(Job):
         if Path(save_path).is_file():
             with open(save_path, "r", encoding="utf-8") as f:
                 try:
-                    job = cls.model_validate_json(
-                        f.read(),
+                    data = yaml.safe_load(f)
+                    if not isinstance(data, dict):
+                        logfire.warning(f"Invalid YAML content in {save_path.name}, ignoring cache.")
+                        return None
+                    job = cls.model_validate(
+                        data,
                         context={"validation_buffer_ms": validation_buffer_ms},
                     )
-                except ValidationError as e:
+                except (yaml.YAMLError, ValidationError) as e:
                     logfire.warning(f"Validation failed for {save_path.name}, ignoring cache. Error: {e}")
                     return None
 
@@ -745,26 +771,6 @@ class SubtitleJob(Job):
         # Otherwise, it's complete if it has no large gaps.
         return not self.response.has_large_gaps(self.video_duration_ms, gap_threshold_s)
 
-    @model_validator(mode="before")
-    @classmethod
-    def migrate_legacy_fields(cls, data: Any) -> Any:
-        """Migrates legacy response field from older files.
-
-        Args:
-            data: The raw dictionary loaded from JSON.
-
-        Returns:
-            The updated dictionary with migrated keys.
-        """
-        if isinstance(data, dict):
-            # 1. Migrate legacy "response" to "responses" list
-            if "response" in data:
-                legacy_resp = data.pop("response")
-                if legacy_resp is not None and "responses" not in data:
-                    data["responses"] = [legacy_resp]
-
-        return data
-
     @model_validator(mode="after")
     def validate_response_timestamps(self, info: ValidationInfo) -> "SubtitleJob":
         """Ensures that the response timestamps are within the video duration.
@@ -782,7 +788,7 @@ class SubtitleJob(Job):
 
     @classmethod
     def load(cls, save_path: Path, validation_buffer_ms: int) -> Optional["SubtitleJob"]:
-        """Loads the job from a JSON file, checking for prompt version mismatch.
+        """Loads the job from a YAML file, checking for prompt version mismatch.
 
         Args:
             save_path (Path): The path to the saved job file.
@@ -798,11 +804,15 @@ class SubtitleJob(Job):
         if Path(save_path).is_file():
             with open(save_path, "r", encoding="utf-8") as f:
                 try:
-                    job = cls.model_validate_json(
-                        f.read(),
+                    data = yaml.safe_load(f)
+                    if not isinstance(data, dict):
+                        logfire.warning(f"Invalid YAML content in {save_path.name}, ignoring cache.")
+                        return None
+                    job = cls.model_validate(
+                        data,
                         context={"validation_buffer_ms": validation_buffer_ms},
                     )
-                except ValidationError as e:
+                except (yaml.YAMLError, ValidationError) as e:
                     logfire.warning(f"Validation failed for {save_path.name}, ignoring cache. Error: {e}")
                     return None
 
