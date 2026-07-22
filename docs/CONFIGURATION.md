@@ -2,6 +2,12 @@
 
 All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) or environment variables with the `AISUB_` prefix (e.g., `AISUB_AI_RPM=10`).
 
+## Positional Arguments
+
+| Argument             | Description                                                 | Default  |
+| -------------------- | ----------------------------------------------------------- | -------- |
+| `<input-video-file>` | The path to the video file for which to generate subtitles. | Required |
+
 ## AI Settings (`--ai.*`)
 
 | Argument                              | Description                                                                                                                                                                    | Default                            |

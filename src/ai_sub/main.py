@@ -37,15 +37,14 @@ from ai_sub.data_models import (
 )
 from ai_sub.gemini_file_uploader import GeminiFileUploader
 from ai_sub.job_runner import JobRunner
-
-# Resolve forward references in AgentDeps now that all modules are loaded.
-# This prevents PydanticUserError when AgentDeps is instantiated.
 from ai_sub.prompt import (
+    LYRICS_PROMPT_VERSION,
     SUBTITLES_PROMPT_VERSION,
     get_lyrics_scenes_prompt,
     get_subtitle_prompt,
     get_verification_prompt,
 )
+from ai_sub.utils import generate_full_shortcode, generate_model_shortcode
 from ai_sub.video import (
     get_video_duration_ms,
     get_working_encoder,
@@ -196,7 +195,7 @@ class LyricsSceneJobRunner(JobRunner):
         """
         super().__init__(settings, max_workers, on_complete, name=name)
         self.agent = agent
-        self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(self.agent.model_name)
+        self.model_code = generate_model_shortcode(self.agent.model_name)
 
     async def process(self, job: SegmentJobs) -> None:
         """Invokes the AI agent to detect lyrics and scenes.
@@ -229,7 +228,7 @@ class LyricsSceneJobRunner(JobRunner):
         lyrics_job = job.lyrics
         assert lyrics_job is not None
 
-        job_state_path = self.settings.dir.tmp / f"{lyrics_job.name}.lyrics.{self.sanitized_model_name}.json"
+        job_state_path = self.settings.dir.tmp / f"{lyrics_job.name}.lyrics.{self.model_code}.json"
         await asyncio.to_thread(lyrics_job.save, job_state_path)
 
 
@@ -257,7 +256,7 @@ class SubtitleJobRunner(JobRunner):
         """
         super().__init__(settings, max_workers, on_complete, name=name)
         self.agent = agent
-        self.sanitized_model_name = self.settings.ai.get_sanitized_model_name(self.agent.model_name)
+        self.model_code = generate_model_shortcode(self.agent.model_name)
 
     async def process(self, job: SegmentJobs) -> None:
         """Invokes the AI agent to generate subtitles.
@@ -284,9 +283,7 @@ class SubtitleJobRunner(JobRunner):
             if response:
                 subtitle_job.response = response
                 # Explicitly checkpoint the initial pass before entering the verification block
-                job_state_path = (
-                    self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.sanitized_model_name}.json"
-                )
+                job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.model_code}.json"
                 await asyncio.to_thread(subtitle_job.save, job_state_path)
 
         # 2. Check for ANY large gap and trigger verification runs as needed
@@ -313,9 +310,7 @@ class SubtitleJobRunner(JobRunner):
                 logfire.info(f"Verification re-run completed for {subtitle_job.name}.")
 
                 # Checkpoint after each successful verification pass
-                job_state_path = (
-                    self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.sanitized_model_name}.json"
-                )
+                job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.model_code}.json"
                 await asyncio.to_thread(subtitle_job.save, job_state_path)
             else:
                 break
@@ -334,12 +329,12 @@ class SubtitleJobRunner(JobRunner):
         assert subtitle_job is not None
 
         # Always save the job state to persist retry counts across runs.
-        job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.sanitized_model_name}.json"
+        job_state_path = self.settings.dir.tmp / f"{subtitle_job.name}.subtitles.{self.model_code}.json"
         await asyncio.to_thread(subtitle_job.save, job_state_path)
 
         # Also generate a subtitle file for this job for the user to view.
         if subtitle_job.response is not None:
-            sanitized_model = self.settings.ai.get_sanitized_model_name(self.settings.ai.model_subtitles)
+            subtitles_model_code = generate_model_shortcode(self.settings.ai.model_subtitles)
 
             def _save_ssa(response: SubtitleAiResponse, path: str) -> None:
                 response.get_ssafile().save(path)
@@ -347,7 +342,7 @@ class SubtitleJobRunner(JobRunner):
             await asyncio.to_thread(
                 _save_ssa,
                 subtitle_job.response,
-                str(self.settings.dir.tmp / f"{subtitle_job.name}.{sanitized_model}.srt"),
+                str(self.settings.dir.tmp / f"{subtitle_job.name}.{subtitles_model_code}.srt"),
             )
 
 
@@ -368,8 +363,8 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
     """
     with logfire.span("Producing final SRT file"):
         all_subtitles = SSAFile()
-        sanitized_lyrics_model = settings.ai.get_sanitized_model_name(settings.ai.model_lyrics)
-        sanitized_subtitles_model = settings.ai.get_sanitized_model_name(settings.ai.model_subtitles)
+        lyrics_model_code = generate_model_shortcode(settings.ai.model_lyrics)
+        subtitles_model_code = generate_model_shortcode(settings.ai.model_subtitles)
 
         chunks_to_skip = int((settings.split.start_offset_min * 60) / settings.split.max_seconds)
         offset_ms = sum(duration for _, duration in video_splits[:chunks_to_skip])
@@ -380,7 +375,7 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
 
         for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
             # Load the job result from the temporary JSON file.
-            job_path = settings.dir.tmp / f"{video_path.stem}.subtitles.{sanitized_subtitles_model}.json"
+            job_path = settings.dir.tmp / f"{video_path.stem}.subtitles.{subtitles_model_code}.json"
             job = SubtitleJob.load(job_path, settings.ai.validation_buffer_ms)
             if job and job.response:
                 current_subtitles = job.response.get_ssafile()
@@ -404,7 +399,7 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
                 sub_attempts = job.total_attempts if job else 0
                 lyrics_attempts = 0
                 if settings.thread.lyrics > 0:
-                    lyrics_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{sanitized_lyrics_model}.json"
+                    lyrics_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{lyrics_model_code}.json"
                     lyrics_job = LyricsSceneJob.load(lyrics_path, settings.ai.validation_buffer_ms)
                     lyrics_attempts = lyrics_job.total_attempts if lyrics_job else 0
 
@@ -433,6 +428,7 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
         state_info = {
             "ai_sub_version": version("ai-sub"),
             "generated_at": datetime.now().isoformat(),
+            "lyrics_prompt_version": LYRICS_PROMPT_VERSION,
             "subtitles_prompt_version": SUBTITLES_PROMPT_VERSION,
             "complete": complete,
             "max_retries_exceeded": max_retries_exceeded,
@@ -447,7 +443,8 @@ def stitch_subtitles(video_splits: list[tuple[Path, int]], settings: Settings) -
             all_subtitles[1].start = 1
 
         input_video_path = cast(Path, settings.input_video_file)
-        all_subtitles.save(str(settings.dir.out / f"{input_video_path.stem}.{sanitized_subtitles_model}.srt"))
+        shortcode = generate_full_shortcode(settings.ai.model_subtitles)
+        all_subtitles.save(str(settings.dir.out / f"{input_video_path.stem}.{shortcode}.srt"))
 
         if any_pending:
             return AiSubResult.INCOMPLETE
@@ -549,8 +546,8 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                 else None
             )
 
-            sanitized_lyrics_model = settings.ai.get_sanitized_model_name(settings.ai.model_lyrics)
-            sanitized_subtitles_model = settings.ai.get_sanitized_model_name(settings.ai.model_subtitles)
+            lyrics_model_code = generate_model_shortcode(settings.ai.model_lyrics)
+            subtitles_model_code = generate_model_shortcode(settings.ai.model_subtitles)
 
             # Initialize progress bars and a background task to handle UI refreshes (resizing)
             bars: dict[str, Any] = {}
@@ -816,14 +813,14 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                 job_state = SegmentJobs()
 
                 # Load jobs if they exist and populate the in-memory JobState
-                lyrics_job_path = settings.dir.tmp / f"{split.stem}.lyrics.{sanitized_lyrics_model}.json"
+                lyrics_job_path = settings.dir.tmp / f"{split.stem}.lyrics.{lyrics_model_code}.json"
                 lyrics_job = await asyncio.to_thread(
                     LyricsSceneJob.load, lyrics_job_path, settings.ai.validation_buffer_ms
                 )
                 if lyrics_job:
                     job_state.lyrics = lyrics_job
 
-                subtitle_job_path = settings.dir.tmp / f"{split.stem}.subtitles.{sanitized_subtitles_model}.json"
+                subtitle_job_path = settings.dir.tmp / f"{split.stem}.subtitles.{subtitles_model_code}.json"
                 subtitle_job = await asyncio.to_thread(
                     SubtitleJob.load, subtitle_job_path, settings.ai.validation_buffer_ms
                 )

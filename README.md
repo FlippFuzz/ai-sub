@@ -38,7 +38,7 @@ Please visit [ai-sub-showcase](https://github.com/FlippFuzz/ai-sub-showcase).
 3.  **Upload (Optional):** Uploads segments to the Gemini Files API for cloud-based processing. This bypasses local processing constraints and leverages the API's multimodal capabilities.
 4.  **Lyrics Search and Scene Detection (Optional):** Detects scenes and performs a web search for official lyrics to improve transcription accuracy for songs.
 5.  **Generation:** Generates synchronized subtitles and translations by using the audio as the ground truth for timing and visuals for context.
-6.  **Assembly:** Stitches the generated subtitles back together into a final SRT file.
+6.  **Assembly:** Stitches the generated subtitles back together into a final SRT file (e.g., `<video_name>.<shortcode>.srt` where the shortcode combines model code and prompt versions such as `video.g36f-0918.srt`).
 
 ---
 
@@ -189,13 +189,13 @@ Intermediate files and job states are stored in a temporary directory (default: 
 
 The application creates separate state files for each processing stage (e.g., lyrics detection, subtitle generation). To re-process a specific segment, you must delete the state file for the stage you want to re-run.
 
-File naming format: `part_XXX.<stage>.<model_name>.json`
+File naming format: `part_XXX.<stage>.<model_shortcode>.json`
 
 **Example: To re-run subtitle generation for the third segment:**
 
 1.  Navigate to the temporary directory.
-2.  Identify the model name used for subtitles (e.g., `gemini-3.6-flash`).
-3.  Delete the corresponding state file (e.g., `part_002.subtitles.gemini-3-6-flash.json`).
+2.  Identify the model shortcode used for subtitles (e.g., `g36f` for `gemini-3.6-flash`).
+3.  Delete the corresponding state file (e.g., `part_002.subtitles.g36f.json`).
 4.  Re-run the script. It will detect the missing subtitle job state and re-process only that segment, using any existing lyrics data.
 
 To re-run the entire pipeline for that segment (including lyrics search), delete both the `lyrics` and `subtitles` JSON files for that part.
