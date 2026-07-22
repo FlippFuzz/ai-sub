@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import os
+import re
 from pathlib import Path
 from time import time
 from typing import Optional
@@ -20,43 +21,113 @@ from google.genai.types import (
 
 from ai_sub.config import Settings
 
+# Pattern to match strictly lowercase managed segment files (e.g. part_001.mp4)
+PART_PATTERN = re.compile(r"^part_\d+")
 
-def calculate_sha256(filename: Path):
-    """Calculates the SHA256 hash of a file, reading it in chunks.
+
+def calculate_sha256_hex(filename: Path) -> str:
+    """Calculates the SHA256 hex digest of a file, reading it in chunks.
 
     Args:
         filename (Path): The path to the file.
 
     Returns:
-        str: The hexadecimal representation of the SHA256 hash.
-
+        str: The SHA256 hex digest string.
     """
-    # Create a sha256 hash object
     h = hashlib.sha256()
-
     with logfire.span(f"Calculating sha256 of {filename.name}", _level="debug"):
-        # Open the file in binary mode ('rb')
         with open(filename, "rb") as file:
-            # Read the file in chunks to avoid memory issues with large files
-            # 65536 bytes (64 KB) is a common, efficient block size
             for block in iter(lambda: file.read(65536), b""):
                 h.update(block)
 
-    # Return the hexadecimal representation of the digest
     return h.hexdigest()
+
+
+def _hashes_match(remote_hash: str | None, local_hex: str) -> bool:
+    """Checks if a remote file's SHA256 hash matches a local file's hex digest.
+
+    Handles Base64-encoded hex strings (Gemini API standard), raw hex strings,
+    and Base64-encoded binary digests.
+
+    Args:
+        remote_hash (str | None): The SHA256 hash string from Gemini Files API.
+        local_hex (str): The calculated local file SHA256 hex digest.
+
+    Returns:
+        bool: True if the hashes match, False otherwise.
+    """
+    if not remote_hash:
+        return False
+
+    # Direct hex match
+    if remote_hash.lower() == local_hex.lower():
+        return True
+
+    # Gemini API format: Base64-encoded ASCII hex string
+    b64_hex = base64.b64encode(local_hex.encode()).decode()
+    if remote_hash == b64_hex:
+        return True
+
+    # Base64-encoded binary digest format fallback
+    try:
+        b64_digest = base64.b64encode(bytes.fromhex(local_hex)).decode()
+        if remote_hash == b64_digest:
+            return True
+    except ValueError:
+        pass
+
+    # Decoded remote base64 match against local hex
+    try:
+        decoded_remote = base64.b64decode(remote_hash).decode("utf-8", errors="ignore")
+        if decoded_remote.lower() == local_hex.lower():
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _is_managed_file(display_name: str | None) -> bool:
+    """Checks if a file display name matches the managed segment pattern (e.g., 'part_XXX').
+
+    Args:
+        display_name (str | None): The display name of the remote file.
+
+    Returns:
+        bool: True if the file matches the managed pattern, False otherwise.
+    """
+    if not display_name:
+        return False
+    filename = Path(display_name).name
+    return bool(PART_PATTERN.match(filename))
+
+
+def _get_unique_display_name(file_path: Path) -> str:
+    """Constructs a unique display name using the workspace folder and filename.
+
+    Args:
+        file_path (Path): Path to the local file.
+
+    Returns:
+        str: Unique display name formatted as 'workspace_folder/part_XXX.ext'.
+    """
+    folder_name = file_path.parent.parent.name if file_path.parent.name == "reencoded" else file_path.parent.name
+    return f"{folder_name}/{file_path.name}"
 
 
 class GeminiFileUploader:
     """Handles uploading files to the Google Gemini Files API.
 
-    Includes caching file lists to avoid redundant API calls and checking for
-    existing files.
+    Includes caching file lists to avoid redundant API calls, checking for existing
+    files across multiple video workspaces using size/hash, and freeing storage only
+    for managed 'part_XXX' files when approaching the configured max storage limit.
     """
 
     _client: genai.Client
     _state: dict[str, File]
     _last_update_time: float = 0
     _list_cache_ttl_seconds: int
+    _max_storage_bytes: int
     _lock: asyncio.Lock
 
     def __init__(self, settings: Settings) -> None:
@@ -74,104 +145,154 @@ class GeminiFileUploader:
             http_options=http_options,
         )
         self._list_cache_ttl_seconds = settings.ai.google.file_cache_ttl
+        self._max_storage_bytes = settings.ai.google.max_storage_bytes
         self._state = {}
         self._lock = asyncio.Lock()
 
     async def _update_file_list(self) -> None:
-        """Updates the local file list cache from the server if the cache is stale.
-
-        The cache is considered stale if the time since the last update is
-        greater than the configured `_list_cache_ttl_seconds`. This mechanism
-        serves as a simple rate limit to avoid excessive `files.list` API calls.
-        """
+        """Updates the local file list cache from the server if the cache is stale."""
         now = time()
         async with self._lock:
             if (now - self._last_update_time) > self._list_cache_ttl_seconds:
-                # The cache is stale, refresh it.
-                self._state = {}
+                new_state: dict[str, File] = {}
                 async for file in await self._client.aio.files.list(config=ListFilesConfig(page_size=100)):
-                    if file.display_name:
-                        display_name = str(file.display_name)
-                        self._state[display_name] = file
+                    if file.name:
+                        new_state[file.name] = file
+                self._state = new_state
                 self._last_update_time = now
 
-    async def _get_file(self, display_name: str) -> Optional[File]:
-        """Retrieves a file from the cached list by its display name.
+    async def _cleanup_storage_if_needed(self, required_bytes: int = 0) -> None:
+        """Deletes oldest uploaded managed files if total remote storage exceeds safety limit.
 
-        Updates the cache if it's stale.
+        Only files with display names matching the managed pattern ('part_XXX') are
+        considered candidates for deletion.
 
         Args:
-            display_name (str): The display name of the file to retrieve.
-
-        Returns:
-            Optional[File]: The File object if found, otherwise None.
+            required_bytes (int): The size in bytes of the incoming file to be uploaded.
         """
         await self._update_file_list()
-        return self._state.get(display_name, None)
+        total_bytes = sum(f.size_bytes or 0 for f in self._state.values())
+
+        if total_bytes + required_bytes <= self._max_storage_bytes:
+            return
+
+        logfire.info(
+            f"Gemini storage threshold reached ({total_bytes / (1024**3):.2f} GB used). "
+            "Cleaning up oldest managed files..."
+        )
+
+        # Filter candidates to ONLY files matching our managed segment pattern (e.g. part_XXX)
+        managed_files = [f for f in self._state.values() if _is_managed_file(f.display_name)]
+
+        # Sort managed files by expiration or creation timestamp (oldest first)
+        sorted_files = sorted(
+            managed_files,
+            key=lambda f: f.expiration_time or f.create_time or "",
+        )
+
+        async with self._lock:
+            for file in sorted_files:
+                if total_bytes + required_bytes <= self._max_storage_bytes:
+                    break
+                if file.name:
+                    try:
+                        logfire.debug(f"Deleting old managed file: {file.display_name} ({file.name})")
+                        await self._client.aio.files.delete(name=file.name)
+                        total_bytes -= file.size_bytes or 0
+                        self._state.pop(file.name, None)
+                    except Exception as e:
+                        logfire.warning(f"Failed to delete remote file {file.name}: {e}")
+
+            self._last_update_time = 0
+
+    async def _find_existing_file(self, file_path: Path, file_size: int, local_hex: str) -> Optional[File]:
+        """Finds an existing remote file matching display name, size, and SHA256 hash.
+
+        Args:
+            file_path (Path): Path to the local file.
+            file_size (int): Size of the local file in bytes.
+            local_hex (str): Calculated SHA256 hex digest of the local file.
+
+        Returns:
+            Optional[File]: The matching File object if found, otherwise None.
+        """
+        await self._update_file_list()
+
+        target_display_names = {
+            file_path.name,
+            _get_unique_display_name(file_path),
+        }
+
+        async with self._lock:
+            for file in self._state.values():
+                if (
+                    file.display_name in target_display_names
+                    and file.size_bytes == file_size
+                    and _hashes_match(file.sha256_hash, local_hex)
+                ):
+                    if file.state == FileState.FAILED:
+                        if file.name:
+                            logfire.debug(f"Deleting failed remote file: {file.display_name}")
+                            try:
+                                await self._client.aio.files.delete(name=file.name)
+                            except Exception:
+                                pass
+                            self._state.pop(file.name, None)
+                        continue
+
+                    return file
+
+        return None
 
     async def upload_file(self, file_path: Path) -> File:
         """Uploads a file to the Gemini Files API.
 
-        If a file with the same display name already exists, it checks for
-        differences (size, SHA256 hash) and re-uploads if necessary, deleting
-        the old version.
+        If an active remote file matches the size, SHA256 hash, and display name,
+        it reuses that file without re-uploading or deleting non-matching files.
+        Older managed ('part_XXX') files are deleted only when total remote storage
+        approaches the configured limit.
 
         Args:
             file_path (Path): The path to the local file to be uploaded.
 
         Returns:
-            File: The uploaded file metadata object.
+            File: The uploaded or existing file metadata object.
 
         Raises:
             RuntimeError: If the file fails to process or cannot be retrieved.
         """
-        display_name = file_path.name
+        display_name = _get_unique_display_name(file_path)
+        file_size = os.path.getsize(file_path)
 
         with logfire.span("Check if the file is already uploaded", _level="debug"):
-            file = await self._get_file(display_name)
-            if file is not None:
-                needs_delete = False
-                # Compare file sizes - If filesizes are different, it's not the same file.
-                file_size = os.path.getsize(file_path)
-                if file.size_bytes != file_size:
-                    needs_delete = True
+            local_hex = await asyncio.to_thread(calculate_sha256_hex, file_path)
+            file = await self._find_existing_file(file_path, file_size, local_hex)
 
-                # Compare sha256 hashes to be sure
-                if not needs_delete:
-                    sha256_hex_string = await asyncio.to_thread(calculate_sha256, file_path)
-                    base64_sha256 = base64.b64encode(sha256_hex_string.encode()).decode()
-                    if base64_sha256 != str(file.sha256_hash):
-                        needs_delete = True
-
-                if needs_delete and file.name is not None:
-                    logfire.debug("Deleting old file with same name")
-                    await self._client.aio.files.delete(name=file.name)
-                    file = None  # Reset file to trigger upload
-
-        # Upload the file
         if file is None:
+            await self._cleanup_storage_if_needed(file_size)
+
             with logfire.span("Uploading File", _level="debug"):
                 file = await self._client.aio.files.upload(
                     file=file_path,
-                    config=UploadFileConfig(display_name=file_path.name),
+                    config=UploadFileConfig(display_name=display_name),
                 )
-                # We need to sleep for at least _list_cache_ttl_seconds to make sure that
-                # the cache contains the file that we just uploaded
+                async with self._lock:
+                    self._last_update_time = 0
+
                 await asyncio.sleep(self._list_cache_ttl_seconds + 1)
 
         with logfire.span("Wait for the file to be ready", _level="debug"):
             while file.state != FileState.ACTIVE:
                 if file.state == FileState.FAILED:
-                    raise RuntimeError(f"File {display_name} failed to process on the server.")
+                    raise RuntimeError(f"File {file_path.name} failed to process on the server.")
 
                 await asyncio.sleep(1)
                 if file.name:
                     file = await self._client.aio.files.get(name=file.name)
                 else:
-                    file = await self._get_file(display_name)
+                    file = await self._find_existing_file(file_path, file_size, local_hex)
 
                 if not file:
-                    # This shouldn't happen. We literally just uploaded the file above
-                    raise RuntimeError(f"Could not retrieve file '{display_name}' after upload.")
+                    raise RuntimeError(f"Could not retrieve file '{file_path.name}' after upload.")
 
         return file
