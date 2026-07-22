@@ -1,7 +1,6 @@
 """Configuration settings for the AI Sub subtitle generation pipeline."""
 
 import os
-import re
 from pathlib import Path
 from typing import Any, Literal, Optional, cast
 
@@ -203,21 +202,6 @@ class AiSettings(BaseSettings):
             self.model_subtitles = self.model
             self.model_lyrics = self.model
         return self
-
-    def get_sanitized_model_name(self, model_name: str) -> str:
-        """Sanitizes the model name to be safe for filenames.
-
-        Strips the provider prefix (if any) and replaces non-alphanumeric
-        characters with hyphens.
-
-        Args:
-            model_name (str): The full model string (e.g. "google-gla:gemini-3.6-flash")
-
-        Returns:
-            str: The sanitized model name.
-        """
-        model_name = model_name.split(":", 1)[-1]
-        return re.sub(r"[^a-zA-Z0-9]+", "-", model_name).strip("-")
 
 
 class ReEncodeSettings(BaseSettings):
