@@ -22,7 +22,7 @@ from google.genai.types import (
 from ai_sub.config import Settings
 
 # Pattern to match strictly lowercase managed segment files (e.g. part_001.mp4)
-PART_PATTERN = re.compile(r"^part_\d+")
+PART_PATTERN = re.compile(r"^part_\d{3}\.[^./]+$")
 
 
 def calculate_sha256_hex(filename: Path) -> str:
