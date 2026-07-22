@@ -161,11 +161,11 @@ class AiSettings(BaseSettings):
     model_subtitles: str = Field(
         description="The AI model for subtitle generation. Use 'google-gla:<model>' for Google models, "
         "'openai:<model>' for OpenAI, or 'custom:<url>' for a custom endpoint.",
-        default="google-gla:gemini-3.5-flash",
+        default="google-gla:gemini-3.6-flash",
     )
     model_lyrics: str = Field(
         description="The AI model for lyrics research and scene detection.",
-        default="google-gla:gemini-3.1-flash-lite",
+        default="google-gla:gemini-3.5-flash-lite",
     )
     rpm: PositiveInt = Field(description="Maximum Requests Per Minute (RPM) for the AI model provider.", default=4)
     tpm: PositiveInt = Field(description="Maximum Tokens Per Minute (TPM) for the AI model provider.", default=250000)
@@ -211,7 +211,7 @@ class AiSettings(BaseSettings):
         characters with hyphens.
 
         Args:
-            model_name (str): The full model string (e.g. "google-gla:gemini-1.5-pro")
+            model_name (str): The full model string (e.g. "google-gla:gemini-3.6-flash")
 
         Returns:
             str: The sanitized model name.
