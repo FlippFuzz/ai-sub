@@ -145,7 +145,7 @@ class GeminiFileUploader:
             http_options=http_options,
         )
         self._list_cache_ttl_seconds = settings.ai.google.file_cache_ttl
-        self._max_storage_bytes = settings.ai.google.max_storage_bytes
+        self._max_storage_bytes = int(settings.ai.google.max_storage_gb * 1024 * 1024 * 1024)
         self._state = {}
         self._lock = asyncio.Lock()
 

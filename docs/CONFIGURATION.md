@@ -23,12 +23,13 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ### Google AI Settings (`--ai.google.*`)
 
-| Argument                           | Description                                                                                                                                                              | Default                         |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------- |
-| `--ai.google.key <key>`            | The API key for Google's generative language models. Falls back to the GOOGLE_API_KEY or GEMINI_API_KEY environment variables if not set.                                | `None` (loads from environment) |
-| `--ai.google.file-cache-ttl <int>` | The time-to-live (TTL) in seconds for the Gemini file list cache. This cache helps avoid frequent API calls to list uploaded files.                                      | `10`                            |
-| `--ai.google.use-files-api <bool>` | Enable the Gemini Files API for cloud-based multimodal processing.                                                                                                       | `True`                          |
-| `--ai.google.base-url <url>`       | The base URL for the Google AI API. This can be used to override the default endpoint, for instance, to use a proxy. If not provided, Google's default URL will be used. | `None`                          |
+| Argument                             | Description                                                                                                                                                              | Default                         |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------- |
+| `--ai.google.key <key>`              | The API key for Google's generative language models. Falls back to the GOOGLE_API_KEY or GEMINI_API_KEY environment variables if not set.                                | `None` (loads from environment) |
+| `--ai.google.file-cache-ttl <int>`   | The time-to-live (TTL) in seconds for the Gemini file list cache. This cache helps avoid frequent API calls to list uploaded files.                                      | `10`                            |
+| `--ai.google.use-files-api <bool>`   | Enable the Gemini Files API for cloud-based multimodal processing.                                                                                                       | `True`                          |
+| `--ai.google.base-url <url>`         | The base URL for the Google AI API. This can be used to override the default endpoint, for instance, to use a proxy. If not provided, Google's default URL will be used. | `None`                          |
+| `--ai.google.max-storage-gb <float>` | Maximum allowed total storage usage in Gigabytes (GB) for Gemini Files API before triggering cleanup.                                                                    | `18.0`                          |
 
 ### Web Search Settings (`--ai.search.*`)
 

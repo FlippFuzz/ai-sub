@@ -52,9 +52,9 @@ class GoogleAiSettings(BaseSettings):
         "for instance, to use a proxy. If not provided, Google's default URL will be used.",
         default=None,
     )
-    max_storage_bytes: PositiveInt = Field(
-        description="Maximum allowed total storage usage in bytes for Gemini Files API before triggering cleanup.",
-        default=18 * 1024 * 1024 * 1024,
+    max_storage_gb: PositiveFloat = Field(
+        description="Maximum allowed total storage usage in Gigabytes (GB) for Gemini Files API before triggering cleanup.",
+        default=18.0,
     )
 
     @model_validator(mode="before")
