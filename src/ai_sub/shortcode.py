@@ -10,7 +10,9 @@ def generate_model_shortcode(model_name: str) -> str:
 
     Shortcodes are currently formatted specifically for Google Gemini models, as this project
     is primarily tested and designed to work with Gemini models. For Gemini models, an
-    ultra-compact tag in the format `g<version><tier>` is generated.
+    ultra-compact tag in the format `g<version><tier>[<variant>]` is generated. Known variant
+    suffixes (such as 'preview') map to single letters, while unhandled suffixes are sanitized
+    and appended with a hyphen (e.g., 'g25f-exp').
 
     For all other (non-Gemini) models, the model name is sanitized to be filename-safe
     by stripping provider prefixes, removing dots, and replacing invalid characters with hyphens.
@@ -20,8 +22,8 @@ def generate_model_shortcode(model_name: str) -> str:
             or "openai:gpt-4.0").
 
     Returns:
-        A shortcode string for Gemini models (e.g., "g35l", "g36f", "g31p"), or a
-        filename-sanitized string for non-Gemini models (e.g., "gpt-40", "claude-35-sonnet").
+        A shortcode string for Gemini models (e.g., "g35l", "g36f", "g31p", "g25fp", or "g25f-exp"),
+        or a filename-sanitized string for non-Gemini models (e.g., "gpt-40", "claude-35-sonnet").
 
     Gemini Shortcode Rules:
         1. Provider Prefix Stripping:
@@ -41,10 +43,10 @@ def generate_model_shortcode(model_name: str) -> str:
            - "flash"      -> "f"
            - "pro"        -> "p"
 
-    Non-Gemini Sanitization Rules:
-        1. Strips provider prefix (e.g., "openai:claude-3.5-sonnet" -> "claude-3.5-sonnet").
-        2. Removes dots (e.g., "claude-3.5-sonnet" -> "claude-35-sonnet").
-        3. Replaces non-alphanumeric characters with hyphens and strips outer hyphens.
+        5. Variant Suffixes:
+           Known variant suffixes map to single letters (e.g., "preview" -> "p", so
+           "gemini-2.5-flash-preview" -> "g25fp"). Unhandled variant suffixes fallback to
+           being sanitized and appended with a hyphen (e.g., "gemini-2.5-flash-exp" -> "g25f-exp").
 
     Examples:
         >>> generate_model_shortcode("gemini-3.5-flash-lite")
@@ -56,6 +58,12 @@ def generate_model_shortcode(model_name: str) -> str:
         >>> generate_model_shortcode("google-gla:gemini-3.1-pro")
         'g31p'
 
+        >>> generate_model_shortcode("gemini-2.5-flash-preview")
+        'g25fp'
+
+        >>> generate_model_shortcode("gemini-2.5-flash-exp")
+        'g25f-exp'
+
         >>> generate_model_shortcode("claude-3.5-sonnet")
         'claude-35-sonnet'
     """
@@ -63,18 +71,41 @@ def generate_model_shortcode(model_name: str) -> str:
 
     # Handle Gemini models specifically
     if clean_name.startswith("gemini"):
-        version_match = re.search(r"(\d+(?:\.\d+)*)", clean_name)
-        version_code = version_match.group(1).replace(".", "") if version_match else ""
+        rem = clean_name[len("gemini") :].lstrip("-_")
+
+        version_match = re.search(r"(\d+(?:\.\d+)*)", rem)
+        if version_match:
+            version_str = version_match.group(1)
+            version_code = version_str.replace(".", "")
+            rem = rem.replace(version_str, "", 1).lstrip("-_")
+        else:
+            version_code = ""
 
         tier_code = "g"
-        if "flash-lite" in clean_name or "lite" in clean_name:
-            tier_code = "l"
-        elif "flash" in clean_name:
-            tier_code = "f"
-        elif "pro" in clean_name:
-            tier_code = "p"
+        for tier_name, code in [
+            ("flash-lite", "l"),
+            ("lite", "l"),
+            ("flash", "f"),
+            ("pro", "p"),
+        ]:
+            if rem == tier_name or rem.startswith(tier_name + "-") or rem.startswith(tier_name + "_"):
+                tier_code = code
+                rem = rem[len(tier_name) :].lstrip("-_")
+                break
 
-        return f"g{version_code}{tier_code}"
+        base_code = f"g{version_code}{tier_code}"
+        if rem:
+            variant_map = {
+                "preview": "p",
+            }
+            if rem in variant_map:
+                return f"{base_code}{variant_map[rem]}"
+
+            variant = rem.replace(".", "")
+            variant = re.sub(r"[^a-zA-Z0-9]+", "-", variant).strip("-")
+            if variant:
+                return f"{base_code}-{variant}"
+        return base_code
 
     # For non-Gemini models: sanitize to be filename-safe and drop dots
     sanitized = clean_name.replace(".", "")
