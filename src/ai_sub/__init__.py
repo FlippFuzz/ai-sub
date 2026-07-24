@@ -15,7 +15,11 @@ from .config import (
 from .data_models import AiSubResult
 from .main import TqdmWriteWrapper, ai_sub, setup_logging
 from .prompt import LYRICS_PROMPT_VERSION, SUBTITLES_PROMPT_VERSION
-from .shortcode import generate_full_shortcode, generate_model_shortcode
+from .shortcode import (
+    generate_full_shortcode,
+    generate_lyrics_shortcode,
+    generate_model_shortcode,
+)
 
 __all__ = [
     "AiSettings",
@@ -35,5 +39,6 @@ __all__ = [
     "LYRICS_PROMPT_VERSION",
     "SUBTITLES_PROMPT_VERSION",
     "generate_full_shortcode",
+    "generate_lyrics_shortcode",
     "generate_model_shortcode",
 ]

@@ -189,13 +189,13 @@ Intermediate files and job states are stored in a temporary directory (default: 
 
 The application creates separate state files for each processing stage (e.g., lyrics detection, subtitle generation). To re-process a specific segment, you must delete the state file for the stage you want to re-run.
 
-File naming format: `part_XXX.<stage>.<model_shortcode>.json`
+File naming format: `part_XXX.<stage>.<model_shortcode>.yaml`
 
 **Example: To re-run subtitle generation for the third segment:**
 
 1.  Navigate to the temporary directory.
 2.  Identify the model shortcode used for subtitles (e.g., `g36f` for `gemini-3.6-flash`).
-3.  Delete the corresponding state file (e.g., `part_002.subtitles.g36f.json`).
+3.  Delete the corresponding state file (e.g., `part_002.subtitles.g36f.yaml`).
 4.  Re-run the script. It will detect the missing subtitle job state and re-process only that segment, using any existing lyrics data.
 
-To re-run the entire pipeline for that segment (including lyrics search), delete both the `lyrics` and `subtitles` JSON files for that part.
+To re-run the entire pipeline for that segment (including lyrics search), delete both the `lyrics` and `subtitles` YAML files for that part.

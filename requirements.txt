@@ -7,3 +7,4 @@ pyrate-limiter
 json_repair
 ruff
 tqdm
+pyyaml
