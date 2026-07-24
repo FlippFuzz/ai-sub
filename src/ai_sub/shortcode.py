@@ -113,6 +113,37 @@ def generate_model_shortcode(model_name: str) -> str:
     return sanitized or "model"
 
 
+def generate_lyrics_shortcode(
+    model_name: str,
+    lyrics_prompt_version: int = LYRICS_PROMPT_VERSION,
+) -> str:
+    """Generates a shortcode tag combining the model shortcode and lyrics prompt version.
+
+    Calls `generate_model_shortcode` to format the base model identifier, then appends
+    a hyphenated 2-digit version suffix (`-<lyrics_v>`).
+
+    Args:
+        model_name: Full model identifier string (e.g., "google-gla:gemini-3.5-flash-lite").
+        lyrics_prompt_version: Version integer for the lyrics prompt (defaults to current prompt version).
+
+    Returns:
+        A lyrics shortcode string in the format `<model_code>-<lyrics_v>`
+        (e.g., "g35l-09" for Gemini, or "claude-35-sonnet-01" for non-Gemini models).
+
+    Examples:
+        >>> generate_lyrics_shortcode("google-gla:gemini-3.5-flash-lite", 9)
+        'g35l-09'
+
+        >>> generate_lyrics_shortcode("google-gla:gemini-3.6-flash", 8)
+        'g36f-08'
+
+        >>> generate_lyrics_shortcode("claude-3.5-sonnet", 1)
+        'claude-35-sonnet-01'
+    """
+    model_code = generate_model_shortcode(model_name)
+    return f"{model_code}-{lyrics_prompt_version:02d}"
+
+
 def generate_full_shortcode(
     model_name: str,
     lyrics_prompt_version: int = LYRICS_PROMPT_VERSION,
