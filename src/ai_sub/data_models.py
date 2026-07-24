@@ -653,13 +653,13 @@ class LyricsSceneJob(Job):
 
     file: Optional[File | Path] = Field(default=None, exclude=True)
     video_duration_ms: PositiveInt
-    response: Optional[LyricsSceneAiResponse] = Field(
-        default=None,
-        description="The structured AI response after successful processing.",
-    )
     lyrics_prompt_version: Optional[int] = Field(
         default_factory=_get_default_lyrics_version,
         description="The version of the prompt used to generate the response, for cache validation.",
+    )
+    response: Optional[LyricsSceneAiResponse] = Field(
+        default=None,
+        description="The structured AI response after successful processing.",
     )
 
     @model_validator(mode="after")
@@ -727,13 +727,13 @@ class SubtitleJob(Job):
 
     file: Optional[File | Path] = Field(default=None, exclude=True)
     video_duration_ms: PositiveInt
-    responses: list[SubtitleAiResponse] = Field(
-        default_factory=list,
-        description="The chronological list of subtitle responses generated during processing.",
-    )
     subtitles_prompt_version: Optional[int] = Field(
         default_factory=_get_default_subtitles_version,
         description="The version of the prompt used to generate the response, for cache validation.",
+    )
+    responses: list[SubtitleAiResponse] = Field(
+        default_factory=list,
+        description="The chronological list of subtitle responses generated during processing.",
     )
 
     @property
