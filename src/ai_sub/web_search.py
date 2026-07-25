@@ -127,7 +127,6 @@ class WebSearchDeps:
             httpx.TimeoutException: If a request times out and retries are exhausted.
             ConnectionError: If a connection error occurs and retries are exhausted.
             asyncio.TimeoutError: If an async operation times out and retries are exhausted.
-            RuntimeError: If the request fails after exhausting all retries.
         """
         max_attempts = self._settings.retries + 1
         for attempt in range(max_attempts):
@@ -163,4 +162,4 @@ class WebSearchDeps:
                     continue
                 raise
 
-        raise RuntimeError("Web search request failed after retries.")
+        assert False, "Unreachable code path"
