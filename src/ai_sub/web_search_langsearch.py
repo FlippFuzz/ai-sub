@@ -38,7 +38,6 @@ async def web_search_langsearch_single(ctx: RunContext[AgentDeps], query: str) -
         "count": 10,
     }
     response = await deps.post("https://api.langsearch.com/v1/web-search", json=payload)
-    response.raise_for_status()
 
     data = response.json()
     # The results are nested within data.webPages.value, requiring manual mapping

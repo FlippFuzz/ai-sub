@@ -5,11 +5,14 @@ dependency container used to orchestrate web search operations across
 different providers.
 """
 
+import asyncio
 import math
+import random
 import string
 from typing import Any, Self
 
-from httpx import AsyncClient, Response
+import logfire
+from httpx import AsyncClient, HTTPStatusError, Response, TimeoutException, TransportError
 from pydantic import BaseModel, Field, HttpUrl
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
@@ -109,7 +112,7 @@ class WebSearchDeps:
             await self._client.__aexit__(exc_type, exc_val, exc_tb)
 
     async def post(self, url: str, json: dict[str, Any]) -> Response:
-        """Send a POST request to the server.
+        """Send a POST request to the server with retries and exponential backoff.
 
         Args:
             url: The destination URL.
@@ -117,7 +120,46 @@ class WebSearchDeps:
 
         Returns:
             The HTTP response object.
+
+        Raises:
+            httpx.HTTPStatusError: If an unretryable HTTP error occurs or retries are exhausted.
+            httpx.TransportError: If a transport error occurs and retries are exhausted.
+            httpx.TimeoutException: If a request times out and retries are exhausted.
+            ConnectionError: If a connection error occurs and retries are exhausted.
+            asyncio.TimeoutError: If an async operation times out and retries are exhausted.
         """
-        # Enforce rate limit
-        await self._limiter.try_acquire_async(self._provider, blocking=True)
-        return await self._client.post(url, json=json)
+        max_attempts = self._settings.retries + 1
+        for attempt in range(max_attempts):
+            await self._limiter.try_acquire_async(self._provider, blocking=True)
+            try:
+                response = await self._client.post(url, json=json)
+                response.raise_for_status()
+                return response
+            except (
+                HTTPStatusError,
+                TransportError,
+                TimeoutException,
+                ConnectionError,
+                asyncio.TimeoutError,
+            ) as e:
+                is_retryable = False
+                if isinstance(e, HTTPStatusError):
+                    status_code = e.response.status_code
+                    is_retryable = status_code in (429, 500, 502, 503, 504)
+                else:
+                    is_retryable = True
+
+                if is_retryable and attempt < self._settings.retries:
+                    backoff = min(
+                        self._settings.max_wait_seconds,
+                        (self._settings.min_wait_seconds * (self._settings.multiplier**attempt)) + random.uniform(0, 1),
+                    )
+                    logfire.warning(
+                        f"Web search POST to {url} failed with {e} (attempt {attempt + 1}/{max_attempts}). "
+                        f"Retrying in {backoff:.2f}s..."
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
+
+        assert False, "Unreachable code path"
