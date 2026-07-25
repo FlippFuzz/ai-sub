@@ -378,7 +378,7 @@ class RateLimitedAgentWrapper:
                 if isinstance(e, (ModelHTTPError, HTTPStatusError)):
                     status_code = e.status_code if isinstance(e, ModelHTTPError) else e.response.status_code
                     # Transient status codes
-                    is_retryable = status_code in (429, 502, 503, 504)
+                    is_retryable = status_code in (429, 500, 502, 503, 504)
                 else:
                     # Network level errors (Connection, Timeout)
                     is_retryable = True
