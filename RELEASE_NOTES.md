@@ -1,5 +1,28 @@
 # AI Sub Release Notes
 
+### v3.4.0
+
+This release introduces YAML-based state persistence, standardized model shortcodes with prompt versioning for output and checkpoint files, Gemini Files API storage management with automatic cleanup, and updates default AI models to Gemini 3.6 Flash and 3.5 Flash-Lite.
+
+**New Features & Improvements:**
+
+- **YAML State Persistence:**
+  - Migrated job and pipeline progress persistence from JSON to YAML (`.yaml`) using [`pyyaml`](pyproject.toml) in [`src/ai_sub/data_models.py`](src/ai_sub/data_models.py).
+- **Model Shortcodes & Prompt Versioning:**
+  - Introduced [`src/ai_sub/shortcode.py`](src/ai_sub/shortcode.py) providing standardized shortcode generation helpers (`generate_model_shortcode`, `generate_lyrics_shortcode`, `generate_full_shortcode`) exported in [`src/ai_sub/__init__.py`](src/ai_sub/__init__.py).
+  - Output SRT filenames and intermediate state checkpoints now include concise model shortcodes combined with prompt versioning (e.g., `<video_name>.<shortcode>.srt`) in [`src/ai_sub/main.py`](src/ai_sub/main.py) and [`README.md`](README.md).
+- **Gemini Files API Storage Management:**
+  - Added a configurable maximum storage limit (`max_storage_gb`, defaulting to 18.0 GB) in [`src/ai_sub/config.py`](src/ai_sub/config.py) and [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
+  - Implemented automatic cleanup of older managed segment files (`part_XXX`) when storage usage approaches the configured limit in [`src/ai_sub/gemini_file_uploader.py`](src/ai_sub/gemini_file_uploader.py).
+  - Improved file reuse by matching file content via SHA256 hashes (`calculate_sha256_hex`) and handling failed or incomplete remote files more reliably.
+- **Updated Default AI Models:**
+  - Updated default AI models to `google-gla:gemini-3.6-flash` for subtitle generation and `google-gla:gemini-3.5-flash-lite` for lyrics research and scene detection in [`src/ai_sub/config.py`](src/ai_sub/config.py).
+- **Documentation & Configuration:**
+  - Added positional argument documentation and refined configuration tables in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
+  - Updated re-processing guidance and examples in [`README.md`](README.md) to reflect YAML state files and shortcode naming conventions.
+
+---
+
 ### v3.3.0
 
 This release includes significant improvements to the subtitle generation prompt, optimizations for parallel web searches, and refinement of the data models for better AI interaction.
