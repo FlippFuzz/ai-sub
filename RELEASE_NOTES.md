@@ -1,5 +1,16 @@
 # AI Sub Release Notes
 
+### v3.5.1
+
+This patch release sets the default gap verification ignore flags to `True` for boundary segments.
+
+**Fixes & Improvements:**
+
+- **Default Gap Verification Settings:**
+  - Updated default values for [`gap_verification_ignore_start`](src/ai_sub/config.py:214) and [`gap_verification_ignore_end`](src/ai_sub/config.py:218) to `True` in [`src/ai_sub/config.py`](src/ai_sub/config.py:214) to bypass gap verification checks for the first and last segments by default.
+
+---
+
 ### v3.5.0
 
 This release introduces robust web search retries with exponential backoff, configurable gap verification exemptions for boundary segments, and improved multiline formatting for lyrics and YAML output.
