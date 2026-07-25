@@ -1,5 +1,25 @@
 # AI Sub Release Notes
 
+### v3.5.0
+
+This release introduces robust web search retries with exponential backoff, configurable gap verification exemptions for boundary segments, and improved multiline formatting for lyrics and YAML output.
+
+**New Features & Improvements:**
+
+- **Web Search Resilience & Retries:**
+  - Added configurable retry counts and exponential backoff settings (`retries`, `min_wait_seconds`, `max_wait_seconds`, `multiplier`) for web searches in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md:38).
+  - Web search requests now automatically retry transient HTTP, timeout, and connection failures with jittered exponential backoff in [`src/ai_sub/web_search.py`](src/ai_sub/web_search.py:115).
+  - Added HTTP 500 status code to retryable errors in [`src/ai_sub/agent_wrapper.py`](src/ai_sub/agent_wrapper.py:381) and removed manual `raise_for_status` calls in provider integrations ([`src/ai_sub/web_search_langsearch.py`](src/ai_sub/web_search_langsearch.py:40), [`src/ai_sub/web_search_ollama.py`](src/ai_sub/web_search_ollama.py:34)).
+- **Gap Verification Exemptions:**
+  - Added options to skip gap verification for the first (`gap_verification_ignore_start`) and last (`gap_verification_ignore_end`) subtitle segments in [`src/ai_sub/config.py`](src/ai_sub/config.py:214) and [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md:20).
+  - Pipeline execution in [`src/ai_sub/main.py`](src/ai_sub/main.py:295) and [`src/ai_sub/data_models.py`](src/ai_sub/data_models.py:758) now tracks segment boundaries (`is_first_segment`, `is_last_segment`) to bypass unnecessary verification retries when configured.
+- **Multiline Formatting & YAML Escaping:**
+  - Improved handling of escaped line breaks (`\r`, `\n`, `\r\n`, `\\r`, `\\n`) in lyrics and generated YAML in [`src/ai_sub/data_models.py`](src/ai_sub/data_models.py:70), ensuring clean multiline block scalar formatting (`|`).
+- **Documentation & Configuration:**
+  - Expanded configuration documentation with web search retry parameters and gap verification exemption flags in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md:38).
+
+---
+
 ### v3.4.0
 
 This release introduces YAML-based state persistence, standardized model shortcodes with prompt versioning for output and checkpoint files, Gemini Files API storage management with automatic cleanup, and updates default AI models to Gemini 3.6 Flash and 3.5 Flash-Lite.
