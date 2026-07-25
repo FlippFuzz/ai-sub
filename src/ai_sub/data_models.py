@@ -67,7 +67,10 @@ class _YamlDumper(yaml.SafeDumper):
 
 
 def _str_presenter(dumper: _YamlDumper, data: str) -> yaml.Node:
-    """Formats multiline strings using the literal block scalar style '|'.
+    r"""Formats multiline strings using the literal block scalar style '|'.
+
+    Converts any literal backslash-n ('\n') sequences to actual newlines
+    so LLM outputs with escaped newlines are properly presented as multiline blocks.
 
     Args:
         dumper (_YamlDumper): The YAML dumper instance.
@@ -76,6 +79,9 @@ def _str_presenter(dumper: _YamlDumper, data: str) -> yaml.Node:
     Returns:
         yaml.Node: The represented scalar node.
     """
+    if "\\n" in data and "\n" not in data:
+        data = data.replace("\\n", "\n")
+    data = data.replace("\r\n", "\n")
     if "\n" in data:
         return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
     return dumper.represent_scalar("tag:yaml.org,2002:str", data)
@@ -493,7 +499,7 @@ class Scene(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def clean_leakage(cls, data: Any) -> Any:
-        """Strips LLM noise from timestamps before field assignment.
+        """Strips LLM noise from timestamps and converts escaped newlines in lyrics.
 
         Args:
             data (Any): The raw input data.
@@ -505,6 +511,9 @@ class Scene(BaseModel):
             for key in ("start", "end"):
                 if key in data and isinstance(data[key], str):
                     data[key] = _clean_timestamp_string(data[key])
+            for key in ("reference_lyrics_og", "reference_lyrics_en"):
+                if key in data and isinstance(data[key], str):
+                    data[key] = data[key].replace("\\n", "\n").replace("\r\n", "\n")
         return data
 
     @model_validator(mode="after")
