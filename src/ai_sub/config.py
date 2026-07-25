@@ -211,6 +211,14 @@ class AiSettings(BaseSettings):
         "with large gaps. Set to 0 to disable gap verification entirely.",
         default=1,
     )
+    gap_verification_ignore_start: bool = Field(
+        description="Whether to ignore gap verification checks for the first segment being processed.",
+        default=False,
+    )
+    gap_verification_ignore_end: bool = Field(
+        description="Whether to ignore gap verification checks for the last segment being processed.",
+        default=False,
+    )
 
     @model_validator(mode="after")
     def validate_models(self) -> "AiSettings":

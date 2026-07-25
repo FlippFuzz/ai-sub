@@ -67,7 +67,10 @@ class _YamlDumper(yaml.SafeDumper):
 
 
 def _str_presenter(dumper: _YamlDumper, data: str) -> yaml.Node:
-    """Formats multiline strings using the literal block scalar style '|'.
+    r"""Formats multiline strings using the literal block scalar style '|'.
+
+    Converts all variations of escaped and unescaped line breaks (\r, \n, \r\n, \\r, \\n, \\r\\n)
+    to standard newline characters so LLM outputs are cleanly presented as multiline blocks.
 
     Args:
         dumper (_YamlDumper): The YAML dumper instance.
@@ -76,6 +79,7 @@ def _str_presenter(dumper: _YamlDumper, data: str) -> yaml.Node:
     Returns:
         yaml.Node: The represented scalar node.
     """
+    data = data.replace("\\r", "\r").replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
     if "\n" in data:
         return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
     return dumper.represent_scalar("tag:yaml.org,2002:str", data)
@@ -493,7 +497,7 @@ class Scene(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def clean_leakage(cls, data: Any) -> Any:
-        """Strips LLM noise from timestamps before field assignment.
+        """Strips LLM noise from timestamps and converts escaped newlines in lyrics.
 
         Args:
             data (Any): The raw input data.
@@ -505,6 +509,11 @@ class Scene(BaseModel):
             for key in ("start", "end"):
                 if key in data and isinstance(data[key], str):
                     data[key] = _clean_timestamp_string(data[key])
+            for key in ("reference_lyrics_og", "reference_lyrics_en"):
+                if key in data and isinstance(data[key], str):
+                    data[key] = (
+                        data[key].replace("\\r", "\r").replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
+                    )
         return data
 
     @model_validator(mode="after")
@@ -746,12 +755,24 @@ class SubtitleJob(Job):
         """Appends a new response to the attempt history."""
         self.responses.append(value)
 
-    def is_complete(self, gap_threshold_s: int, gap_verification_retries: int) -> bool:
+    def is_complete(
+        self,
+        gap_threshold_s: int,
+        gap_verification_retries: int,
+        is_first_segment: bool = False,
+        is_last_segment: bool = False,
+        ignore_start: bool = False,
+        ignore_end: bool = False,
+    ) -> bool:
         """Checks if the subtitle job is complete and verified.
 
         Args:
             gap_threshold_s: The gap threshold in seconds.
             gap_verification_retries: The maximum allowed verification attempts.
+            is_first_segment: Whether this job is for the first segment being processed.
+            is_last_segment: Whether this job is for the last segment being processed.
+            ignore_start: Whether to ignore gap verification for the first segment being processed.
+            ignore_end: Whether to ignore gap verification for the last segment being processed.
 
         Returns:
             True if complete and verified, False otherwise.
@@ -766,6 +787,13 @@ class SubtitleJob(Job):
 
         # If we have exceeded our allowed verification runs, it is complete.
         if len(self.responses) > gap_verification_retries:
+            return True
+
+        # Complete segment bypass for first or last segment if enabled
+        if is_first_segment and ignore_start:
+            return True
+
+        if is_last_segment and ignore_end:
             return True
 
         # Otherwise, it's complete if it has no large gaps.
@@ -846,4 +874,10 @@ class SegmentJobs(BaseModel):
     )
     subtitles: Optional[SubtitleJob] = Field(
         default=None, description="The final subtitle generation job for the segment."
+    )
+    is_first_segment: bool = Field(
+        default=False, description="Whether this segment is the first segment being processed."
+    )
+    is_last_segment: bool = Field(
+        default=False, description="Whether this segment is the last segment being processed."
     )
