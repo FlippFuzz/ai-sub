@@ -213,11 +213,11 @@ class AiSettings(BaseSettings):
     )
     gap_verification_ignore_start: bool = Field(
         description="Whether to ignore gap verification checks for the first segment being processed.",
-        default=False,
+        default=True,
     )
     gap_verification_ignore_end: bool = Field(
         description="Whether to ignore gap verification checks for the last segment being processed.",
-        default=False,
+        default=True,
     )
 
     @model_validator(mode="after")
