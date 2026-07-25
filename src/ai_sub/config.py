@@ -117,6 +117,22 @@ class WebSearchSettings(BaseSettings):
         "Search queries can occasionally be slow depending on the provider.",
         default=60.0,
     )
+    retries: NonNegativeInt = Field(
+        description="Maximum retry attempts for web search HTTP requests on transient errors.",
+        default=3,
+    )
+    min_wait_seconds: PositiveFloat = Field(
+        description="The minimum wait time in seconds for web search retry backoff.",
+        default=1.0,
+    )
+    max_wait_seconds: PositiveFloat = Field(
+        description="The maximum wait time in seconds for web search retry backoff.",
+        default=10.0,
+    )
+    multiplier: PositiveFloat = Field(
+        description="The multiplier for exponential backoff between web search retries.",
+        default=2.0,
+    )
 
     @model_validator(mode="before")
     @classmethod

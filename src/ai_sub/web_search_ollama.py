@@ -32,7 +32,6 @@ async def web_search_ollama_single(ctx: RunContext[AgentDeps], query: str) -> li
         return deps._cache[cache_key]
 
     response = await deps.post("https://ollama.com/api/web_search", json={"query": query})
-    response.raise_for_status()
 
     data = response.json()
     results = [
