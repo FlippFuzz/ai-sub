@@ -746,12 +746,24 @@ class SubtitleJob(Job):
         """Appends a new response to the attempt history."""
         self.responses.append(value)
 
-    def is_complete(self, gap_threshold_s: int, gap_verification_retries: int) -> bool:
+    def is_complete(
+        self,
+        gap_threshold_s: int,
+        gap_verification_retries: int,
+        is_first_segment: bool = False,
+        is_last_segment: bool = False,
+        ignore_start: bool = False,
+        ignore_end: bool = False,
+    ) -> bool:
         """Checks if the subtitle job is complete and verified.
 
         Args:
             gap_threshold_s: The gap threshold in seconds.
             gap_verification_retries: The maximum allowed verification attempts.
+            is_first_segment: Whether this job is for the first segment being processed.
+            is_last_segment: Whether this job is for the last segment being processed.
+            ignore_start: Whether to ignore gap verification for the first segment being processed.
+            ignore_end: Whether to ignore gap verification for the last segment being processed.
 
         Returns:
             True if complete and verified, False otherwise.
@@ -766,6 +778,13 @@ class SubtitleJob(Job):
 
         # If we have exceeded our allowed verification runs, it is complete.
         if len(self.responses) > gap_verification_retries:
+            return True
+
+        # Complete segment bypass for first or last segment if enabled
+        if is_first_segment and ignore_start:
+            return True
+
+        if is_last_segment and ignore_end:
             return True
 
         # Otherwise, it's complete if it has no large gaps.
@@ -846,4 +865,10 @@ class SegmentJobs(BaseModel):
     )
     subtitles: Optional[SubtitleJob] = Field(
         default=None, description="The final subtitle generation job for the segment."
+    )
+    is_first_segment: bool = Field(
+        default=False, description="Whether this segment is the first segment being processed."
+    )
+    is_last_segment: bool = Field(
+        default=False, description="Whether this segment is the last segment being processed."
     )

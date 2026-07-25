@@ -292,7 +292,14 @@ class SubtitleJobRunner(JobRunner):
         # 2. Check for ANY large gap and trigger verification runs as needed
         gap_threshold_s = self.settings.ai.verification_gap_seconds
         gap_verification_retries = self.settings.ai.gap_verification_retries
-        while gap_verification_retries > 0 and not subtitle_job.is_complete(gap_threshold_s, gap_verification_retries):
+        while gap_verification_retries > 0 and not subtitle_job.is_complete(
+            gap_threshold_s,
+            gap_verification_retries,
+            is_first_segment=job.is_first_segment,
+            is_last_segment=job.is_last_segment,
+            ignore_start=self.settings.ai.gap_verification_ignore_start,
+            ignore_end=self.settings.ai.gap_verification_ignore_end,
+        ):
             attempt_num = len(subtitle_job.responses)
             logfire.warning(
                 f"Large gap(s) (>= {gap_threshold_s}s) detected in '{subtitle_job.name}'. "
@@ -714,6 +721,10 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                     if job.subtitles.is_complete(
                         settings.ai.verification_gap_seconds,
                         settings.ai.gap_verification_retries,
+                        is_first_segment=job.is_first_segment,
+                        is_last_segment=job.is_last_segment,
+                        ignore_start=settings.ai.gap_verification_ignore_start,
+                        ignore_end=settings.ai.gap_verification_ignore_end,
                     ):
                         mark_done("subtitles")
                         return
@@ -810,8 +821,15 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                 reencode_dir.mkdir(exist_ok=True)
 
             # Iterate through all video segments to determine their starting point in the pipeline.
-            for split, duration in splits_to_process:
-                job_state = SegmentJobs()
+            total_splits = len(splits_to_process)
+            for idx, (split, duration) in enumerate(splits_to_process):
+                is_first = idx == 0
+                is_last = idx == total_splits - 1
+
+                job_state = SegmentJobs(
+                    is_first_segment=is_first,
+                    is_last_segment=is_last,
+                )
 
                 # Load jobs if they exist and populate the in-memory JobState
                 lyrics_job_path = settings.dir.tmp / f"{split.stem}.lyrics.{lyrics_shortcode}.yaml"
@@ -832,6 +850,10 @@ async def ai_sub(settings: Settings, configure_logging: bool = True) -> AiSubRes
                 is_complete = subtitle_job is not None and subtitle_job.is_complete(
                     settings.ai.verification_gap_seconds,
                     settings.ai.gap_verification_retries,
+                    is_first_segment=is_first,
+                    is_last_segment=is_last,
+                    ignore_start=settings.ai.gap_verification_ignore_start,
+                    ignore_end=settings.ai.gap_verification_ignore_end,
                 )
                 if is_complete:
                     sync_progress("done")
