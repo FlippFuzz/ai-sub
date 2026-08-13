@@ -70,11 +70,11 @@ You can use AI Sub a Google AI Studio API Key and an optional langsearch API key
 This option provides the best quality for the free tier.
 
 - As of 22 July 2026:
-- Gemini API provides 20 free requests/day for gemini-3.6-flash
+- Gemini API provides 20 free requests/day for gemini-3.7-flash
 - Gemini API provides 500 free requests/day for gemini-3.5-flash-lite
 - Langsearch provides 1000 free request/day for web searches
 
-The limiting factor is the daily free quota for gemini-3.6-flash.
+The limiting factor is the daily free quota for gemini-3.7-flash.
 You should be able to create subtitles for between 1 hour to 1 hour 40 mins of videos per day.
 
 1.  **Obtain your API Keys:**
@@ -97,7 +97,7 @@ You should be able to create subtitles for between 1 hour to 1 hour 40 mins of v
 
     ai-sub \
     --ai.model-lyrics=google-gla:gemini-3.5-flash-lite \
-    --ai.model-subtitles=google-gla:gemini-3.6-flash \
+    --ai.model-subtitles=google-gla:gemini-3.7-flash \
     --ai.search.web-search-tool=langsearch \
     --ai.google.key="${GOOGLE_KEY}" \
     --ai.search.key="${LANGSEARCH_KEY}" \
@@ -113,7 +113,7 @@ You should be able to create subtitles for between 1 hour to 1 hour 40 mins of v
 
     ai-sub ^
     --ai.model-lyrics=google-gla:gemini-3.5-flash-lite ^
-    --ai.model-subtitles=google-gla:gemini-3.6-flash ^
+    --ai.model-subtitles=google-gla:gemini-3.7-flash ^
     --ai.search.web-search-tool=langsearch ^
     --ai.google.key="%GOOGLE_KEY%" ^
     --ai.search.key="%LANGSEARCH_KEY%" ^
@@ -138,7 +138,7 @@ We can use duckduckgo to try to lookup lyrics, but it is not as reliable.
 
     ai-sub \
     --ai.model-lyrics=google-gla:gemini-3.5-flash-lite \
-    --ai.model-subtitles=google-gla:gemini-3.6-flash \
+    --ai.model-subtitles=google-gla:gemini-3.7-flash \
     --ai.search.web-search-tool=duckduckgo \
     --ai.google.key="${GOOGLE_KEY}" \
     "${FILE_NAME}"
@@ -152,7 +152,7 @@ We can use duckduckgo to try to lookup lyrics, but it is not as reliable.
 
     ai-sub ^
     --ai.model-lyrics=google-gla:gemini-3.5-flash-lite ^
-    --ai.model-subtitles=google-gla:gemini-3.6-flash ^
+    --ai.model-subtitles=google-gla:gemini-3.7-flash ^
     --ai.search.web-search-tool=duckduckgo ^
     --ai.google.key="%GOOGLE_KEY%" ^
     "%FILE_NAME%"
@@ -164,7 +164,7 @@ We can use duckduckgo to try to lookup lyrics, but it is not as reliable.
 
 For a detailed list of all configuration options, including AI models, re-encoding settings, and concurrency controls, please refer to [CONFIGURATION.md](https://github.com/FlippFuzz/ai-sub/blob/main/docs/CONFIGURATION.md).
 
-All settings can be configured via command-line arguments (e.g., `--ai.model=google-gla:gemini-3.6-flash`) or environment variables with the `AISUB_` prefix (e.g., `AISUB_AI_MODEL=google-gla:gemini-3.6-flash`).
+All settings can be configured via command-line arguments (e.g., `--ai.model=google-gla:gemini-3.7-flash`) or environment variables with the `AISUB_` prefix (e.g., `AISUB_AI_MODEL=google-gla:gemini-3.7-flash`).
 
 ---
 
@@ -194,7 +194,7 @@ File naming format: `part_XXX.<stage>.<model_shortcode>.yaml`
 **Example: To re-run subtitle generation for the third segment:**
 
 1.  Navigate to the temporary directory.
-2.  Identify the model shortcode used for subtitles (e.g., `g36f` for `gemini-3.6-flash`).
+2.  Identify the model shortcode used for subtitles (e.g., `g36f` for `gemini-3.7-flash`).
 3.  Delete the corresponding state file (e.g., `part_002.subtitles.g36f.yaml`).
 4.  Re-run the script. It will detect the missing subtitle job state and re-process only that segment, using any existing lyrics data.
 

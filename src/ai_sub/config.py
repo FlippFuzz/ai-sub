@@ -181,7 +181,7 @@ class AiSettings(BaseSettings):
     model_subtitles: str = Field(
         description="The AI model for subtitle generation. Use 'google-gla:<model>' for Google models, "
         "'openai:<model>' for OpenAI, or 'custom:<url>' for a custom endpoint.",
-        default="google-gla:gemini-3.6-flash",
+        default="google-gla:gemini-3.7-flash",
     )
     model_lyrics: str = Field(
         description="The AI model for lyrics research and scene detection.",
