@@ -1,5 +1,17 @@
 # AI Sub Release Notes
 
+### v3.5.2
+
+This patch release updates the default subtitle generation model from `gemini-3.6-flash` to `gemini-3.7-flash` across the codebase and documentation.
+
+**Fixes & Improvements:**
+
+- **Updated Default Subtitle Model:**
+  - Updated default [`model_subtitles`](src/ai_sub/config.py:181) to `google-gla:gemini-3.7-flash` in [`src/ai_sub/config.py`](src/ai_sub/config.py:184).
+  - Updated configuration reference documentation in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md:16) and usage examples and quota notes in [`README.md`](README.md:73).
+
+---
+
 ### v3.5.1
 
 This patch release sets the default gap verification ignore flags to `True` for boundary segments.
