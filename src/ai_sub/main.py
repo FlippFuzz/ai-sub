@@ -305,6 +305,7 @@ class SubtitleJobRunner(JobRunner):
                 {
                     "model": self.agent.model_name,
                     "error_type": "large_gap_detected",
+                    "prompt_version": str(SUBTITLES_PROMPT_VERSION),
                 },
             )
             attempt_num = len(subtitle_job.responses)

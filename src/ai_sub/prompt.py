@@ -15,7 +15,7 @@ class Prompt(BaseModel):
     """Container for system and user prompts used to instruct the AI agents.
 
     Attributes:
-        system_prompt: The dynamic or static system instructions for the AI model.
+        system_prompt: The dynamic or static system instructions for the AI agent.
         user_prompt: The specific instructions or input data for the current request.
     """
 

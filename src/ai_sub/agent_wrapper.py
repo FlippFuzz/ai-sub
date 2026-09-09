@@ -31,11 +31,13 @@ from ai_sub.config import Settings
 from ai_sub.data_models import (
     AgentDeps,
     DurationExceededError,
+    LyricsSceneAiResponse,
     QuotaExceededError,
+    SubtitleAiResponse,
     TimestampFormatError,
     TimestampOrderError,
 )
-from ai_sub.prompt import Prompt
+from ai_sub.prompt import LYRICS_PROMPT_VERSION, SUBTITLES_PROMPT_VERSION, Prompt
 from ai_sub.web_search_langsearch import web_search_langsearch_multi
 from ai_sub.web_search_ollama import web_search_ollama_multi
 
@@ -50,7 +52,9 @@ llm_request_counter = logfire.metric_counter(
 llm_validation_counter = logfire.metric_counter(
     "llm_validation_errors",
     unit="1",
-    description="Count of local validation and quality check failures partitioned by model and error type.",
+    description=(
+        "Count of local validation and quality check failures partitioned by model, error type, and prompt version."
+    ),
 )
 
 
@@ -202,12 +206,13 @@ def _record_llm_request_metric(
     )
 
 
-def _record_validation_error(model_name: str, error: Any) -> None:
+def _record_validation_error(model_name: str, error: Any, prompt_version: int | None = None) -> None:
     """Records a validation failure in the llm_validation_errors metric counter.
 
     Args:
         model_name: The full model identifier string.
         error: The error object, dict, or message string to classify and record.
+        prompt_version: The version number of the prompt template, or None.
     """
     error_type = classify_validation_error(error)
     llm_validation_counter.add(
@@ -215,6 +220,7 @@ def _record_validation_error(model_name: str, error: Any) -> None:
         {
             "model": model_name,
             "error_type": error_type,
+            "prompt_version": str(prompt_version) if prompt_version is not None else "none",
         },
     )
 
@@ -491,6 +497,14 @@ class RateLimitedAgentWrapper:
         if self._quota_exceeded:
             raise QuotaExceededError(f"Quota previously exceeded for model {self.model_name}")
 
+        prompt_version = (
+            SUBTITLES_PROMPT_VERSION
+            if response_type is SubtitleAiResponse
+            else LYRICS_PROMPT_VERSION
+            if response_type is LyricsSceneAiResponse
+            else None
+        )
+
         # Prepare the prompt
         # Each model provider requires a different input format for video.
         if self.is_google():
@@ -544,9 +558,11 @@ class RateLimitedAgentWrapper:
                             if isinstance(part, RetryPromptPart):
                                 if isinstance(part.content, list):
                                     for err in part.content:
-                                        _record_validation_error(self.model_name, err)
+                                        _record_validation_error(self.model_name, err, prompt_version=prompt_version)
                                 else:
-                                    _record_validation_error(self.model_name, part.content)
+                                    _record_validation_error(
+                                        self.model_name, part.content, prompt_version=prompt_version
+                                    )
 
                 # Record successful model requests
                 model_responses = sum(1 for msg in result.new_messages() if isinstance(msg, ModelResponse))
@@ -579,12 +595,12 @@ class RateLimitedAgentWrapper:
                 )
                 if isinstance(e, ValidationError):
                     for err in e.errors():
-                        _record_validation_error(self.model_name, err)
+                        _record_validation_error(self.model_name, err, prompt_version=prompt_version)
                 elif isinstance(e, UnexpectedModelBehavior) and isinstance(e.__cause__, ValidationError):
                     for err in e.__cause__.errors():
-                        _record_validation_error(self.model_name, err)
+                        _record_validation_error(self.model_name, err, prompt_version=prompt_version)
                 else:
-                    _record_validation_error(self.model_name, e)
+                    _record_validation_error(self.model_name, e, prompt_version=prompt_version)
                 raise
             except (
                 ModelHTTPError,
