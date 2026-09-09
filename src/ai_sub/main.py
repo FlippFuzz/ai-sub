@@ -22,7 +22,7 @@ from pydantic_settings import CliApp
 from pysubs2 import SSAEvent, SSAFile
 from tqdm.auto import tqdm
 
-from ai_sub.agent_wrapper import RateLimitedAgentWrapper
+from ai_sub.agent_wrapper import RateLimitedAgentWrapper, llm_validation_counter
 from ai_sub.config import LoggingSettings, Settings
 from ai_sub.data_models import (
     AgentDeps,
@@ -300,6 +300,13 @@ class SubtitleJobRunner(JobRunner):
             ignore_start=self.settings.ai.gap_verification_ignore_start,
             ignore_end=self.settings.ai.gap_verification_ignore_end,
         ):
+            llm_validation_counter.add(
+                1,
+                {
+                    "model": self.agent.model_name,
+                    "error_type": "large_gap_detected",
+                },
+            )
             attempt_num = len(subtitle_job.responses)
             logfire.warning(
                 f"Large gap(s) (>= {gap_threshold_s}s) detected in '{subtitle_job.name}'. "

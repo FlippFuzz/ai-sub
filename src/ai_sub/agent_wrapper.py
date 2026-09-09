@@ -2,10 +2,13 @@
 
 from __future__ import annotations as _annotations
 
+import ast
 import asyncio
+import json
 import random
+import re
 from pathlib import Path
-from typing import Sequence, TypeVar, cast
+from typing import Any, Sequence, TypeVar, cast
 
 import logfire
 from google import genai as genai
@@ -15,22 +18,205 @@ from google.genai.types import (
     ThinkingConfigDict,
 )
 from httpx import HTTPStatusError, TransportError
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from pydantic_ai import Agent, BinaryContent, ModelRequestContext, RunContext, WebSearchTool
 from pydantic_ai.capabilities import AbstractCapability, Hooks, NativeTool
-from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import DocumentUrl, ModelResponse, ThinkingPart
+from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
+from pydantic_ai.messages import DocumentUrl, ModelRequest, ModelResponse, RetryPromptPart, ThinkingPart
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.providers.google import GoogleProvider
 from pyrate_limiter import Duration, limiter_factory
 
 from ai_sub.config import Settings
-from ai_sub.data_models import AgentDeps, QuotaExceededError
+from ai_sub.data_models import (
+    AgentDeps,
+    DurationExceededError,
+    QuotaExceededError,
+    TimestampFormatError,
+    TimestampOrderError,
+)
 from ai_sub.prompt import Prompt
 from ai_sub.web_search_langsearch import web_search_langsearch_multi
 from ai_sub.web_search_ollama import web_search_ollama_multi
 
 T = TypeVar("T", bound=BaseModel)
+
+llm_request_counter = logfire.metric_counter(
+    "llm_requests",
+    unit="1",
+    description="Count of LLM API requests partitioned by model, status code, and Google error details.",
+)
+
+llm_validation_counter = logfire.metric_counter(
+    "llm_validation_errors",
+    unit="1",
+    description="Count of local validation and quality check failures partitioned by model and error type.",
+)
+
+
+def _extract_google_error_details(e: Exception) -> tuple[str, str]:
+    """Extracts google_status and google_detail_reason from an exception if available.
+
+    Args:
+        e: The exception to inspect.
+
+    Returns:
+        A tuple of (google_status, google_detail_reason). Defaults to ("none", "none").
+    """
+    body: Any = None
+    if isinstance(e, ModelHTTPError):
+        body = getattr(e, "body", None)
+        if body is None:
+            body = str(e)
+    elif isinstance(e, HTTPStatusError):
+        try:
+            body = e.response.json()
+        except Exception:
+            try:
+                body = e.response.text
+            except Exception:
+                body = None
+
+    if body is None:
+        return "none", "none"
+
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(body)
+                if isinstance(parsed, dict):
+                    body = parsed
+            except Exception:
+                pass
+
+    if isinstance(body, dict):
+        error_dict = body.get("error")
+        if isinstance(error_dict, dict):
+            status = str(error_dict.get("status") or "none")
+            details = error_dict.get("details")
+            detail_reason = "none"
+            if isinstance(details, list):
+                for item in details:
+                    if isinstance(item, dict) and "reason" in item:
+                        detail_reason = str(item["reason"])
+                        break
+            return status, detail_reason
+
+    # Fallback string matching using regex on string representation
+    body_str = str(body)
+    status = "none"
+    detail_reason = "none"
+
+    status_match = re.search(r"['\"]status['\"]\s*:\s*['\"]([^'\"]+)['\"]", body_str)
+    if status_match:
+        status = status_match.group(1)
+
+    reason_match = re.search(r"['\"]reason['\"]\s*:\s*['\"]([^'\"]+)['\"]", body_str)
+    if reason_match:
+        detail_reason = reason_match.group(1)
+
+    return status, detail_reason
+
+
+def classify_validation_error(err: Any) -> str:
+    """Classifies a validation error into a standardized error_type string.
+
+    Args:
+        err: A Pydantic error dictionary, Exception, or error message string.
+
+    Returns:
+        The standardized error_type string.
+    """
+    if isinstance(err, DurationExceededError):
+        return "duration_exceeded"
+    if isinstance(err, TimestampOrderError):
+        return "timestamp_order_invalid"
+    if isinstance(err, TimestampFormatError):
+        return "invalid_timestamp_format"
+
+    if isinstance(err, dict):
+        ctx = err.get("ctx")
+        if isinstance(ctx, dict):
+            ctx_err = ctx.get("error")
+            if isinstance(ctx_err, DurationExceededError):
+                return "duration_exceeded"
+            if isinstance(ctx_err, TimestampOrderError):
+                return "timestamp_order_invalid"
+            if isinstance(ctx_err, TimestampFormatError):
+                return "invalid_timestamp_format"
+
+        err_type = str(err.get("type", ""))
+        err_msg = str(err.get("msg", "")).lower()
+
+        if "exceeds video duration" in err_msg:
+            return "duration_exceeded"
+        if "strictly before end time" in err_msg:
+            return "timestamp_order_invalid"
+        if "invalid timestamp format" in err_msg or "invalid timestamp" in err_msg:
+            return "invalid_timestamp_format"
+
+        if err_type == "missing":
+            return "missing_required_field"
+        if err_type == "json_invalid":
+            return "json_syntax_error"
+        if "type" in err_type or err_type.endswith("_type"):
+            return "schema_type_error"
+        return "schema_violation"
+
+    msg = str(err).lower()
+    if "exceeds video duration" in msg:
+        return "duration_exceeded"
+    if "strictly before end time" in msg:
+        return "timestamp_order_invalid"
+    if "invalid timestamp format" in msg or "invalid timestamp" in msg:
+        return "invalid_timestamp_format"
+    if "json" in msg:
+        return "json_syntax_error"
+    return "schema_violation"
+
+
+def _record_llm_request_metric(
+    model_name: str,
+    status_code: str,
+    google_status: str = "none",
+    google_detail_reason: str = "none",
+) -> None:
+    """Records an LLM request attempt in the llm_requests metric counter.
+
+    Args:
+        model_name: The full model identifier string.
+        status_code: The HTTP status code or failure category.
+        google_status: The Google RPC status string, or "none".
+        google_detail_reason: The Google detail reason string, or "none".
+    """
+    llm_request_counter.add(
+        1,
+        {
+            "model": model_name,
+            "status_code": status_code,
+            "google_status": google_status,
+            "google_detail_reason": google_detail_reason,
+        },
+    )
+
+
+def _record_validation_error(model_name: str, error: Any) -> None:
+    """Records a validation failure in the llm_validation_errors metric counter.
+
+    Args:
+        model_name: The full model identifier string.
+        error: The error object, dict, or message string to classify and record.
+    """
+    error_type = classify_validation_error(error)
+    llm_validation_counter.add(
+        1,
+        {
+            "model": model_name,
+            "error_type": error_type,
+        },
+    )
 
 
 def _calculate_tokens(text_prompt: Prompt, video_duration_ms: int) -> int:
@@ -297,6 +483,8 @@ class RateLimitedAgentWrapper:
             TransportError: If a transport error occurs during the HTTP request.
             ConnectionError: If a network connection error occurs.
             asyncio.TimeoutError: If the request times out.
+            UnexpectedModelBehavior: If the model fails to return a valid response after retries.
+            ValidationError: If the model output fails schema validation after retries.
             RuntimeError: If the retry limit is reached or the agent fails to execute the loop.
 
         """
@@ -349,6 +537,27 @@ class RateLimitedAgentWrapper:
                 result = await self.agent.run(user_prompt=user_prompt, output_type=response_type, deps=deps)
                 output = result.output
 
+                # Inspect messages for any validation errors that occurred during internal retries
+                for msg in result.new_messages():
+                    if isinstance(msg, ModelRequest):
+                        for part in msg.parts:
+                            if isinstance(part, RetryPromptPart):
+                                if isinstance(part.content, list):
+                                    for err in part.content:
+                                        _record_validation_error(self.model_name, err)
+                                else:
+                                    _record_validation_error(self.model_name, part.content)
+
+                # Record successful model requests
+                model_responses = sum(1 for msg in result.new_messages() if isinstance(msg, ModelResponse))
+                for _ in range(max(1, model_responses)):
+                    _record_llm_request_metric(
+                        model_name=self.model_name,
+                        status_code="200",
+                        google_status="OK" if self.is_google() else "none",
+                        google_detail_reason="none",
+                    )
+
                 if hasattr(output, "thoughts"):
                     thinking_parts = []
                     for msg in result.new_messages():
@@ -360,6 +569,23 @@ class RateLimitedAgentWrapper:
                         setattr(output, "thoughts", "\n".join(thinking_parts))
 
                 return output
+            except (UnexpectedModelBehavior, ValidationError) as e:
+                # The model responded (HTTP 200), but validation failed and retries were exhausted
+                _record_llm_request_metric(
+                    model_name=self.model_name,
+                    status_code="200",
+                    google_status="OK" if self.is_google() else "none",
+                    google_detail_reason="none",
+                )
+                if isinstance(e, ValidationError):
+                    for err in e.errors():
+                        _record_validation_error(self.model_name, err)
+                elif isinstance(e, UnexpectedModelBehavior) and isinstance(e.__cause__, ValidationError):
+                    for err in e.__cause__.errors():
+                        _record_validation_error(self.model_name, err)
+                else:
+                    _record_validation_error(self.model_name, e)
+                raise
             except (
                 ModelHTTPError,
                 HTTPStatusError,
@@ -367,6 +593,29 @@ class RateLimitedAgentWrapper:
                 ConnectionError,
                 asyncio.TimeoutError,
             ) as e:
+                status_code = "ERROR"
+                if isinstance(e, (ModelHTTPError, HTTPStatusError)):
+                    status_code = str(e.status_code if isinstance(e, ModelHTTPError) else e.response.status_code)
+                elif isinstance(e, asyncio.TimeoutError):
+                    status_code = "TIMEOUT"
+                elif isinstance(e, TransportError):
+                    status_code = "TRANSPORT_ERROR"
+                elif isinstance(e, ConnectionError):
+                    status_code = "CONNECTION_ERROR"
+
+                if self.is_google():
+                    google_status, google_detail_reason = _extract_google_error_details(e)
+                else:
+                    google_status = "none"
+                    google_detail_reason = "none"
+
+                _record_llm_request_metric(
+                    model_name=self.model_name,
+                    status_code=status_code,
+                    google_status=google_status,
+                    google_detail_reason=google_detail_reason,
+                )
+
                 # 1. Check for hard daily quota (terminal)
                 if _is_free_tier_quota_exceeded(e):
                     self._quota_exceeded = True
@@ -376,9 +625,9 @@ class RateLimitedAgentWrapper:
                 # 2. Determine if the error is retryable (transient)
                 is_retryable = False
                 if isinstance(e, (ModelHTTPError, HTTPStatusError)):
-                    status_code = e.status_code if isinstance(e, ModelHTTPError) else e.response.status_code
+                    code = e.status_code if isinstance(e, ModelHTTPError) else e.response.status_code
                     # Transient status codes
-                    is_retryable = status_code in (429, 500, 502, 503, 504)
+                    is_retryable = code in (429, 500, 502, 503, 504)
                 else:
                     # Network level errors (Connection, Timeout)
                     is_retryable = True

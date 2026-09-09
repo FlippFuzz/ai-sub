@@ -57,6 +57,24 @@ class QuotaExceededError(Exception):
     pass
 
 
+class DurationExceededError(ValueError):
+    """Raised when an end timestamp exceeds the video duration plus buffer."""
+
+    pass
+
+
+class TimestampOrderError(ValueError):
+    """Raised when a start timestamp is not strictly before the end timestamp."""
+
+    pass
+
+
+class TimestampFormatError(ValueError):
+    """Raised when a timestamp string is in an invalid format."""
+
+    pass
+
+
 # ==============================================================================
 # Utility Functions & YAML Serializer Setup
 # ==============================================================================
@@ -124,7 +142,7 @@ def _parse_timestamp_string_ms(timestamp_string: str) -> int:
         The parsed timestamp in milliseconds.
 
     Raises:
-        ValueError: If the timestamp string is in an invalid format.
+        TimestampFormatError: If the timestamp string is in an invalid format.
 
     """
     ts = timestamp_string
@@ -151,7 +169,7 @@ def _parse_timestamp_string_ms(timestamp_string: str) -> int:
         seconds = int(split[1])
         timestamp = minutes * 60000 + seconds * 1000
     else:
-        raise ValueError(f"Invalid timestamp format: {timestamp_string}")
+        raise TimestampFormatError(f"Invalid timestamp format: {timestamp_string}")
     return timestamp
 
 
@@ -210,7 +228,7 @@ class AgentDeps(BaseModel):
 
     Provides a centralized, extensible way to store and access multiple
     dependencies (e.g., web search clients, databases, etc.) for use by
-    agent tools.  Add new fields here as the pipeline grows.
+    agent tools. Add new fields here as the pipeline grows.
 
     Example::
 
@@ -294,16 +312,12 @@ class Subtitles(BaseModel):
             Subtitles: The validated subtitle instance.
 
         Raises:
-            ValueError: If the timestamp format is invalid or if the start time
-                is not strictly before the end time.
+            TimestampOrderError: If the start time is not strictly before the end time.
         """
-        try:
-            start_ms = _parse_timestamp_string_ms(self.start)
-            end_ms = _parse_timestamp_string_ms(self.end)
-            if start_ms >= end_ms:
-                raise ValueError(f"Start time ({self.start}) must be strictly before end time ({self.end})")
-        except ValueError as e:
-            raise ValueError(f"Invalid timestamp: {e}") from e
+        start_ms = _parse_timestamp_string_ms(self.start)
+        end_ms = _parse_timestamp_string_ms(self.end)
+        if start_ms >= end_ms:
+            raise TimestampOrderError(f"Start time ({self.start}) must be strictly before end time ({self.end})")
         return self
 
 
@@ -425,13 +439,13 @@ class SubtitleAiResponse(BaseModel):
             SubtitleAiResponse: The validated instance.
 
         Raises:
-            ValueError: If a subtitle end timestamp is too far beyond the duration.
+            DurationExceededError: If a subtitle end timestamp is too far beyond the duration.
         """
         limit_ms = duration_ms + buffer_ms
         for i, sub in enumerate(self.subtitles):
             end_ms = _parse_timestamp_string_ms(sub.end)
             if end_ms > limit_ms:
-                raise ValueError(
+                raise DurationExceededError(
                     f"Subtitle {i} end time ({sub.end}) exceeds video duration "
                     f"({_format_ms_timestamp(duration_ms)}) by more than {buffer_ms}ms."
                 )
@@ -451,9 +465,7 @@ class Scene(BaseModel):
     )
     song_title: Optional[str] = Field(
         default=None,
-        description=(
-            "The title of the song detected in the scene, or null if no song or no title could be identified."
-        ),
+        description="The title of the song detected in the scene, or null if no song or no title could be identified.",
     )
     original_artist: Optional[str] = Field(
         default=None,
@@ -471,7 +483,7 @@ class Scene(BaseModel):
     )
     original_language: Optional[str] = Field(
         default=None,
-        description=("The primary language the song is sung in (e.g., Japanese, English, Chinese), or null."),
+        description="The primary language the song is sung in (e.g., Japanese, English, Chinese), or null.",
     )
     reference_lyrics_og: Optional[str] = Field(
         default=None,
@@ -524,16 +536,12 @@ class Scene(BaseModel):
             Scene: The validated scene instance.
 
         Raises:
-            ValueError: If the timestamp format is invalid or if the start time
-                is not strictly before the end time.
+            TimestampOrderError: If the start time is not strictly before the end time.
         """
-        try:
-            start_ms = _parse_timestamp_string_ms(self.start)
-            end_ms = _parse_timestamp_string_ms(self.end)
-            if start_ms >= end_ms:
-                raise ValueError(f"Start time ({self.start}) must be strictly before end time ({self.end})")
-        except ValueError as e:
-            raise ValueError(f"Invalid timestamp: {e}") from e
+        start_ms = _parse_timestamp_string_ms(self.start)
+        end_ms = _parse_timestamp_string_ms(self.end)
+        if start_ms >= end_ms:
+            raise TimestampOrderError(f"Start time ({self.start}) must be strictly before end time ({self.end})")
         return self
 
 
@@ -588,13 +596,13 @@ class LyricsSceneAiResponse(BaseModel):
             LyricsSceneAiResponse: The validated instance.
 
         Raises:
-            ValueError: If a scene end timestamp is too far beyond the duration.
+            DurationExceededError: If a scene end timestamp is too far beyond the duration.
         """
         limit_ms = duration_ms + buffer_ms
         for i, scene in enumerate(self.scenes):
             end_ms = _parse_timestamp_string_ms(scene.end)
             if end_ms > limit_ms:
-                raise ValueError(
+                raise DurationExceededError(
                     f"Scene {i} end time ({scene.end}) exceeds video duration "
                     f"({_format_ms_timestamp(duration_ms)}) by more than {buffer_ms}ms."
                 )
@@ -646,7 +654,7 @@ class ReEncodingJob(Job):
     height: PositiveInt = Field(description="Target height (resolution) for the re-encoded video.")
     bitrate_kb: PositiveInt = Field(description="Target bitrate in kilobytes per second.")
     duration_tolerance_ms: NonNegativeInt = Field(
-        description=("Allowed duration difference in milliseconds to consider an existing re-encoded file valid.")
+        description="Allowed duration difference in milliseconds to consider an existing re-encoded file valid."
     )
 
 
