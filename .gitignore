@@ -196,3 +196,5 @@ cython_debug/
 
 .logfire
 .qwen
+
+repomix-output.xml
