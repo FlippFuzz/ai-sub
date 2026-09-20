@@ -1,5 +1,22 @@
 # AI Sub Release Notes
 
+### v3.6.0
+
+This release introduces configurable AI service tier support for subtitle generation and lyrics research models, enabling flexible execution across `auto`, `default`, `flex`, and `priority` tiers.
+
+**New Features & Improvements:**
+
+- **AI Service Tier Configuration:**
+  - Added [`ServiceTier`](src/ai_sub/config.py:26) type definition (`Literal["auto", "default", "flex", "priority"]`) exported in [`src/ai_sub/__init__.py`](src/ai_sub/__init__.py:10).
+  - Added CLI and configuration settings (`--ai.service-tier`, `--ai.service-tier-subtitles`, `--ai.service-tier-lyrics`) in [`src/ai_sub/config.py`](src/ai_sub/config.py:192) and documented in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md:18).
+  - Updated [`AiSettings.validate_models`](src/ai_sub/config.py:239) validator to propagate global `--ai.service-tier` shorthand to subtitle and lyrics tier settings.
+  - Integrated service tier settings into [`RateLimitedAgentWrapper`](src/ai_sub/agent_wrapper.py:121) for both Google models (`GoogleModelSettings` at [`src/ai_sub/agent_wrapper.py`](src/ai_sub/agent_wrapper.py:235)) and non-Google models (`ModelSettings` at [`src/ai_sub/agent_wrapper.py`](src/ai_sub/agent_wrapper.py:270)).
+  - Passed [`service_tier_subtitles`](src/ai_sub/main.py:545) and [`service_tier_lyrics`](src/ai_sub/main.py:557) during pipeline agent initialization in [`src/ai_sub/main.py`](src/ai_sub/main.py:542).
+- **Project Maintenance & Chores:**
+  - Added [`.repomixignore`](.repomixignore:1) to exclude showcase and release notes from repomix packing and updated [`.gitignore`](.gitignore:200) to ignore [`repomix-output.xml`](repomix-output.xml).
+
+---
+
 ### v3.5.2
 
 This patch release updates the default subtitle generation model from `gemini-3.6-flash` to `gemini-3.7-flash` across the codebase and documentation.
@@ -685,7 +702,6 @@ This release introduces significant improvements to prompt engineering for bette
 
 - **Resumption Stability:**
   - Fixed an issue where resuming a job with expired Gemini cloud files (older than 48 hours) would fail. The system now forces a re-check and re-upload if necessary.
-  - Fixed a `RuntimeError` related to asyncio event loops by lazily initializing the AI Agent.
 - **Mixed Provider Support:**
   - Fixed file path handling when using a Google model for lyrics detection and a non-Google (e.g., local or different API) model for subtitle generation.
   - Ensure `WebSearchTool` is correctly enabled for API-based lyrics detection.
@@ -1197,7 +1213,7 @@ This release introduces a new offset feature for video processing and significan
 
 **New Features & Improvements:**
 
-- **Video Processing Offset:** Added a new `--start_offset_min` argument to allow users to skip a specified number of minutes from the beginning of a video, enabling more flexible processing of long videos.
+- **Video Processing Offset:** Added a new `--start_offset_min` argument to allow users to skip the first _X_ minutes of the input video (e.g., to bypass waiting screens) enabling more flexible processing of long videos.
 - **Enhanced Subtitle Prompt Instructions:** The prompt template for subtitle generation has been significantly updated to improve timing precision, enforce strict chronological order, enhance translation accuracy and nuance, and ensure better readability and formatting.
 
 **Full Changelog**: https://github.com/FlippFuzz/ai-sub/compare/v0.0.6...v0.0.7
