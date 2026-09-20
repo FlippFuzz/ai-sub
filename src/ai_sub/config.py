@@ -23,6 +23,8 @@ _BASE_CONFIG: SettingsConfigDict = {
     "extra": "ignore",
 }
 
+ServiceTier = Literal["auto", "default", "flex", "priority"]
+
 
 class GoogleAiSettings(BaseSettings):
     """Configuration for Google Generative AI (GLA) integration."""
@@ -187,6 +189,20 @@ class AiSettings(BaseSettings):
         description="The AI model for lyrics research and scene detection.",
         default="google-gla:gemini-3.5-flash-lite",
     )
+    service_tier: Optional[ServiceTier] = Field(
+        default=None,
+        description="A shorthand to set both service_tier_subtitles and service_tier_lyrics to the same value. "
+        "If provided, this will override the other two settings. "
+        "Allowed values: 'auto', 'default', 'flex', 'priority'.",
+    )
+    service_tier_subtitles: Optional[ServiceTier] = Field(
+        default=None,
+        description="The service tier for subtitle generation ('auto', 'default', 'flex', 'priority').",
+    )
+    service_tier_lyrics: Optional[ServiceTier] = Field(
+        default=None,
+        description="The service tier for lyrics research and scene detection ('auto', 'default', 'flex', 'priority').",
+    )
     rpm: PositiveInt = Field(description="Maximum Requests Per Minute (RPM) for the AI model provider.", default=4)
     tpm: PositiveInt = Field(description="Maximum Tokens Per Minute (TPM) for the AI model provider.", default=250000)
     google: GoogleAiSettings = Field(
@@ -222,7 +238,7 @@ class AiSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_models(self) -> "AiSettings":
-        """Overrides model-specific settings if the global shorthand is set.
+        """Overrides model-specific settings and service tiers if the global shorthand is set.
 
         Returns:
             The updated settings instance.
@@ -230,6 +246,9 @@ class AiSettings(BaseSettings):
         if self.model:
             self.model_subtitles = self.model
             self.model_lyrics = self.model
+        if self.service_tier is not None:
+            self.service_tier_subtitles = self.service_tier
+            self.service_tier_lyrics = self.service_tier
         return self
 
 
