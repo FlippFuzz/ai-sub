@@ -5,7 +5,7 @@ from __future__ import annotations as _annotations
 import asyncio
 import random
 from pathlib import Path
-from typing import Sequence, TypeVar, cast
+from typing import Any, Sequence, TypeVar, cast
 
 import logfire
 from google import genai as genai
@@ -22,9 +22,10 @@ from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import DocumentUrl, ModelResponse, ThinkingPart
 from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
 from pydantic_ai.providers.google import GoogleProvider
+from pydantic_ai.settings import ModelSettings
 from pyrate_limiter import Duration, limiter_factory
 
-from ai_sub.config import Settings
+from ai_sub.config import ServiceTier, Settings
 from ai_sub.data_models import AgentDeps, QuotaExceededError
 from ai_sub.prompt import Prompt
 from ai_sub.web_search_langsearch import web_search_langsearch_multi
@@ -121,6 +122,7 @@ class RateLimitedAgentWrapper:
 
     settings: Settings
     model_name: str
+    service_tier: ServiceTier | None
 
     def is_google(self) -> bool:
         """Checks if the model is a Google model.
@@ -137,6 +139,7 @@ class RateLimitedAgentWrapper:
         model_name: str,
         deps: AgentDeps | None = None,
         use_web_search: bool = False,
+        service_tier: ServiceTier | None = None,
     ):
         """Initializes the agent wrapper with settings.
 
@@ -145,11 +148,12 @@ class RateLimitedAgentWrapper:
             model_name (str): The name of the model to use.
             deps: Optional dependencies to pass to the agent. Defaults to a new ``AgentDeps`` instance.
             use_web_search (bool): Whether to enable the web search tool.
-
+            service_tier: The service tier for the model ('auto', 'default', 'flex', 'priority').
         """
         self.settings = settings
         self.model_name = model_name
         self.use_web_search = use_web_search
+        self.service_tier = service_tier
         self._quota_exceeded = False
         self.deps = deps or AgentDeps(validation_buffer_ms=settings.ai.validation_buffer_ms)
 
@@ -231,9 +235,9 @@ class RateLimitedAgentWrapper:
                     base_url=(str(self.settings.ai.google.base_url) if self.settings.ai.google.base_url else None),
                 ),
             )
-            google_model_settings = GoogleModelSettings(
-                google_thinking_config=thinking_config,
-                google_safety_settings=[
+            google_model_settings_kwargs: dict[str, Any] = {
+                "google_thinking_config": thinking_config,
+                "google_safety_settings": [
                     {
                         "category": HarmCategory.HARM_CATEGORY_HARASSMENT,
                         "threshold": HarmBlockThreshold.BLOCK_NONE,
@@ -251,7 +255,11 @@ class RateLimitedAgentWrapper:
                         "threshold": HarmBlockThreshold.BLOCK_NONE,
                     },
                 ],
-            )
+            }
+            if self.service_tier is not None:
+                google_model_settings_kwargs["service_tier"] = self.service_tier
+
+            google_model_settings = GoogleModelSettings(**google_model_settings_kwargs)
 
             agent = Agent(
                 model=model,
@@ -260,8 +268,10 @@ class RateLimitedAgentWrapper:
             )
         else:
             # For non-Google models
+            model_settings = ModelSettings(service_tier=self.service_tier) if self.service_tier is not None else None
             agent = Agent(
                 model=self.model_name,
+                model_settings=model_settings,
                 **agent_kwargs,
             )
 
