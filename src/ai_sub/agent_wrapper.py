@@ -341,6 +341,19 @@ class RateLimitedAgentWrapper:
 
         config = types.GenerateContentConfig(**config_kwargs)
 
+        config_final = config
+        if tools:
+            config_final_kwargs = dict(config_kwargs)
+            if self.settings.ai.search.web_search_tool != "builtin":
+                config_final_kwargs["tool_config"] = types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(
+                        mode=types.FunctionCallingConfigMode.NONE,
+                    )
+                )
+            else:
+                config_final_kwargs.pop("tools", None)
+            config_final = types.GenerateContentConfig(**config_final_kwargs)
+
         for attempt in range(self.settings.retry.per_run + 1):
             contents: list[Any] = [video, prompt.user_prompt]
             search_turns = 0
@@ -350,10 +363,11 @@ class RateLimitedAgentWrapper:
                     await self.request_limiter.try_acquire_async("rpm")
                     await self.token_limiter.try_acquire_async("tpm", weight=tokens)
 
+                    current_config = config_final if search_turns >= MAX_SEARCH_TURNS else config
                     response = await self._client.aio.models.generate_content(
                         model=self.model_id,
                         contents=contents,
-                        config=config,
+                        config=current_config,
                     )
 
                     candidate = response.candidates[0] if response.candidates else None
