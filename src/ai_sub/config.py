@@ -42,12 +42,7 @@ class GoogleAiSettings(BaseSettings):
     key: Optional[SecretStr] = Field(
         description="The API key for Google's generative language models. "
         "Falls back to the GOOGLE_API_KEY or GEMINI_API_KEY environment variables if not set.",
-        # We handle default loading from env in the validator
         default=None,
-    )
-    use_files_api: bool = Field(
-        description="Enable the Gemini Files API for cloud-based multimodal processing.",
-        default=True,
     )
     base_url: Optional[HttpUrl] = Field(
         description="The base URL for the Google AI API. This can be used to override the default endpoint, "
@@ -72,7 +67,7 @@ class GoogleAiSettings(BaseSettings):
             values: The raw input values to validate.
 
         Returns:
-            The updated values dictionary including the API key if found.
+            dict[str, Any]: The updated values dictionary including the API key if found.
         """
         # If 'key' is not provided directly, try to load it from standard env vars.
         if (key := values.get("key")) is None:
@@ -145,7 +140,7 @@ class WebSearchSettings(BaseSettings):
             values: The raw input values to validate.
 
         Returns:
-            The updated values dictionary including the API key if found.
+            dict[str, Any]: The updated values dictionary including the API key if found.
         """
         if (key := values.get("key")) is None:
             # Determine which tool is selected to avoid loading the wrong key.
@@ -178,15 +173,16 @@ class AiSettings(BaseSettings):
     model: Optional[str] = Field(
         default=None,
         description="A shorthand to set both model_subtitles and model_lyrics to the same value. "
-        "If provided, this will override the other two settings.",
+        "If provided, this will override the other two settings. Must start with 'google-gla:'.",
     )
     model_subtitles: str = Field(
-        description="The AI model for subtitle generation. Use 'google-gla:<model>' for Google models, "
-        "'openai:<model>' for OpenAI, or 'custom:<url>' for a custom endpoint.",
+        description="The AI model for subtitle generation. Must start with 'google-gla:' "
+        "(e.g., 'google-gla:gemini-3.7-flash').",
         default="google-gla:gemini-3.7-flash",
     )
     model_lyrics: str = Field(
-        description="The AI model for lyrics research and scene detection.",
+        description="The AI model for lyrics research and scene detection. Must start with 'google-gla:' "
+        "(e.g., 'google-gla:gemini-3.5-flash-lite').",
         default="google-gla:gemini-3.5-flash-lite",
     )
     service_tier: Optional[ServiceTier] = Field(
@@ -238,14 +234,28 @@ class AiSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_models(self) -> "AiSettings":
-        """Overrides model-specific settings and service tiers if the global shorthand is set.
+        """Overrides model-specific settings and validates required model prefixes.
 
         Returns:
-            The updated settings instance.
+            AiSettings: The updated settings instance.
+
+        Raises:
+            ValueError: If model_subtitles or model_lyrics does not start with 'google-gla:'.
         """
         if self.model:
             self.model_subtitles = self.model
             self.model_lyrics = self.model
+
+        for field_name, model_val in (
+            ("model_subtitles", self.model_subtitles),
+            ("model_lyrics", self.model_lyrics),
+        ):
+            if not model_val.lower().startswith("google-gla:"):
+                raise ValueError(
+                    f"Invalid model '{model_val}' for '{field_name}'. "
+                    "Model name must start with 'google-gla:' (e.g., 'google-gla:gemini-3.7-flash')."
+                )
+
         if self.service_tier is not None:
             self.service_tier_subtitles = self.service_tier
             self.service_tier_lyrics = self.service_tier
@@ -462,19 +472,15 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_api_keys(self) -> "Settings":
-        """Validates that required API keys are provided for the selected models and tools.
+        """Validates that required API keys are provided for Google AI and web search tools.
 
         Returns:
-            The validated settings instance.
+            Settings: The validated settings instance.
 
         Raises:
             ValueError: If a required API key is missing.
         """
-        is_google_subtitles = self.ai.model_subtitles.lower().startswith("google-gla")
-        # Only check lyrics model if lyrics threads are > 0 (i.e. enabled)
-        is_google_scene = self.thread.lyrics > 0 and self.ai.model_lyrics.lower().startswith("google-gla")
-
-        if (is_google_subtitles or is_google_scene) and self.ai.google.key is None:
+        if self.ai.google.key is None:
             raise ValueError(
                 "A Google AI API key must be provided either via the 'key' field, "
                 "GOOGLE_API_KEY, GEMINI_API_KEY or AISUB_AI_GOOGLE_KEY environment variables."
@@ -506,7 +512,7 @@ class Settings(BaseSettings):
         the temporary directory.
 
         Returns:
-            The validated settings instance.
+            Settings: The validated settings instance.
         """
         # Resolve input video file to an absolute path first
         input_video_path = cast(Path, self.input_video_file).resolve()
