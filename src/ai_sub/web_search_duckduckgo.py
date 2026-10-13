@@ -67,7 +67,7 @@ async def web_search_duckduckgo_single(deps: WebSearchDeps, query: str) -> list[
                 await asyncio.sleep(backoff)
                 continue
             logfire.error(f"DuckDuckGo search for '{query}' failed after {max_attempts} attempts: {e}")
-            raw_results = []
+            return []
 
     results = [
         WebSearchResult(
