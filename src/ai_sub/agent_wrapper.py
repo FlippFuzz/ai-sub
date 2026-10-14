@@ -11,7 +11,7 @@ import logfire
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
 from ai_sub.config import ServiceTier, Settings
@@ -316,6 +316,8 @@ class RateLimitedAgentWrapper:
         Raises:
             QuotaExceededError: If the model's quota has been exhausted.
             APIError: If an unretryable API error occurs or retries are exhausted.
+            ValidationError: If model output validation fails and retries are exhausted.
+            ValueError: If output field validation fails and retries are exhausted.
             ConnectionError: If network connectivity fails and retries are exhausted.
             TimeoutError: If request timeouts occur and retries are exhausted.
             RuntimeError: If retries are exhausted or generation fails.
@@ -445,6 +447,21 @@ class RateLimitedAgentWrapper:
                     )
                     logfire.info(
                         f"Transient API error in {self.model_name} (attempt {attempt + 1}). "
+                        f"Retrying in {backoff:.2f}s... Error: {e}"
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
+
+            except (ValidationError, ValueError) as e:
+                if attempt < self.settings.retry.per_run:
+                    backoff = min(
+                        float(self.settings.retry.max_wait_seconds),
+                        (self.settings.retry.min_wait_seconds * (self.settings.retry.multiplier**attempt))
+                        + random.uniform(0, 1),
+                    )
+                    logfire.warning(
+                        f"Validation error in {self.model_name} output (attempt {attempt + 1}). "
                         f"Retrying in {backoff:.2f}s... Error: {e}"
                     )
                     await asyncio.sleep(backoff)

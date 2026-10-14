@@ -5,6 +5,7 @@ import base64
 import hashlib
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from time import time
 from typing import Optional
@@ -115,6 +116,30 @@ def _get_unique_display_name(file_path: Path) -> str:
     return f"{folder_name}/{file_path.name}"
 
 
+def _get_file_timestamp(f: File) -> float:
+    """Extracts a timestamp in seconds for ordering files chronologically.
+
+    Args:
+        f (File): The remote File object.
+
+    Returns:
+        float: The timestamp in seconds since epoch, or 0.0 if not found.
+    """
+    ts = f.expiration_time or f.create_time
+    if ts is None:
+        return 0.0
+    if isinstance(ts, datetime):
+        return ts.timestamp()
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    if isinstance(ts, str):
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
 class GeminiFileUploader:
     """Handles uploading files to the Google Gemini Files API.
 
@@ -187,7 +212,7 @@ class GeminiFileUploader:
         # Sort managed files by expiration or creation timestamp (oldest first)
         sorted_files = sorted(
             managed_files,
-            key=lambda f: f.expiration_time or f.create_time or "",
+            key=_get_file_timestamp,
         )
 
         async with self._lock:

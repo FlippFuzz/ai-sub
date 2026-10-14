@@ -105,16 +105,20 @@ def _clean_timestamp_string(ts_str: str) -> str:
         "03:52.000,start:" -> "03:52.000"
         "01:23.456"        -> "01:23.456"
         "start: 00:10"     -> "00:10"
+        "00:01:23"         -> "00:01:23"
     """
-    # Matches MM:SS, MM:SS.mmm, or MM:SS:mmm
-    match = re.search(r"(\d{1,2}:\d{2}(?:[:.]\d{1,3})?)", ts_str)
+    # Matches MM:SS, MM:SS.mmm, MM:SS:mmm, HH:MM:SS, or HH:MM:SS.mmm
+    match = re.search(
+        r"(\d{1,2}:\d{2}:\d{2}(?!\d)(?:\.\d{1,3})?|\d{1,2}:\d{2}(?:[.]\d{1,3}|:\d{3}(?!\d))|\d{1,2}:\d{2}(?!\d))",
+        ts_str,
+    )
     return match.group(1) if match else ts_str
 
 
 def _parse_timestamp_string_ms(timestamp_string: str) -> int:
     """Parses a timestamp string into milliseconds.
 
-    Supports "MM:SS.mmm", "MM:SS:mmm", and "MM:SS" formats.
+    Supports "MM:SS.mmm", "HH:MM:SS.mmm", "HH:MM:SS", "MM:SS:mmm", and "MM:SS" formats.
 
     Args:
         timestamp_string: The timestamp string to parse.
@@ -125,32 +129,72 @@ def _parse_timestamp_string_ms(timestamp_string: str) -> int:
     Raises:
         ValueError: If the timestamp string is in an invalid format.
     """
-    ts = timestamp_string
+    ts = timestamp_string.strip()
 
     if "." in ts:
-        # Handles "MM:SS.mmm"
+        # Handles "MM:SS.mmm", "HH:MM:SS.mmm", or "SS.mmm"
         split1 = ts.split(".")
-        split2 = split1[0].split(":")
-        minutes = int(split2[0])
-        seconds = int(split2[1])
+        if len(split1) != 2:
+            raise ValueError(f"Invalid timestamp format: {timestamp_string}")
+
         milliseconds = int(split1[1].ljust(3, "0")[:3])
-        timestamp = minutes * 60000 + seconds * 1000 + milliseconds
-    elif ts.count(":") == 2:
-        # Handles "MM:SS:mmm"
+        split2 = split1[0].split(":")
+
+        if len(split2) == 3:
+            # HH:MM:SS.mmm (HH is expected to be 0 for 5-minute segments)
+            hours = int(split2[0])
+            minutes = int(split2[1])
+            seconds = int(split2[2])
+            return hours * 3600000 + minutes * 60000 + seconds * 1000 + milliseconds
+        elif len(split2) == 2:
+            # MM:SS.mmm
+            minutes = int(split2[0])
+            seconds = int(split2[1])
+            return minutes * 60000 + seconds * 1000 + milliseconds
+        elif len(split2) == 1:
+            # SS.mmm
+            seconds = int(split2[0])
+            return seconds * 1000 + milliseconds
+        else:
+            raise ValueError(f"Invalid timestamp format: {timestamp_string}")
+
+    colon_count = ts.count(":")
+    if colon_count == 2:
         split = ts.split(":")
-        minutes = int(split[0])
-        seconds = int(split[1])
-        milliseconds = int(split[2].ljust(3, "0")[:3])
-        timestamp = minutes * 60000 + seconds * 1000 + milliseconds
-    elif ts.count(":") == 1:
+        # Disambiguate between "MM:SS:mmm" (e.g. 01:23:456) and "HH:MM:SS" (e.g. 00:01:23)
+        # Since video segments are ~5 minutes, HH is expected to be 0.
+        # If the third segment has 3 digits or is >= 60, it represents milliseconds.
+        if len(split[2]) == 3 or int(split[2]) >= 60:
+            # MM:SS:mmm
+            minutes = int(split[0])
+            seconds = int(split[1])
+            milliseconds = int(split[2].ljust(3, "0")[:3])
+            return minutes * 60000 + seconds * 1000 + milliseconds
+        else:
+            # HH:MM:SS
+            hours = int(split[0])
+            minutes = int(split[1])
+            seconds = int(split[2])
+            return hours * 3600000 + minutes * 60000 + seconds * 1000
+
+    elif colon_count == 1:
         # Handles "MM:SS"
         split = ts.split(":")
         minutes = int(split[0])
         seconds = int(split[1])
-        timestamp = minutes * 60000 + seconds * 1000
+        return minutes * 60000 + seconds * 1000
+
+    elif colon_count == 3:
+        # Handles "HH:MM:SS:mmm"
+        split = ts.split(":")
+        hours = int(split[0])
+        minutes = int(split[1])
+        seconds = int(split[2])
+        milliseconds = int(split[3].ljust(3, "0")[:3])
+        return hours * 3600000 + minutes * 60000 + seconds * 1000 + milliseconds
+
     else:
         raise ValueError(f"Invalid timestamp format: {timestamp_string}")
-    return timestamp
 
 
 def _format_ms_timestamp(ms: int) -> str:
