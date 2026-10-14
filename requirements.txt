@@ -1,8 +1,11 @@
 pysubs2
 static-ffmpeg
 pydantic
-pydantic-ai-slim[google, logfire, duckduckgo] >= 1.99.0
 pydantic-settings
+google-genai
+logfire[google-genai]
+ddgs
+httpx
 pyrate-limiter
 json_repair
 ruff

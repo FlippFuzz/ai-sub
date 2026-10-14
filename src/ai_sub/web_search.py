@@ -5,6 +5,8 @@ dependency container used to orchestrate web search operations across
 different providers.
 """
 
+from __future__ import annotations
+
 import asyncio
 import math
 import random
@@ -41,27 +43,27 @@ class WebSearchDeps:
     """
 
     _settings: WebSearchSettings
-    _client: AsyncClient
+    _client: AsyncClient | None
     _cache: dict[str, list[WebSearchResult]]
     _limiter: Limiter
     _provider: str
 
-    def __init__(self, settings: WebSearchSettings, provider: str):
+    def __init__(self, settings: WebSearchSettings, provider: str) -> None:
         """Initializes the WebSearchDeps.
 
         Args:
             settings: A WebSearchSettings instance.
-            provider: The name of the provider (e.g., 'ollama', 'langsearch') for rate limiting.
+            provider: The name of the provider (e.g., 'ollama', 'langsearch', 'duckduckgo') for rate limiting.
         """
         self._settings = settings
         self._provider = provider
         self._cache = {}
+        self._client = None
 
         # Handle fractional QPS by scaling the duration.
         # e.g., 0.5 QPS becomes 1 query per 2 seconds.
         if self._settings.qps < 1:
             rate = 1
-            # Convert to float to resolve Pylance operator issues and round up with math.ceil.
             duration = int(math.ceil(1 / self._settings.qps)) * Duration.SECOND
         else:
             rate = int(self._settings.qps)
@@ -79,7 +81,7 @@ class WebSearchDeps:
             query: The raw search query string.
 
         Returns:
-            A normalized version of the query suitable for cache-key comparison.
+            str: A normalized version of the query suitable for cache-key comparison.
         """
         translator = str.maketrans("", "", string.punctuation)
         return query.translate(translator).casefold()
@@ -88,19 +90,28 @@ class WebSearchDeps:
         """Initialize the underlying httpx.AsyncClient and enter its context.
 
         Returns:
-            The initialized session instance.
+            Self: The initialized session instance.
 
         Raises:
-            ValueError: If the API key is not configured.
+            ValueError: If the API key is not configured for providers requiring an API key.
         """
-        if self._settings.key is None:
+        if self._provider != "duckduckgo" and self._settings.key is None:
             raise ValueError(f"{self._provider.capitalize()} API key is not configured")
-        headers = {"Authorization": f"Bearer {self._settings.key.get_secret_value()}"}
+
+        headers = {}
+        if self._settings.key is not None:
+            headers["Authorization"] = f"Bearer {self._settings.key.get_secret_value()}"
+
         self._client = AsyncClient(headers=headers, timeout=self._settings.timeout)
         await self._client.__aenter__()
         return self
 
-    async def __aexit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: Any) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
         """Close the underlying httpx.AsyncClient when exiting the context.
 
         Args:
@@ -119,7 +130,7 @@ class WebSearchDeps:
             json: The JSON payload for the request body.
 
         Returns:
-            The HTTP response object.
+            Response: The HTTP response object.
 
         Raises:
             httpx.HTTPStatusError: If an unretryable HTTP error occurs or retries are exhausted.
@@ -127,7 +138,11 @@ class WebSearchDeps:
             httpx.TimeoutException: If a request times out and retries are exhausted.
             ConnectionError: If a connection error occurs and retries are exhausted.
             asyncio.TimeoutError: If an async operation times out and retries are exhausted.
+            RuntimeError: If an internal execution path fails unexpectedly.
         """
+        if self._client is None:
+            raise RuntimeError("WebSearchDeps HTTP client has not been initialized.")
+
         max_attempts = self._settings.retries + 1
         for attempt in range(max_attempts):
             await self._limiter.try_acquire_async(self._provider, blocking=True)
@@ -162,4 +177,4 @@ class WebSearchDeps:
                     continue
                 raise
 
-        assert False, "Unreachable code path"
+        raise RuntimeError(f"POST request to {url} failed after {max_attempts} attempts.")

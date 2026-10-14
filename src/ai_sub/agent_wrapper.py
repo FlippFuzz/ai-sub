@@ -1,137 +1,72 @@
-"""AI Agent wrapper for the subtitle generation pipeline."""
+"""AI Agent wrapper for the subtitle generation pipeline using Google Gen AI SDK."""
 
-from __future__ import annotations as _annotations
+from __future__ import annotations
 
 import asyncio
 import random
-from pathlib import Path
-from typing import Any, Sequence, TypeVar, cast
+from typing import Any, TypeVar
 
+import json_repair
 import logfire
-from google import genai as genai
-from google.genai.types import (
-    HarmBlockThreshold,
-    HarmCategory,
-    ThinkingConfigDict,
-)
-from httpx import HTTPStatusError, TransportError
-from pydantic import BaseModel
-from pydantic_ai import Agent, BinaryContent, ModelRequestContext, RunContext, WebSearchTool
-from pydantic_ai.capabilities import AbstractCapability, Hooks, NativeTool
-from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import DocumentUrl, ModelResponse, ThinkingPart
-from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
-from pydantic_ai.providers.google import GoogleProvider
-from pydantic_ai.settings import ModelSettings
-from pyrate_limiter import Duration, limiter_factory
+from google import genai
+from google.genai import types
+from google.genai.errors import APIError
+from pydantic import BaseModel, ValidationError
+from pyrate_limiter import Duration, Limiter, limiter_factory
 
 from ai_sub.config import ServiceTier, Settings
 from ai_sub.data_models import AgentDeps, QuotaExceededError
 from ai_sub.prompt import Prompt
+from ai_sub.web_search_duckduckgo import duckduckgo_search, web_search_duckduckgo_multi
 from ai_sub.web_search_langsearch import web_search_langsearch_multi
 from ai_sub.web_search_ollama import web_search_ollama_multi
 
 T = TypeVar("T", bound=BaseModel)
 
+MAX_SEARCH_TURNS = 3
+
 
 def _calculate_tokens(text_prompt: Prompt, video_duration_ms: int) -> int:
     """Estimates the number of tokens for a given text prompt and video duration.
 
-    This is a rough estimation used for rate limiting purposes. The actual
-    token count may vary depending on the model and tokenizer.
-
-    The estimation is based on:
-    - Text: A simple character count.
-    - Video: A fixed rate of tokens per second of video.
+    This estimation is used for rate limiting purposes.
 
     Args:
-        text_prompt (Prompt): The text prompt.
-        video_duration_ms (int): The duration of the video in milliseconds.
+        text_prompt: The text prompt containing system and user instructions.
+        video_duration_ms: The duration of the video segment in milliseconds.
 
     Returns:
         int: The estimated number of tokens.
-
     """
-    # TODO: Make this more accurate. This is just a rough estimation
     return int(len(text_prompt.system_prompt) + len(text_prompt.user_prompt) + (video_duration_ms / 1000) * 300)
 
 
 def _is_free_tier_quota_exceeded(e: Exception) -> bool:
     """Checks if an exception indicates a Google Free Tier daily quota exhaustion.
 
-    This logic supports a two-stage check:
-    1. During retries: It attempts to inspect HTTPStatusError, though this usually
-       fails because bodies aren't read yet in async streams.
-    2. After exhaustion: It inspects ModelHTTPError, which contains the fully
-       buffered error message from the provider.
-
     Args:
         e: The exception to check.
 
     Returns:
-        bool: True if it is a daily (hard) quota exhaustion error.
+        bool: True if it is a daily (hard) quota exhaustion error, False otherwise.
     """
-    if isinstance(e, HTTPStatusError):
-        try:
-            # At the tenacity transport level, the response body is typically unread.
-            # Accessing .text might raise ResponseNotRead. We catch it to allow
-            # the retry logic to treat this as a generic (retryable) 429.
-            body = e.response.text.lower()
-        except Exception:
-            body = ""
-
-        return e.response.status_code == 429 and "GenerateRequestsPerDayPerProjectPerModel-FreeTier".lower() in body
-
-    if isinstance(e, ModelHTTPError):
-        # When pydantic-ai raises ModelHTTPError, it has already read the body.
-        # This is the reliable place to detect the daily free tier limit.
-        return e.status_code == 429 and "GenerateRequestsPerDayPerProjectPerModel-FreeTier".lower() in str(e).lower()
-    return False
-
-
-async def _rate_limit(ctx: RunContext[AgentDeps], request_context: ModelRequestContext) -> ModelRequestContext:
-    """Hook for enforcing rate limits before making a model request.
-
-    Args:
-        ctx: The run context containing agent dependencies.
-        request_context: The context for the current model request.
-
-    Returns:
-        The unmodified request context.
-    """
-    deps = ctx.deps
-
-    request_limiter = deps.request_limiter
-    token_limiter = deps.token_limiter
-
-    if request_limiter:
-        await request_limiter.try_acquire_async("rpm")
-
-    if token_limiter:
-        await token_limiter.try_acquire_async("tpm", weight=deps.request_tokens)
-
-    return request_context
+    err_str = str(e).lower()
+    return "429" in err_str and "generaterequestsperdayperprojectpermodel-freetier" in err_str
 
 
 class RateLimitedAgentWrapper:
-    """A wrapper around the Pydantic AI Agent.
-
-    Handles rate limiting, token usage tracking, and model-specific configurations
-    (e.g., Google).
-    """
+    """A rate-limited wrapper around Google Gen AI client for subtitle and lyrics processing."""
 
     settings: Settings
     model_name: str
+    model_id: str
     service_tier: ServiceTier | None
-
-    def is_google(self) -> bool:
-        """Checks if the model is a Google model.
-
-        Returns:
-            bool: True if the model is a Google model, False otherwise.
-
-        """
-        return self.model_name.lower().startswith("google-gla")
+    use_web_search: bool
+    deps: AgentDeps
+    request_limiter: Limiter
+    token_limiter: Limiter
+    _client: genai.Client
+    _quota_exceeded: bool
 
     def __init__(
         self,
@@ -140,22 +75,46 @@ class RateLimitedAgentWrapper:
         deps: AgentDeps | None = None,
         use_web_search: bool = False,
         service_tier: ServiceTier | None = None,
-    ):
-        """Initializes the agent wrapper with settings.
+    ) -> None:
+        """Initializes the agent wrapper with settings and Google Gen AI client.
 
         Args:
-            settings (Settings): The application configuration settings.
-            model_name (str): The name of the model to use.
-            deps: Optional dependencies to pass to the agent. Defaults to a new ``AgentDeps`` instance.
-            use_web_search (bool): Whether to enable the web search tool.
-            service_tier: The service tier for the model ('auto', 'default', 'flex', 'priority').
+            settings: The application configuration settings.
+            model_name: The name of the model (must start with 'google-gla:').
+            deps: Optional dependencies for the agent.
+            use_web_search: Whether to enable web search tools.
+            service_tier: The service tier for the model.
+
+        Raises:
+            ValueError: If the model name does not start with 'google-gla:' or the API key is missing.
         """
+        if not model_name.lower().startswith("google-gla:"):
+            raise ValueError(
+                f"Model '{model_name}' is invalid. Model name must start with 'google-gla:' "
+                "(e.g., 'google-gla:gemini-3.7-flash')."
+            )
+
+        if settings.ai.google.key is None:
+            raise ValueError("Google AI API key is missing.")
+
+        api_key = settings.ai.google.key.get_secret_value()
+
         self.settings = settings
         self.model_name = model_name
+        self.model_id = model_name.split(":", 1)[-1]
         self.use_web_search = use_web_search
         self.service_tier = service_tier
         self._quota_exceeded = False
         self.deps = deps or AgentDeps(validation_buffer_ms=settings.ai.validation_buffer_ms)
+
+        http_options: types.HttpOptions | None = None
+        if self.settings.ai.google.base_url:
+            http_options = types.HttpOptions(base_url=str(self.settings.ai.google.base_url))
+
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options=http_options,
+        )
 
         self.request_limiter = limiter_factory.create_inmemory_limiter(
             rate_per_duration=self.settings.ai.rpm, duration=Duration.MINUTE
@@ -163,250 +122,365 @@ class RateLimitedAgentWrapper:
         self.token_limiter = limiter_factory.create_inmemory_limiter(
             rate_per_duration=self.settings.ai.tpm, duration=Duration.MINUTE
         )
-        self.agent = self._create_agent()
 
-    def _create_agent(self) -> Agent[AgentDeps]:
-        """Creates and configures the Pydantic AI Agent based on the model type.
+    def _get_thinking_config(self) -> types.ThinkingConfig:
+        """Constructs the appropriate thinking configuration based on the model version.
 
         Returns:
-            Agent: The configured Pydantic AI Agent.
-
-        Raises:
-            ValueError: If the Google AI API key is missing.
+            types.ThinkingConfig: The thinking configuration for Google Gen AI.
         """
-        function_tools = []
-
-        agent: Agent[AgentDeps]
-        capabilities: Sequence[AbstractCapability[AgentDeps]] = []
-        capabilities.append(Hooks(before_model_request=_rate_limit))
-
-        if self.use_web_search:
-            if self.settings.ai.search.web_search_tool == "ollama":
-                function_tools.append(web_search_ollama_multi)
-            elif self.settings.ai.search.web_search_tool == "langsearch":
-                function_tools.append(web_search_langsearch_multi)
-            elif self.settings.ai.search.web_search_tool == "duckduckgo":
-                from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
-
-                function_tools.append(duckduckgo_search_tool())
-            else:
-                capabilities.append(NativeTool(WebSearchTool()))
-
-        agent_kwargs = {
-            "deps_type": AgentDeps,
-            "tools": function_tools,
-            "capabilities": capabilities,
-            "validation_context": lambda ctx: {
-                "video_duration_ms": ctx.deps.video_duration_ms,
-                "validation_buffer_ms": ctx.deps.validation_buffer_ms,
-            },
-            "retries": self.settings.retry.per_run,
-        }
-
-        if self.is_google():
-            model_str = self.model_name.split(":", 1)[-1]
-            # Configure thinking levels for Google models
-            # https://ai.google.dev/gemini-api/docs/thinking
-            thinking_config: ThinkingConfigDict
-            if model_str.lower().startswith("gemini-3"):
-                thinking_config = {
-                    "include_thoughts": True,
-                    "thinking_level": genai.types.ThinkingLevel.HIGH,
-                }
-            elif model_str.lower().startswith("gemini-2.5-pro"):
-                thinking_config = {
-                    "include_thoughts": True,
-                    "thinking_budget": 32768,
-                }
-            else:
-                thinking_config = {
-                    "include_thoughts": True,
-                    "thinking_budget": 24576,
-                }
-
-            if self.settings.ai.google.key is None:
-                raise ValueError("Google AI API key is missing.")
-
-            model = GoogleModel(
-                model_str,
-                provider=GoogleProvider(
-                    api_key=self.settings.ai.google.key.get_secret_value(),
-                    http_client=None,
-                    base_url=(str(self.settings.ai.google.base_url) if self.settings.ai.google.base_url else None),
-                ),
+        model_lower = self.model_id.lower()
+        if model_lower.startswith("gemini-3"):
+            return types.ThinkingConfig(
+                include_thoughts=True,
+                thinking_level=types.ThinkingLevel.HIGH,
             )
-            google_model_settings_kwargs: dict[str, Any] = {
-                "google_thinking_config": thinking_config,
-                "google_safety_settings": [
-                    {
-                        "category": HarmCategory.HARM_CATEGORY_HARASSMENT,
-                        "threshold": HarmBlockThreshold.BLOCK_NONE,
-                    },
-                    {
-                        "category": HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                        "threshold": HarmBlockThreshold.BLOCK_NONE,
-                    },
-                    {
-                        "category": HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                        "threshold": HarmBlockThreshold.BLOCK_NONE,
-                    },
-                    {
-                        "category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                        "threshold": HarmBlockThreshold.BLOCK_NONE,
-                    },
-                ],
-            }
-            if self.service_tier is not None:
-                google_model_settings_kwargs["service_tier"] = self.service_tier
-
-            google_model_settings = GoogleModelSettings(**google_model_settings_kwargs)
-
-            agent = Agent(
-                model=model,
-                model_settings=google_model_settings,
-                **agent_kwargs,
+        if model_lower.startswith("gemini-2.5-pro"):
+            return types.ThinkingConfig(
+                include_thoughts=True,
+                thinking_budget=32768,
             )
-        else:
-            # For non-Google models
-            model_settings = ModelSettings(service_tier=self.service_tier) if self.service_tier is not None else None
-            agent = Agent(
-                model=self.model_name,
-                model_settings=model_settings,
-                **agent_kwargs,
+        return types.ThinkingConfig(
+            include_thoughts=True,
+            thinking_budget=24576,
+        )
+
+    def _get_safety_settings(self) -> list[types.SafetySetting]:
+        """Builds default permissive safety settings for multimedia transcription.
+
+        Returns:
+            list[types.SafetySetting]: The configured safety settings.
+        """
+        return [
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+            types.SafetySetting(
+                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                threshold=types.HarmBlockThreshold.BLOCK_NONE,
+            ),
+        ]
+
+    def _get_tools(self) -> list[types.Tool] | None:
+        """Constructs tool declarations for web search if enabled.
+
+        Returns:
+            list[types.Tool] | None: The tool configuration, or None if web search is disabled.
+        """
+        if not self.use_web_search:
+            return None
+
+        tool_type = self.settings.ai.search.web_search_tool
+        if tool_type == "builtin":
+            return [types.Tool(google_search=types.GoogleSearch())]
+
+        declarations: list[types.FunctionDeclaration] = []
+        if tool_type == "langsearch":
+            declarations.append(
+                types.FunctionDeclaration(
+                    name="web_search_langsearch_multi",
+                    description="Perform multiple web search queries in parallel using Langsearch.",
+                    parameters_json_schema={
+                        "type": "object",
+                        "properties": {
+                            "queries": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "A list of search query strings.",
+                            },
+                        },
+                        "required": ["queries"],
+                    },
+                )
+            )
+        elif tool_type == "ollama":
+            declarations.append(
+                types.FunctionDeclaration(
+                    name="web_search_ollama_multi",
+                    description="Perform multiple web search queries in parallel using Ollama.",
+                    parameters_json_schema={
+                        "type": "object",
+                        "properties": {
+                            "queries": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "A list of search query strings.",
+                            },
+                        },
+                        "required": ["queries"],
+                    },
+                )
+            )
+        elif tool_type == "duckduckgo":
+            declarations.extend(
+                [
+                    types.FunctionDeclaration(
+                        name="duckduckgo_search",
+                        description="Perform a single web search query using DuckDuckGo.",
+                        parameters_json_schema={
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "The search query string.",
+                                },
+                            },
+                            "required": ["query"],
+                        },
+                    ),
+                    types.FunctionDeclaration(
+                        name="web_search_duckduckgo_multi",
+                        description="Perform multiple web search queries in parallel using DuckDuckGo.",
+                        parameters_json_schema={
+                            "type": "object",
+                            "properties": {
+                                "queries": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "A list of search query strings.",
+                                },
+                            },
+                            "required": ["queries"],
+                        },
+                    ),
+                ]
             )
 
-        # Register dynamic system prompt to get the system prompt text from AgentDeps
-        @agent.system_prompt
-        def get_dynamic_system_prompt(ctx: RunContext[AgentDeps]) -> str:
-            return ctx.deps.system_prompt
+        return [types.Tool(function_declarations=declarations)] if declarations else None
 
-        return agent
+    async def _execute_tool_call(self, name: str, args: dict[str, Any]) -> Any:
+        """Executes a single tool call requested by the model.
+
+        Args:
+            name: The name of the function to execute.
+            args: The function arguments provided by the model.
+
+        Returns:
+            Any: The JSON-serializable tool output.
+        """
+        search_deps = self.deps.web_search
+        assert search_deps is not None, "WebSearchDeps must be initialized when web search is enabled."
+
+        if name == "web_search_langsearch_multi":
+            raw_queries = args.get("queries") or [args.get("query")]
+            queries = [str(q) for q in raw_queries if q]
+            results = await web_search_langsearch_multi(search_deps, queries)
+            return [r.model_dump(mode="json") for r in results]
+
+        if name == "web_search_ollama_multi":
+            raw_queries = args.get("queries") or [args.get("query")]
+            queries = [str(q) for q in raw_queries if q]
+            results = await web_search_ollama_multi(search_deps, queries)
+            return [r.model_dump(mode="json") for r in results]
+
+        if name == "duckduckgo_search":
+            query = str(args.get("query") or "")
+            results = await duckduckgo_search(search_deps, query)
+            return [r.model_dump(mode="json") for r in results]
+
+        if name == "web_search_duckduckgo_multi":
+            raw_queries = args.get("queries") or [args.get("query")]
+            queries = [str(q) for q in raw_queries if q]
+            results = await web_search_duckduckgo_multi(search_deps, queries)
+            return [r.model_dump(mode="json") for r in results]
+
+        return {"error": f"Unknown tool: {name}"}
 
     async def run(
         self,
         prompt: Prompt,
-        video: genai.types.File | Path,
+        video: types.File,
         video_duration_ms: int,
         response_type: type[T],
     ) -> T:
-        """Runs the AI agent to generate subtitles for the given video.
+        """Runs the AI agent to generate structured responses from the uploaded video.
 
         Args:
-            prompt (Prompt): The Prompt object guiding the AI (with system and user prompt strings).
-            video (genai.types.File | Path): The video file (either a Google File object or a local Path).
-            video_duration_ms (int): The duration of the video in milliseconds (used for token estimation).
-            response_type (type[T]): The expected Pydantic model for the response.
+            prompt: The Prompt object containing system and user prompt strings.
+            video: The uploaded video file handle in the Gemini Files API.
+            video_duration_ms: The duration of the video in milliseconds (used for rate limiting).
+            response_type: The expected Pydantic model for the structured response.
 
         Returns:
-            T: The structured response containing subtitles or scene data.
+            T: The parsed and validated structured response.
 
         Raises:
             QuotaExceededError: If the model's quota has been exhausted.
-            ModelHTTPError: If the AI provider returns an HTTP error other than quota exhaustion.
-            HTTPStatusError: If the HTTP request fails with a status error.
-            TransportError: If a transport error occurs during the HTTP request.
-            ConnectionError: If a network connection error occurs.
-            asyncio.TimeoutError: If the request times out.
-            RuntimeError: If the retry limit is reached or the agent fails to execute the loop.
-
+            APIError: If an unretryable API error occurs or retries are exhausted.
+            ValidationError: If model output validation fails and retries are exhausted.
+            ValueError: If output field validation fails and retries are exhausted.
+            ConnectionError: If network connectivity fails and retries are exhausted.
+            TimeoutError: If request timeouts occur and retries are exhausted.
+            RuntimeError: If retries are exhausted or generation fails.
         """
         if self._quota_exceeded:
             raise QuotaExceededError(f"Quota previously exceeded for model {self.model_name}")
 
-        # Prepare the prompt
-        # Each model provider requires a different input format for video.
-        if self.is_google():
-            if isinstance(video, genai.types.File):
-                file = cast(genai.types.File, video)
-                uri = str(file.uri)
-                user_prompt = [
-                    DocumentUrl(url=uri, media_type=file.mime_type),
-                    prompt.user_prompt,
-                ]
-            else:
-                python_file = cast(Path, video)
-                data = await asyncio.to_thread(python_file.read_bytes)
-                user_prompt = [
-                    BinaryContent(data=data, media_type=f"video/{python_file.suffix[1:]}"),
-                    prompt.user_prompt,
-                ]
-        else:
-            # For other models (e.g., OpenAI), we read the file into memory
-            # and send it as binary content.
-            # TODO: This is not tested. Only tested against Google's models
-            python_file = cast(Path, video)
-            data = await asyncio.to_thread(python_file.read_bytes)
-            user_prompt = [
-                BinaryContent(data=data, media_type=f"video/{python_file.suffix[1:]}"),
-                prompt.user_prompt,
-            ]
-
-        # Create sort out dependencies for handling rate limiting
         tokens = _calculate_tokens(prompt, video_duration_ms)
-        deps = AgentDeps(
-            request_limiter=self.request_limiter,
-            token_limiter=self.token_limiter,
-            request_tokens=tokens,
-            video_duration_ms=video_duration_ms,
-            validation_buffer_ms=self.settings.ai.validation_buffer_ms,
-            web_search=self.deps.web_search,
-            system_prompt=prompt.system_prompt,
-        )
 
-        # Execute the AI agent to generate subtitles and get a structured response.
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": prompt.system_prompt,
+            "thinking_config": self._get_thinking_config(),
+            "safety_settings": self._get_safety_settings(),
+            "response_mime_type": "application/json",
+            "response_schema": response_type,
+        }
+        if self.service_tier is not None:
+            config_kwargs["service_tier"] = self.service_tier
+
+        tools = self._get_tools()
+        if tools:
+            config_kwargs["tools"] = tools
+
+        config = types.GenerateContentConfig(**config_kwargs)
+
+        config_final = config
+        if tools:
+            config_final_kwargs = dict(config_kwargs)
+            if self.settings.ai.search.web_search_tool != "builtin":
+                config_final_kwargs["tool_config"] = types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(
+                        mode=types.FunctionCallingConfigMode.NONE,
+                    )
+                )
+            else:
+                config_final_kwargs.pop("tools", None)
+            config_final = types.GenerateContentConfig(**config_final_kwargs)
+
         for attempt in range(self.settings.retry.per_run + 1):
+            contents: list[Any] = [video, prompt.user_prompt]
+            search_turns = 0
+
             try:
-                result = await self.agent.run(user_prompt=user_prompt, output_type=response_type, deps=deps)
-                output = result.output
+                while True:
+                    await self.request_limiter.try_acquire_async("rpm")
+                    await self.token_limiter.try_acquire_async("tpm", weight=tokens)
 
-                if hasattr(output, "thoughts"):
-                    thinking_parts = []
-                    for msg in result.new_messages():
-                        if isinstance(msg, ModelResponse):
-                            for part in msg.parts:
-                                if isinstance(part, ThinkingPart) and part.content:
-                                    thinking_parts.append(part.content)
-                    if thinking_parts:
-                        setattr(output, "thoughts", "\n".join(thinking_parts))
+                    current_config = config_final if search_turns >= MAX_SEARCH_TURNS else config
+                    response = await self._client.aio.models.generate_content(
+                        model=self.model_id,
+                        contents=contents,
+                        config=current_config,
+                    )
 
-                return output
-            except (
-                ModelHTTPError,
-                HTTPStatusError,
-                TransportError,
-                ConnectionError,
-                asyncio.TimeoutError,
-            ) as e:
-                # 1. Check for hard daily quota (terminal)
+                    candidate = response.candidates[0] if response.candidates else None
+                    if candidate is None:
+                        raise RuntimeError(f"No response candidate returned by {self.model_name}")
+
+                    # Check for function calls
+                    function_calls = response.function_calls
+                    if function_calls and search_turns < MAX_SEARCH_TURNS:
+                        search_turns += 1
+
+                        async def _run_call(call: types.FunctionCall) -> tuple[str, Any]:
+                            call_name = call.name or ""
+                            result = await self._execute_tool_call(call_name, call.args or {})
+                            return call_name, result
+
+                        call_results = await asyncio.gather(*[_run_call(fc) for fc in function_calls])
+
+                        response_parts = [
+                            types.Part.from_function_response(
+                                name=call_name,
+                                response={"result": res},
+                            )
+                            for call_name, res in call_results
+                        ]
+
+                        contents.append(candidate.content)
+                        contents.append(types.Content(role="user", parts=response_parts))
+                        continue
+
+                    # Final response parsing
+                    text_content = response.text or ""
+                    try:
+                        output = response_type.model_validate_json(
+                            text_content,
+                            context={
+                                "video_duration_ms": video_duration_ms,
+                                "validation_buffer_ms": self.settings.ai.validation_buffer_ms,
+                            },
+                        )
+                    except Exception:
+                        repaired_data = json_repair.loads(text_content)
+                        output = response_type.model_validate(
+                            repaired_data,
+                            context={
+                                "video_duration_ms": video_duration_ms,
+                                "validation_buffer_ms": self.settings.ai.validation_buffer_ms,
+                            },
+                        )
+
+                    # Extract thoughts if present
+                    if hasattr(output, "thoughts") and candidate.content and candidate.content.parts:
+                        thinking_parts: list[str] = [
+                            text
+                            for part in candidate.content.parts
+                            if getattr(part, "thought", False) and (text := part.text) is not None
+                        ]
+                        if thinking_parts:
+                            setattr(output, "thoughts", "\n".join(thinking_parts))
+
+                    return output
+
+            except APIError as e:
                 if _is_free_tier_quota_exceeded(e):
                     self._quota_exceeded = True
                     logfire.warning(f"Free tier daily quota exceeded for {self.model_name}. Halting pipeline.")
                     raise QuotaExceededError(str(e)) from e
 
-                # 2. Determine if the error is retryable (transient)
-                is_retryable = False
-                if isinstance(e, (ModelHTTPError, HTTPStatusError)):
-                    status_code = e.status_code if isinstance(e, ModelHTTPError) else e.response.status_code
-                    # Transient status codes
-                    is_retryable = status_code in (429, 500, 502, 503, 504)
-                else:
-                    # Network level errors (Connection, Timeout)
-                    is_retryable = True
-
+                is_retryable = e.code in (429, 500, 502, 503, 504) if e.code else True
                 if is_retryable and attempt < self.settings.retry.per_run:
                     backoff = min(
-                        self.settings.retry.max_wait_seconds,
+                        float(self.settings.retry.max_wait_seconds),
                         (self.settings.retry.min_wait_seconds * (self.settings.retry.multiplier**attempt))
                         + random.uniform(0, 1),
                     )
                     logfire.info(
-                        f"Transient error in {self.model_name} (attempt {attempt + 1}). "
+                        f"Transient API error in {self.model_name} (attempt {attempt + 1}). "
                         f"Retrying in {backoff:.2f}s... Error: {e}"
                     )
                     await asyncio.sleep(backoff)
                     continue
-                # Final failure after exhausting retries or non-retryable error
                 raise
 
-        # Safeguard for type safety: if the loop completes (e.g. per_run is 0)
-        raise RuntimeError(f"Agent failed to run: retry limit ({self.settings.retry.per_run}) reached or invalid.")
+            except (ValidationError, ValueError) as e:
+                if attempt < self.settings.retry.per_run:
+                    backoff = min(
+                        float(self.settings.retry.max_wait_seconds),
+                        (self.settings.retry.min_wait_seconds * (self.settings.retry.multiplier**attempt))
+                        + random.uniform(0, 1),
+                    )
+                    logfire.warning(
+                        f"Validation error in {self.model_name} output (attempt {attempt + 1}). "
+                        f"Retrying in {backoff:.2f}s... Error: {e}"
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
+
+            except (ConnectionError, asyncio.TimeoutError) as e:
+                if attempt < self.settings.retry.per_run:
+                    backoff = min(
+                        float(self.settings.retry.max_wait_seconds),
+                        (self.settings.retry.min_wait_seconds * (self.settings.retry.multiplier**attempt))
+                        + random.uniform(0, 1),
+                    )
+                    logfire.info(
+                        f"Network error in {self.model_name} (attempt {attempt + 1}). "
+                        f"Retrying in {backoff:.2f}s... Error: {e}"
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
+
+        raise RuntimeError(f"Agent failed to run: retry limit ({self.settings.retry.per_run}) reached.")

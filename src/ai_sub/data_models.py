@@ -73,8 +73,8 @@ def _str_presenter(dumper: _YamlDumper, data: str) -> yaml.Node:
     to standard newline characters so LLM outputs are cleanly presented as multiline blocks.
 
     Args:
-        dumper (_YamlDumper): The YAML dumper instance.
-        data (str): The string scalar to present.
+        dumper: The YAML dumper instance.
+        data: The string scalar to present.
 
     Returns:
         yaml.Node: The represented scalar node.
@@ -96,7 +96,7 @@ def _clean_timestamp_string(ts_str: str) -> str:
     regex to isolate the actual timecode from such noise.
 
     Args:
-        ts_str (str): The potentially noisy timestamp string.
+        ts_str: The potentially noisy timestamp string.
 
     Returns:
         str: The extracted timestamp string.
@@ -105,54 +105,96 @@ def _clean_timestamp_string(ts_str: str) -> str:
         "03:52.000,start:" -> "03:52.000"
         "01:23.456"        -> "01:23.456"
         "start: 00:10"     -> "00:10"
-
+        "00:01:23"         -> "00:01:23"
     """
-    # Matches MM:SS, MM:SS.mmm, or MM:SS:mmm
-    match = re.search(r"(\d{1,2}:\d{2}(?:[:.]\d{1,3})?)", ts_str)
+    # Matches MM:SS, MM:SS.mmm, MM:SS:mmm, HH:MM:SS, or HH:MM:SS.mmm
+    match = re.search(
+        r"(\d{1,2}:\d{2}:\d{2}(?!\d)(?:\.\d{1,3})?|\d{1,2}:\d{2}(?:[.]\d{1,3}|:\d{3}(?!\d))|\d{1,2}:\d{2}(?!\d))",
+        ts_str,
+    )
     return match.group(1) if match else ts_str
 
 
 def _parse_timestamp_string_ms(timestamp_string: str) -> int:
     """Parses a timestamp string into milliseconds.
 
-    Supports "MM:SS.mmm", "MM:SS:mmm", and "MM:SS" formats.
+    Supports "MM:SS.mmm", "HH:MM:SS.mmm", "HH:MM:SS", "MM:SS:mmm", and "MM:SS" formats.
 
     Args:
         timestamp_string: The timestamp string to parse.
 
     Returns:
-        The parsed timestamp in milliseconds.
+        int: The parsed timestamp in milliseconds.
 
     Raises:
         ValueError: If the timestamp string is in an invalid format.
-
     """
-    ts = timestamp_string
+    ts = timestamp_string.strip()
 
     if "." in ts:
-        # Handles "MM:SS.mmm"
+        # Handles "MM:SS.mmm", "HH:MM:SS.mmm", or "SS.mmm"
         split1 = ts.split(".")
-        split2 = split1[0].split(":")
-        minutes = int(split2[0])
-        seconds = int(split2[1])
+        if len(split1) != 2:
+            raise ValueError(f"Invalid timestamp format: {timestamp_string}")
+
         milliseconds = int(split1[1].ljust(3, "0")[:3])
-        timestamp = minutes * 60000 + seconds * 1000 + milliseconds
-    elif ts.count(":") == 2:
-        # Handles "MM:SS:mmm"
+        split2 = split1[0].split(":")
+
+        if len(split2) == 3:
+            # HH:MM:SS.mmm (HH is expected to be 0 for 5-minute segments)
+            hours = int(split2[0])
+            minutes = int(split2[1])
+            seconds = int(split2[2])
+            return hours * 3600000 + minutes * 60000 + seconds * 1000 + milliseconds
+        elif len(split2) == 2:
+            # MM:SS.mmm
+            minutes = int(split2[0])
+            seconds = int(split2[1])
+            return minutes * 60000 + seconds * 1000 + milliseconds
+        elif len(split2) == 1:
+            # SS.mmm
+            seconds = int(split2[0])
+            return seconds * 1000 + milliseconds
+        else:
+            raise ValueError(f"Invalid timestamp format: {timestamp_string}")
+
+    colon_count = ts.count(":")
+    if colon_count == 2:
         split = ts.split(":")
-        minutes = int(split[0])
-        seconds = int(split[1])
-        milliseconds = int(split[2].ljust(3, "0")[:3])
-        timestamp = minutes * 60000 + seconds * 1000 + milliseconds
-    elif ts.count(":") == 1:
+        # Disambiguate between "MM:SS:mmm" (e.g. 01:23:456) and "HH:MM:SS" (e.g. 00:01:23)
+        # Since video segments are ~5 minutes, HH is expected to be 0.
+        # If the third segment has 3 digits or is >= 60, it represents milliseconds.
+        if len(split[2]) == 3 or int(split[2]) >= 60:
+            # MM:SS:mmm
+            minutes = int(split[0])
+            seconds = int(split[1])
+            milliseconds = int(split[2].ljust(3, "0")[:3])
+            return minutes * 60000 + seconds * 1000 + milliseconds
+        else:
+            # HH:MM:SS
+            hours = int(split[0])
+            minutes = int(split[1])
+            seconds = int(split[2])
+            return hours * 3600000 + minutes * 60000 + seconds * 1000
+
+    elif colon_count == 1:
         # Handles "MM:SS"
         split = ts.split(":")
         minutes = int(split[0])
         seconds = int(split[1])
-        timestamp = minutes * 60000 + seconds * 1000
+        return minutes * 60000 + seconds * 1000
+
+    elif colon_count == 3:
+        # Handles "HH:MM:SS:mmm"
+        split = ts.split(":")
+        hours = int(split[0])
+        minutes = int(split[1])
+        seconds = int(split[2])
+        milliseconds = int(split[3].ljust(3, "0")[:3])
+        return hours * 3600000 + minutes * 60000 + seconds * 1000 + milliseconds
+
     else:
         raise ValueError(f"Invalid timestamp format: {timestamp_string}")
-    return timestamp
 
 
 def _format_ms_timestamp(ms: int) -> str:
@@ -162,7 +204,7 @@ def _format_ms_timestamp(ms: int) -> str:
         ms: The duration in milliseconds.
 
     Returns:
-        The formatted timestamp string.
+        str: The formatted timestamp string.
     """
     minutes, ms = divmod(ms, 60000)
     seconds, ms = divmod(ms, 1000)
@@ -206,16 +248,9 @@ def _get_default_subtitles_version() -> int:
 
 
 class AgentDeps(BaseModel):
-    """Container for agent dependencies passed to Pydantic AI's RunContext.
+    """Container for runtime dependencies used during agent execution.
 
-    Provides a centralized, extensible way to store and access multiple
-    dependencies (e.g., web search clients, databases, etc.) for use by
-    agent tools.  Add new fields here as the pipeline grows.
-
-    Example::
-
-        deps = AgentDeps(ollama_search=OllamaWebSearchDeps(settings))
-        # In a tool: ctx.deps.ollama_search
+    Stores rate limiters, token tracking, validation parameters, and web search clients.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -229,8 +264,6 @@ class AgentDeps(BaseModel):
 
     web_search: WebSearchDeps | None = None
     """Web-search dependency (:class:`WebSearchDeps`), or ``None``."""
-
-    system_prompt: str = Field(description="The dynamic system prompt text for the current run.", default="")
 
 
 class Subtitles(BaseModel):
@@ -274,7 +307,7 @@ class Subtitles(BaseModel):
         """Strips LLM noise from timestamps before field assignment.
 
         Args:
-            data (Any): The raw input data.
+            data: The raw input data.
 
         Returns:
             Any: The cleaned data.
@@ -287,7 +320,7 @@ class Subtitles(BaseModel):
         return data
 
     @model_validator(mode="after")
-    def validate_timestamps(self) -> "Subtitles":
+    def validate_timestamps(self) -> Subtitles:
         """Validates the timestamps for a subtitle.
 
         Returns:
@@ -311,8 +344,7 @@ class SubtitleAiResponse(BaseModel):
     """Represents the structured response from the AI model for subtitle generation.
 
     This model is the expected output from the AI after it has processed a video
-    segment for transcription and translation. It includes a high-level analysis
-    from the model and a list of individual subtitle entries.
+    segment for transcription and translation. It includes a list of individual subtitle entries.
     """
 
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
@@ -335,7 +367,6 @@ class SubtitleAiResponse(BaseModel):
 
         Returns:
             SSAFile: An SSAFile object containing the parsed subtitles.
-
         """
         subtitles = SSAFile()
 
@@ -371,7 +402,7 @@ class SubtitleAiResponse(BaseModel):
             gap_threshold_s: The threshold in seconds to consider a gap "large".
 
         Returns:
-            True if a large gap is detected, False otherwise.
+            bool: True if a large gap is detected, False otherwise.
         """
         gap_threshold_ms = gap_threshold_s * 1000
         if not self.subtitles:
@@ -398,11 +429,11 @@ class SubtitleAiResponse(BaseModel):
         return False
 
     @model_validator(mode="after")
-    def _validate_against_duration_validator(self, info: ValidationInfo) -> "SubtitleAiResponse":
-        """Internal validator to trigger duration checks via Pydantic AI context.
+    def _validate_against_duration_validator(self, info: ValidationInfo) -> SubtitleAiResponse:
+        """Internal validator to trigger duration checks via Pydantic validation context.
 
         Args:
-            info (ValidationInfo): The validation context.
+            info: The validation context.
 
         Returns:
             SubtitleAiResponse: The validated instance.
@@ -414,12 +445,12 @@ class SubtitleAiResponse(BaseModel):
             self.validate_against_duration(duration_ms, buffer_ms)
         return self
 
-    def validate_against_duration(self, duration_ms: int, buffer_ms: int) -> "SubtitleAiResponse":
+    def validate_against_duration(self, duration_ms: int, buffer_ms: int) -> SubtitleAiResponse:
         """Validates that no subtitle end timestamp exceeds the video duration + buffer.
 
         Args:
-            duration_ms (int): The duration of the video in milliseconds.
-            buffer_ms (int): The allowed buffer in milliseconds.
+            duration_ms: The duration of the video in milliseconds.
+            buffer_ms: The allowed buffer in milliseconds.
 
         Returns:
             SubtitleAiResponse: The validated instance.
@@ -444,16 +475,14 @@ class Scene(BaseModel):
     start: str = Field(description="The start timestamp of the scene in 'MM:SS.mmm' format (e.g., '01:23.456').")
     end: str = Field(description="The end timestamp of the scene in 'MM:SS.mmm' format (e.g., '01:23.789').")
     description: str = Field(
-        description=("A comprehensive description of the visual environment and auditory cues happening in this scene.")
+        description="A comprehensive description of the visual environment and auditory cues happening in this scene."
     )
     contains_vocal_music: bool = Field(
         description="True if the scene contains active music with sung vocals, False otherwise."
     )
     song_title: Optional[str] = Field(
         default=None,
-        description=(
-            "The title of the song detected in the scene, or null if no song or no title could be identified."
-        ),
+        description="The title of the song detected in the scene, or null if no song or no title could be identified.",
     )
     original_artist: Optional[str] = Field(
         default=None,
@@ -471,7 +500,7 @@ class Scene(BaseModel):
     )
     original_language: Optional[str] = Field(
         default=None,
-        description=("The primary language the song is sung in (e.g., Japanese, English, Chinese), or null."),
+        description="The primary language the song is sung in (e.g., Japanese, English, Chinese), or null.",
     )
     reference_lyrics_og: Optional[str] = Field(
         default=None,
@@ -500,7 +529,7 @@ class Scene(BaseModel):
         """Strips LLM noise from timestamps and converts escaped newlines in lyrics.
 
         Args:
-            data (Any): The raw input data.
+            data: The raw input data.
 
         Returns:
             Any: The cleaned data.
@@ -517,7 +546,7 @@ class Scene(BaseModel):
         return data
 
     @model_validator(mode="after")
-    def validate_timestamps(self) -> "Scene":
+    def validate_timestamps(self) -> Scene:
         """Validates the timestamps for a scene.
 
         Returns:
@@ -549,9 +578,8 @@ class LyricsSceneAiResponse(BaseModel):
         description="An overall summary describing the video content, flow, and identified musical segments."
     )
     scenes: list[Scene] = Field(
-        description=(
-            "A list of chronological, non-overlapping scenes mapping the entire video segment from start to end."
-        )
+        description="A list of chronological, non-overlapping scenes mapping the entire video segment from start to "
+        "end."
     )
 
     # Hide from LLM schema, but preserve in file serialization on disk
@@ -561,11 +589,11 @@ class LyricsSceneAiResponse(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _validate_against_duration_validator(self, info: ValidationInfo) -> "LyricsSceneAiResponse":
-        """Internal validator to trigger duration checks via Pydantic AI context.
+    def _validate_against_duration_validator(self, info: ValidationInfo) -> LyricsSceneAiResponse:
+        """Internal validator to trigger duration checks via Pydantic validation context.
 
         Args:
-            info (ValidationInfo): The validation context.
+            info: The validation context.
 
         Returns:
             LyricsSceneAiResponse: The validated instance.
@@ -577,12 +605,12 @@ class LyricsSceneAiResponse(BaseModel):
             self.validate_against_duration(duration_ms, buffer_ms)
         return self
 
-    def validate_against_duration(self, duration_ms: int, buffer_ms: int) -> "LyricsSceneAiResponse":
+    def validate_against_duration(self, duration_ms: int, buffer_ms: int) -> LyricsSceneAiResponse:
         """Validates that no scene end timestamp exceeds the video duration + buffer.
 
         Args:
-            duration_ms (int): The duration of the video in milliseconds.
-            buffer_ms (int): The allowed buffer in milliseconds.
+            duration_ms: The duration of the video in milliseconds.
+            buffer_ms: The allowed buffer in milliseconds.
 
         Returns:
             LyricsSceneAiResponse: The validated instance.
@@ -612,9 +640,7 @@ class Job(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     name: str = Field(
-        description=(
-            "The unique name of the job, typically derived from the video segment filename (e.g., 'part_001')."
-        )
+        description="The unique name of the job, typically derived from the video segment filename (e.g., 'part_001')."
     )
     total_attempts: NonNegativeInt = Field(
         default=0,
@@ -630,7 +656,7 @@ class Job(BaseModel):
         """Saves the current object to a YAML file.
 
         Args:
-            filename (Path): The path to the file where the object should be saved.
+            filename: The path to the file where the object should be saved.
         """
         data = self.model_dump(mode="json")
         with open(filename, "w", encoding="utf-8") as file:
@@ -646,7 +672,7 @@ class ReEncodingJob(Job):
     height: PositiveInt = Field(description="Target height (resolution) for the re-encoded video.")
     bitrate_kb: PositiveInt = Field(description="Target bitrate in kilobytes per second.")
     duration_tolerance_ms: NonNegativeInt = Field(
-        description=("Allowed duration difference in milliseconds to consider an existing re-encoded file valid.")
+        description="Allowed duration difference in milliseconds to consider an existing re-encoded file valid."
     )
 
 
@@ -660,7 +686,7 @@ class UploadFileJob(Job):
 class LyricsSceneJob(Job):
     """Represents a job to detect lyrics and scenes in a video segment."""
 
-    file: Optional[File | Path] = Field(default=None, exclude=True)
+    file: Optional[File] = Field(default=None, exclude=True)
     video_duration_ms: PositiveInt
     lyrics_prompt_version: Optional[int] = Field(
         default_factory=_get_default_lyrics_version,
@@ -672,11 +698,11 @@ class LyricsSceneJob(Job):
     )
 
     @model_validator(mode="after")
-    def validate_response_timestamps(self, info: ValidationInfo) -> "LyricsSceneJob":
+    def validate_response_timestamps(self, info: ValidationInfo) -> LyricsSceneJob:
         """Ensures that the response timestamps are within the video duration.
 
         Args:
-            info (ValidationInfo): The validation context containing the buffer setting.
+            info: The validation context containing the buffer setting.
 
         Returns:
             LyricsSceneJob: The validated job instance.
@@ -687,12 +713,12 @@ class LyricsSceneJob(Job):
         return self
 
     @classmethod
-    def load(cls, save_path: Path, validation_buffer_ms: int) -> Optional["LyricsSceneJob"]:
+    def load(cls, save_path: Path, validation_buffer_ms: int) -> Optional[LyricsSceneJob]:
         """Loads the job from a YAML file, checking for prompt version mismatch.
 
         Args:
-            save_path (Path): The path to the saved job file.
-            validation_buffer_ms (int): The allowed buffer in milliseconds.
+            save_path: The path to the saved job file.
+            validation_buffer_ms: The allowed buffer in milliseconds.
 
         Returns:
             Optional[LyricsSceneJob]: The loaded job, or None if validation fails
@@ -729,12 +755,12 @@ class LyricsSceneJob(Job):
 
 
 class SubtitleJob(Job):
-    """Represents a job to generate subtitles (Transcription).
+    """Represents a job to generate subtitles (transcription).
 
     Uses scene/lyrics data from a `LyricsSceneAiResponse` as a reference.
     """
 
-    file: Optional[File | Path] = Field(default=None, exclude=True)
+    file: Optional[File] = Field(default=None, exclude=True)
     video_duration_ms: PositiveInt
     subtitles_prompt_version: Optional[int] = Field(
         default_factory=_get_default_subtitles_version,
@@ -775,7 +801,7 @@ class SubtitleJob(Job):
             ignore_end: Whether to ignore gap verification for the last segment being processed.
 
         Returns:
-            True if complete and verified, False otherwise.
+            bool: True if complete and verified, False otherwise.
         """
         # If we don't even have an initial response, it's not complete.
         if not self.response:
@@ -800,11 +826,11 @@ class SubtitleJob(Job):
         return not self.response.has_large_gaps(self.video_duration_ms, gap_threshold_s)
 
     @model_validator(mode="after")
-    def validate_response_timestamps(self, info: ValidationInfo) -> "SubtitleJob":
+    def validate_response_timestamps(self, info: ValidationInfo) -> SubtitleJob:
         """Ensures that the response timestamps are within the video duration.
 
         Args:
-            info (ValidationInfo): The validation context containing the buffer setting.
+            info: The validation context containing the buffer setting.
 
         Returns:
             SubtitleJob: The validated job instance.
@@ -815,12 +841,12 @@ class SubtitleJob(Job):
         return self
 
     @classmethod
-    def load(cls, save_path: Path, validation_buffer_ms: int) -> Optional["SubtitleJob"]:
+    def load(cls, save_path: Path, validation_buffer_ms: int) -> Optional[SubtitleJob]:
         """Loads the job from a YAML file, checking for prompt version mismatch.
 
         Args:
-            save_path (Path): The path to the saved job file.
-            validation_buffer_ms (int): The allowed buffer in milliseconds.
+            save_path: The path to the saved job file.
+            validation_buffer_ms: The allowed buffer in milliseconds.
 
         Returns:
             Optional[SubtitleJob]: The loaded job, or None if validation fails
