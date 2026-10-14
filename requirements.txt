@@ -3,7 +3,7 @@ static-ffmpeg
 pydantic
 pydantic-settings
 google-genai
-logfire
+logfire[google-genai]
 ddgs
 httpx
 pyrate-limiter
