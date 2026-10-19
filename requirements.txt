@@ -3,11 +3,10 @@ static-ffmpeg
 pydantic
 pydantic-settings
 google-genai
-logfire[google-genai]
+logfire[google-genai, httpx]
 ddgs
 httpx
-pyrate-limiter
 json_repair
-ruff
-tqdm
+pyrate-limiter
+rich
 pyyaml

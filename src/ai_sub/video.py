@@ -1,4 +1,6 @@
-"""Utility functions for video processing using FFmpeg."""
+"""FFmpeg-based video manipulation utilities for segmentation and compression."""
+
+from __future__ import annotations
 
 import asyncio
 import subprocess
@@ -9,24 +11,31 @@ import static_ffmpeg
 
 
 async def _run_ffmpeg(cmd: list[str]) -> str:
-    """Helper to run ffmpeg command asynchronously.
+    """Executes an FFmpeg command asynchronously with cancellation handling.
 
     Args:
-        cmd (list[str]): The FFmpeg command as a list of strings.
+        cmd: Command arguments as a list of strings.
 
     Returns:
-        str: The standard output from the command.
+        str: Standard output from the command.
 
     Raises:
-        subprocess.CalledProcessError: If the FFmpeg command fails.
-
+        subprocess.CalledProcessError: If the process returns a non-zero exit code.
     """
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
+    try:
+        stdout, stderr = await process.communicate()
+    except asyncio.CancelledError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.wait()
+        raise
 
     stdout_str = stdout.decode("utf-8", errors="replace")
     stderr_str = stderr.decode("utf-8", errors="replace")
@@ -37,17 +46,16 @@ async def _run_ffmpeg(cmd: list[str]) -> str:
 
 
 async def get_video_duration_ms(video_path: Path) -> int:
-    """Retrieves the duration of a video file in milliseconds.
+    """Calculates the duration of a video file in milliseconds.
 
     Args:
-        video_path (Path): The path to the video file.
+        video_path: Path to the target media file.
 
     Returns:
-        int: The duration of the video in milliseconds.
+        int: Duration in milliseconds.
 
     Raises:
-        RuntimeError: If the duration cannot be determined.
-
+        RuntimeError: If the duration cannot be probed.
     """
     static_ffmpeg.add_paths(weak=True)
     try:
@@ -62,23 +70,23 @@ async def get_video_duration_ms(video_path: Path) -> int:
             str(video_path),
         ]
         stdout = await _run_ffmpeg(cmd)
-        return int(float(stdout) * 1000)
+        return int(float(stdout.strip()) * 1000)
     except (subprocess.CalledProcessError, ValueError) as e:
         logfire.exception(f"Could not determine duration for {video_path.name}")
         raise RuntimeError(f"Could not determine duration for video file: {video_path.name}") from e
 
 
 async def get_video_fps(video_path: Path) -> float:
-    """Retrieves the frame rate of a video file.
+    """Calculates the average framerate (FPS) of a video file.
 
     Args:
-        video_path (Path): The path to the video file.
+        video_path: Path to the target media file.
 
     Returns:
-        float: The frame rate of the video.
+        float: Frames per second.
 
     Raises:
-        RuntimeError: If the fps cannot be determined.
+        RuntimeError: If the framerate cannot be determined.
     """
     static_ffmpeg.add_paths(weak=True)
     try:
@@ -95,7 +103,6 @@ async def get_video_fps(video_path: Path) -> float:
             str(video_path),
         ]
         stdout = await _run_ffmpeg(cmd)
-        # Parse "numerator/denominator"
         num, den = map(int, stdout.strip().split("/"))
         return num / den
     except (subprocess.CalledProcessError, ValueError, ZeroDivisionError) as e:
@@ -104,18 +111,16 @@ async def get_video_fps(video_path: Path) -> float:
 
 
 async def get_working_encoder() -> str:
-    """Checks for available hardware acceleration for H.264 encoding.
+    """Discovers available hardware-accelerated H.264 encoders.
 
     Returns:
-        The name of the encoder to use (e.g., 'h264_nvenc', 'libx264').
+        str: Preferred encoder name, falling back to 'libx264'.
     """
     static_ffmpeg.add_paths(weak=True)
-    # List of hardware encoders to check in order of preference
     candidates = ["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox", "h264_mf"]
 
     for encoder in candidates:
         try:
-            # Attempt to encode a 1-frame dummy video to null output
             await _run_ffmpeg(
                 cmd=[
                     "ffmpeg",
@@ -133,11 +138,7 @@ async def get_working_encoder() -> str:
                 ]
             )
             return encoder
-        except subprocess.CalledProcessError as e:
-            logfire.debug(f"Encoder {encoder} check failed.\nstdout: {e.stdout}\nstderr: {e.stderr}")
-            continue
-        except FileNotFoundError:
-            logfire.debug(f"Encoder {encoder} check failed: FFmpeg not found.")
+        except (subprocess.CalledProcessError, FileNotFoundError):
             continue
 
     return "libx264"
@@ -151,74 +152,51 @@ async def split_video(
     output_pattern: str = "part_%03d",
     duration_tolerance_ms: int = 100,
 ) -> list[Path]:
-    """Splits a video file into segments of a specified duration using FFmpeg.
+    """Splits an input video into uniform segments using FFmpeg stream copying.
 
-    If the segments already exist and their total duration matches the input video,
-    splitting is skipped.
-
-    If splitting is required, it creates the output directory (if it doesn't exist)
-    and executes an FFmpeg command.
+    Skips splitting if valid segments matching the pattern and duration already exist.
 
     Args:
-        input_video (Path): The path to the input video file.
-        output_dir (Path): The directory where the video segments will be saved.
-        split_duration_s (int): The target duration of each video segment in seconds.
-        output_pattern (str): The filename pattern for the output segments. Defaults to "part_%03d".
-        duration_tolerance_ms (int): The allowed duration difference per segment in milliseconds.
-            This value is multiplied by the number of segments to determine the total
-            allowed variance between the input video duration and the sum of segment
-            durations. Defaults to 100ms.
+        input_video: Path to the input video.
+        output_dir: Directory where segments will be saved.
+        split_duration_s: Target segment length in seconds.
+        output_pattern: Pattern formatting segment filenames. Defaults to 'part_%03d'.
+        duration_tolerance_ms: Allowed total duration variance in milliseconds.
 
     Returns:
-        list[Path]: A sorted list of Path objects, each pointing to a generated video segment.
+        list[Path]: Sorted list of generated segment paths.
 
     Raises:
-        subprocess.CalledProcessError: If the FFmpeg command fails.
-
+        subprocess.CalledProcessError: If FFmpeg segmentation fails.
     """
-    ext = input_video.suffix  # Includes the dot, e.g., ".mp4"
-
-    # Check if we have files matching the pattern
+    ext = input_video.suffix
     glob_pattern = output_pattern.replace("%03d", "*") + ext
-    existing_segments = list(sorted(output_dir.glob(glob_pattern)))
+    existing_segments = sorted(output_dir.glob(glob_pattern))
 
     if existing_segments:
         try:
             input_duration = await get_video_duration_ms(input_video)
-
-            # Run duration checks in parallel for speed
-            durations = await asyncio.gather(*[get_video_duration_ms(s) for s in existing_segments])
+            durations = await asyncio.gather(*(get_video_duration_ms(s) for s in existing_segments))
             total_segment_duration = sum(durations)
-
-            # Allow tolerance per split
             threshold = duration_tolerance_ms * len(existing_segments)
 
             if abs(input_duration - total_segment_duration) < threshold:
-                logfire.info(
-                    f"Skipping split for {input_video.name} as {len(existing_segments)} "
-                    "segments exist with valid total duration."
-                )
+                logfire.info(f"Reusing {len(existing_segments)} existing valid segments for {input_video.name}.")
                 return existing_segments
 
-            logfire.info(
-                f"Re-splitting {input_video.name}. Existing segments duration ({total_segment_duration}ms) "
+            logfire.warning(
+                f"Re-splitting {input_video.name}: existing duration ({total_segment_duration}ms) "
                 f"mismatches input ({input_duration}ms)."
             )
-
-            # Clean up existing invalid segments to avoid mixing old and new files
             for segment in existing_segments:
                 try:
                     segment.unlink()
                 except OSError:
-                    logfire.warning(f"Failed to delete invalid segment: {segment}")
-
+                    pass
         except Exception:
-            logfire.warning(f"Re-splitting {input_video.name}. Could not verify duration of existing segments.")
+            logfire.warning(f"Re-splitting {input_video.name}: existing segments verification failed.")
 
     static_ffmpeg.add_paths(weak=True)
-
-    # Escape '%' in the directory path by doubling it ('%%').
-    # This is required because the segment muxer interprets '%' as a format specifier.
     escaped_dir = str(output_dir).replace("%", "%%")
     full_output_pattern = str(Path(escaped_dir) / f"{output_pattern}{ext}")
 
@@ -242,12 +220,10 @@ async def split_video(
     try:
         await _run_ffmpeg(cmd)
     except subprocess.CalledProcessError as e:
-        logfire.exception(f"FFmpeg command failed. Stdout: {e.stdout}, Stderr: {e.stderr}")
+        logfire.exception(f"FFmpeg split failed. Stdout: {e.stdout}, Stderr: {e.stderr}")
         raise
 
-    result = list(sorted(output_dir.glob(glob_pattern)))
-    logfire.info(f"Split into {len(result)} segments")
-    return result
+    return sorted(output_dir.glob(glob_pattern))
 
 
 async def reencode_video(
@@ -259,28 +235,20 @@ async def reencode_video(
     encoder: str,
     duration_tolerance_ms: int = 100,
 ) -> None:
-    """Re-encodes a video file to a specific format.
-
-    If the output file already exists, its duration and FPS are compared to the input file
-    and target requirements. If the differences are within the specified tolerance,
-    re-encoding is skipped.
+    """Compresses a video segment using low framerates and downscaled resolution.
 
     Args:
-        input_path (Path): The path to the input video file.
-        output_path (Path): The path where the re-encoded video will be saved.
-        fps (float): The target framerate.
-        height (int): The target height (resolution).
-        bitrate_kb (int): The target bitrate in KB/s.
-        encoder (str): The encoder to use.
-        duration_tolerance_ms (int): The maximum allowed difference in milliseconds between
-            the input and output video durations. This accounts for minor discrepancies
-            caused by container overhead or frame rounding. Defaults to 100ms.
+        input_path: Source video segment path.
+        output_path: Destination path for compressed output.
+        fps: Target framerate.
+        height: Target height resolution.
+        bitrate_kb: Target bitrate in Kilobytes per second.
+        encoder: Encoder codec to employ.
+        duration_tolerance_ms: Allowed duration variance in milliseconds.
 
     Raises:
-        subprocess.CalledProcessError: If the FFmpeg re-encode command fails.
-
+        subprocess.CalledProcessError: If FFmpeg re-encoding fails.
     """
-    # If output file already exists, verify validity by comparing duration and fps with input
     if output_path.exists():
         try:
             input_duration, output_duration, output_fps = await asyncio.gather(
@@ -288,39 +256,17 @@ async def reencode_video(
                 get_video_duration_ms(output_path),
                 get_video_fps(output_path),
             )
-
-            # Allow tolerance for container overhead/frame rounding
-            # If FPS is very low, increase tolerance because FFmpeg pads to GOP
-            effective_tolerance = duration_tolerance_ms
-            if fps < 1.0:
-                effective_tolerance += int(1000 / fps)
-
-            duration_match = abs(input_duration - output_duration) < effective_tolerance
-            # Small tolerance for float fps comparison
-            fps_match = abs(fps - output_fps) < 0.01
-
-            if duration_match and fps_match:
-                logfire.info(
-                    f"Skipping re-encode for {input_path.name} as {output_path.name} "
-                    "already exists and has valid duration and fps."
-                )
+            effective_tolerance = duration_tolerance_ms + (int(1000 / fps) if fps < 1.0 else 0)
+            if abs(input_duration - output_duration) < effective_tolerance and abs(fps - output_fps) < 0.01:
+                logfire.info(f"Reusing existing valid compressed segment: {output_path.name}")
                 return
-
-            logfire.info(
-                f"Re-encoding {input_path.name}. "
-                f"Existing output duration ({output_duration}ms) mismatches input ({input_duration}ms) "
-                f"or fps ({output_fps}) mismatches target ({fps})."
-            )
-        except Exception as e:
-            logfire.warning(
-                f"Re-encoding {input_path.name}. "
-                f"Could not verify duration or fps of existing output file {output_path.name}: {e}"
-            )
+        except Exception:
+            pass
 
     static_ffmpeg.add_paths(weak=True)
     video_bytes_per_sec = bitrate_kb * 1024
 
-    cmd_encode = [
+    cmd = [
         "ffmpeg",
         "-y",
         "-i",
@@ -347,7 +293,7 @@ async def reencode_video(
     ]
 
     try:
-        await _run_ffmpeg(cmd_encode)
+        await _run_ffmpeg(cmd)
     except subprocess.CalledProcessError as e:
-        logfire.exception(f"FFmpeg re-encode failed for {input_path.name}. Stdout: {e.stdout}, Stderr: {e.stderr}")
+        logfire.exception(f"FFmpeg re-encoding failed for {input_path.name}. Stderr: {e.stderr}")
         raise
