@@ -117,13 +117,10 @@ def stitch_subtitles(
                 complete = False
                 sub_attempts = sub_job.total_attempts if sub_job else 0
 
-                lyrics_attempts = 0
-                if settings.concurrency.lyrics > 0:
-                    lyr_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{lyrics_shortcode}.yaml"
-                    lyr_job = LyricsSceneJob.load(lyr_path, settings.ai.validation_buffer_ms)
-                    lyrics_attempts = lyr_job.total_attempts if lyr_job else 0
-
-                if sub_attempts >= settings.retry.max_runs or lyrics_attempts >= settings.retry.max_runs:
+                # Only depends on subtitle attempts. When lyrics reaches max_runs, _lyrics_worker only logs a warning
+                # and still sends the segment to the subtitles queue.
+                # On the next run, the subtitle stage runs again for that segment.
+                if sub_attempts >= settings.retry.max_runs:
                     max_retries_exceeded = True
                 else:
                     any_pending = True

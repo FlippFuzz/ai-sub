@@ -26,7 +26,7 @@ def _str_presenter(dumper: _YamlDumper, data: str) -> yaml.Node:
     Returns:
         yaml.Node: Represented scalar node.
     """
-    data = data.replace("\\r", "\r").replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
+    data = data.replace("\r\n", "\n").replace("\r", "\n")
     if "\n" in data:
         return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
     return dumper.represent_scalar("tag:yaml.org,2002:str", data)

@@ -128,7 +128,7 @@ def get_subtitle_prompt(scene_response: LyricsSceneAiResponse | None) -> Prompt:
     """
     if scene_response:
         scenes_data = scene_response.model_dump(mode="json")["scenes"]
-        scene_json = json.dumps(scenes_data)
+        scene_json = json.dumps(scenes_data, ensure_ascii=False)
     else:
         scene_json = "null"
 

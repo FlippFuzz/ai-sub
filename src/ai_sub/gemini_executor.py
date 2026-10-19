@@ -12,6 +12,7 @@ from pathlib import Path
 from time import time
 from typing import Any, Callable, TypeVar
 
+import httpx
 import json_repair
 import logfire
 from google import genai
@@ -40,10 +41,12 @@ def _get_unique_display_name(file_path: Path) -> str:
         file_path: Path to the local file.
 
     Returns:
-        str: Display name formatted as 'workspace/filename.ext'.
+        str: Display name formatted as 'workspace/filename.ext' or 'workspace/reencoded/filename.ext'.
     """
-    folder = file_path.parent.parent.name if file_path.parent.name == "reencoded" else file_path.parent.name
-    return f"{folder}/{file_path.name}"
+    resolved = file_path.resolve()
+    if resolved.parent.name == "reencoded":
+        return f"{resolved.parent.parent.name}/reencoded/{resolved.name}"
+    return f"{resolved.parent.name}/{resolved.name}"
 
 
 def _get_file_timestamp(remote_file: types.File) -> float:
@@ -219,14 +222,13 @@ class GeminiExecutor:
             await self._cleanup_storage_if_needed()
 
             display_name = _get_unique_display_name(file_path)
-            target_names = {file_path.name, display_name}
 
             try:
                 with logfire.span("Check existing remote file", _level="debug"):
                     async for remote_file in await self._client.aio.files.list(
                         config=types.ListFilesConfig(page_size=100)
                     ):
-                        if remote_file.display_name in target_names:
+                        if remote_file.display_name == display_name:
                             if remote_file.state == types.FileState.ACTIVE:
                                 logfire.debug(
                                     "Reusing existing remote file: {name} ({file_id})",
@@ -385,6 +387,7 @@ class GeminiExecutor:
             ValueError: If input arguments or model identifiers are invalid.
             ConnectionError: If network connectivity fails and retries are exhausted.
             TimeoutError: If asynchronous operations time out and retries are exhausted.
+            TransportError: If transport connectivity fails and retries are exhausted.
         """
         if not model_name.lower().startswith("google-gla:"):
             raise ValueError(f"Model identifier '{model_name}' must start with 'google-gla:'.")
@@ -564,7 +567,7 @@ class GeminiExecutor:
                         continue
                     raise
 
-                except (ConnectionError, asyncio.TimeoutError) as e:
+                except (ConnectionError, asyncio.TimeoutError, httpx.TransportError) as e:
                     if attempt < policy.per_run:
                         backoff = min(
                             float(policy.max_wait_seconds),

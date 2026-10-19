@@ -254,7 +254,10 @@ class LyricsSceneJob(BaseJob):
                     return None
                 job = cls.model_validate(
                     data,
-                    context={"validation_buffer_ms": validation_buffer_ms},
+                    context={
+                        "video_duration_ms": data.get("video_duration_ms"),
+                        "validation_buffer_ms": validation_buffer_ms,
+                    },
                 )
             except (yaml.YAMLError, ValidationError) as e:
                 logfire.warning(f"Validation failed for {save_path.name}: {e}. Re-processing.")

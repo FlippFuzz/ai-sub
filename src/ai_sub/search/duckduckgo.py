@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import random
-from typing import Any, Callable
+from typing import Any, Callable, Self
 
 import logfire
 from ddgs import DDGS
@@ -53,6 +53,29 @@ class DuckDuckGoSearchProvider:
             duration = Duration.SECOND
 
         self._limiter = limiter_factory.create_inmemory_limiter(rate_per_duration=rate, duration=duration)
+
+    async def __aenter__(self) -> Self:
+        """Enters the search provider async context.
+
+        Returns:
+            Self: Active provider instance.
+        """
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        """Exits the search provider async context.
+
+        Args:
+            exc_type: Exception type if raised.
+            exc_val: Exception value if raised.
+            exc_tb: Traceback if raised.
+        """
+        return None
 
     async def duckduckgo_search(self, query: str) -> list[dict[str, Any]]:
         """Perform a single web search query using DuckDuckGo.

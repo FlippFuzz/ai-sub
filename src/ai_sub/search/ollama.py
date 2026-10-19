@@ -63,7 +63,7 @@ class OllamaSearchProvider(BaseHttpSearchProvider):
             data = response.json()
 
             results = [
-                WebSearchResult(title=title, url=url, content=content)
+                WebSearchResult(title=title, url=url, content=content[: self.settings.max_length])
                 for item in (data.get("results") or [])
                 if (title := item.get("title"))
                 and (url := item.get("url"))
