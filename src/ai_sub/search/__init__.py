@@ -7,9 +7,16 @@ from typing import Any
 from google.genai import types
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import WebQueryResult, WebSearchResult, normalize_query
+from ai_sub.search.base import (
+    BaseHttpSearchProvider,
+    WebQueryResult,
+    WebSearchResult,
+    normalize_query,
+    parse_retry_after,
+)
 from ai_sub.search.duckduckgo import DuckDuckGoSearchProvider
 from ai_sub.search.langsearch import LangsearchSearchProvider
+from ai_sub.search.lrclib import LrclibSearchProvider
 from ai_sub.search.ollama import OllamaSearchProvider
 from ai_sub.search.tinyfish import TinyfishSearchProvider
 
@@ -50,12 +57,15 @@ def create_search_provider(settings: SearchSettings) -> tuple[Any | None, list[A
 
 
 __all__ = [
+    "BaseHttpSearchProvider",
     "DuckDuckGoSearchProvider",
     "LangsearchSearchProvider",
+    "LrclibSearchProvider",
     "OllamaSearchProvider",
     "TinyfishSearchProvider",
     "WebQueryResult",
     "WebSearchResult",
     "create_search_provider",
     "normalize_query",
+    "parse_retry_after",
 ]

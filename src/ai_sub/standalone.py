@@ -44,7 +44,7 @@ from ai_sub.jobs import (
     get_subtitle_prompt,
     get_summary_prompt,
 )
-from ai_sub.search import create_search_provider
+from ai_sub.search import LrclibSearchProvider, create_search_provider
 from ai_sub.shortcode import (
     generate_full_shortcode,
     generate_lyrics_shortcode,
@@ -217,11 +217,17 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
             reencode_dir.mkdir(exist_ok=True)
 
         async with AsyncExitStack() as stack:
-            search_tools: list[Any] = []
+            base_search_tools: list[Any] = []
             if use_summary or use_lyrics:
-                search_provider, search_tools = create_search_provider(settings.ai.search)
+                search_provider, base_search_tools = create_search_provider(settings.ai.search)
                 if search_provider is not None and hasattr(search_provider, "__aenter__"):
                     await stack.enter_async_context(search_provider)
+
+            lyrics_search_tools: list[Any] = list(base_search_tools)
+            if use_lyrics:
+                lrclib_provider = LrclibSearchProvider(settings.ai.search)
+                await stack.enter_async_context(lrclib_provider)
+                lyrics_search_tools.extend(lrclib_provider.get_tools())
 
             executor = GeminiExecutor(settings)
 
@@ -297,7 +303,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                     response_type=SummaryAiResponse,
                                     model_name=settings.ai.model_summary,
                                     service_tier=settings.ai.service_tier_summary,
-                                    tools=search_tools,
+                                    tools=base_search_tools,
                                     retry_policy=settings.retry,
                                     agentic_video=True,
                                 )
@@ -494,7 +500,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                             response_type=LyricsSceneAiResponse,
                                             model_name=settings.ai.model_lyrics,
                                             service_tier=settings.ai.service_tier_lyrics,
-                                            tools=search_tools,
+                                            tools=lyrics_search_tools,
                                             retry_policy=settings.retry,
                                             agentic_video=False,
                                         )

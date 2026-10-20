@@ -68,7 +68,7 @@ _SUMMARY_SYSTEM_TEMPLATE = dedent(
         Execute verification queries concurrently in parallel batches to minimize roundtrips within your allowed search turns.
       </rule>
     </search_rules>
-    """
+    """  # noqa: E501
 ).strip()
 
 
@@ -192,7 +192,7 @@ class SummaryAiResponse(BaseModel):
 
     @property
     def glossary_dict(self) -> dict[str, str]:
-        """Returns the glossary as a key-value dictionary mapping term to meaning.
+        """The glossary is returned as a key-value dictionary mapping term to meaning.
 
         Returns:
             dict[str, str]: Mapping of terms to their contextual meanings.

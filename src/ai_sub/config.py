@@ -110,11 +110,11 @@ class SearchSettings(BaseSettings):
     )
     min_wait_seconds: PositiveFloat = Field(
         description="Minimum wait time in seconds for search exponential backoff.",
-        default=1.0,
+        default=5.0,
     )
     max_wait_seconds: PositiveFloat = Field(
         description="Maximum wait time in seconds for search exponential backoff.",
-        default=10.0,
+        default=60.0,
     )
     multiplier: PositiveFloat = Field(
         description="Exponential backoff multiplier for search retries.",

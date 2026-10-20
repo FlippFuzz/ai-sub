@@ -57,8 +57,8 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | `--ai.search.max-length <int>`         | `AISUB_AI_SEARCH_MAX_LENGTH`                                                         | Character cutoff limit per search result snippet or fetched page.                | `4096`       |
 | `--ai.search.timeout <float>`          | `AISUB_AI_SEARCH_TIMEOUT`                                                            | Timeout in seconds for search HTTP requests.                                     | `60.0`       |
 | `--ai.search.retries <int>`            | `AISUB_AI_SEARCH_RETRIES`                                                            | Maximum retries on transient search network errors.                              | `3`          |
-| `--ai.search.min-wait-seconds <float>` | `AISUB_AI_SEARCH_MIN_WAIT_SECONDS`                                                   | Minimum backoff wait time in seconds for search retries.                         | `1.0`        |
-| `--ai.search.max-wait-seconds <float>` | `AISUB_AI_SEARCH_MAX_WAIT_SECONDS`                                                   | Maximum backoff wait time in seconds for search retries.                         | `10.0`       |
+| `--ai.search.min-wait-seconds <float>` | `AISUB_AI_SEARCH_MIN_WAIT_SECONDS`                                                   | Minimum backoff wait time in seconds for search retries.                         | `5.0`        |
+| `--ai.search.max-wait-seconds <float>` | `AISUB_AI_SEARCH_MAX_WAIT_SECONDS`                                                   | Maximum backoff wait time in seconds for search retries.                         | `60.0`       |
 | `--ai.search.multiplier <float>`       | `AISUB_AI_SEARCH_MULTIPLIER`                                                         | Exponential backoff multiplier for search retries.                               | `2.0`        |
 
 ---

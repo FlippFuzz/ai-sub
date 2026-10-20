@@ -1,4 +1,4 @@
-"""Base data structures and shared HTTP client base for search providers."""
+"""Base data structures, HTTP client base, and Retry-After parser for search providers."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import math
 import random
 import string
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Self
 
 import logfire
@@ -45,24 +47,55 @@ def normalize_query(query: str) -> str:
     return query.translate(translator).casefold()
 
 
+def parse_retry_after(header_value: str | None) -> float | None:
+    """Parses an HTTP Retry-After header value into a delay in seconds.
+
+    Supports both delay-seconds and HTTP-date formats according to RFC 9110 §10.2.3.
+
+    Args:
+        header_value: Raw header value string.
+
+    Returns:
+        float | None: Delay in seconds if parseable, or None if missing or invalid.
+    """
+    if not header_value:
+        return None
+    cleaned = header_value.strip()
+    try:
+        return max(0.0, float(cleaned))
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(cleaned)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return max(0.0, (dt - now).total_seconds())
+    except Exception:
+        return None
+
+
 class BaseHttpSearchProvider(ABC):
     """Abstract base class managing rate limits, HTTP sessions, retries, and caching for search providers."""
 
     settings: SearchSettings
     provider_name: str
+    requires_api_key: bool
     _client: AsyncClient | None
     _cache: dict[str, Any]
     _limiter: Limiter
 
-    def __init__(self, settings: SearchSettings, provider_name: str) -> None:
+    def __init__(self, settings: SearchSettings, provider_name: str, requires_api_key: bool = True) -> None:
         """Initializes the base HTTP search provider.
 
         Args:
             settings: Search configuration settings.
             provider_name: Name identifier of the search provider.
+            requires_api_key: Whether an API key is mandatory to initialize the client session.
         """
         self.settings = settings
         self.provider_name = provider_name
+        self.requires_api_key = requires_api_key
         self._cache = {}
         self._client = None
 
@@ -102,7 +135,7 @@ class BaseHttpSearchProvider(ABC):
         Raises:
             ValueError: If the required API key is missing.
         """
-        if self.settings.key is None:
+        if self.requires_api_key and self.settings.key is None:
             raise ValueError(f"{self.provider_name.capitalize()} API key is required but not configured.")
 
         headers = self._get_headers()
@@ -128,7 +161,7 @@ class BaseHttpSearchProvider(ABC):
             self._client = None
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> Response:
-        """Sends an HTTP request with rate limiting and exponential backoff retries.
+        """Sends an HTTP request with rate limiting, Retry-After compliance, and exponential backoff.
 
         Args:
             method: HTTP method (e.g. 'GET', 'POST').
@@ -169,10 +202,22 @@ class BaseHttpSearchProvider(ABC):
                     e.response.status_code in (429, 500, 502, 503, 504) if isinstance(e, HTTPStatusError) else True
                 )
                 if is_retryable and attempt < self.settings.retries:
-                    backoff = min(
-                        self.settings.max_wait_seconds,
-                        (self.settings.min_wait_seconds * (self.settings.multiplier**attempt)) + random.uniform(0, 1),
-                    )
+                    retry_after: float | None = None
+                    if isinstance(e, HTTPStatusError):
+                        retry_after = parse_retry_after(e.response.headers.get("retry-after"))
+
+                    if retry_after is not None:
+                        backoff = min(
+                            self.settings.max_wait_seconds,
+                            max(self.settings.min_wait_seconds, retry_after) + random.uniform(0, 1),
+                        )
+                    else:
+                        backoff = min(
+                            self.settings.max_wait_seconds,
+                            (self.settings.min_wait_seconds * (self.settings.multiplier**attempt))
+                            + random.uniform(0, 1),
+                        )
+
                     logfire.warning(
                         f"{self.provider_name.capitalize()} {method} to {url} failed with {e} "
                         f"(attempt {attempt + 1}/{max_attempts}). Retrying in {backoff:.2f}s..."
