@@ -71,22 +71,10 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
         if artist_name and artist_name.strip():
             params["artist_name"] = artist_name.strip()
 
-        with logfire.span("lrclib_search: {title=}, {artist=}", title=track_title, artist=artist_name or ""):
-            response = await self._request("GET", "https://lrclib.net/api/search", params=params)
-            raw_data = response.json()
-
-            # If structured track_name search returns no results, fall back to keyword query
-            if not raw_data:
-                fallback_res = await self._request(
-                    "GET",
-                    "https://lrclib.net/api/search",
-                    params={"q": track_title.strip()},
-                )
-                raw_data = fallback_res.json()
-
-            results: list[dict[str, Any]] = []
-            if isinstance(raw_data, list):
-                for item in raw_data:
+        def _extract_valid_results(data: Any) -> list[dict[str, Any]]:
+            extracted: list[dict[str, Any]] = []
+            if isinstance(data, list):
+                for item in data:
                     if item.get("instrumental"):
                         continue
                     plain_lyrics = item.get("plainLyrics")
@@ -94,15 +82,30 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
                         continue
 
                     truncated_lyrics = str(plain_lyrics).strip()[: self.settings.max_length]
-                    results.append(
+                    extracted.append(
                         {
                             "track_name": item.get("trackName") or item.get("name"),
                             "artist_name": item.get("artistName"),
                             "plain_lyrics": truncated_lyrics,
                         }
                     )
-                    if len(results) >= 3:
+                    if len(extracted) >= 3:
                         break
+            return extracted
+
+        with logfire.span("lrclib_search: {title=}, {artist=}", title=track_title, artist=artist_name or ""):
+            response = await self._request("GET", "https://lrclib.net/api/search", params=params)
+
+            results = _extract_valid_results(response.json())
+
+            # If structured track_name search returns no usable results, fall back to keyword query
+            if not results:
+                fallback_res = await self._request(
+                    "GET",
+                    "https://lrclib.net/api/search",
+                    params={"q": track_title.strip()},
+                )
+                results = _extract_valid_results(fallback_res.json())
 
             self._cache[cache_key] = results
             return results
