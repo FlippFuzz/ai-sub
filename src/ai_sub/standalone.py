@@ -142,14 +142,19 @@ def stitch_subtitles(
 
             offset_ms += video_duration_ms
 
+        # Exclude local filesystem paths (context_file, dir) to avoid leaking usernames or machine structures
         settings_dump = settings.model_dump(
             mode="json",
             exclude={
                 "input_video_file": True,
+                "context_file": True,
                 "dir": True,
                 "ai": {"key": True, "base_url": True, "search": {"key": True}},
             },
         )
+        # Preserve the resolved context string for reproducibility without path leakage
+        settings_dump["context"] = settings.get_resolved_user_context()
+
         metadata = {
             "ai_sub_version": get_app_version(),
             "generated_at": datetime.now().isoformat(),
@@ -245,7 +250,10 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                         summary_job = SummaryJob(
                             name="summary",
                             video_duration_ms=await get_video_duration_ms(input_video_path),
+                            user_context=user_context,
                         )
+                    else:
+                        summary_job.user_context = user_context
 
                     if summary_job.response:
                         summary_response = summary_job.response
@@ -412,6 +420,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                     bitrate_kb=settings.reencode.segment.bitrate_kb,
                                     duration_tolerance_ms=settings.reencode.segment.duration_tolerance_ms,
                                     encoder=settings.reencode.encoder,
+                                    user_context=user_context,
                                 )
                                 compressed_path = await job.execute()
                                 task.media_path = compressed_path
@@ -460,7 +469,13 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                 lyr_file = settings.dir.tmp / f"{task.stem}.lyrics.{lyrics_shortcode}.yaml"
                                 job = LyricsSceneJob.load(lyr_file, settings.ai.validation_buffer_ms)
                                 if not job:
-                                    job = LyricsSceneJob(name=task.stem, video_duration_ms=task.duration_ms)
+                                    job = LyricsSceneJob(
+                                        name=task.stem,
+                                        video_duration_ms=task.duration_ms,
+                                        user_context=user_context,
+                                    )
+                                else:
+                                    job.user_context = user_context
 
                                 if job.response:
                                     task.lyrics_response = job.response
@@ -511,7 +526,13 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                 sub_file = settings.dir.tmp / f"{task.stem}.subtitles.{subtitles_shortcode}.yaml"
                                 job = SubtitleJob.load(sub_file, settings.ai.validation_buffer_ms)
                                 if not job:
-                                    job = SubtitleJob(name=task.stem, video_duration_ms=task.duration_ms)
+                                    job = SubtitleJob(
+                                        name=task.stem,
+                                        video_duration_ms=task.duration_ms,
+                                        user_context=user_context,
+                                    )
+                                else:
+                                    job.user_context = user_context
 
                                 if not job.response and job.total_attempts < settings.retry.max_runs:
                                     try:

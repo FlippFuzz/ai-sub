@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, Self
@@ -25,6 +24,7 @@ from ai_sub.jobs.base import (
     clean_timestamp_string,
     format_ms_timestamp,
     parse_timestamp_string_ms,
+    serialize_prompt_context,
     validate_duration_bound,
 )
 
@@ -139,13 +139,7 @@ def get_lyrics_scenes_prompt(
             ]
         )
     if global_summary:
-        if hasattr(global_summary, "model_dump"):
-            clean_summary = global_summary.model_dump(mode="json", exclude={"thoughts": True}, exclude_none=True)
-        elif isinstance(global_summary, dict):
-            clean_summary = {k: v for k, v in global_summary.items() if k != "thoughts" and v is not None}
-        else:
-            clean_summary = global_summary
-        summary_json = json.dumps(clean_summary, ensure_ascii=False)
+        summary_json = serialize_prompt_context(global_summary)
         parts.extend(
             [
                 "<global_video_summary>",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -163,6 +164,34 @@ def validate_duration_bound(
             )
 
 
+def serialize_prompt_context(data: Any) -> str:
+    """Serializes models or dictionaries into clean, indented JSON for prompt injection.
+
+    Systematically excludes:
+    - `thoughts`: Raw internal model reasoning traces.
+    - `user_context`: Prevents duplicate context injection across stages.
+    - `None` values: Compacts prompt size and conserves tokens.
+
+    Args:
+        data: A Pydantic model instance, dictionary, or primitive to serialize.
+
+    Returns:
+        str: Clean JSON string ready for prompt template encapsulation.
+    """
+    if hasattr(data, "model_dump"):
+        cleaned = data.model_dump(
+            mode="json",
+            exclude={"thoughts": True, "user_context": True},
+            exclude_none=True,
+        )
+    elif isinstance(data, dict):
+        cleaned = {k: v for k, v in data.items() if k not in ("thoughts", "user_context") and v is not None}
+    else:
+        cleaned = data
+
+    return json.dumps(cleaned, ensure_ascii=False)
+
+
 class Prompt(BaseModel):
     """Container for system and user prompt strings."""
 
@@ -181,6 +210,10 @@ class BaseJob(BaseModel):
     total_attempts: NonNegativeInt = Field(
         default=0,
         description="Total processing attempts recorded across all executions.",
+    )
+    user_context: str | None = Field(
+        default=None,
+        description="Resolved user-supplied context string applied during execution.",
     )
 
     def save(self, filename: Path) -> None:

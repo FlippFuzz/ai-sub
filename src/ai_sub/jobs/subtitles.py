@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import string
 from pathlib import Path
 from textwrap import dedent
@@ -28,6 +27,7 @@ from ai_sub.jobs.base import (
     clean_timestamp_string,
     format_ms_timestamp,
     parse_timestamp_string_ms,
+    serialize_prompt_context,
     validate_duration_bound,
 )
 
@@ -163,13 +163,7 @@ def get_subtitle_prompt(
             ]
         )
     if global_summary:
-        if hasattr(global_summary, "model_dump"):
-            clean_summary = global_summary.model_dump(mode="json", exclude={"thoughts": True}, exclude_none=True)
-        elif isinstance(global_summary, dict):
-            clean_summary = {k: v for k, v in global_summary.items() if k != "thoughts" and v is not None}
-        else:
-            clean_summary = global_summary
-        summary_json = json.dumps(clean_summary, ensure_ascii=False)
+        summary_json = serialize_prompt_context(global_summary)
         parts.extend(
             [
                 "<global_video_summary>",
@@ -178,13 +172,7 @@ def get_subtitle_prompt(
             ]
         )
     if scene_response:
-        if hasattr(scene_response, "model_dump"):
-            clean_scene = scene_response.model_dump(mode="json", exclude={"thoughts": True}, exclude_none=True)
-        elif isinstance(scene_response, dict):
-            clean_scene = {k: v for k, v in scene_response.items() if k != "thoughts" and v is not None}
-        else:
-            clean_scene = scene_response
-        scene_json = json.dumps(clean_scene, ensure_ascii=False)
+        scene_json = serialize_prompt_context(scene_response)
         parts.extend(
             [
                 "<scene_and_lyrics_reference_json>",
@@ -224,7 +212,7 @@ class Subtitles(BaseModel):
 
     @model_validator(mode="after")
     def validate_timestamps(self) -> Self:
-        """Validates that start time precedes end time.
+        """Validates that start timecode precedes end timecode.
 
         Returns:
             Self: Validated subtitle block.

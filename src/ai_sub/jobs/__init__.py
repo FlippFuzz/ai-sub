@@ -6,6 +6,7 @@ from ai_sub.jobs.base import (
     clean_timestamp_string,
     format_ms_timestamp,
     parse_timestamp_string_ms,
+    serialize_prompt_context,
     validate_duration_bound,
 )
 from ai_sub.jobs.lyrics_scene import (
@@ -57,5 +58,6 @@ __all__ = [
     "get_subtitle_prompt",
     "get_summary_prompt",
     "parse_timestamp_string_ms",
+    "serialize_prompt_context",
     "validate_duration_bound",
 ]
