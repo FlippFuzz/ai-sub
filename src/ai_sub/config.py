@@ -8,7 +8,6 @@ from typing import Any, Literal, Self, cast
 
 from logfire import LevelName
 from pydantic import (
-    BaseModel,
     Field,
     FilePath,
     HttpUrl,
@@ -268,111 +267,94 @@ class AiSettings(BaseSettings):
         return self
 
 
-class StageReEncodeSettings(BaseSettings):
-    """Configuration for a specific re-encoding stage (summary or segment)."""
+class SummaryReEncodeSettings(BaseSettings):
+    """Re-encoding configuration for the whole-video summary proxy (Phase 1)."""
 
-    model_config = _BASE_CONFIG
+    model_config = {
+        "env_prefix": "AISUB_REENCODE_SUMMARY_",
+        **_BASE_CONFIG,
+    }
 
     enabled: bool = Field(
-        description="Whether re-encoding is enabled for this stage.",
+        default=True,
+        description="Whether whole-video proxy re-encoding is enabled.",
     )
     threshold_mb: NonNegativeInt = Field(
-        description="File size threshold in MB above which media is re-encoded. 0 compresses unconditionally.",
+        default=300,
+        description="File size threshold in MB above which the full video is compressed. 0 compresses unconditionally.",
     )
-    fps: PositiveFloat | None = Field(
-        default=None,
-        description="Stage-specific framerate override (FPS). Falls back to base re-encode fps if None.",
+    fps: PositiveFloat = Field(
+        default=1.0,
+        description="Target framerate (FPS) for the summary proxy video.",
     )
-    height: PositiveInt | None = Field(
-        default=None,
-        description="Stage-specific resolution height override. Falls back to base re-encode height if None.",
+    height: PositiveInt = Field(
+        default=360,
+        description="Target resolution height in pixels (aspect ratio is preserved).",
     )
-    bitrate_kb: PositiveInt | None = Field(
-        default=None,
-        description="Stage-specific video bitrate override in KB/s. Falls back to base re-encode bitrate if None.",
+    bitrate_kb: PositiveInt = Field(
+        default=35,
+        description="Target video bitrate in Kilobytes per second (KB/s).",
+    )
+    duration_tolerance_ms: NonNegativeInt = Field(
+        default=100,
+        description="Allowed duration divergence in milliseconds for summary proxy output.",
     )
 
 
-class ResolvedReEncodeConfig(BaseModel):
-    """Fully resolved re-encoding parameters for a specific stage execution."""
+class SegmentReEncodeSettings(BaseSettings):
+    """Re-encoding configuration for individual video chunk segments (Phases 2 & 3)."""
 
-    enabled: bool
-    threshold_mb: int
-    fps: float
-    height: int
-    bitrate_kb: int
-    encoder: str | None
-    duration_tolerance_ms: int
+    model_config = {
+        "env_prefix": "AISUB_REENCODE_SEGMENT_",
+        **_BASE_CONFIG,
+    }
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether segment re-encoding is enabled.",
+    )
+    threshold_mb: NonNegativeInt = Field(
+        default=20,
+        description="File size threshold in MB above which chunks are compressed. 0 compresses unconditionally.",
+    )
+    fps: PositiveFloat = Field(
+        default=1.0,
+        description="Target framerate (FPS) for compressed segment chunks.",
+    )
+    height: PositiveInt = Field(
+        default=360,
+        description="Target resolution height in pixels (aspect ratio is preserved).",
+    )
+    bitrate_kb: PositiveInt = Field(
+        default=35,
+        description="Target video bitrate in Kilobytes per second (KB/s).",
+    )
+    duration_tolerance_ms: NonNegativeInt = Field(
+        default=100,
+        description="Allowed duration divergence in milliseconds for re-encoded chunk output.",
+    )
 
 
 class ReEncodeSettings(BaseSettings):
-    """Configuration for FFmpeg video re-encoding and compression."""
+    """Configuration for FFmpeg video re-encoding across pipeline stages."""
 
     model_config = {
         "env_prefix": "AISUB_REENCODE_",
         **_BASE_CONFIG,
     }
 
-    fps: PositiveFloat = Field(
-        description="Base target framerate (FPS) for compressed media.",
-        default=1.0,
-    )
-    height: PositiveInt = Field(
-        description="Base target resolution height in pixels (aspect ratio is preserved).",
-        default=360,
-    )
-    bitrate_kb: PositiveInt = Field(
-        description="Base target video bitrate in Kilobytes per second (KB/s).",
-        default=35,
-    )
-    duration_tolerance_ms: NonNegativeInt = Field(
-        description="Maximum allowed duration divergence in milliseconds for re-encoded output.",
-        default=100,
-    )
     encoder: str | None = Field(
-        description="Specific H.264 encoder to use (e.g., 'h264_nvenc', 'libx264'). Auto-detected if null.",
         default=None,
+        description="Specific H.264 encoder to use (e.g., 'h264_nvenc', 'libx264'). Auto-detected if null.",
     )
-    summary: StageReEncodeSettings = Field(
+    summary: SummaryReEncodeSettings = Field(
         description="Re-encoding rules for the whole-video summary proxy (Phase 1).",
-        default_factory=lambda: StageReEncodeSettings(enabled=True, threshold_mb=300),
+        default_factory=SummaryReEncodeSettings,
     )
-    segment: StageReEncodeSettings = Field(
+    segment: SegmentReEncodeSettings = Field(
         description="Re-encoding rules for individual video chunk segments (Phases 2 & 3).",
-        default_factory=lambda: StageReEncodeSettings(enabled=False, threshold_mb=20),
+        default_factory=SegmentReEncodeSettings,
     )
-
-    def resolve_summary(self) -> ResolvedReEncodeConfig:
-        """Resolves effective re-encode configuration for Phase 1 whole-video summary.
-
-        Returns:
-            ResolvedReEncodeConfig: Fully populated configuration for summary re-encoding.
-        """
-        return ResolvedReEncodeConfig(
-            enabled=self.summary.enabled,
-            threshold_mb=self.summary.threshold_mb,
-            fps=self.summary.fps if self.summary.fps is not None else self.fps,
-            height=self.summary.height if self.summary.height is not None else self.height,
-            bitrate_kb=self.summary.bitrate_kb if self.summary.bitrate_kb is not None else self.bitrate_kb,
-            encoder=self.encoder,
-            duration_tolerance_ms=self.duration_tolerance_ms,
-        )
-
-    def resolve_segment(self) -> ResolvedReEncodeConfig:
-        """Resolves effective re-encode configuration for Phase 2 & 3 video segments.
-
-        Returns:
-            ResolvedReEncodeConfig: Fully populated configuration for segment re-encoding.
-        """
-        return ResolvedReEncodeConfig(
-            enabled=self.segment.enabled,
-            threshold_mb=self.segment.threshold_mb,
-            fps=self.segment.fps if self.segment.fps is not None else self.fps,
-            height=self.segment.height if self.segment.height is not None else self.height,
-            bitrate_kb=self.segment.bitrate_kb if self.segment.bitrate_kb is not None else self.bitrate_kb,
-            encoder=self.encoder,
-            duration_tolerance_ms=self.duration_tolerance_ms,
-        )
 
 
 class SplittingSettings(BaseSettings):
@@ -554,15 +536,18 @@ class Settings(BaseSettings):
 
         Returns:
             str | None: Combined, non-empty user context string or None if neither provided.
+
+        Raises:
+            ValueError: If context_file cannot be read due to file errors or encoding issues.
         """
         parts: list[str] = []
-        if self.context_file is not None and self.context_file.is_file():
+        if self.context_file is not None:
             try:
                 content = self.context_file.read_text(encoding="utf-8").strip()
                 if content:
                     parts.append(content)
-            except Exception:
-                pass
+            except (OSError, UnicodeDecodeError) as e:
+                raise ValueError(f"Could not read context file '{self.context_file}': {e}") from e
 
         if self.context is not None and self.context.strip():
             parts.append(self.context.strip())

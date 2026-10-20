@@ -197,13 +197,8 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
         if user_context:
             logfire.info(f"Loaded user context ({len(user_context)} characters).")
 
-        summary_reencode_cfg = settings.reencode.resolve_summary()
-        segment_reencode_cfg = settings.reencode.resolve_segment()
-
-        if (summary_reencode_cfg.enabled or segment_reencode_cfg.enabled) and not settings.reencode.encoder:
+        if (settings.reencode.summary.enabled or settings.reencode.segment.enabled) and not settings.reencode.encoder:
             settings.reencode.encoder = await get_working_encoder()
-            summary_reencode_cfg.encoder = settings.reencode.encoder
-            segment_reencode_cfg.encoder = settings.reencode.encoder
             logfire.info(f"Using encoder: {settings.reencode.encoder}")
 
         use_summary = settings.concurrency.summary > 0
@@ -213,7 +208,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
         subtitles_shortcode = generate_full_shortcode(settings.ai.model_subtitles)
 
         reencode_dir = settings.dir.tmp / "reencoded"
-        if segment_reencode_cfg.enabled:
+        if settings.reencode.segment.enabled:
             reencode_dir.mkdir(exist_ok=True)
 
         async with AsyncExitStack() as stack:
@@ -245,26 +240,27 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                 if use_summary:
                     summary_tid = progress.add_task("[yellow]Global Summary", total=1)
                     summary_file = settings.dir.tmp / f"summary.{summary_shortcode}.yaml"
-                    existing_summary = SummaryJob.load(summary_file, settings.ai.validation_buffer_ms)
-
-                    if existing_summary and existing_summary.response:
-                        summary_response = existing_summary.response
-                        progress.update(summary_tid, completed=1)
-                        logfire.info("Reusing existing valid global summary.")
-                    else:
+                    summary_job = SummaryJob.load(summary_file, settings.ai.validation_buffer_ms)
+                    if not summary_job:
                         summary_job = SummaryJob(
                             name="summary",
                             video_duration_ms=await get_video_duration_ms(input_video_path),
                         )
+
+                    if summary_job.response:
+                        summary_response = summary_job.response
+                        progress.update(summary_tid, completed=1)
+                        logfire.info("Reusing existing valid global summary.")
+                    elif summary_job.total_attempts < settings.retry.max_runs:
                         summary_media = input_video_path
                         should_reencode_summary = False
 
-                        if summary_reencode_cfg.enabled:
-                            if summary_reencode_cfg.threshold_mb == 0:
+                        if settings.reencode.summary.enabled:
+                            if settings.reencode.summary.threshold_mb == 0:
                                 should_reencode_summary = True
                             else:
                                 mb = input_video_path.stat().st_size / (1024 * 1024)
-                                should_reencode_summary = mb >= summary_reencode_cfg.threshold_mb
+                                should_reencode_summary = mb >= settings.reencode.summary.threshold_mb
 
                         if should_reencode_summary:
                             proxy_output = settings.dir.tmp / f"summary_proxy{input_video_path.suffix}"
@@ -272,11 +268,11 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                 await reencode_video(
                                     input_path=input_video_path,
                                     output_path=proxy_output,
-                                    fps=summary_reencode_cfg.fps,
-                                    height=summary_reencode_cfg.height,
-                                    bitrate_kb=summary_reencode_cfg.bitrate_kb,
-                                    encoder=summary_reencode_cfg.encoder or "libx264",
-                                    duration_tolerance_ms=summary_reencode_cfg.duration_tolerance_ms,
+                                    fps=settings.reencode.summary.fps,
+                                    height=settings.reencode.summary.height,
+                                    bitrate_kb=settings.reencode.summary.bitrate_kb,
+                                    encoder=settings.reencode.encoder or "libx264",
+                                    duration_tolerance_ms=settings.reencode.summary.duration_tolerance_ms,
                                 )
                                 summary_media = proxy_output
 
@@ -300,7 +296,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                 summary_job.response = res
                                 summary_job.total_attempts += 1
                                 summary_response = res
-                                await asyncio.to_thread(summary_job.save, summary_file)
                                 logfire.info("Phase 1 global summary completed successfully.")
                         except QuotaExceededError:
                             logfire.warning("Quota exceeded during Phase 1 summary pass.")
@@ -308,7 +303,11 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                             summary_job.total_attempts += 1
                             logfire.warning(f"Phase 1 summary failed: {e}. Proceeding without global summary.")
                         finally:
+                            await asyncio.to_thread(summary_job.save, summary_file)
                             progress.update(summary_tid, completed=1)
+                    else:
+                        logfire.warning("Skipping Phase 1 summary: max attempts reached.")
+                        progress.update(summary_tid, completed=1)
 
                 # ------------------------------------------------------------------
                 # Video Segmentation & Segment Setup
@@ -342,7 +341,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
 
                 reencode_tid: TaskID | None = (
                     progress.add_task("[cyan]Re-encoding", total=len(splits_to_process))
-                    if segment_reencode_cfg.enabled
+                    if settings.reencode.segment.enabled
                     else None
                 )
                 lyrics_tid: TaskID | None = (
@@ -376,12 +375,12 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                     )
 
                     should_reencode = False
-                    if segment_reencode_cfg.enabled:
-                        if segment_reencode_cfg.threshold_mb == 0:
+                    if settings.reencode.segment.enabled:
+                        if settings.reencode.segment.threshold_mb == 0:
                             should_reencode = True
                         else:
                             mb = path.stat().st_size / (1024 * 1024)
-                            should_reencode = mb >= segment_reencode_cfg.threshold_mb
+                            should_reencode = mb >= settings.reencode.segment.threshold_mb
 
                     if should_reencode:
                         await reencode_queue.put(task)
@@ -408,11 +407,11 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                     name=task.stem,
                                     input_file=task.raw_path,
                                     output_file=out_file,
-                                    fps=segment_reencode_cfg.fps,
-                                    height=segment_reencode_cfg.height,
-                                    bitrate_kb=segment_reencode_cfg.bitrate_kb,
-                                    duration_tolerance_ms=segment_reencode_cfg.duration_tolerance_ms,
-                                    encoder=segment_reencode_cfg.encoder,
+                                    fps=settings.reencode.segment.fps,
+                                    height=settings.reencode.segment.height,
+                                    bitrate_kb=settings.reencode.segment.bitrate_kb,
+                                    duration_tolerance_ms=settings.reencode.segment.duration_tolerance_ms,
+                                    encoder=settings.reencode.encoder,
                                 )
                                 compressed_path = await job.execute()
                                 task.media_path = compressed_path
@@ -554,7 +553,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
 
                 worker_tasks: list[asyncio.Task[Any]] = []
                 try:
-                    if segment_reencode_cfg.enabled:
+                    if settings.reencode.segment.enabled:
                         for _ in range(settings.concurrency.re_encode):
                             worker_tasks.append(asyncio.create_task(_reencode_worker()))
                     if use_lyrics:
@@ -563,7 +562,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                     for _ in range(settings.concurrency.subtitles):
                         worker_tasks.append(asyncio.create_task(_subtitles_worker()))
 
-                    if segment_reencode_cfg.enabled:
+                    if settings.reencode.segment.enabled:
                         await reencode_queue.join()
                     if use_lyrics:
                         await lyrics_queue.join()

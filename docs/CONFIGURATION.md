@@ -65,23 +65,31 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ## Re-Encoding Settings (`--reencode.*`)
 
-| Argument                                 | Environment Variable                   | Description                                                             | Default |
-| :--------------------------------------- | :------------------------------------- | :---------------------------------------------------------------------- | :------ |
-| `--reencode.fps <float>`                 | `AISUB_REENCODE_FPS`                   | Base target framerate (FPS) for compressed media.                       | `1.0`   |
-| `--reencode.height <int>`                | `AISUB_REENCODE_HEIGHT`                | Base target resolution height in pixels (aspect ratio preserved).       | `360`   |
-| `--reencode.bitrate-kb <int>`            | `AISUB_REENCODE_BITRATE_KB`            | Base target video bitrate in Kilobytes per second (KB/s).               | `35`    |
-| `--reencode.duration-tolerance-ms <int>` | `AISUB_REENCODE_DURATION_TOLERANCE_MS` | Allowed duration variance (ms) for re-encoded media.                    | `100`   |
-| `--reencode.encoder <str>`               | `AISUB_REENCODE_ENCODER`               | Specific encoder (e.g. `h264_nvenc`, `libx264`). Auto-detected if null. | _None_  |
-| `--reencode.summary.enabled <bool>`      | `AISUB_REENCODE_SUMMARY_ENABLED`       | Whether to compress a whole-video proxy before Phase 1 analysis.        | `True`  |
-| `--reencode.summary.threshold-mb <int>`  | `AISUB_REENCODE_SUMMARY_THRESHOLD_MB`  | File size threshold in MB above which the full video is compressed.     | `300`   |
-| `--reencode.summary.fps <float>`         | `AISUB_REENCODE_SUMMARY_FPS`           | Stage-specific framerate override for summary proxy.                    | _None_  |
-| `--reencode.summary.height <int>`        | `AISUB_REENCODE_SUMMARY_HEIGHT`        | Stage-specific height override for summary proxy.                       | _None_  |
-| `--reencode.summary.bitrate-kb <int>`    | `AISUB_REENCODE_SUMMARY_BITRATE_KB`    | Stage-specific bitrate override for summary proxy.                      | _None_  |
-| `--reencode.segment.enabled <bool>`      | `AISUB_REENCODE_SEGMENT_ENABLED`       | Whether to compress individual 5-minute video chunks before uploading.  | `False` |
-| `--reencode.segment.threshold-mb <int>`  | `AISUB_REENCODE_SEGMENT_THRESHOLD_MB`  | File size threshold in MB above which segment chunks are compressed.    | `20`    |
-| `--reencode.segment.fps <float>`         | `AISUB_REENCODE_SEGMENT_FPS`           | Stage-specific framerate override for chunk segments.                   | _None_  |
-| `--reencode.segment.height <int>`        | `AISUB_REENCODE_SEGMENT_HEIGHT`        | Stage-specific height override for chunk segments.                      | _None_  |
-| `--reencode.segment.bitrate-kb <int>`    | `AISUB_REENCODE_SEGMENT_BITRATE_KB`    | Stage-specific bitrate override for chunk segments.                     | _None_  |
+| Argument                   | Environment Variable     | Description                                                                 | Default |
+| :------------------------- | :----------------------- | :-------------------------------------------------------------------------- | :------ |
+| `--reencode.encoder <str>` | `AISUB_REENCODE_ENCODER` | Shared H.264 encoder (e.g. `h264_nvenc`, `libx264`). Auto-detected if null. | _None_  |
+
+### Phase 1 Summary Proxy Settings (`--reencode.summary.*`)
+
+| Argument                                         | Environment Variable                           | Description                                                         | Default |
+| :----------------------------------------------- | :--------------------------------------------- | :------------------------------------------------------------------ | :------ |
+| `--reencode.summary.enabled <bool>`              | `AISUB_REENCODE_SUMMARY_ENABLED`               | Whether to compress a whole-video proxy before Phase 1 analysis.    | `True`  |
+| `--reencode.summary.threshold-mb <int>`          | `AISUB_REENCODE_SUMMARY_THRESHOLD_MB`          | File size threshold in MB above which the full video is compressed. | `300`   |
+| `--reencode.summary.fps <float>`                 | `AISUB_REENCODE_SUMMARY_FPS`                   | Framerate (FPS) for summary proxy video.                            | `1.0`   |
+| `--reencode.summary.height <int>`                | `AISUB_REENCODE_SUMMARY_HEIGHT`                | Resolution height in pixels for summary proxy.                      | `360`   |
+| `--reencode.summary.bitrate-kb <int>`            | `AISUB_REENCODE_SUMMARY_BITRATE_KB`            | Video bitrate in KB/s for summary proxy.                            | `35`    |
+| `--reencode.summary.duration-tolerance-ms <int>` | `AISUB_REENCODE_SUMMARY_DURATION_TOLERANCE_MS` | Allowed duration variance (ms) for summary proxy.                   | `100`   |
+
+### Segment Chunk Settings (`--reencode.segment.*`)
+
+| Argument                                         | Environment Variable                           | Description                                                            | Default |
+| :----------------------------------------------- | :--------------------------------------------- | :--------------------------------------------------------------------- | :------ |
+| `--reencode.segment.enabled <bool>`              | `AISUB_REENCODE_SEGMENT_ENABLED`               | Whether to compress individual 5-minute video chunks before uploading. | `False` |
+| `--reencode.segment.threshold-mb <int>`          | `AISUB_REENCODE_SEGMENT_THRESHOLD_MB`          | File size threshold in MB above which chunks are compressed.           | `20`    |
+| `--reencode.segment.fps <float>`                 | `AISUB_REENCODE_SEGMENT_FPS`                   | Framerate (FPS) for chunk segments.                                    | `1.0`   |
+| `--reencode.segment.height <int>`                | `AISUB_REENCODE_SEGMENT_HEIGHT`                | Resolution height in pixels for chunk segments.                        | `360`   |
+| `--reencode.segment.bitrate-kb <int>`            | `AISUB_REENCODE_SEGMENT_BITRATE_KB`            | Video bitrate in KB/s for chunk segments.                              | `35`    |
+| `--reencode.segment.duration-tolerance-ms <int>` | `AISUB_REENCODE_SEGMENT_DURATION_TOLERANCE_MS` | Allowed duration variance (ms) for chunk segments.                     | `100`   |
 
 ---
 

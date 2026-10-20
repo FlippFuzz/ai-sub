@@ -73,23 +73,18 @@ def _get_file_timestamp(remote_file: types.File) -> float:
     return 0.0
 
 
-def _calculate_tokens(text_prompt: Prompt, video_duration_ms: int, agentic_video: bool = False) -> int:
+def _calculate_tokens(text_prompt: Prompt, video_duration_ms: int) -> int:
     """Estimates tokens consumed by text prompts and video duration for rate limiting.
 
     Args:
         text_prompt: Combined system and user prompt.
         video_duration_ms: Video segment duration in milliseconds.
-        agentic_video: Whether agentic video understanding is enabled.
 
     Returns:
         int: Estimated token count.
     """
     prompt_tokens = len(text_prompt.system) + len(text_prompt.user)
-    if agentic_video:
-        # Agentic mode dynamically inspects the timeline, consuming ~10-15% of static frame tokens
-        video_tokens = int((video_duration_ms / 1000) * 35)
-    else:
-        video_tokens = int((video_duration_ms / 1000) * 300)
+    video_tokens = int((video_duration_ms / 1000) * 300)
     return prompt_tokens + video_tokens
 
 
@@ -412,7 +407,10 @@ class GeminiExecutor:
         with logfire.span("Gemini {model_id}: {filename}", model_id=model_id, filename=media_path.name):
             remote_file = await self.ensure_file_uploaded(media_path)
             req_limiter, tok_limiter = self._get_limiters(model_id)
-            tokens = _calculate_tokens(prompt, video_duration_ms, agentic_video=agentic_video)
+
+            # Estimate tokens and clamp to bucket capacity so full videos throttle without overflowing the limiter
+            tokens = _calculate_tokens(prompt, video_duration_ms)
+            token_weight = min(tokens, self.settings.ai.tpm)
 
             # Build media part: Agentic mode uses dynamic timeline inspection; default uses static frames
             if agentic_video:
@@ -466,7 +464,7 @@ class GeminiExecutor:
                             model_id=model_id,
                         ):
                             await req_limiter.try_acquire_async("rpm")
-                            await tok_limiter.try_acquire_async("tpm", weight=tokens)
+                            await tok_limiter.try_acquire_async("tpm", weight=token_weight)
 
                             active_config = config_final if search_turns >= max_turns else config
                             response = await self._client.aio.models.generate_content(
