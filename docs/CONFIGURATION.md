@@ -10,21 +10,32 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ---
 
+## User Context Options
+
+| Argument                | Environment Variable | Description                                                                                        | Default |
+| :---------------------- | :------------------- | :------------------------------------------------------------------------------------------------- | :------ |
+| `--context <text>`      | `AISUB_CONTEXT`      | Inline background context string (character names, spelling preferences, lore, translation rules). | _None_  |
+| `--context-file <path>` | `AISUB_CONTEXT_FILE` | Path to a UTF-8 text file containing background context.                                           | _None_  |
+
+---
+
 ## AI Settings (`--ai.*`)
 
-| Argument                             | Environment Variable                                 | Description                                                                 | Default                            |
-| :----------------------------------- | :--------------------------------------------------- | :-------------------------------------------------------------------------- | :--------------------------------- |
-| `--ai.key <key>`                     | `AISUB_AI_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Google Gemini API key.                                                      | _None_                             |
-| `--ai.base-url <url>`                | `AISUB_AI_BASE_URL`                                  | Optional base URL or proxy for Google Gemini API calls.                     | _None_                             |
-| `--ai.model <model>`                 | `AISUB_AI_MODEL`                                     | Shorthand setting both `model_subtitles` and `model_lyrics` simultaneously. | _None_                             |
-| `--ai.model-subtitles <model>`       | `AISUB_AI_MODEL_SUBTITLES`                           | Gemini model for subtitle generation. Must start with `google-gla:`.        | `google-gla:gemini-3.7-flash`      |
-| `--ai.model-lyrics <model>`          | `AISUB_AI_MODEL_LYRICS`                              | Gemini model for scene detection and song lyrics search.                    | `google-gla:gemini-3.5-flash-lite` |
-| `--ai.service-tier <tier>`           | `AISUB_AI_SERVICE_TIER`                              | Shorthand service tier (`auto`, `default`, `flex`, `priority`).             | _None_                             |
-| `--ai.service-tier-subtitles <tier>` | `AISUB_AI_SERVICE_TIER_SUBTITLES`                    | Service tier for subtitle generation.                                       | _None_                             |
-| `--ai.service-tier-lyrics <tier>`    | `AISUB_AI_SERVICE_TIER_LYRICS`                       | Service tier for lyrics and scene detection.                                | _None_                             |
-| `--ai.rpm <int>`                     | `AISUB_AI_RPM`                                       | Maximum Requests Per Minute (RPM) for model endpoints.                      | `4`                                |
-| `--ai.tpm <int>`                     | `AISUB_AI_TPM`                                       | Maximum Tokens Per Minute (TPM) for model endpoints.                        | `250000`                           |
-| `--ai.validation-buffer-ms <int>`    | `AISUB_AI_VALIDATION_BUFFER_MS`                      | Allowed tolerance buffer (ms) for timestamps exceeding segment duration.    | `2000`                             |
+| Argument                             | Environment Variable                                 | Description                                                                               | Default                            |
+| :----------------------------------- | :--------------------------------------------------- | :---------------------------------------------------------------------------------------- | :--------------------------------- |
+| `--ai.key <key>`                     | `AISUB_AI_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Google Gemini API key.                                                                    | _None_                             |
+| `--ai.base-url <url>`                | `AISUB_AI_BASE_URL`                                  | Optional base URL or proxy for Google Gemini API calls.                                   | _None_                             |
+| `--ai.model <model>`                 | `AISUB_AI_MODEL`                                     | Shorthand setting `model_summary`, `model_lyrics`, and `model_subtitles` at once.         | _None_                             |
+| `--ai.model-summary <model>`         | `AISUB_AI_MODEL_SUMMARY`                             | Gemini model for Phase 1 whole-video summary and entity indexing.                         | `google-gla:gemini-3.5-flash-lite` |
+| `--ai.model-lyrics <model>`          | `AISUB_AI_MODEL_LYRICS`                              | Gemini model for Phase 2 segment scene detection and song lyrics search.                  | `google-gla:gemini-3.5-flash-lite` |
+| `--ai.model-subtitles <model>`       | `AISUB_AI_MODEL_SUBTITLES`                           | Gemini model for Phase 3 subtitle generation and alignment.                               | `google-gla:gemini-3.8-flash`      |
+| `--ai.service-tier <tier>`           | `AISUB_AI_SERVICE_TIER`                              | Shorthand setting service tier across all phases (`auto`, `default`, `flex`, `priority`). | _None_                             |
+| `--ai.service-tier-summary <tier>`   | `AISUB_AI_SERVICE_TIER_SUMMARY`                      | Service tier for Phase 1 whole-video summary.                                             | _None_                             |
+| `--ai.service-tier-lyrics <tier>`    | `AISUB_AI_SERVICE_TIER_LYRICS`                       | Service tier for Phase 2 lyrics and scene detection.                                      | _None_                             |
+| `--ai.service-tier-subtitles <tier>` | `AISUB_AI_SERVICE_TIER_SUBTITLES`                    | Service tier for Phase 3 subtitle generation.                                             | _None_                             |
+| `--ai.rpm <int>`                     | `AISUB_AI_RPM`                                       | Maximum Requests Per Minute (RPM) for model endpoints.                                    | `4`                                |
+| `--ai.tpm <int>`                     | `AISUB_AI_TPM`                                       | Maximum Tokens Per Minute (TPM) for model endpoints.                                      | `250000`                           |
+| `--ai.validation-buffer-ms <int>`    | `AISUB_AI_VALIDATION_BUFFER_MS`                      | Allowed tolerance buffer (ms) for timestamps exceeding segment duration.                  | `2000`                             |
 
 ### Files API Storage Settings (`--ai.storage.*`)
 
@@ -52,6 +63,28 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ---
 
+## Re-Encoding Settings (`--reencode.*`)
+
+| Argument                                 | Environment Variable                   | Description                                                             | Default |
+| :--------------------------------------- | :------------------------------------- | :---------------------------------------------------------------------- | :------ |
+| `--reencode.fps <float>`                 | `AISUB_REENCODE_FPS`                   | Base target framerate (FPS) for compressed media.                       | `1.0`   |
+| `--reencode.height <int>`                | `AISUB_REENCODE_HEIGHT`                | Base target resolution height in pixels (aspect ratio preserved).       | `360`   |
+| `--reencode.bitrate-kb <int>`            | `AISUB_REENCODE_BITRATE_KB`            | Base target video bitrate in Kilobytes per second (KB/s).               | `35`    |
+| `--reencode.duration-tolerance-ms <int>` | `AISUB_REENCODE_DURATION_TOLERANCE_MS` | Allowed duration variance (ms) for re-encoded media.                    | `100`   |
+| `--reencode.encoder <str>`               | `AISUB_REENCODE_ENCODER`               | Specific encoder (e.g. `h264_nvenc`, `libx264`). Auto-detected if null. | _None_  |
+| `--reencode.summary.enabled <bool>`      | `AISUB_REENCODE_SUMMARY_ENABLED`       | Whether to compress a whole-video proxy before Phase 1 analysis.        | `True`  |
+| `--reencode.summary.threshold-mb <int>`  | `AISUB_REENCODE_SUMMARY_THRESHOLD_MB`  | File size threshold in MB above which the full video is compressed.     | `300`   |
+| `--reencode.summary.fps <float>`         | `AISUB_REENCODE_SUMMARY_FPS`           | Stage-specific framerate override for summary proxy.                    | _None_  |
+| `--reencode.summary.height <int>`        | `AISUB_REENCODE_SUMMARY_HEIGHT`        | Stage-specific height override for summary proxy.                       | _None_  |
+| `--reencode.summary.bitrate-kb <int>`    | `AISUB_REENCODE_SUMMARY_BITRATE_KB`    | Stage-specific bitrate override for summary proxy.                      | _None_  |
+| `--reencode.segment.enabled <bool>`      | `AISUB_REENCODE_SEGMENT_ENABLED`       | Whether to compress individual 5-minute video chunks before uploading.  | `False` |
+| `--reencode.segment.threshold-mb <int>`  | `AISUB_REENCODE_SEGMENT_THRESHOLD_MB`  | File size threshold in MB above which segment chunks are compressed.    | `20`    |
+| `--reencode.segment.fps <float>`         | `AISUB_REENCODE_SEGMENT_FPS`           | Stage-specific framerate override for chunk segments.                   | _None_  |
+| `--reencode.segment.height <int>`        | `AISUB_REENCODE_SEGMENT_HEIGHT`        | Stage-specific height override for chunk segments.                      | _None_  |
+| `--reencode.segment.bitrate-kb <int>`    | `AISUB_REENCODE_SEGMENT_BITRATE_KB`    | Stage-specific bitrate override for chunk segments.                     | _None_  |
+
+---
+
 ## Splitting Settings (`--split.*`)
 
 | Argument                              | Environment Variable                | Description                                                   | Default |
@@ -60,25 +93,14 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | `--split.start-offset-min <int>`      | `AISUB_SPLIT_START_OFFSET_MIN`      | Number of minutes to skip from the beginning of the video.    | `0`     |
 | `--split.duration-tolerance-ms <int>` | `AISUB_SPLIT_DURATION_TOLERANCE_MS` | Duration tolerance (ms) per segment to reuse existing splits. | `100`   |
 
-### Re-Encoding Settings (`--split.re-encode.*`)
-
-| Argument                                        | Environment Variable                          | Description                                                              | Default |
-| :---------------------------------------------- | :-------------------------------------------- | :----------------------------------------------------------------------- | :------ |
-| `--split.re-encode.enabled <bool>`              | `AISUB_SPLIT_RE_ENCODE_ENABLED`               | Re-encode segments before uploading to reduce bandwidth.                 | `False` |
-| `--split.re-encode.fps <float>`                 | `AISUB_SPLIT_RE_ENCODE_FPS`                   | Target framerate (FPS) for compressed segments.                          | `1.0`   |
-| `--split.re-encode.height <int>`                | `AISUB_SPLIT_RE_ENCODE_HEIGHT`                | Target resolution height in pixels (aspect ratio preserved).             | `360`   |
-| `--split.re-encode.bitrate-kb <int>`            | `AISUB_SPLIT_RE_ENCODE_BITRATE_KB`            | Target video bitrate in Kilobytes per second (KB/s).                     | `35`    |
-| `--split.re-encode.threshold-mb <int>`          | `AISUB_SPLIT_RE_ENCODE_THRESHOLD_MB`          | File size threshold in MB above which segments are re-encoded.           | `20`    |
-| `--split.re-encode.duration-tolerance-ms <int>` | `AISUB_SPLIT_RE_ENCODE_DURATION_TOLERANCE_MS` | Allowed duration difference (ms) for re-encoded outputs.                 | `100`   |
-| `--split.re-encode.encoder <str>`               | `AISUB_SPLIT_RE_ENCODE_ENCODER`               | Specific encoder (e.g., `h264_nvenc`, `libx264`). Auto-detected if null. | _None_  |
-
 ---
 
 ## Concurrency Settings (`--concurrency.*`)
 
 | Argument                        | Environment Variable          | Description                                                              | Default |
 | :------------------------------ | :---------------------------- | :----------------------------------------------------------------------- | :------ |
-| `--concurrency.re-encode <int>` | `AISUB_CONCURRENCY_RE_ENCODE` | Number of concurrent FFmpeg compression tasks.                           | `2`     |
+| `--concurrency.re-encode <int>` | `AISUB_CONCURRENCY_RE_ENCODE` | Number of concurrent FFmpeg compression processes.                       | `2`     |
+| `--concurrency.summary <int>`   | `AISUB_CONCURRENCY_SUMMARY`   | Number of concurrent summary tasks. Set to `0` to disable Phase 1.       | `1`     |
 | `--concurrency.lyrics <int>`    | `AISUB_CONCURRENCY_LYRICS`    | Number of concurrent lyrics/scene analysis tasks. Set to `0` to disable. | `4`     |
 | `--concurrency.subtitles <int>` | `AISUB_CONCURRENCY_SUBTITLES` | Number of concurrent subtitle generation tasks.                          | `4`     |
 

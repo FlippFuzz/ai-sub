@@ -1,7 +1,8 @@
-"""Job definition, prompt templates, and schemas for scene mapping and lyrics search."""
+"""Job definition, prompt templates, and schemas for Phase 2 scene mapping and lyrics retrieval."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, Self
@@ -22,94 +23,137 @@ from ai_sub.jobs.base import (
     BaseJob,
     Prompt,
     clean_timestamp_string,
+    format_ms_timestamp,
     parse_timestamp_string_ms,
     validate_duration_bound,
 )
 
-LYRICS_PROMPT_VERSION = 9
+LYRICS_PROMPT_VERSION = 10
 
 _LYRICS_SCENES_SYSTEM_TEMPLATE = dedent(
     """
     <role>
-      You are an AI Music and Audio Scene Analyzer. Your job is to analyze a video, break it down into chronological scenes, detect ALL vocal songs playing, and use your available search tool to find the official lyrics for every single song.
+      You are an AI Music and Audio Scene Analyzer. Your job is to analyze a video segment, break it down into chronological scenes, detect ALL vocal music, identify whether lyrics are present on screen, and retrieve official lyrics using on-screen text or web search with an audio validation loop.
     </role>
 
     <critical_constraints>
-      <constraint name="NO MANUAL TRANSCRIPTION OR TRANSLATION">
-        DO NOT attempt to manually transcribe the video's audio track or translate any vocals on your own. You are NOT responsible for generating subtitles. Your ONLY source of lyrics must be the web search tool.
+      <constraint name="NO MANUAL TRANSCRIPTION OF SUNG LYRICS">
+        DO NOT attempt to manually transcribe the audio track or translate sung vocals on your own. You are NOT generating subtitles. Reference lyrics must come SOLELY from on-screen text or search tool results.
       </constraint>
       <constraint name="SEARCH FAILURE FALLBACK">
-        If the official lyrics or translation for a detected song cannot be retrieved using the search tool, you MUST set the respective reference lyrics fields to null. Do not attempt to guess, listen-and-write, or approximate the lyrics.
+        If official lyrics cannot be confirmed via on-screen text or web search, set the reference lyrics fields to null. Never guess or approximate lyrics.
       </constraint>
-      <constraint name="NO LYRIC TRUNCATION OR PLACEHOLDERS">
-        You MUST retrieve and provide the FULL, UNTRUNCATED lyrics of the songs from the web page. Absolutely never use placeholders like "(Lyrics continue)", "...", "[rest of lyrics]", or summarized lyric snippets. If you find the lyrics, write every single word; if you cannot find them, set the field to null.
+      <constraint name="SEGMENT-MATCHED LYRICS ONLY (NO FULL-SONG DUMPING)">
+        When providing reference lyrics, provide ONLY the specific lines, stanzas, or verses that are ACTUALLY SUNG within this specific video segment. Absolutely NEVER dump the entire song's lyrics if only a portion is performed in this segment.
+      </constraint>
+      <constraint name="NO PLACEHOLDERS">
+        Within the sung portion, write every word found. Never use placeholders like "(Lyrics continue)", "...", or "[chorus]".
+      </constraint>
+      <constraint name="LOCAL GROUND TRUTH SUPREMACY">
+        If a `<global_video_summary>` block is provided, use it as an auxiliary guide for song titles and cast. However, local audio and visuals in this specific video segment strictly override the global summary if there is any contradiction.
       </constraint>
     </critical_constraints>
 
-    <execution_pipeline>
-      <step name="Scene Mapping & Recognition">
-        Watch and listen to the entire video. Map scene boundaries, detect vocal music, and identify song metadata using either on-screen text or auditory recognition. Do not transcribe or translate the spoken words.
-      </step>
-      <step name="Song Metadata Resolution">
-        For every vocal segment, resolve: Song Title, Original Artist (simplified), Performer, and Original Language.
-      </step>
-      <step name="Parallel Lyrics Lookup">
-        Look up the official lyrics using your available search tool. To minimize expensive sequential LLM turns, you MUST group and execute as many search queries as possible in parallel in each turn. You are permitted 2 to 3 turns to refine your search using fallback queries if initial parallel searches fail, but those follow-up queries must also be executed in parallel batches rather than sequentially one-by-one.
-      </step>
-    </execution_pipeline>
+    <onscreen_lyrics_and_search_rules>
+      <rule name="ON-SCREEN LYRICS DETECTION (has_onscreen_lyrics)">
+        For every scene containing vocal singing, you MUST determine and record `has_onscreen_lyrics` (true/false).
+        - If clear, burnt-in lyrics are displayed on screen in the singing language (e.g. music video captions, karaoke subtitles):
+          * Set `has_onscreen_lyrics` to true.
+          * Set `reference_lyrics_og` to null (the subtitle generator will read the text directly from the screen with high visual fidelity).
+          * You MAY still use the search tool to find the official English translation if it is NOT shown on screen.
+        - If vocal singing is heard and NO complete lyrics appear on screen:
+          * Set `has_onscreen_lyrics` to false.
+          * You MUST use your search tool to find the official lyrics.
+      </rule>
+      <rule name="AUDIO VALIDATION & RETRY LOOP">
+        Web searches often return wrong songs with identical titles. When search results return candidate lyrics:
+        - Step 1 (Validation): Cross-reference candidate lyrics against audible phonetic hooks, chorus lines, or refrain phrases heard in the audio track.
+        - Step 2 (Match): If the text matches what is sung, extract ONLY the lines sung in this segment.
+        - Step 3 (Mismatch / Retry): If candidate lyrics contradict what is heard (e.g. wrong song with same title, parody lyrics), reject them. Formulate a refined query in your next turn using the composer or a distinct heard lyric phrase.
+        - Step 4 (Exhaustion): If after retry the lyrics still do not match what is heard, set reference_lyrics_og and reference_lyrics_en to null.
+      </rule>
+    </onscreen_lyrics_and_search_rules>
 
     <search_rules>
       <rule name="USE ORIGINAL COMPOSER, NOT PERFORMER">
-        Search using the Original Artist/Composer's name (often credited on-screen as "Music:", "Original:", or "Composer:"). Do NOT include the names of the video performers (e.g., VTubers singing a cover) in your search query.
+        Search using the Original Artist/Composer's name (credited on screen or noted in the global summary). Do not search using cover performers.
       </rule>
       <rule name="DO NOT TRANSLATE TITLES FOR SEARCHES">
-        If a song title appears on screen in Japanese (Kanji/Kana), search using the ORIGINAL Japanese characters or Romaji. NEVER translate a Japanese title into English for a search query.
+        If a song title is in Japanese, Korean, or Chinese, search using the original script or Romaji. Never translate titles into English for queries.
       </rule>
-      <rule name="NEVER USE QUOTATION MARKS">
-        Do NOT use quotes ("") anywhere in your search query. Quotes force exact matches and break the search tool. Use plain, space-separated keywords.
-      </rule>
-      <rule name="PARALLEL SEARCH STRATEGY (MAX 3 SEARCH TURNS)">
-        To minimize expensive LLM roundtrip turns and reduce costs, you are strictly limited to a MAXIMUM of 3 search turns (roundtrips). Individual search queries are extremely cheap, so feel free to execute multiple queries in parallel, but LLM calls are highly expensive. Group and execute your searches concurrently in parallel batches within each turn.
-
-        Follow this multi-turn parallel strategy:
-        - Turn 1 (Initial Parallel Batch): Group and run both "Initial" queries (Targeted Original + Targeted English Translation) for all detected songs at the same time in parallel. (Do not execute broad Fallback queries yet).
-        - Turn 2 (Refinement Parallel Batch, if needed): Only if an Initial query failed to yield results in Turn 1, execute the corresponding broad "Fallback" query for that specific failed song in parallel.
-
-        Determine whether to pass a single list of queries or execute multiple parallel calls natively based on the parameters specified in your search tool's JSON schema.
-
-        Strategic Query Formulations:
-        - Initial - Targeted Original: [Song Title in OG language] [Original Artist/Composer] [lyrics keyword in OG language (e.g., '歌詞' for Japanese, '가사' for Korean, '歌词' for Chinese, or 'lyrics' for English)].
-        - Initial - Targeted English Translation: [Romaji or English Title] [Original Artist/Composer] lyrics English.
-        - Fallback - Broad Original: [Song Title in OG language] [lyrics keyword in OG language] (omits the artist to broaden search results if targeted search fails).
-        - Fallback - Broad English Translation: [Romaji or English Title] lyrics English (omits the artist to broaden translation results if targeted translation fails).
-      </rule>
-      <rule name="SEARCH-ONLY SOURCE OF TRUTH">
-        The lyrics MUST come entirely from your search tool's results. If a search yields no results, do not attempt to listen to the audio to construct the lyrics.
+      <rule name="PARALLEL BATCHING">
+        Execute queries concurrently in parallel batches to minimize turns within your allowed tool turns:
+        - Turn 1: Initial parallel search for targeted original lyrics and English translation.
+        - Turn 2: Audio validation check. If mismatched, run a refined retry query in parallel.
       </rule>
     </search_rules>
     """  # noqa: E501
 ).strip()
 
-_LYRICS_SCENES_USER_TEMPLATE = dedent(
-    """
-    <task>
-      Analyze the provided video to map scenes and detect songs. Look up the official lyrics using the web search tool.
-      CRITICAL: Do NOT transcribe the audio or translate any lyrics yourself. If you cannot find the official lyrics via web search, leave the lyrics fields as null.
-    </task>
-    """  # noqa: E501
-).strip()
 
+def get_lyrics_scenes_prompt(
+    user_context: str | None = None,
+    global_summary: Any | None = None,
+    segment_offset_ms: int = 0,
+    segment_duration_ms: int = 0,
+) -> Prompt:
+    """Generates the prompt for Phase 2 segment scene mapping and lyrics retrieval.
 
-def get_lyrics_scenes_prompt() -> Prompt:
-    """Generates the system and user instructions for lyrics and scene detection.
+    Args:
+        user_context: Optional background text or directives supplied by the user.
+        global_summary: Optional Phase 1 global summary schema or dictionary.
+        segment_offset_ms: Absolute start time offset of this segment in milliseconds.
+        segment_duration_ms: Duration of this segment in milliseconds.
 
     Returns:
-        Prompt: Prompt container.
+        Prompt: Configured system and user prompt pair.
     """
-    return Prompt(
-        system=_LYRICS_SCENES_SYSTEM_TEMPLATE,
-        user=_LYRICS_SCENES_USER_TEMPLATE,
-    )
+    parts = [
+        "<task>",
+        "  Analyze the provided video segment to map scenes and detect vocal music.",
+        "  Indicate whether on-screen lyrics are present (has_onscreen_lyrics).",
+        "  If vocal music lacks on-screen lyrics, find official lyrics via web search, validate them against the audio,",  # noqa: E501
+        "  and return ONLY the lines sung in this segment.",
+        "  CRITICAL: Do NOT transcribe audio into lyrics yourself if search yields nothing; leave lyrics as null.",
+        "</task>",
+    ]
+    if segment_duration_ms > 0:
+        start_tc = format_ms_timestamp(segment_offset_ms)
+        end_tc = format_ms_timestamp(segment_offset_ms + segment_duration_ms)
+        parts.extend(
+            [
+                "<segment_time_window>",
+                f"  This video segment covers {start_tc} to {end_tc} of the full video.",
+                "  The <global_video_summary> references absolute full-video timestamps.",
+                "  CRITICAL: All output timestamps (start, end) MUST be local timecodes relative to this file",
+                "  starting at 00:00.000. Never use full-video absolute timestamps in your output.",
+                "</segment_time_window>",
+            ]
+        )
+    if user_context and user_context.strip():
+        parts.extend(
+            [
+                "<user_provided_context>",
+                f"  {user_context.strip()}",
+                "</user_provided_context>",
+            ]
+        )
+    if global_summary:
+        if hasattr(global_summary, "model_dump"):
+            clean_summary = global_summary.model_dump(mode="json", exclude={"thoughts": True}, exclude_none=True)
+        elif isinstance(global_summary, dict):
+            clean_summary = {k: v for k, v in global_summary.items() if k != "thoughts" and v is not None}
+        else:
+            clean_summary = global_summary
+        summary_json = json.dumps(clean_summary, ensure_ascii=False)
+        parts.extend(
+            [
+                "<global_video_summary>",
+                f"  {summary_json}",
+                "</global_video_summary>",
+            ]
+        )
+    return Prompt(system=_LYRICS_SCENES_SYSTEM_TEMPLATE, user="\n".join(parts))
 
 
 class Scene(BaseModel):
@@ -119,17 +163,21 @@ class Scene(BaseModel):
     end: str = Field(description="End timestamp in 'MM:SS.mmm' format.")
     description: str = Field(description="Detailed visual and auditory scene context.")
     contains_vocal_music: bool = Field(description="True if active sung vocals are present.")
+    has_onscreen_lyrics: bool = Field(
+        default=False,
+        description="True if lyrics are visibly displayed/burnt into the video during this scene.",
+    )
     song_title: str | None = Field(default=None, description="Title of the detected song or null.")
     original_artist: str | None = Field(default=None, description="Composer or original artist name.")
     performer_in_video: str | None = Field(default=None, description="Cover performer seen in video.")
     original_language: str | None = Field(default=None, description="Primary singing language.")
     reference_lyrics_og: str | None = Field(
         default=None,
-        description="Official lyrics in original language from search tool. Null if not found.",
+        description="Official lyrics in original language for lines sung in this segment. Null if on screen or not found.",  # noqa: E501
     )
     reference_lyrics_en: str | None = Field(
         default=None,
-        description="Official English translation of lyrics from search tool. Null if not found.",
+        description="Official English translation of lyrics sung in this segment. Null if not found.",
     )
 
     @model_validator(mode="before")

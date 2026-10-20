@@ -1,11 +1,14 @@
 """Configuration settings for the AI Sub subtitle generation pipeline."""
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
 from typing import Any, Literal, Self, cast
 
 from logfire import LevelName
 from pydantic import (
+    BaseModel,
     Field,
     FilePath,
     HttpUrl,
@@ -164,27 +167,35 @@ class AiSettings(BaseSettings):
     )
     model: str | None = Field(
         default=None,
-        description="Shorthand setting both model_subtitles and model_lyrics to the same identifier.",
+        description="Shorthand setting model_subtitles, model_lyrics, and model_summary to the same identifier.",
     )
-    model_subtitles: str = Field(
-        description="AI model for audio transcription and translation.",
-        default="google-gla:gemini-3.7-flash",
+    model_summary: str = Field(
+        description="AI model for whole-video summary, entity extraction, and knowledge base (Phase 1).",
+        default="google-gla:gemini-3.5-flash-lite",
     )
     model_lyrics: str = Field(
-        description="AI model for scene analysis and song lyrics lookup.",
+        description="AI model for segment scene analysis and song lyrics lookup (Phase 2).",
         default="google-gla:gemini-3.5-flash-lite",
+    )
+    model_subtitles: str = Field(
+        description="AI model for audio transcription and translation (Phase 3).",
+        default="google-gla:gemini-3.8-flash",
     )
     service_tier: ServiceTier | None = Field(
         default=None,
-        description="Shorthand setting both service_tier_subtitles and service_tier_lyrics.",
+        description="Shorthand setting service tiers across all pipeline phases.",
     )
-    service_tier_subtitles: ServiceTier | None = Field(
+    service_tier_summary: ServiceTier | None = Field(
         default=None,
-        description="Google Gemini service tier for subtitle generation.",
+        description="Google Gemini service tier for whole-video summary (Phase 1).",
     )
     service_tier_lyrics: ServiceTier | None = Field(
         default=None,
-        description="Google Gemini service tier for lyrics and scene detection.",
+        description="Google Gemini service tier for lyrics and scene detection (Phase 2).",
+    )
+    service_tier_subtitles: ServiceTier | None = Field(
+        default=None,
+        description="Google Gemini service tier for subtitle generation (Phase 3).",
     )
     rpm: PositiveInt = Field(
         description="Maximum Requests Per Minute (RPM) allowed for the model.",
@@ -203,7 +214,7 @@ class AiSettings(BaseSettings):
         default_factory=StorageSettings,
     )
     search: SearchSettings = Field(
-        description="Web search configuration for lyrics retrieval.",
+        description="Web search configuration for lyrics and metadata retrieval.",
         default_factory=SearchSettings,
     )
 
@@ -224,63 +235,95 @@ class AiSettings(BaseSettings):
         return values
 
     @model_validator(mode="after")
-    def validate_models_and_tiers(self) -> "AiSettings":
+    def validate_models_and_tiers(self) -> Self:
         """Synchronizes shorthands and validates required provider prefixes.
 
         Returns:
-            AiSettings: The validated instance.
+            Self: The validated instance.
 
         Raises:
             ValueError: If a model identifier does not start with 'google-gla:'.
         """
         if self.model:
-            self.model_subtitles = self.model
+            self.model_summary = self.model
             self.model_lyrics = self.model
+            self.model_subtitles = self.model
 
         for field_name, model_val in (
-            ("model_subtitles", self.model_subtitles),
+            ("model_summary", self.model_summary),
             ("model_lyrics", self.model_lyrics),
+            ("model_subtitles", self.model_subtitles),
         ):
             if not model_val.lower().startswith("google-gla:"):
                 raise ValueError(
                     f"Invalid model '{model_val}' for '{field_name}'. "
-                    "Model identifier must start with 'google-gla:' (e.g., 'google-gla:gemini-3.7-flash')."
+                    "Model identifier must start with 'google-gla:' (e.g., 'google-gla:gemini-3.8-flash')."
                 )
 
         if self.service_tier is not None:
-            self.service_tier_subtitles = self.service_tier
+            self.service_tier_summary = self.service_tier
             self.service_tier_lyrics = self.service_tier
+            self.service_tier_subtitles = self.service_tier
 
         return self
+
+
+class StageReEncodeSettings(BaseSettings):
+    """Configuration for a specific re-encoding stage (summary or segment)."""
+
+    model_config = _BASE_CONFIG
+
+    enabled: bool = Field(
+        description="Whether re-encoding is enabled for this stage.",
+    )
+    threshold_mb: NonNegativeInt = Field(
+        description="File size threshold in MB above which media is re-encoded. 0 compresses unconditionally.",
+    )
+    fps: PositiveFloat | None = Field(
+        default=None,
+        description="Stage-specific framerate override (FPS). Falls back to base re-encode fps if None.",
+    )
+    height: PositiveInt | None = Field(
+        default=None,
+        description="Stage-specific resolution height override. Falls back to base re-encode height if None.",
+    )
+    bitrate_kb: PositiveInt | None = Field(
+        default=None,
+        description="Stage-specific video bitrate override in KB/s. Falls back to base re-encode bitrate if None.",
+    )
+
+
+class ResolvedReEncodeConfig(BaseModel):
+    """Fully resolved re-encoding parameters for a specific stage execution."""
+
+    enabled: bool
+    threshold_mb: int
+    fps: float
+    height: int
+    bitrate_kb: int
+    encoder: str | None
+    duration_tolerance_ms: int
 
 
 class ReEncodeSettings(BaseSettings):
     """Configuration for FFmpeg video re-encoding and compression."""
 
     model_config = {
-        "env_prefix": "AISUB_SPLIT_RE_ENCODE_",
+        "env_prefix": "AISUB_REENCODE_",
         **_BASE_CONFIG,
     }
 
-    enabled: bool = Field(
-        description="Whether to re-encode video segments before uploading.",
-        default=False,
-    )
     fps: PositiveFloat = Field(
-        description="Target framerate (FPS) for compressed segments.",
+        description="Base target framerate (FPS) for compressed media.",
         default=1.0,
     )
     height: PositiveInt = Field(
-        description="Target resolution height in pixels (aspect ratio is preserved).",
+        description="Base target resolution height in pixels (aspect ratio is preserved).",
         default=360,
     )
     bitrate_kb: PositiveInt = Field(
-        description="Target video bitrate in Kilobytes per second (KB/s).",
+        description="Base target video bitrate in Kilobytes per second (KB/s).",
         default=35,
-    )
-    threshold_mb: NonNegativeInt = Field(
-        description="Size threshold in MB above which segments are compressed. 0 compresses everything.",
-        default=20,
     )
     duration_tolerance_ms: NonNegativeInt = Field(
         description="Maximum allowed duration divergence in milliseconds for re-encoded output.",
@@ -290,10 +333,50 @@ class ReEncodeSettings(BaseSettings):
         description="Specific H.264 encoder to use (e.g., 'h264_nvenc', 'libx264'). Auto-detected if null.",
         default=None,
     )
+    summary: StageReEncodeSettings = Field(
+        description="Re-encoding rules for the whole-video summary proxy (Phase 1).",
+        default_factory=lambda: StageReEncodeSettings(enabled=True, threshold_mb=300),
+    )
+    segment: StageReEncodeSettings = Field(
+        description="Re-encoding rules for individual video chunk segments (Phases 2 & 3).",
+        default_factory=lambda: StageReEncodeSettings(enabled=False, threshold_mb=20),
+    )
+
+    def resolve_summary(self) -> ResolvedReEncodeConfig:
+        """Resolves effective re-encode configuration for Phase 1 whole-video summary.
+
+        Returns:
+            ResolvedReEncodeConfig: Fully populated configuration for summary re-encoding.
+        """
+        return ResolvedReEncodeConfig(
+            enabled=self.summary.enabled,
+            threshold_mb=self.summary.threshold_mb,
+            fps=self.summary.fps if self.summary.fps is not None else self.fps,
+            height=self.summary.height if self.summary.height is not None else self.height,
+            bitrate_kb=self.summary.bitrate_kb if self.summary.bitrate_kb is not None else self.bitrate_kb,
+            encoder=self.encoder,
+            duration_tolerance_ms=self.duration_tolerance_ms,
+        )
+
+    def resolve_segment(self) -> ResolvedReEncodeConfig:
+        """Resolves effective re-encode configuration for Phase 2 & 3 video segments.
+
+        Returns:
+            ResolvedReEncodeConfig: Fully populated configuration for segment re-encoding.
+        """
+        return ResolvedReEncodeConfig(
+            enabled=self.segment.enabled,
+            threshold_mb=self.segment.threshold_mb,
+            fps=self.segment.fps if self.segment.fps is not None else self.fps,
+            height=self.segment.height if self.segment.height is not None else self.height,
+            bitrate_kb=self.segment.bitrate_kb if self.segment.bitrate_kb is not None else self.bitrate_kb,
+            encoder=self.encoder,
+            duration_tolerance_ms=self.duration_tolerance_ms,
+        )
 
 
 class SplittingSettings(BaseSettings):
-    """Configuration for splitting input videos into segments."""
+    """Configuration for splitting input videos into uniform segments."""
 
     model_config = {
         "env_prefix": "AISUB_SPLIT_",
@@ -312,10 +395,6 @@ class SplittingSettings(BaseSettings):
         description="Maximum allowed duration variance in milliseconds per segment during split validation.",
         default=100,
     )
-    re_encode: ReEncodeSettings = Field(
-        description="Settings for video compression.",
-        default_factory=ReEncodeSettings,
-    )
 
 
 class ConcurrencySettings(BaseSettings):
@@ -330,12 +409,16 @@ class ConcurrencySettings(BaseSettings):
         description="Number of concurrent FFmpeg compression processes.",
         default=2,
     )
+    summary: NonNegativeInt = Field(
+        description="Number of concurrent summary tasks (Phase 1). Set to 0 to skip this stage.",
+        default=1,
+    )
     lyrics: NonNegativeInt = Field(
-        description="Number of concurrent lyrics/scene analysis tasks. Set to 0 to skip this stage.",
+        description="Number of concurrent lyrics/scene analysis tasks (Phase 2). Set to 0 to skip this stage.",
         default=4,
     )
     subtitles: PositiveInt = Field(
-        description="Number of concurrent subtitle generation tasks.",
+        description="Number of concurrent subtitle generation tasks (Phase 3).",
         default=4,
     )
 
@@ -429,8 +512,12 @@ class Settings(BaseSettings):
         description="AI models, quotas, storage, and search settings.",
         default_factory=AiSettings,
     )
+    reencode: ReEncodeSettings = Field(
+        description="Video re-encoding and compression parameters.",
+        default_factory=ReEncodeSettings,
+    )
     split: SplittingSettings = Field(
-        description="Video segmentation and compression parameters.",
+        description="Video segmentation parameters.",
         default_factory=SplittingSettings,
     )
     concurrency: ConcurrencySettings = Field(
@@ -449,17 +536,45 @@ class Settings(BaseSettings):
         description="Telemetry and logging controls.",
         default_factory=LoggingSettings,
     )
+    context: str | None = Field(
+        default=None,
+        description="Inline text providing background context, speaker names, or translation preferences.",
+    )
+    context_file: FilePath | None = Field(
+        default=None,
+        description="Path to a text file containing user background context.",
+    )
 
     input_video_file: CliPositionalArg[FilePath] = Field(
         description="Path to the video file to transcribe and subtitle.",
     )
 
+    def get_resolved_user_context(self) -> str | None:
+        """Reads and merges context from context_file and inline context if provided.
+
+        Returns:
+            str | None: Combined, non-empty user context string or None if neither provided.
+        """
+        parts: list[str] = []
+        if self.context_file is not None and self.context_file.is_file():
+            try:
+                content = self.context_file.read_text(encoding="utf-8").strip()
+                if content:
+                    parts.append(content)
+            except Exception:
+                pass
+
+        if self.context is not None and self.context.strip():
+            parts.append(self.context.strip())
+
+        return "\n\n".join(parts) if parts else None
+
     @model_validator(mode="after")
-    def validate_api_keys(self) -> "Settings":
+    def validate_api_keys(self) -> Self:
         """Ensures required API keys are configured before pipeline initialization.
 
         Returns:
-            Settings: The validated instance.
+            Self: The validated instance.
 
         Raises:
             ValueError: If a required API key is missing.
@@ -470,7 +585,7 @@ class Settings(BaseSettings):
                 "or the GEMINI_API_KEY / GOOGLE_API_KEY environment variables."
             )
 
-        if self.concurrency.lyrics > 0:
+        if self.concurrency.summary > 0 or self.concurrency.lyrics > 0:
             tool = self.ai.search.tool
             if tool in ("ollama", "langsearch", "tinyfish") and self.ai.search.key is None:
                 raise ValueError(
@@ -481,11 +596,11 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def setup_file_locations(self) -> "Settings":
+    def setup_file_locations(self) -> Self:
         """Resolves input, output, and temporary paths to absolute directory locations.
 
         Returns:
-            Settings: The validated instance.
+            Self: The validated instance.
         """
         input_video_path = cast(Path, self.input_video_file).resolve()
         self.input_video_file = cast(Any, input_video_path)

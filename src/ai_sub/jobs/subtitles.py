@@ -1,4 +1,4 @@
-"""Job definition, prompt templates, and schemas for audio-visual subtitle transcription."""
+"""Job definition, prompt templates, and schemas for Phase 3 audio-visual subtitle transcription."""
 
 from __future__ import annotations
 
@@ -26,17 +26,17 @@ from ai_sub.jobs.base import (
     BaseJob,
     Prompt,
     clean_timestamp_string,
+    format_ms_timestamp,
     parse_timestamp_string_ms,
     validate_duration_bound,
 )
-from ai_sub.jobs.lyrics_scene import LyricsSceneAiResponse
 
-SUBTITLES_PROMPT_VERSION = 18
+SUBTITLES_PROMPT_VERSION = 19
 
 _SUBTITLES_SYSTEM_TEMPLATE = dedent(
     """
     <role>
-      You are an advanced AI expert in audio-visual translation and subtitling. Your specialty is generating audio-synchronized, contextually rich subtitles from multimodal inputs using native audio tokenization.
+      You are an advanced AI expert in audio-visual translation and subtitling. Your specialty is generating audio-synchronized, contextually rich subtitles from multimodal inputs using native audio perception.
     </role>
 
     <golden_rules>
@@ -44,70 +44,70 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
         The vocal audio waveform is your absolute ground truth for spoken dialogue. The exact millisecond a vocal cord activates dictates the 's' (start) timecode. NEVER output dialogue text if there is no vocal audio driving it.
       </rule>
       <rule name="VISUAL EVENTS (The On-Screen Text Exception)">
-        If prominent, relevant text (e.g., Chapter Titles, Location Signs, Letters) appears on screen, subtitle it for the duration it is clearly visible, even if there is no audio.
+        If prominent, relevant text (e.g. Chapter Titles, Location Signs, Letters) appears on screen, subtitle it for the duration it is clearly visible, even if there is no audio.
       </rule>
     </golden_rules>
 
     <decoding_hierarchy>
-      When transcribing spoken audio (vocal events), if the vocals are slurred, fast, or ambiguous, use this fallback hierarchy to determine the correct intended words:
-      <step level="1" name="Primary Fallback (Burnt-in Subs/Lyrics)">
-        Hardcoded subtitles or on-screen lyrics that correspond to the audio are your most reliable guide for correct spelling and strictly override everything else.
+      When transcribing spoken dialogue or singing, resolve the correct words using this strict priority hierarchy:
+      <step level="1" name="Audible Waveform & Burnt-in On-Screen Text">
+        Audible vocal phonetics and burnt-in subtitles/lyrics clearly visible on screen strictly override all external references.
       </step>
-      <step level="2" name="Secondary Fallback (Scene Context)">
-        Visual actions, character emotions, and environments (e.g., rain, night) provide powerful context clues.
+      <step level="2" name="User Context Directives">
+        If `<user_provided_context>` is provided, its instructions regarding character names, pronouns, and translation tone take immediate precedence over general assumptions.
       </step>
-      <step level="3" name="Tertiary Fallback (Auxiliary Reference JSON)">
-        Use the provided `<scene_and_lyrics_reference_json>` block ONLY as an auxiliary spelling reference.
+      <step level="3" name="Global Video Summary & Glossary">
+        If `<global_video_summary>` is provided, use its character roster, speaker identities, and domain glossary to resolve ambiguous nouns, jargon, and speaker attributions.
       </step>
-      <step level="4" name="The Manual Transcription Mandate">
-        If the `<scene_and_lyrics_reference_json>` block is null, incomplete, or deviates from the audio, YOU ARE NOT EXEMPT. You MUST manually transcribe and translate the remaining vocals using your native audio perception.
+      <step level="4" name="Auxiliary Scene & Lyrics Reference">
+        Use the provided `<scene_and_lyrics_reference_json>` block ONLY as an auxiliary spelling and alignment reference for songs.
+      </step>
+      <step level="5" name="The Manual Transcription Mandate">
+        If reference blocks are null, incomplete, or deviate from what is heard, YOU ARE NOT EXEMPT. You MUST manually transcribe and translate the remaining audible speech using native audio perception.
       </step>
     </decoding_hierarchy>
 
     <grounding_instructions>
-      The provided `<scene_and_lyrics_reference_json>` block contains web-scraped lyrics meant solely as an auxiliary guide for song spelling and composition. It is NOT a script.
+      The `<scene_and_lyrics_reference_json>` block contains auxiliary reference lyrics scoped to this segment. It is NOT a rigid script.
       <instruction name="AUDIO IS SUPREME">
-        If the performer stops singing to talk, if the background music goes silent, or if they sing a different verse, melody, or song, YOU MUST IGNORE the `<scene_and_lyrics_reference_json>` block entirely for that duration.
+        If the performer stops singing to talk, if the background music goes silent, or if they sing different words, ad-libs, or parodies, IGNORE the reference lyrics and transcribe what is actually heard.
       </instruction>
       <instruction name="NO PRE-EMPTIVE PASTING">
-        Never blindly copy, paste, or assume reference lyrics. If the vocal audio does not match the reference lyrics in the `<scene_and_lyrics_reference_json>` block, do not force them into the subtitles.
-      </instruction>
-      <instruction name="MISMATCH OR WRONG SONG">
-        If the audio clearly differs from the `<scene_and_lyrics_reference_json>` block, ignore it entirely and perform 100% manual transcription of what is actually heard.
+        Never blindly paste reference lyrics into silent gaps, instrumental sections, or during spoken chatter. Only output lines when the corresponding singing is audibly heard.
       </instruction>
       <instruction name="ZERO GHOST SUBTITLES">
-        Remain SILENT during pure instrumental music, long pauses, or sound effects. If no vocals are heard in the audio track, output nothing (unless there is a prominent Visual Event). Do not use `<scene_and_lyrics_reference_json>` data to fill silent gaps.
+        Remain completely SILENT during pure instrumental music, background sound effects, or pauses. If no vocals are heard, output nothing (unless translating a prominent Visual Event).
       </instruction>
-      <instruction name="VIDEO LONGER THAN REFERENCE">
-        Switch immediately to 100% manual transcription for the remainder of the video beyond what is covered in the `<scene_and_lyrics_reference_json>` block. Subtitle 100% of the audible vocals.
+      <instruction name="TERMINOLOGY CONSISTENCY">
+        Maintain consistent spelling of proper nouns and character names throughout the segment in alignment with `<global_video_summary>` and `<user_provided_context>`.
       </instruction>
     </grounding_instructions>
 
     <timecode_rules>
-      AI models frequently suffer from "Cascading Delays" (subtitles falling behind audio). Override this bias using these strict mechanical rules:
+      Prevent cascading delays with these mechanical rules:
       <rule name="The Sacred Start Timecode">
-        The 's' (start) timecode is immutable. It MUST trigger the exact millisecond the word is spoken in the audio track. Never delay a start timecode to accommodate a previous long subtitle block.
+        The 's' (start) timecode is immutable. It MUST trigger the exact millisecond speech begins in the audio track. Never delay a start timecode to accommodate a previous subtitle block.
       </rule>
       <rule name="Truncation Over Extension">
-        If Line 1 is spoken, and Line 2 begins immediately after, Line 1's 'e' timecode MUST be aggressively truncated to make room for Line 2's 's' timecode.
+        If Line 1 is spoken and Line 2 begins immediately after, Line 1's 'e' (end) timecode MUST be aggressively truncated to make room for Line 2's 's' timecode.
       </rule>
       <rule name="Instantaneous Transitions">
-        In rapid speech with no breaths, Line 1's 'e' MUST EXACTLY EQUAL Line 2's 's' (e.g., Line 1 'e': 01:05.500 -> Line 2 's': 01:05.500).
+        In rapid speech with no breaths between lines, Line 1's 'e' MUST EXACTLY EQUAL Line 2's 's' (e.g. Line 1 'e': 01:05.500 -> Line 2 's': 01:05.500).
       </rule>
       <rule name="Timecode Format">
-        MUST strictly adhere to MM:SS.mmm (e.g., 01:05.300). Always pad with zeros. Always ensure timecodes represent the actual time of occurrence in the audio.
+        MUST strictly adhere to MM:SS.mmm (e.g. 01:05.300). Always pad with zeros.
       </rule>
     </timecode_rules>
 
     <segmentation_and_translation>
       <max_length>
-        Limit each subtitle block to 50 characters per line. Group phrases logically.
+        Limit each subtitle block to 50 characters per line. Group phrases logically by natural speech cadence.
       </max_length>
       <context_aware_translation>
-        Ensure semantic continuity. If a sentence is split across two blocks, ensure the English translation grammatically flows from Part 1 to Part 2 (e.g., using ellipses "..."). Always analyze the Previous 2 Sentences, the Next 2 Sentences, and the Full Current Sentence. Use this context to determine pronouns, tense, and tone.
+        Ensure semantic continuity. If a sentence spans multiple blocks, ensure English grammar flows naturally (e.g. using ellipses "..."). Leverage global and user context to determine correct pronouns, verb tenses, and formal/informal tone.
       </context_aware_translation>
       <visual_text_rules>
-        Translate prominent, relevant visual text (titles, signs). Exclude meaningless background clutter or UI elements. If visual text appears simultaneously with spoken dialogue, prioritize translating the spoken dialogue (do not merge them).
+        Translate prominent, narrative-relevant visual text. If visual text appears simultaneously with spoken dialogue, prioritize translating the spoken dialogue.
       </visual_text_rules>
       <no_cc_tags>
         Transcribe speech/vocals only. NO closed captioning tags like [applause], (sighs), or ♪.
@@ -117,36 +117,82 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
 ).strip()
 
 
-def get_subtitle_prompt(scene_response: LyricsSceneAiResponse | None) -> Prompt:
-    """Generates the subtitle prompt populated with optional reference scene metadata.
+def get_subtitle_prompt(
+    user_context: str | None = None,
+    global_summary: Any | None = None,
+    scene_response: Any | None = None,
+    segment_offset_ms: int = 0,
+    segment_duration_ms: int = 0,
+) -> Prompt:
+    """Generates the prompt for Phase 3 subtitle generation and audio-visual alignment.
 
     Args:
-        scene_response: Scene detection metadata if available.
+        user_context: Optional background text or directives supplied by the user.
+        global_summary: Optional Phase 1 global summary schema or dictionary.
+        scene_response: Optional Phase 2 scene and lyrics response schema or dictionary.
+        segment_offset_ms: Absolute start time offset of this segment in milliseconds.
+        segment_duration_ms: Duration of this segment in milliseconds.
 
     Returns:
-        Prompt: System and user prompt container.
+        Prompt: Configured system and user prompt pair.
     """
+    parts = [
+        "<task>",
+        "  Generate precise, audio-synchronized subtitles for the provided video segment based on the system instructions.",  # noqa: E501
+        "</task>",
+    ]
+    if segment_duration_ms > 0:
+        start_tc = format_ms_timestamp(segment_offset_ms)
+        end_tc = format_ms_timestamp(segment_offset_ms + segment_duration_ms)
+        parts.extend(
+            [
+                "<segment_time_window>",
+                f"  This video segment covers {start_tc} to {end_tc} of the full video.",
+                "  The <global_video_summary> references absolute full-video timestamps.",
+                "  CRITICAL: All output timestamps (start, end, s, e) MUST be local timecodes relative to this file",
+                "  starting at 00:00.000. Never use full-video absolute timestamps in your output.",
+                "</segment_time_window>",
+            ]
+        )
+    if user_context and user_context.strip():
+        parts.extend(
+            [
+                "<user_provided_context>",
+                f"  {user_context.strip()}",
+                "</user_provided_context>",
+            ]
+        )
+    if global_summary:
+        if hasattr(global_summary, "model_dump"):
+            clean_summary = global_summary.model_dump(mode="json", exclude={"thoughts": True}, exclude_none=True)
+        elif isinstance(global_summary, dict):
+            clean_summary = {k: v for k, v in global_summary.items() if k != "thoughts" and v is not None}
+        else:
+            clean_summary = global_summary
+        summary_json = json.dumps(clean_summary, ensure_ascii=False)
+        parts.extend(
+            [
+                "<global_video_summary>",
+                f"  {summary_json}",
+                "</global_video_summary>",
+            ]
+        )
     if scene_response:
-        scenes_data = scene_response.model_dump(mode="json")["scenes"]
-        scene_json = json.dumps(scenes_data, ensure_ascii=False)
-    else:
-        scene_json = "null"
-
-    user_prompt = dedent(
-        f"""
-        <task>
-          Generate precise, synchronized subtitles for the provided video segment based on the system instructions.
-        </task>
-        <scene_and_lyrics_reference_json>
-          {scene_json}
-        </scene_and_lyrics_reference_json>
-        """
-    ).strip()
-
-    return Prompt(
-        system=_SUBTITLES_SYSTEM_TEMPLATE,
-        user=user_prompt,
-    )
+        if hasattr(scene_response, "model_dump"):
+            clean_scene = scene_response.model_dump(mode="json", exclude={"thoughts": True}, exclude_none=True)
+        elif isinstance(scene_response, dict):
+            clean_scene = {k: v for k, v in scene_response.items() if k != "thoughts" and v is not None}
+        else:
+            clean_scene = scene_response
+        scene_json = json.dumps(clean_scene, ensure_ascii=False)
+        parts.extend(
+            [
+                "<scene_and_lyrics_reference_json>",
+                f"  {scene_json}",
+                "</scene_and_lyrics_reference_json>",
+            ]
+        )
+    return Prompt(system=_SUBTITLES_SYSTEM_TEMPLATE, user="\n".join(parts))
 
 
 class Subtitles(BaseModel):

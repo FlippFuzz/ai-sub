@@ -26,8 +26,8 @@ from ai_sub.jobs.base import Prompt
 
 T = TypeVar("T", bound=BaseModel)
 
-# Strictly matches managed video segments (e.g., 'part_001.mp4', 'part_002.mov')
-PART_PATTERN = re.compile(r"^part_\d{3}\.[^./]+$")
+# Matches managed segment chunks and global summary proxies
+MANAGED_PATTERN = re.compile(r"^(part_\d{3}|summary_proxy)\.[^./]+$")
 
 
 class QuotaExceededError(Exception):
@@ -73,17 +73,24 @@ def _get_file_timestamp(remote_file: types.File) -> float:
     return 0.0
 
 
-def _calculate_tokens(text_prompt: Prompt, video_duration_ms: int) -> int:
+def _calculate_tokens(text_prompt: Prompt, video_duration_ms: int, agentic_video: bool = False) -> int:
     """Estimates tokens consumed by text prompts and video duration for rate limiting.
 
     Args:
         text_prompt: Combined system and user prompt.
         video_duration_ms: Video segment duration in milliseconds.
+        agentic_video: Whether agentic video understanding is enabled.
 
     Returns:
         int: Estimated token count.
     """
-    return int(len(text_prompt.system) + len(text_prompt.user) + (video_duration_ms / 1000) * 300)
+    prompt_tokens = len(text_prompt.system) + len(text_prompt.user)
+    if agentic_video:
+        # Agentic mode dynamically inspects the timeline, consuming ~10-15% of static frame tokens
+        video_tokens = int((video_duration_ms / 1000) * 35)
+    else:
+        video_tokens = int((video_duration_ms / 1000) * 300)
+    return prompt_tokens + video_tokens
 
 
 def _is_daily_quota_exceeded(e: Exception) -> bool:
@@ -187,7 +194,9 @@ class GeminiExecutor:
                             f"Files API storage threshold reached ({total_bytes / (1024**3):.2f} GB used). "
                             f"Cleaning down to {self.settings.ai.storage.target_gb} GB..."
                         )
-                        managed = [f for f in files if f.display_name and PART_PATTERN.match(Path(f.display_name).name)]
+                        managed = [
+                            f for f in files if f.display_name and MANAGED_PATTERN.match(Path(f.display_name).name)
+                        ]
                         managed.sort(key=_get_file_timestamp)
 
                         for f in managed:
@@ -363,6 +372,7 @@ class GeminiExecutor:
         service_tier: ServiceTier | None = None,
         tools: Sequence[Callable[..., Any] | types.Tool] | None = None,
         retry_policy: RetrySettings | None = None,
+        agentic_video: bool = False,
     ) -> T:
         """Uploads media and generates validated structured outputs with tool turns.
 
@@ -375,6 +385,7 @@ class GeminiExecutor:
             service_tier: Optional Gemini service tier.
             tools: Sequence of callable tools (bound provider methods) or types.Tool instances.
             retry_policy: Retry configuration policy (defaults to settings.retry if omitted).
+            agentic_video: Whether to enable Agentic Video Understanding (for whole-video summaries).
 
         Returns:
             T: Parsed and validated Pydantic model instance.
@@ -401,7 +412,19 @@ class GeminiExecutor:
         with logfire.span("Gemini {model_id}: {filename}", model_id=model_id, filename=media_path.name):
             remote_file = await self.ensure_file_uploaded(media_path)
             req_limiter, tok_limiter = self._get_limiters(model_id)
-            tokens = _calculate_tokens(prompt, video_duration_ms)
+            tokens = _calculate_tokens(prompt, video_duration_ms, agentic_video=agentic_video)
+
+            # Build media part: Agentic mode uses dynamic timeline inspection; default uses static frames
+            if agentic_video:
+                media_part: Any = types.Part(
+                    file_data=types.FileData(
+                        file_uri=remote_file.uri,
+                        mime_type=remote_file.mime_type,
+                    ),
+                    media_processing="AGENTIC",
+                )
+            else:
+                media_part = remote_file
 
             gemini_tools, dispatch_map = self._setup_tools(tools)
             config_kwargs: dict[str, Any] = {
@@ -431,7 +454,7 @@ class GeminiExecutor:
             max_turns = self.settings.ai.search.max_turns
 
             for attempt in range(policy.per_run + 1):
-                contents: list[Any] = [remote_file, prompt.user]
+                contents: list[Any] = [media_part, prompt.user]
                 search_turns = 0
                 accumulated_thoughts: list[str] = []
 
@@ -493,7 +516,19 @@ class GeminiExecutor:
                                     for cname, resp_data in call_results
                                 ]
 
-                                contents.append(candidate.content)
+                                # Sanitize model parts: Exclude internal server-side tool calls/responses
+                                # (e.g. agentic video MEDIA_PROCESSING) which trigger 400 errors when replayed
+                                raw_parts = (
+                                    candidate.content.parts if candidate.content and candidate.content.parts else []
+                                )
+                                clean_model_parts = [
+                                    part
+                                    for part in raw_parts
+                                    if getattr(part, "tool_call", None) is None
+                                    and getattr(part, "tool_response", None) is None
+                                ]
+
+                                contents.append(types.Content(role="model", parts=clean_model_parts))
                                 contents.append(types.Content(role="user", parts=response_parts))
                                 continue
 
@@ -504,6 +539,10 @@ class GeminiExecutor:
                                     if getattr(part, "thought", False):
                                         continue
                                     if getattr(part, "function_call", None) is not None:
+                                        continue
+                                    if getattr(part, "tool_call", None) is not None:
+                                        continue
+                                    if getattr(part, "tool_response", None) is not None:
                                         continue
                                     if part.text:
                                         text_parts.append(part.text)

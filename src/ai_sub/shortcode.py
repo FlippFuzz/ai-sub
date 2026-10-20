@@ -6,16 +6,17 @@ import re
 
 from ai_sub.jobs.lyrics_scene import LYRICS_PROMPT_VERSION
 from ai_sub.jobs.subtitles import SUBTITLES_PROMPT_VERSION
+from ai_sub.jobs.summary import SUMMARY_PROMPT_VERSION
 
 
 def generate_model_shortcode(model_name: str) -> str:
     """Generates an ultra-compact filename shortcode for a model identifier.
 
-    Transforms Gemini models into 'g<version><tier>[variant]' (e.g., 'g37f', 'g35l').
+    Transforms Gemini models into 'g<version><tier>[variant]' (e.g., 'g38f', 'g35l').
     Non-Gemini models are sanitized to safe kebab-case strings.
 
     Args:
-        model_name: Model identifier (e.g., 'google-gla:gemini-3.7-flash').
+        model_name: Model identifier (e.g., 'google-gla:gemini-3.8-flash').
 
     Returns:
         str: Sanitized shortcode string.
@@ -63,6 +64,23 @@ def generate_model_shortcode(model_name: str) -> str:
     return sanitized or "model"
 
 
+def generate_summary_shortcode(
+    model_name: str,
+    summary_prompt_version: int = SUMMARY_PROMPT_VERSION,
+) -> str:
+    """Combines model shortcode and 2-digit summary prompt version tag.
+
+    Args:
+        model_name: Model identifier string.
+        summary_prompt_version: Prompt version number. Defaults to SUMMARY_PROMPT_VERSION.
+
+    Returns:
+        str: Tag formatted as '<model_code>-<summary_v>' (e.g., 'g35l-01').
+    """
+    model_code = generate_model_shortcode(model_name)
+    return f"{model_code}-{summary_prompt_version:02d}"
+
+
 def generate_lyrics_shortcode(
     model_name: str,
     lyrics_prompt_version: int = LYRICS_PROMPT_VERSION,
@@ -74,7 +92,7 @@ def generate_lyrics_shortcode(
         lyrics_prompt_version: Prompt version number. Defaults to LYRICS_PROMPT_VERSION.
 
     Returns:
-        str: Tag formatted as '<model_code>-<lyrics_v>' (e.g., 'g35l-09').
+        str: Tag formatted as '<model_code>-<lyrics_v>' (e.g., 'g35l-10').
     """
     model_code = generate_model_shortcode(model_name)
     return f"{model_code}-{lyrics_prompt_version:02d}"
@@ -82,19 +100,21 @@ def generate_lyrics_shortcode(
 
 def generate_full_shortcode(
     model_name: str,
+    summary_prompt_version: int = SUMMARY_PROMPT_VERSION,
     lyrics_prompt_version: int = LYRICS_PROMPT_VERSION,
     subtitles_prompt_version: int = SUBTITLES_PROMPT_VERSION,
 ) -> str:
-    """Combines model shortcode with 4-digit prompt version suffix.
+    """Combines model shortcode with a 6-digit prompt version suffix.
 
     Args:
         model_name: Model identifier string.
+        summary_prompt_version: Summary prompt version number. Defaults to SUMMARY_PROMPT_VERSION.
         lyrics_prompt_version: Lyrics prompt version number. Defaults to LYRICS_PROMPT_VERSION.
         subtitles_prompt_version: Subtitle prompt version number. Defaults to SUBTITLES_PROMPT_VERSION.
 
     Returns:
-        str: Tag formatted as '<model_code>-<lyrics_v><sub_v>' (e.g., 'g37f-0918').
+        str: Tag formatted as '<model_code>-<summary_v><lyrics_v><sub_v>' (e.g., 'g38f-011019').
     """
     model_code = generate_model_shortcode(model_name)
-    suffix = f"-{lyrics_prompt_version:02d}{subtitles_prompt_version:02d}"
+    suffix = f"-{summary_prompt_version:02d}{lyrics_prompt_version:02d}{subtitles_prompt_version:02d}"
     return f"{model_code}{suffix}"

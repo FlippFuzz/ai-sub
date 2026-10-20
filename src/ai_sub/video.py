@@ -235,10 +235,10 @@ async def reencode_video(
     encoder: str,
     duration_tolerance_ms: int = 100,
 ) -> None:
-    """Compresses a video segment using low framerates and downscaled resolution.
+    """Compresses a video segment or full video using low framerates and downscaled resolution.
 
     Args:
-        input_path: Source video segment path.
+        input_path: Source video media path.
         output_path: Destination path for compressed output.
         fps: Target framerate.
         height: Target height resolution.
@@ -258,13 +258,19 @@ async def reencode_video(
             )
             effective_tolerance = duration_tolerance_ms + (int(1000 / fps) if fps < 1.0 else 0)
             if abs(input_duration - output_duration) < effective_tolerance and abs(fps - output_fps) < 0.01:
-                logfire.info(f"Reusing existing valid compressed segment: {output_path.name}")
+                logfire.info(f"Reusing existing valid compressed media: {output_path.name}")
                 return
         except Exception:
             pass
 
     static_ffmpeg.add_paths(weak=True)
     video_bytes_per_sec = bitrate_kb * 1024
+
+    # Container-aware audio encoding: .mov supports pcm_u8; .mp4 requires aac
+    if output_path.suffix.lower() == ".mp4":
+        audio_args = ["-c:a", "aac", "-b:a", "64k", "-ac", "1", "-ar", "16000"]
+    else:
+        audio_args = ["-c:a", "pcm_u8", "-ac", "1", "-ar", "16000"]
 
     cmd = [
         "ffmpeg",
@@ -283,12 +289,7 @@ async def reencode_video(
         str(video_bytes_per_sec * 8),
         "-bufsize",
         str(video_bytes_per_sec * 8 * 2),
-        "-c:a",
-        "pcm_u8",
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
+        *audio_args,
         str(output_path),
     ]
 
