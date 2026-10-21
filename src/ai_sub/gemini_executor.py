@@ -12,17 +12,18 @@ from pathlib import Path
 from time import time
 from typing import Any, Callable, TypeVar
 
-import httpx
 import json_repair
 import logfire
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
+from httpx import TimeoutException, TransportError
 from pydantic import BaseModel, ValidationError
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
 from ai_sub.config import RetrySettings, ServiceTier, Settings
 from ai_sub.jobs.base import Prompt
+from ai_sub.search.base import parse_retry_after
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -99,6 +100,78 @@ def _is_daily_quota_exceeded(e: Exception) -> bool:
     """
     err_str = str(e).lower()
     return "429" in err_str and "generaterequestsperdayperprojectpermodel-freetier" in err_str
+
+
+def _is_transient_api_error(e: APIError) -> bool:
+    """Checks whether an API error is transient and eligible for retry.
+
+    Args:
+        e: Caught APIError exception.
+
+    Returns:
+        bool: True if the API error is considered transient and safe to retry.
+    """
+    if _is_daily_quota_exceeded(e):
+        return False
+
+    code = getattr(e, "code", None)
+    if code is not None:
+        return code in (408, 429, 499, 500, 502, 503, 504)
+
+    err_str = str(e).lower()
+    transient_indicators = (
+        "408",
+        "429",
+        "499",
+        "500",
+        "502",
+        "503",
+        "504",
+        "unavailable",
+        "resource_exhausted",
+        "deadline_exceeded",
+        "internal",
+        "try again later",
+        "overloaded",
+    )
+    return any(indicator in err_str for indicator in transient_indicators)
+
+
+def _calculate_backoff(
+    e: Exception,
+    attempt: int,
+    policy: RetrySettings,
+) -> float:
+    """Calculates backoff delay in seconds respecting Retry-After headers and exponential policy.
+
+    Args:
+        e: Caught exception.
+        attempt: Zero-based retry attempt number.
+        policy: Configured retry policy settings.
+
+    Returns:
+        float: Computed backoff delay in seconds.
+    """
+    retry_after: float | None = None
+    if isinstance(e, APIError):
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            headers = getattr(resp, "headers", None)
+            if headers:
+                header_val = headers.get("retry-after") or headers.get("Retry-After")
+                if header_val:
+                    retry_after = parse_retry_after(str(header_val))
+
+    if retry_after is not None:
+        return min(
+            float(policy.max_wait_seconds),
+            max(float(policy.min_wait_seconds), retry_after) + random.uniform(0, 1),
+        )
+
+    return min(
+        float(policy.max_wait_seconds),
+        (policy.min_wait_seconds * (policy.multiplier**attempt)) + random.uniform(0, 1),
+    )
 
 
 class GeminiExecutor:
@@ -220,7 +293,12 @@ class GeminiExecutor:
             types.File: Active remote file handle from the Gemini Files API.
 
         Raises:
+            APIError: If an API error occurs during upload or retries are exhausted.
+            ConnectionError: If network connectivity fails and retries are exhausted.
             RuntimeError: If file processing fails on the server.
+            TimeoutError: If asynchronous operations time out and retries are exhausted.
+            TimeoutException: If HTTP transport times out and retries are exhausted.
+            TransportError: If transport connectivity fails and retries are exhausted.
         """
         with logfire.span("Gemini Files API: {filename}", filename=file_path.name, _level="debug"):
             await self._cleanup_storage_if_needed()
@@ -251,10 +329,35 @@ class GeminiExecutor:
 
             with logfire.span("Uploading file to Files API", _level="debug"):
                 logfire.debug(f"Uploading {file_path.name} to Gemini Files API...")
-                uploaded = await self._client.aio.files.upload(
-                    file=file_path,
-                    config=types.UploadFileConfig(display_name=display_name),
-                )
+                for upload_attempt in range(self.settings.retry.per_run + 1):
+                    try:
+                        uploaded = await self._client.aio.files.upload(
+                            file=file_path,
+                            config=types.UploadFileConfig(display_name=display_name),
+                        )
+                        break
+                    except APIError as e:
+                        if _is_daily_quota_exceeded(e):
+                            raise
+                        if _is_transient_api_error(e) and upload_attempt < self.settings.retry.per_run:
+                            backoff = _calculate_backoff(e, upload_attempt, self.settings.retry)
+                            logfire.info(
+                                f"Upload API error for {file_path.name} (attempt {upload_attempt + 1}). "
+                                f"Retrying in {backoff:.2f}s: {e}"
+                            )
+                            await asyncio.sleep(backoff)
+                            continue
+                        raise
+                    except (ConnectionError, asyncio.TimeoutError, TransportError, TimeoutException) as e:
+                        if upload_attempt < self.settings.retry.per_run:
+                            backoff = _calculate_backoff(e, upload_attempt, self.settings.retry)
+                            logfire.info(
+                                f"Upload network error for {file_path.name} (attempt {upload_attempt + 1}). "
+                                f"Retrying in {backoff:.2f}s: {e}"
+                            )
+                            await asyncio.sleep(backoff)
+                            continue
+                        raise
 
             poll_interval = self.settings.ai.storage.polling_interval_seconds
             await asyncio.sleep(poll_interval)
@@ -266,7 +369,16 @@ class GeminiExecutor:
 
                     await asyncio.sleep(poll_interval)
                     if uploaded.name:
-                        uploaded = await self._client.aio.files.get(name=uploaded.name)
+                        try:
+                            uploaded = await self._client.aio.files.get(name=uploaded.name)
+                        except APIError as e:
+                            if _is_transient_api_error(e):
+                                logfire.debug(f"Transient error polling file {uploaded.name}: {e}. Retrying...")
+                                continue
+                            raise
+                        except (ConnectionError, asyncio.TimeoutError, TransportError, TimeoutException) as e:
+                            logfire.debug(f"Network error polling file {uploaded.name}: {e}. Retrying...")
+                            continue
                     else:
                         raise RuntimeError(f"Could not retrieve file '{file_path.name}' status.")
 
@@ -357,6 +469,77 @@ class GeminiExecutor:
 
         return gemini_tools or None, dispatch_map
 
+    async def _generate_content_with_retry(
+        self,
+        model_id: str,
+        contents: list[Any],
+        config: types.GenerateContentConfig,
+        token_weight: int,
+        turn: int,
+        policy: RetrySettings,
+    ) -> types.GenerateContentResponse:
+        """Executes a content generation call with rate-limiting and transient error retries.
+
+        Args:
+            model_id: Target Gemini model identifier.
+            contents: Multi-turn prompt contents including conversation history.
+            config: Generation configuration settings.
+            token_weight: Token weight for rate limiter acquisition.
+            turn: Current multi-turn conversation turn index.
+            policy: Retry policy settings.
+
+        Returns:
+            types.GenerateContentResponse: Response returned by the Gemini API.
+
+        Raises:
+            APIError: If an unretryable API error occurs or retries are exhausted.
+            ConnectionError: If network connectivity fails and retries are exhausted.
+            QuotaExceededError: If daily project quota is exhausted.
+            RuntimeError: If retries are exhausted.
+            TimeoutError: If asynchronous operations time out and retries are exhausted.
+            TimeoutException: If HTTP transport times out and retries are exhausted.
+            TransportError: If transport connectivity fails and retries are exhausted.
+        """
+        req_limiter, tok_limiter = self._get_limiters(model_id)
+
+        for attempt in range(policy.per_run + 1):
+            await req_limiter.try_acquire_async("rpm")
+            await tok_limiter.try_acquire_async("tpm", weight=token_weight)
+
+            try:
+                return await self._client.aio.models.generate_content(
+                    model=model_id,
+                    contents=contents,
+                    config=config,
+                )
+            except APIError as e:
+                if _is_daily_quota_exceeded(e):
+                    self._quota_exhausted[model_id] = True
+                    logfire.warning(f"Daily quota exhausted for {model_id}.")
+                    raise QuotaExceededError(str(e)) from e
+
+                if _is_transient_api_error(e) and attempt < policy.per_run:
+                    backoff = _calculate_backoff(e, attempt, policy)
+                    logfire.info(
+                        f"API error in {model_id} (turn {turn}, attempt {attempt + 1}). Retrying in {backoff:.2f}s: {e}"
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
+
+            except (ConnectionError, asyncio.TimeoutError, TransportError, TimeoutException) as e:
+                if attempt < policy.per_run:
+                    backoff = _calculate_backoff(e, attempt, policy)
+                    logfire.info(
+                        f"Network error in {model_id} (turn {turn}, attempt {attempt + 1}). "
+                        f"Retrying in {backoff:.2f}s: {e}"
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
+
+        raise RuntimeError(f"Model generation failed for {model_id} at turn {turn} after {policy.per_run} retries.")
+
     async def run_structured(
         self,
         prompt: Prompt,
@@ -388,12 +571,8 @@ class GeminiExecutor:
         Raises:
             QuotaExceededError: If daily quota is exhausted for the model.
             RuntimeError: If media fails to process or retries are exhausted.
-            APIError: If an unretryable API error occurs or retries are exhausted.
             ValidationError: If model output validation fails and retries are exhausted.
             ValueError: If input arguments or model identifiers are invalid.
-            ConnectionError: If network connectivity fails and retries are exhausted.
-            TimeoutError: If asynchronous operations time out and retries are exhausted.
-            TransportError: If transport connectivity fails and retries are exhausted.
         """
         if not model_name.lower().startswith("google-gla:"):
             raise ValueError(f"Model identifier '{model_name}' must start with 'google-gla:'.")
@@ -406,7 +585,6 @@ class GeminiExecutor:
 
         with logfire.span("Gemini {model_id}: {filename}", model_id=model_id, filename=media_path.name):
             remote_file = await self.ensure_file_uploaded(media_path)
-            req_limiter, tok_limiter = self._get_limiters(model_id)
 
             # Estimate tokens and clamp to bucket capacity so full videos throttle without overflowing the limiter
             tokens = _calculate_tokens(prompt, video_duration_ms)
@@ -463,19 +641,19 @@ class GeminiExecutor:
                             turn=search_turns,
                             model_id=model_id,
                         ):
-                            await req_limiter.try_acquire_async("rpm")
-                            await tok_limiter.try_acquire_async("tpm", weight=token_weight)
-
                             active_config = config_final if search_turns >= max_turns else config
-                            response = await self._client.aio.models.generate_content(
-                                model=model_id,
+                            response = await self._generate_content_with_retry(
+                                model_id=model_id,
                                 contents=contents,
                                 config=active_config,
+                                token_weight=token_weight,
+                                turn=search_turns,
+                                policy=policy,
                             )
 
                             candidate = response.candidates[0] if response.candidates else None
                             if candidate is None:
-                                raise RuntimeError(f"No response candidate returned by {model_id}.")
+                                raise ValueError(f"No response candidate returned by {model_id}.")
 
                             # Accumulate reasoning traces from this turn
                             if candidate.content and candidate.content.parts:
@@ -572,25 +750,6 @@ class GeminiExecutor:
 
                             return output
 
-                except APIError as e:
-                    if _is_daily_quota_exceeded(e):
-                        self._quota_exhausted[model_id] = True
-                        logfire.warning(f"Daily quota exhausted for {model_id}.")
-                        raise QuotaExceededError(str(e)) from e
-
-                    is_retryable = e.code in (429, 500, 502, 503, 504) if e.code else True
-                    if is_retryable and attempt < policy.per_run:
-                        backoff = min(
-                            float(policy.max_wait_seconds),
-                            (policy.min_wait_seconds * (policy.multiplier**attempt)) + random.uniform(0, 1),
-                        )
-                        logfire.info(
-                            f"API error in {model_id} (attempt {attempt + 1}). Retrying in {backoff:.2f}s: {e}"
-                        )
-                        await asyncio.sleep(backoff)
-                        continue
-                    raise
-
                 except (ValidationError, ValueError) as e:
                     if attempt < policy.per_run:
                         backoff = min(
@@ -599,19 +758,6 @@ class GeminiExecutor:
                         )
                         logfire.warning(
                             f"Validation error in {model_id} (attempt {attempt + 1}). Retrying in {backoff:.2f}s: {e}"
-                        )
-                        await asyncio.sleep(backoff)
-                        continue
-                    raise
-
-                except (ConnectionError, asyncio.TimeoutError, httpx.TransportError) as e:
-                    if attempt < policy.per_run:
-                        backoff = min(
-                            float(policy.max_wait_seconds),
-                            (policy.min_wait_seconds * (policy.multiplier**attempt)) + random.uniform(0, 1),
-                        )
-                        logfire.info(
-                            f"Network error in {model_id} (attempt {attempt + 1}). Retrying in {backoff:.2f}s: {e}"
                         )
                         await asyncio.sleep(backoff)
                         continue
