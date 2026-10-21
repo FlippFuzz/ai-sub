@@ -30,24 +30,26 @@ from rich.progress import (
 from ai_sub.config import Settings
 from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError
 from ai_sub.jobs import (
-    LYRICS_PROMPT_VERSION,
+    MUSIC_REFINE_PROMPT_VERSION,
     SUBTITLES_PROMPT_VERSION,
     SUMMARY_PROMPT_VERSION,
-    LyricsSceneAiResponse,
-    LyricsSceneJob,
+    DetectedMusicalPerformance,
+    MusicRefineAiResponse,
+    MusicRefineJob,
     ReencodeJob,
     SubtitleAiResponse,
     SubtitleJob,
+    Subtitles,
     SummaryAiResponse,
     SummaryJob,
-    get_lyrics_scenes_prompt,
+    get_music_refine_prompt,
     get_subtitle_prompt,
     get_summary_prompt,
 )
 from ai_sub.search import LrclibSearchProvider, create_search_provider
 from ai_sub.shortcode import (
     generate_full_shortcode,
-    generate_lyrics_shortcode,
+    generate_music_refine_shortcode,
     generate_summary_shortcode,
 )
 from ai_sub.telemetry import get_app_version, setup_logging
@@ -82,25 +84,78 @@ class SegmentTask:
     stem: str
     media_path: Path
     offset_ms: int = 0
-    lyrics_response: LyricsSceneAiResponse | None = None
+    draft_subtitles: list[Subtitles] | None = None
+    detected_performances: list[DetectedMusicalPerformance] | None = None
     subtitles_complete: bool = False
+
+
+async def prefetch_lyrics(
+    performances: list[DetectedMusicalPerformance],
+    lrclib_provider: LrclibSearchProvider,
+    search_provider: Any | None,
+) -> str:
+    """Pre-fetches lyrics from LRCLIB and web search in Python to avoid burning LLM search turns.
+
+    Args:
+        performances: List of detected musical performances.
+        lrclib_provider: LRCLIB search provider instance.
+        search_provider: Optional web search provider instance.
+
+    Returns:
+        str: Formatted initial search results text block.
+    """
+    results_parts: list[str] = []
+
+    for perf in performances:
+        if not perf.title or not perf.title.strip():
+            continue
+
+        clean_title = perf.title.strip()
+        clean_artist = perf.artist.strip() if perf.artist else None
+        logfire.info(f"Pre-fetching lyrics for: '{clean_title}' by '{clean_artist or 'Unknown'}'")
+
+        try:
+            lrclib_results = await lrclib_provider.search_lrclib_lyrics_database(
+                track_title=clean_title,
+                artist_name=clean_artist,
+            )
+            if lrclib_results:
+                best = lrclib_results[0]
+                results_parts.append(
+                    f"Official Lyrics for '{best.get('track_name')}' by {best.get('artist_name')}:\n"
+                    f"{best.get('plain_lyrics')}"
+                )
+        except Exception as e:
+            logfire.warning(f"LRCLIB pre-fetch error for '{clean_title}': {e}")
+
+        if not results_parts and search_provider and hasattr(search_provider, "search_single"):
+            try:
+                query = f"{clean_title} {clean_artist or ''} lyrics 歌詞"
+                search_res = await search_provider.search_single(query.strip())
+                if search_res:
+                    snippets = "\n---\n".join(f"[{r.title}]: {r.content}" for r in search_res[:2])
+                    results_parts.append(f"Web Search Results for '{clean_title}':\n{snippets}")
+            except Exception as e:
+                logfire.debug(f"Web search pre-fetch error for '{clean_title}': {e}")
+
+    return "\n\n".join(results_parts)
 
 
 def stitch_subtitles(
     video_splits: list[tuple[Path, int]],
     settings: Settings,
     summary_shortcode: str,
-    lyrics_shortcode: str,
+    music_refine_shortcode: str,
     subtitles_shortcode: str,
     summary_available: bool,
 ) -> AiSubResult:
-    """Assembles individual segment subtitle files into the final merged SRT file.
+    """Assembles segment subtitles (refined or draft) into the final merged SRT file.
 
     Args:
         video_splits: Ordered list of segment paths and durations in milliseconds.
         settings: Application settings.
         summary_shortcode: Model shortcode used for summary state files.
-        lyrics_shortcode: Model shortcode used for lyrics state files.
+        music_refine_shortcode: Model shortcode used for refinement state files.
         subtitles_shortcode: Model shortcode used for subtitle state files.
         summary_available: True if Phase 1 global summary succeeded.
 
@@ -117,11 +172,21 @@ def stitch_subtitles(
         any_pending = False
 
         for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
-            job_path = settings.dir.tmp / f"{video_path.stem}.subtitles.{subtitles_shortcode}.yaml"
-            sub_job = SubtitleJob.load(job_path, settings.ai.validation_buffer_ms)
+            # Prefer refined job if music was detected and refined; otherwise use draft subtitle job
+            refine_job_path = settings.dir.tmp / f"{video_path.stem}.refine.{music_refine_shortcode}.yaml"
+            sub_job_path = settings.dir.tmp / f"{video_path.stem}.subtitles.{subtitles_shortcode}.yaml"
 
-            if sub_job and sub_job.response:
-                segment_subs = sub_job.response.get_ssafile()
+            refine_job = MusicRefineJob.load(refine_job_path, settings.ai.validation_buffer_ms)
+            sub_job = SubtitleJob.load(sub_job_path, settings.ai.validation_buffer_ms)
+
+            active_response = (
+                refine_job.response
+                if (refine_job and refine_job.response)
+                else (sub_job.response if (sub_job and sub_job.response) else None)
+            )
+
+            if active_response:
+                segment_subs = active_response.get_ssafile()
                 segment_subs.shift(ms=offset_ms)
                 all_subs += segment_subs
             else:
@@ -133,16 +198,18 @@ def stitch_subtitles(
                     )
                 )
                 complete = False
-                sub_attempts = sub_job.total_attempts if sub_job else 0
+                attempts = max(
+                    refine_job.total_attempts if refine_job else 0,
+                    sub_job.total_attempts if sub_job else 0,
+                )
 
-                if sub_attempts >= settings.retry.max_runs:
+                if attempts >= settings.retry.max_runs:
                     max_retries_exceeded = True
                 else:
                     any_pending = True
 
             offset_ms += video_duration_ms
 
-        # Exclude local filesystem paths (context_file, dir) to avoid leaking usernames or machine structures
         settings_dump = settings.model_dump(
             mode="json",
             exclude={
@@ -152,14 +219,13 @@ def stitch_subtitles(
                 "ai": {"key": True, "base_url": True, "search": {"key": True}},
             },
         )
-        # Preserve the resolved context string for reproducibility without path leakage
         settings_dump["context"] = settings.get_resolved_user_context()
 
         metadata = {
             "ai_sub_version": get_app_version(),
             "generated_at": datetime.now().isoformat(),
             "summary_prompt_version": SUMMARY_PROMPT_VERSION if summary_available else None,
-            "lyrics_prompt_version": LYRICS_PROMPT_VERSION,
+            "music_refine_prompt_version": MUSIC_REFINE_PROMPT_VERSION,
             "subtitles_prompt_version": SUBTITLES_PROMPT_VERSION,
             "complete": complete,
             "max_retries_exceeded": max_retries_exceeded,
@@ -185,7 +251,7 @@ def stitch_subtitles(
 
 
 async def run_pipeline(settings: Settings) -> AiSubResult:
-    """Executes the 3-phase video subtitle generation pipeline.
+    """Executes the optimized 2-pass video subtitle generation pipeline.
 
     Args:
         settings: Configured application settings.
@@ -207,9 +273,9 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
             logfire.info(f"Using encoder: {settings.reencode.encoder}")
 
         use_summary = settings.concurrency.summary > 0
-        use_lyrics = settings.concurrency.lyrics > 0
+        use_refine = settings.concurrency.music_refine > 0
         summary_shortcode = generate_summary_shortcode(settings.ai.model_summary)
-        lyrics_shortcode = generate_lyrics_shortcode(settings.ai.model_lyrics)
+        music_refine_shortcode = generate_music_refine_shortcode(settings.ai.model_music_refine)
         subtitles_shortcode = generate_full_shortcode(settings.ai.model_subtitles)
 
         reencode_dir = settings.dir.tmp / "reencoded"
@@ -218,16 +284,18 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
 
         async with AsyncExitStack() as stack:
             base_search_tools: list[Any] = []
-            if use_summary or use_lyrics:
+            search_provider: Any | None = None
+            if use_summary or use_refine:
                 search_provider, base_search_tools = create_search_provider(settings.ai.search)
                 if search_provider is not None and hasattr(search_provider, "__aenter__"):
                     await stack.enter_async_context(search_provider)
 
-            lyrics_search_tools: list[Any] = list(base_search_tools)
-            if use_lyrics:
-                lrclib_provider = LrclibSearchProvider(settings.ai.search)
-                await stack.enter_async_context(lrclib_provider)
-                lyrics_search_tools.extend(lrclib_provider.get_tools())
+            lrclib_provider = LrclibSearchProvider(settings.ai.search)
+            await stack.enter_async_context(lrclib_provider)
+
+            refine_search_tools: list[Any] = list(base_search_tools)
+            if use_refine:
+                refine_search_tools.extend(lrclib_provider.get_tools())
 
             executor = GeminiExecutor(settings)
 
@@ -246,7 +314,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
 
             with progress:
                 # ------------------------------------------------------------------
-                # Phase 1: Whole-Video Summary & Knowledge Base (Global Barrier)
+                # Phase 1: Macro Summary & Chapter Indexing
                 # ------------------------------------------------------------------
                 if use_summary:
                     summary_tid = progress.add_task("[yellow]Global Summary", total=1)
@@ -350,33 +418,49 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                     logfire.info(f"Skipping first {chunks_to_skip} chunks ({skipped_ms}ms) due to start offset.")
 
                 reencode_queue: asyncio.Queue[SegmentTask] = asyncio.Queue()
-                lyrics_queue: asyncio.Queue[SegmentTask] = asyncio.Queue()
                 subtitles_queue: asyncio.Queue[SegmentTask] = asyncio.Queue()
+                refine_queue: asyncio.Queue[SegmentTask] = asyncio.Queue()
 
                 reencode_tid: TaskID | None = (
                     progress.add_task("[cyan]Re-encoding", total=len(splits_to_process))
                     if settings.reencode.segment.enabled
                     else None
                 )
-                lyrics_tid: TaskID | None = (
-                    progress.add_task("[magenta]Lyrics & Scenes", total=len(splits_to_process)) if use_lyrics else None
+                subtitles_tid: TaskID = progress.add_task("[green]Subtitles (Pass A)", total=len(splits_to_process))
+                refine_tid: TaskID | None = (
+                    progress.add_task("[magenta]Music Refine (Pass B)", total=len(splits_to_process))
+                    if use_refine
+                    else None
                 )
-                subtitles_tid: TaskID = progress.add_task("[green]Subtitles", total=len(splits_to_process))
 
                 current_offset_ms = skipped_ms
                 for idx, (path, duration_ms) in enumerate(splits_to_process):
                     sub_file = settings.dir.tmp / f"{path.stem}.subtitles.{subtitles_shortcode}.yaml"
+                    refine_file = settings.dir.tmp / f"{path.stem}.refine.{music_refine_shortcode}.yaml"
+
+                    existing_refine = MusicRefineJob.load(refine_file, settings.ai.validation_buffer_ms)
                     existing_sub = SubtitleJob.load(sub_file, settings.ai.validation_buffer_ms)
 
                     task_offset_ms = current_offset_ms
                     current_offset_ms += duration_ms
 
-                    if existing_sub and existing_sub.response:
+                    # Check if already completed (either refined or draft when no music occurred)
+                    is_done = False
+                    if existing_refine and existing_refine.response:
+                        is_done = True
+                    elif (
+                        existing_sub
+                        and existing_sub.response
+                        and not existing_sub.response.detected_musical_performances
+                    ):  # noqa: E501
+                        is_done = True
+
+                    if is_done:
                         if reencode_tid is not None:
                             progress.update(reencode_tid, advance=1)
-                        if lyrics_tid is not None:
-                            progress.update(lyrics_tid, advance=1)
                         progress.update(subtitles_tid, advance=1)
+                        if refine_tid is not None:
+                            progress.update(refine_tid, advance=1)
                         continue
 
                     task = SegmentTask(
@@ -398,16 +482,13 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
 
                     if should_reencode:
                         await reencode_queue.put(task)
-                    elif use_lyrics:
-                        lyr_file = settings.dir.tmp / f"{path.stem}.lyrics.{lyrics_shortcode}.yaml"
-                        existing_lyr = LyricsSceneJob.load(lyr_file, settings.ai.validation_buffer_ms)
-                        if existing_lyr and existing_lyr.response:
-                            task.lyrics_response = existing_lyr.response
-                            if lyrics_tid is not None:
-                                progress.update(lyrics_tid, advance=1)
-                            await subtitles_queue.put(task)
-                        else:
-                            await lyrics_queue.put(task)
+                    elif existing_sub and existing_sub.response:
+                        # Pass A was already done, but needs Pass B
+                        task.draft_subtitles = existing_sub.response.subtitles
+                        task.detected_performances = existing_sub.response.detected_musical_performances
+                        progress.update(subtitles_tid, advance=1)
+                        if use_refine and task.detected_performances:
+                            await refine_queue.put(task)
                     else:
                         await subtitles_queue.put(task)
 
@@ -435,100 +516,21 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                             if reencode_tid is not None:
                                 progress.update(reencode_tid, advance=1)
 
-                            if use_lyrics:
-                                lyr_file = settings.dir.tmp / f"{task.stem}.lyrics.{lyrics_shortcode}.yaml"
-                                existing_lyr = LyricsSceneJob.load(lyr_file, settings.ai.validation_buffer_ms)
-                                if existing_lyr and existing_lyr.response:
-                                    task.lyrics_response = existing_lyr.response
-                                    if lyrics_tid is not None:
-                                        progress.update(lyrics_tid, advance=1)
-                                    await subtitles_queue.put(task)
-                                else:
-                                    await lyrics_queue.put(task)
-                            else:
-                                await subtitles_queue.put(task)
+                            await subtitles_queue.put(task)
                         except Exception as e:
                             logfire.warning(f"Re-encoding failed for {task.stem}: {e}. Falling back to raw segment.")
                             task.media_path = task.raw_path
                             if reencode_tid is not None:
                                 progress.update(reencode_tid, advance=1)
-                            if use_lyrics:
-                                lyr_file = settings.dir.tmp / f"{task.stem}.lyrics.{lyrics_shortcode}.yaml"
-                                existing_lyr = LyricsSceneJob.load(lyr_file, settings.ai.validation_buffer_ms)
-                                if existing_lyr and existing_lyr.response:
-                                    task.lyrics_response = existing_lyr.response
-                                    if lyrics_tid is not None:
-                                        progress.update(lyrics_tid, advance=1)
-                                    await subtitles_queue.put(task)
-                                else:
-                                    await lyrics_queue.put(task)
-                            else:
-                                await subtitles_queue.put(task)
-                        finally:
-                            reencode_queue.task_done()
-
-                async def _lyrics_worker() -> None:
-                    while True:
-                        task = await lyrics_queue.get()
-                        try:
-                            with logfire.span("Lyrics & Scenes: {segment}", segment=task.stem):
-                                lyr_file = settings.dir.tmp / f"{task.stem}.lyrics.{lyrics_shortcode}.yaml"
-                                job = LyricsSceneJob.load(lyr_file, settings.ai.validation_buffer_ms)
-                                if not job:
-                                    job = LyricsSceneJob(
-                                        name=task.stem,
-                                        video_duration_ms=task.duration_ms,
-                                        user_context=user_context,
-                                    )
-                                else:
-                                    job.user_context = user_context
-
-                                if job.response:
-                                    task.lyrics_response = job.response
-                                elif job.total_attempts < settings.retry.max_runs:
-                                    try:
-                                        prompt = get_lyrics_scenes_prompt(
-                                            user_context=user_context,
-                                            global_summary=summary_response,
-                                            segment_offset_ms=task.offset_ms,
-                                            segment_duration_ms=task.duration_ms,
-                                        )
-                                        res = await executor.run_structured(
-                                            prompt=prompt,
-                                            media_path=task.media_path,
-                                            video_duration_ms=task.duration_ms,
-                                            response_type=LyricsSceneAiResponse,
-                                            model_name=settings.ai.model_lyrics,
-                                            service_tier=settings.ai.service_tier_lyrics,
-                                            tools=lyrics_search_tools,
-                                            retry_policy=settings.retry,
-                                            agentic_video=False,
-                                        )
-                                        job.response = res
-                                        task.lyrics_response = res
-                                        job.total_attempts += 1
-                                    except QuotaExceededError:
-                                        logfire.warning(f"Quota exceeded during lyrics pass for {task.stem}.")
-                                    except Exception as e:
-                                        job.total_attempts += 1
-                                        logfire.exception(f"Lyrics job error for {task.stem}: {e}")
-                                    finally:
-                                        await asyncio.to_thread(job.save, lyr_file)
-                                else:
-                                    logfire.warning(f"Skipping lyrics for {task.stem}: max attempts reached.")
-
-                            if lyrics_tid is not None:
-                                progress.update(lyrics_tid, advance=1)
-
                             await subtitles_queue.put(task)
                         finally:
-                            lyrics_queue.task_done()
+                            reencode_queue.task_done()
 
                 async def _subtitles_worker() -> None:
                     while True:
                         task = await subtitles_queue.get()
                         try:
-                            with logfire.span("Subtitles: {segment}", segment=task.stem):
+                            with logfire.span("Subtitles (Pass A): {segment}", segment=task.stem):
                                 sub_file = settings.dir.tmp / f"{task.stem}.subtitles.{subtitles_shortcode}.yaml"
                                 job = SubtitleJob.load(sub_file, settings.ai.validation_buffer_ms)
                                 if not job:
@@ -545,7 +547,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                         prompt = get_subtitle_prompt(
                                             user_context=user_context,
                                             global_summary=summary_response,
-                                            scene_response=task.lyrics_response,
                                             segment_offset_ms=task.offset_ms,
                                             segment_duration_ms=task.duration_ms,
                                         )
@@ -562,6 +563,10 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                         )
                                         job.response = res
                                         job.total_attempts += 1
+                                        task.draft_subtitles = res.subtitles
+                                        task.detected_performances = res.detected_musical_performances
+
+                                        # Save draft SRT
                                         srt_path = settings.dir.tmp / f"{task.stem}.{subtitles_shortcode}.srt"
                                         await asyncio.to_thread(job.save_srt, srt_path)
                                     except QuotaExceededError:
@@ -571,29 +576,108 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                         logfire.exception(f"Subtitles job error for {task.stem}: {e}")
                                     finally:
                                         await asyncio.to_thread(job.save, sub_file)
+                                elif job.response:
+                                    task.draft_subtitles = job.response.subtitles
+                                    task.detected_performances = job.response.detected_musical_performances
                                 elif job.total_attempts >= settings.retry.max_runs:
                                     logfire.warning(f"Skipping subtitles for {task.stem}: max attempts reached.")
 
                             progress.update(subtitles_tid, advance=1)
+
+                            # Route to Pass B only if music was detected and refinement is enabled
+                            if use_refine and task.detected_performances:
+                                await refine_queue.put(task)
+                            elif refine_tid is not None:
+                                progress.update(refine_tid, advance=1)
                         finally:
                             subtitles_queue.task_done()
+
+                async def _refine_worker() -> None:
+                    while True:
+                        task = await refine_queue.get()
+                        try:
+                            with logfire.span("Music Refine (Pass B): {segment}", segment=task.stem):
+                                refine_file = settings.dir.tmp / f"{task.stem}.refine.{music_refine_shortcode}.yaml"
+                                job = MusicRefineJob.load(refine_file, settings.ai.validation_buffer_ms)
+                                if not job:
+                                    job = MusicRefineJob(
+                                        name=task.stem,
+                                        video_duration_ms=task.duration_ms,
+                                        user_context=user_context,
+                                    )
+                                else:
+                                    job.user_context = user_context
+
+                                if (
+                                    not job.response
+                                    and job.total_attempts < settings.retry.max_runs
+                                    and task.draft_subtitles
+                                    and task.detected_performances
+                                ):
+                                    try:
+                                        # Pre-fetch lyrics in Python before LLM call to save search turns
+                                        prefetched = await prefetch_lyrics(
+                                            performances=task.detected_performances,
+                                            lrclib_provider=lrclib_provider,
+                                            search_provider=search_provider,
+                                        )
+
+                                        prompt = get_music_refine_prompt(
+                                            draft_subtitles=task.draft_subtitles,
+                                            detected_performances=task.detected_performances,
+                                            initial_search_results=prefetched,
+                                            user_context=user_context,
+                                            global_summary=summary_response,
+                                            segment_offset_ms=task.offset_ms,
+                                            segment_duration_ms=task.duration_ms,
+                                        )
+
+                                        res = await executor.run_structured(
+                                            prompt=prompt,
+                                            media_path=task.media_path,
+                                            video_duration_ms=task.duration_ms,
+                                            response_type=MusicRefineAiResponse,
+                                            model_name=settings.ai.model_music_refine,
+                                            service_tier=settings.ai.service_tier_music_refine,
+                                            tools=refine_search_tools,
+                                            retry_policy=settings.retry,
+                                            agentic_video=True,
+                                        )
+                                        job.response = res
+                                        job.total_attempts += 1
+                                        srt_path = settings.dir.tmp / f"{task.stem}.{subtitles_shortcode}.srt"
+                                        await asyncio.to_thread(job.save_srt, srt_path)
+                                    except QuotaExceededError:
+                                        logfire.warning(f"Quota exceeded during refine pass for {task.stem}.")
+                                    except Exception as e:
+                                        job.total_attempts += 1
+                                        logfire.exception(f"Music refine job error for {task.stem}: {e}")
+                                    finally:
+                                        await asyncio.to_thread(job.save, refine_file)
+                                elif job.total_attempts >= settings.retry.max_runs:
+                                    logfire.warning(f"Skipping refine for {task.stem}: max attempts reached.")
+
+                            if refine_tid is not None:
+                                progress.update(refine_tid, advance=1)
+                        finally:
+                            refine_queue.task_done()
 
                 worker_tasks: list[asyncio.Task[Any]] = []
                 try:
                     if settings.reencode.segment.enabled:
                         for _ in range(settings.concurrency.re_encode):
                             worker_tasks.append(asyncio.create_task(_reencode_worker()))
-                    if use_lyrics:
-                        for _ in range(settings.concurrency.lyrics):
-                            worker_tasks.append(asyncio.create_task(_lyrics_worker()))
                     for _ in range(settings.concurrency.subtitles):
                         worker_tasks.append(asyncio.create_task(_subtitles_worker()))
+                    if use_refine:
+                        for _ in range(settings.concurrency.music_refine):
+                            worker_tasks.append(asyncio.create_task(_refine_worker()))
 
                     if settings.reencode.segment.enabled:
                         await reencode_queue.join()
-                    if use_lyrics:
-                        await lyrics_queue.join()
                     await subtitles_queue.join()
+                    if use_refine:
+                        await refine_queue.join()
                 finally:
                     for wt in worker_tasks:
                         wt.cancel()
@@ -604,7 +688,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
             video_splits=video_splits,
             settings=settings,
             summary_shortcode=summary_shortcode,
-            lyrics_shortcode=lyrics_shortcode,
+            music_refine_shortcode=music_refine_shortcode,
             subtitles_shortcode=subtitles_shortcode,
             summary_available=summary_response is not None,
         )

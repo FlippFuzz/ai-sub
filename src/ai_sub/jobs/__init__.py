@@ -9,16 +9,16 @@ from ai_sub.jobs.base import (
     serialize_prompt_context,
     validate_duration_bound,
 )
-from ai_sub.jobs.lyrics_scene import (
-    LYRICS_PROMPT_VERSION,
-    LyricsSceneAiResponse,
-    LyricsSceneJob,
-    Scene,
-    get_lyrics_scenes_prompt,
+from ai_sub.jobs.music_refine import (
+    MUSIC_REFINE_PROMPT_VERSION,
+    MusicRefineAiResponse,
+    MusicRefineJob,
+    get_music_refine_prompt,
 )
 from ai_sub.jobs.reencode import ReencodeJob
-from ai_sub.jobs.subtitles import (
+from ai_sub.jobs.subtitle import (
     SUBTITLES_PROMPT_VERSION,
+    DetectedMusicalPerformance,
     SubtitleAiResponse,
     SubtitleJob,
     Subtitles,
@@ -26,35 +26,35 @@ from ai_sub.jobs.subtitles import (
 )
 from ai_sub.jobs.summary import (
     SUMMARY_PROMPT_VERSION,
+    ChapterItem,
     EntityItem,
     GlossaryItem,
     SummaryAiResponse,
     SummaryJob,
-    TrackItem,
     get_summary_prompt,
 )
 
 __all__ = [
-    "LYRICS_PROMPT_VERSION",
+    "MUSIC_REFINE_PROMPT_VERSION",
     "SUBTITLES_PROMPT_VERSION",
     "SUMMARY_PROMPT_VERSION",
     "BaseJob",
+    "ChapterItem",
+    "DetectedMusicalPerformance",
     "EntityItem",
     "GlossaryItem",
-    "LyricsSceneAiResponse",
-    "LyricsSceneJob",
+    "MusicRefineAiResponse",
+    "MusicRefineJob",
     "Prompt",
     "ReencodeJob",
-    "Scene",
     "SubtitleAiResponse",
     "SubtitleJob",
     "Subtitles",
     "SummaryAiResponse",
     "SummaryJob",
-    "TrackItem",
     "clean_timestamp_string",
     "format_ms_timestamp",
-    "get_lyrics_scenes_prompt",
+    "get_music_refine_prompt",
     "get_subtitle_prompt",
     "get_summary_prompt",
     "parse_timestamp_string_ms",

@@ -3,82 +3,99 @@
 [![PyPI version](https://img.shields.io/pypi/v/ai-sub)](https://pypi.org/project/ai-sub)
 [![Downloads](https://img.shields.io/pypi/dw/ai-sub)](https://pypistats.org/packages/ai-sub)
 
+**AI Sub** is a tool that uses Google's Gemini AI to automatically transcribe and translate videos into audio-synchronized, bilingual English subtitles.
+
+It handles fast Japanese speech, livestream banter, video game terms, and live singing performances with high timing accuracy.
+
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [How It Works](#how-it-works)
+- [How It Works (In Simple Terms)](#how-it-works-in-simple-terms)
+- [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Usage](#usage)
+  - [Option 1: Recommended Setup (Gemini + Tinyfish)](#option-1-recommended-setup-gemini--tinyfish)
+  - [Option 2: Free Search Setup (DuckDuckGo)](#option-2-free-search-setup-duckduckgo)
+  - [Option 3: Providing Custom Notes & Lore](#option-3-providing-custom-notes--lore)
+  - [Option 4: Speed Mode (Skipping Steps)](#option-4-speed-mode-skipping-steps)
+- [Intermediate Files & Resuming](#intermediate-files--resuming)
 - [Configuration](#configuration)
-- [Intermediate Files & Re-processing](#intermediate-files--re-processing)
 
 ---
 
-## Overview
+## How It Works (In Simple Terms)
 
-**AI Sub** is a high-performance command-line tool that leverages Google's **Gemini** multimodal models to generate audio-synchronized, context-aware subtitles with English translations.
+AI Sub breaks down video subtitling into a clean, human-like workflow:
 
-It operates in **3 distinct phases**:
-
-1. **Global Video Intelligence:** Analyzes the full video using Gemini's **Agentic Video Understanding** to build an overarching character roster, tracklist, and domain glossary.
-2. **Segment Music & Scene Analysis:** Detects scenes per chunk, validates web-searched song lyrics against the audio waveform, identifies on-screen lyrics, and extracts only the lines performed in each segment.
-3. **Synchronized Subtitle Generation:** Transcribes speech synchronized to the millisecond using audio waveforms as absolute ground truth, translating natural English dialogue guided by the global context and user instructions.
+```
+[Your Video File]
+       │
+       ▼
+ 1. The Big Picture (Global Summary)
+    The AI takes a quick bird's-eye view of the entire video to learn who is in it,
+    what they are doing (chatting, gaming, singing), and any inside jokes or names.
+       │
+       ▼
+ 2. Divide into 5-Minute Chunks
+    Long videos are split into 5-minute pieces so processing is fast and manageable.
+       │
+       ▼
+ 3. Listen & Transcribe (Pass A)
+    The AI listens directly to the audio track down to the millisecond to catch
+    exactly when voices speak or sing. It also watches for on-screen signs or text,
+    writing dialogue and natural English translations.
+       │
+       ▼
+ 4. Music & Lyrics Polish (Pass B — Only when someone sings!)
+    - If the segment was just talking or gaming: This step is skipped completely!
+    - If someone sang a song: The AI looks up official lyrics in a music database
+      to make sure tricky song lyrics, puns, and song names are spelled and translated
+      perfectly without messing up the audio timing.
+       │
+       ▼
+ 5. Stitched Subtitle File (.srt)
+    All pieces are assembled into a single subtitle file ready to drag-and-drop into
+    VLC, MPV, or YouTube.
+```
 
 ---
 
-## How It Works
+## Prerequisites
 
-```
-[Input Video] + [Optional User Context]
-       │
-       ▼
- 1. Phase 1: Whole-Video Summary & Knowledge Base
-    (Agentic Video Understanding + Web Search for lore, cast, & tracklist)
-       │
-       ▼
- 2. Segmentation (Uniform 5-minute chunks via FFmpeg copy)
-       │
-       ▼
- 3. Optional Compression (1 FPS, 360p chunks to save upload bandwidth)
-       │
-       ▼
- 4. Phase 2: Lyrics & Scene Detection
-    (Identifies on-screen lyrics, searches web for singing without screen text,
-     validates candidate lyrics against audio chorus, extracts segment-only lines)
-       │
-       ▼
- 5. Phase 3: Subtitle Generation
-    (Audio ground-truth timestamps + context-aware translation via Gemini 3.8 Flash)
-       │
-       ▼
- 6. Assembly (Stitches segment subtitles into a unified SRT file)
-```
-
-1. **Phase 1 (Global Summary):** Re-encodes a lightweight whole-video proxy (if ≥ 300 MB) and uses Gemini Agentic Video Understanding to map the entire video without massive token overhead.
-2. **Segmentation:** Splits the input video into 5-minute chunks using stream copying (no re-encoding delay).
-3. **Segment Re-encoding (Optional):** Compresses segments (e.g., 1 FPS, 360p) if bandwidth conservation is desired.
-4. **Phase 2 (Lyrics & Scenes):** Maps scene bounds, flags whether lyrics are burnt into the video, retrieves missing lyrics via web search, checks candidate lyrics against audible phonetics, and returns only the lines performed in that segment.
-5. **Phase 3 (Subtitles):** Uses Google Gemini 3.8 Flash to align dialogue to the millisecond, resolving pronoun ambiguity and homophones using the Phase 1 glossary.
-6. **Assembly:** Stitches all segment subtitles together with offset compensation into `<video_name>.<model_shortcode>.srt`.
+- **Python 3.11** or higher installed on your computer.
+- A **Google Gemini API Key** ([Get one here from Google AI Studio](https://aistudio.google.com/)).
+- (Recommended) A **Tinyfish API Key** for fast, accurate web search and lyric lookups ([Get one here](https://tinyfish.ai/)).
 
 ---
 
 ## Installation
 
-**Prerequisites:** Python 3.11 or higher.
+### Linux & macOS
 
-1. **Create and activate a virtual environment:**
+1. Open your terminal and create a virtual environment:
 
    ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   python3 -m venv venv
+   source venv/bin/activate
    ```
 
-2. **Install AI Sub:**
-
+2. Install AI Sub:
    ```bash
+   pip install --upgrade ai-sub
+   ```
+
+### Windows
+
+1. Open **Command Prompt** or **PowerShell** and create a virtual environment:
+
+   ```powershell
+   python -m venv venv
+   .\venv\Scripts\activate
+   ```
+
+2. Install AI Sub:
+   ```powershell
    pip install --upgrade ai-sub
    ```
 
@@ -86,87 +103,110 @@ It operates in **3 distinct phases**:
 
 ## Usage
 
-### Option 1 (Recommended): Google API Key + Langsearch
+### Option 1: Recommended Setup (Gemini + Tinyfish)
 
-This configuration offers the highest search accuracy for music, character lore, and lyrics lookups:
+This configuration gives the best results for song lyrics, VTuber lore, video game jargon, and character names.
+
+#### On Linux / macOS:
 
 ```bash
-export GEMINI_API_KEY="YOUR_GOOGLE_GEMINI_KEY"
-export LANGSEARCH_API_KEY="YOUR_LANGSEARCH_KEY"
+export GEMINI_API_KEY="your_gemini_api_key_here"
+export TINYFISH_API_KEY="your_tinyfish_api_key_here"
 
-ai-sub \
-  --ai.search.tool=langsearch \
-  "path/to/video.mp4"
+ai-sub --ai.search.tool=tinyfish "path/to/video.mp4"
 ```
 
-### Option 2: DuckDuckGo (Free Search)
+#### On Windows (PowerShell):
 
-DuckDuckGo requires no additional API key:
+```powershell
+$env:GEMINI_API_KEY="your_gemini_api_key_here"
+$env:TINYFISH_API_KEY="your_tinyfish_api_key_here"
 
-```bash
-export GEMINI_API_KEY="YOUR_GOOGLE_GEMINI_KEY"
-
-ai-sub \
-  --ai.search.tool=duckduckgo \
-  "path/to/video.mp4"
+ai-sub --ai.search.tool=tinyfish "path\to\video.mp4"
 ```
 
-### Option 3: Providing User Background Context
+#### On Windows (Command Prompt):
 
-You can provide inline background context or point to a context file to guide speaker names, spelling, and translation tone:
+```cmd
+set GEMINI_API_KEY=your_gemini_api_key_here
+set TINYFISH_API_KEY=your_tinyfish_api_key_here
 
-```bash
-# Inline context
-ai-sub \
-  --context "Streamers are Fuwawa and Mococo (Fuwamoco). Translate 'bau bau' as untranslated catchphrase." \
-  "path/to/video.mp4"
-
-# Context from a text file
-ai-sub \
-  --context-file "path/to/notes.txt" \
-  "path/to/video.mp4"
+ai-sub --ai.search.tool=tinyfish "path\to\video.mp4"
 ```
 
-### Option 4: Skipping Summary or Lyrics Phases
+---
 
-To skip Phase 1 (Whole-video summary) or Phase 2 (Lyrics search) for fast pure-dialogue transcription:
+### Option 2: Free Search Setup (DuckDuckGo)
+
+If you do not have a Tinyfish key, you can use DuckDuckGo search for free with no extra API key:
+
+#### On Linux / macOS:
 
 ```bash
-# Skip Phase 1 (Global summary)
-ai-sub --concurrency.summary=0 "path/to/video.mp4"
+export GEMINI_API_KEY="your_gemini_api_key_here"
 
-# Skip Phase 2 (Lyrics & scene mapping)
-ai-sub --concurrency.lyrics=0 "path/to/video.mp4"
+ai-sub --ai.search.tool=duckduckgo "path/to/video.mp4"
+```
 
-# Dialogue transcription only (Skip both Phase 1 and Phase 2)
-ai-sub --concurrency.summary=0 --concurrency.lyrics=0 "path/to/video.mp4"
+#### On Windows (PowerShell):
+
+```powershell
+$env:GEMINI_API_KEY="your_gemini_api_key_here"
+
+ai-sub --ai.search.tool=duckduckgo "path\to\video.mp4"
+```
+
+---
+
+### Option 3: Providing Custom Notes & Lore
+
+You can feed custom notes to the AI (such as character names, spelling preferences, or specific terms) using `--context` or a text file:
+
+```bash
+# Inline notes
+ai-sub --context "The streamers are Fuwawa and Mococo. Keep 'Bau bau' untranslated." "video.mp4"
+
+# Notes from a text file
+ai-sub --context-file "notes.txt" "video.mp4"
+```
+
+---
+
+### Option 4: Speed Mode (Skipping Steps)
+
+If you are subtitling a pure talking/gaming stream with no singing, or if you want to skip the whole-video preview to save time:
+
+```bash
+# Skip the whole-video summary preview (Phase 1)
+ai-sub --concurrency.summary=0 "video.mp4"
+
+# Skip lyric searches and music refinement (Pass B)
+ai-sub --concurrency.music-refine=0 "video.mp4"
+
+# Fast dialogue-only mode (skip both preview and music refinement)
+ai-sub --concurrency.summary=0 --concurrency.music-refine=0 "video.mp4"
+```
+
+---
+
+## Intermediate Files & Resuming
+
+AI Sub automatically saves its work in a temporary folder (`tmp_<video_name>`).
+
+If your internet drops, your computer shuts down, or an API error occurs, **you do not lose your progress**. Simply run the exact same command again:
+
+- AI Sub will automatically pick up where it left off.
+- It will reuse all completed chunks and only finish the missing pieces.
+
+Once the process finishes, your final subtitle file is saved alongside your video:
+
+```
+my_video.mp4
+my_video.g38f-011019.srt  <-- Drag this into your video player!
 ```
 
 ---
 
 ## Configuration
 
-For a complete reference of all command-line arguments and environment variables, refer to [CONFIGURATION.md](docs/CONFIGURATION.md).
-
----
-
-## Intermediate Files & Re-processing
-
-Intermediate files and job states are stored in a temporary directory (default: `tmp_<video_stem>`).
-
-The application persists state for each stage in human-readable YAML files:
-
-- **Phase 1 (Global Summary):** `summary.<summary_shortcode>.yaml` (e.g., `summary.g35l-01.yaml`)
-- **Phase 2 (Lyrics & Scenes):** `part_XXX.lyrics.<lyrics_shortcode>.yaml` (e.g., `part_002.lyrics.g35l-10.yaml`)
-- **Phase 3 (Subtitles):** `part_XXX.subtitles.<subtitles_shortcode>.yaml` (e.g., `part_002.subtitles.g38f-011019.yaml`)
-
-### Re-running a Specific Stage or Segment
-
-The pipeline is fully resumable. To re-process a specific part:
-
-1. Open the `tmp_<video_stem>` directory.
-2. Delete the state YAML file you wish to re-run:
-   - To re-run Phase 1 for the whole video: delete `summary.*.yaml`.
-   - To re-run Phase 2 for chunk 2: delete `part_002.lyrics.*.yaml`.
-   - To re-run Phase 3 subtitles for chunk 2: delete `part_002.subtitles.*.yaml`.
-3. Re-run `ai-sub`. It will detect the missing YAML state file and execute only the invalidated tasks while reusing all existing intermediate files.
+For advanced settings (such as custom frame rates, custom models, rate limits, and storage cleanup rules), refer to [CONFIGURATION.md](docs/CONFIGURATION.md).

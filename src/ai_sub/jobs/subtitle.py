@@ -1,4 +1,4 @@
-"""Job definition, prompt templates, and schemas for Phase 3 audio-visual subtitle transcription."""
+"""Job definition, prompt templates, and schemas for Phase 2 Pass A audio-visual subtitle transcription."""
 
 from __future__ import annotations
 
@@ -36,83 +36,64 @@ SUBTITLES_PROMPT_VERSION = 19
 _SUBTITLES_SYSTEM_TEMPLATE = dedent(
     """
     <role>
-      You are an advanced AI expert in audio-visual translation and subtitling. Your specialty is generating audio-synchronized, contextually rich subtitles from multimodal inputs using native audio perception.
+      You generate audio-synchronized subtitles with context-aware English translations from multimodal video and audio inputs.
     </role>
 
-    <golden_rules>
-      <rule name="VOCAL EVENTS (The Audio Rule)">
-        The vocal audio waveform is your absolute ground truth for spoken dialogue. The exact millisecond a vocal cord activates dictates the 's' (start) timecode. NEVER output dialogue text if there is no vocal audio driving it.
-      </rule>
-      <rule name="VISUAL EVENTS (The On-Screen Text Exception)">
-        If prominent, relevant text (e.g. Chapter Titles, Location Signs, Letters) appears on screen, subtitle it for the duration it is clearly visible, even if there is no audio.
-      </rule>
-    </golden_rules>
+    <input_priority_and_modality_separation>
+      1. Primary Media:
+         - Audio Waveform (16kHz): The SOLE authority for vocal start ('s') and end ('e') timestamps. Video frames are sampled coarsely (1 FPS) and CANNOT determine millisecond audio timing.
+         - Video Frames: Used strictly for visual translation context (speaker identities, pronouns, physical actions) and determining the duration of on-screen text.
+      2. User Directives: Follow `<user_provided_context>` for participant names, pronouns, and translation style.
+      3. Background Context: Use `<global_video_summary>` to understand overarching stream lore, participants, and chapter progression.
+    </input_priority_and_modality_separation>
 
-    <decoding_hierarchy>
-      When transcribing spoken dialogue or singing, resolve the correct words using this strict priority hierarchy:
-      <step level="1" name="Audible Waveform & Burnt-in On-Screen Text">
-        Audible vocal phonetics and burnt-in subtitles/lyrics clearly visible on screen strictly override all external references.
-      </step>
-      <step level="2" name="User Context Directives">
-        If `<user_provided_context>` is provided, its instructions regarding character names, pronouns, and translation tone take immediate precedence over general assumptions.
-      </step>
-      <step level="3" name="Global Video Summary & Glossary">
-        If `<global_video_summary>` is provided, use its character roster, speaker identities, and domain glossary to resolve ambiguous nouns, jargon, and speaker attributions.
-      </step>
-      <step level="4" name="Auxiliary Scene & Lyrics Reference">
-        Use the provided `<scene_and_lyrics_reference_json>` block ONLY as an auxiliary spelling and alignment reference for songs.
-      </step>
-      <step level="5" name="The Manual Transcription Mandate">
-        If reference blocks are null, incomplete, or deviate from what is heard, YOU ARE NOT EXEMPT. You MUST manually transcribe and translate the remaining audible speech using native audio perception.
-      </step>
-    </decoding_hierarchy>
+    <subtitle_generation_pipeline>
+      Process the video chronologically. For each subtitle block, execute these three steps:
 
-    <grounding_instructions>
-      The `<scene_and_lyrics_reference_json>` block contains auxiliary reference lyrics scoped to this segment. It is NOT a rigid script.
-      <instruction name="AUDIO IS SUPREME">
-        If the performer stops singing to talk, if the background music goes silent, or if they sing different words, ad-libs, or parodies, IGNORE the reference lyrics and transcribe what is actually heard.
-      </instruction>
-      <instruction name="NO PRE-EMPTIVE PASTING">
-        Never blindly paste reference lyrics into silent gaps, instrumental sections, or during spoken chatter. Only output lines when the corresponding singing is audibly heard.
-      </instruction>
-      <instruction name="ZERO GHOST SUBTITLES">
-        Remain completely SILENT during pure instrumental music, background sound effects, or pauses. If no vocals are heard, output nothing (unless translating a prominent Visual Event).
-      </instruction>
-      <instruction name="TERMINOLOGY CONSISTENCY">
-        Maintain consistent spelling of proper nouns and character names throughout the segment in alignment with `<global_video_summary>` and `<user_provided_context>`.
-      </instruction>
-    </grounding_instructions>
+      STEP 1: DETECT AND TIME (AUDIO TIMELINE)
+      Identify the exact start ('s') and end ('e') timecodes:
+      - Spoken & Sung Dialogue:
+        * The audio waveform is your absolute ground truth for dialogue timing. Set 's' to the exact millisecond human vocal cords begin producing sound in the audio track.
+        * Set 'e' to when that vocal phrase audibly finishes.
+        * Instrumental Gaps: Music fanfares, intros, drum grooves, and guitar solos contain no speech or singing. Never default 's' to the previous line's 'e'; advance the timeline to when the next vocal phrase actually begins in the audio.
+      - On-Screen Text Events:
+        * If prominent narrative text appears on screen (signs, title cards, letters, chat messages) and is NOT read aloud, set 's' and 'e' to the visual duration it is displayed on screen.
+        * If a speaker reads on-screen text aloud, subtitle the spoken audio only.
 
-    <timecode_rules>
-      Prevent cascading delays with these mechanical rules:
-      <rule name="The Sacred Start Timecode">
-        The 's' (start) timecode is immutable. It MUST trigger the exact millisecond speech begins in the audio track. Never delay a start timecode to accommodate a previous subtitle block.
-      </rule>
-      <rule name="Truncation Over Extension">
-        If Line 1 is spoken and Line 2 begins immediately after, Line 1's 'e' (end) timecode MUST be aggressively truncated to make room for Line 2's 's' timecode.
-      </rule>
-      <rule name="Instantaneous Transitions">
-        In rapid speech with no breaths between lines, Line 1's 'e' MUST EXACTLY EQUAL Line 2's 's' (e.g. Line 1 'e': 01:05.500 -> Line 2 's': 01:05.500).
-      </rule>
-      <rule name="Timecode Format">
-        MUST strictly adhere to MM:SS.mmm (e.g. 01:05.300). Always pad with zeros.
-      </rule>
-    </timecode_rules>
+      STEP 2: TRANSCRIBE ORIGINAL ('og')
+      Transcribe the original language text for that interval:
+      - Dialogue & Ad-libs: Transcribe all spoken words, live stage banter, and crowd interactions as heard.
+      - Sung Vocals: Transcribe the phonetics and words actually sung by the performers.
+      - Tagged Visual Text: Wrap unread on-screen text in matching tags: `[Sign: <text>]`, `[Title: <text>]`, or `[Text: <text>]`.
 
-    <segmentation_and_translation>
-      <max_length>
-        Limit each subtitle block to 50 characters per line. Group phrases logically by natural speech cadence.
-      </max_length>
-      <context_aware_translation>
-        Ensure semantic continuity. If a sentence spans multiple blocks, ensure English grammar flows naturally (e.g. using ellipses "..."). Leverage global and user context to determine correct pronouns, verb tenses, and formal/informal tone.
-      </context_aware_translation>
-      <visual_text_rules>
-        Translate prominent, narrative-relevant visual text. If visual text appears simultaneously with spoken dialogue, prioritize translating the spoken dialogue.
-      </visual_text_rules>
-      <no_cc_tags>
-        Transcribe speech/vocals only. NO closed captioning tags like [applause], (sighs), or ♪.
-      </no_cc_tags>
-    </segmentation_and_translation>
+      STEP 3: TRANSLATE TO ENGLISH ('en')
+      Translate the transcribed block into natural, context-aware English:
+      - Use visual context from video frames (who is on screen, who they address, visual expressions) and `<global_video_summary>` to resolve ambiguous pronouns and formal/informal tone.
+      - Maintain narrative continuity across line breaks, using ellipses "..." where a thought carries over.
+      - For tagged visual text, retain the identical tag in English (e.g. og: `[Sign: 立ち入り禁止]`, en: `[Sign: Keep Out]`).
+    </subtitle_generation_pipeline>
+
+    <musical_performance_detection>
+      In the `detected_musical_performances` field, list all vocal musical performances or singing detected in this segment:
+      - Record the song title and artist if displayed on screen, announced, or recognizable; otherwise set them to null.
+      - Record approximate start and end timestamps.
+      - If NO singing or vocal music occurs in this segment (e.g. pure gaming, talk, or background BGM only), leave `detected_musical_performances` empty ([]).
+    </musical_performance_detection>
+
+    <timing_and_formatting>
+      <rule name="CONCURRENCY">
+        Overlapping timecodes are permitted when multiple participants speak at once, when vocals harmonize, or when visual text appears while someone is speaking.
+        For an individual speaker, timecodes must advance forward without self-overlapping.
+      </rule>
+
+      <rule name="NO AMBIENT SOUND TAGS">
+        Subtitle spoken dialogue, sung lyrics, and tagged visual text only. Do not add sound-effect descriptions or musical symbols (such as [applause], (laughs), or ♪).
+      </rule>
+
+      <rule name="TIMECODE FORMAT">
+        Strictly MM:SS.mmm format padded with zeros (e.g. 01:23.450).
+      </rule>
+    </timing_and_formatting>
     """  # noqa: E501
 ).strip()
 
@@ -120,16 +101,14 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
 def get_subtitle_prompt(
     user_context: str | None = None,
     global_summary: Any | None = None,
-    scene_response: Any | None = None,
     segment_offset_ms: int = 0,
     segment_duration_ms: int = 0,
 ) -> Prompt:
-    """Generates the prompt for Phase 3 subtitle generation and audio-visual alignment.
+    """Generates the prompt for Phase 2 Pass A subtitle generation.
 
     Args:
         user_context: Optional background text or directives supplied by the user.
         global_summary: Optional Phase 1 global summary schema or dictionary.
-        scene_response: Optional Phase 2 scene and lyrics response schema or dictionary.
         segment_offset_ms: Absolute start time offset of this segment in milliseconds.
         segment_duration_ms: Duration of this segment in milliseconds.
 
@@ -138,7 +117,7 @@ def get_subtitle_prompt(
     """
     parts = [
         "<task>",
-        "  Generate precise, audio-synchronized subtitles for the provided video segment based on the system instructions.",  # noqa: E501
+        "  Generate precise, audio-synchronized subtitles and identify any musical performances for the provided video segment.",  # noqa: E501
         "</task>",
     ]
     if segment_duration_ms > 0:
@@ -171,16 +150,39 @@ def get_subtitle_prompt(
                 "</global_video_summary>",
             ]
         )
-    if scene_response:
-        scene_json = serialize_prompt_context(scene_response)
-        parts.extend(
-            [
-                "<scene_and_lyrics_reference_json>",
-                f"  {scene_json}",
-                "</scene_and_lyrics_reference_json>",
-            ]
-        )
     return Prompt(system=_SUBTITLES_SYSTEM_TEMPLATE, user="\n".join(parts))
+
+
+class DetectedMusicalPerformance(BaseModel):
+    """Represents an identified singing or musical performance detected in the segment."""
+
+    title: str | None = Field(
+        default=None,
+        description="Song title if identified on screen, announced, or recognized; otherwise null.",
+    )
+    artist: str | None = Field(
+        default=None,
+        description="Original artist or composer if known; otherwise null.",
+    )
+    start: str = Field(description="Approximate start timecode within this segment (e.g. '00:15').")
+    end: str = Field(description="Approximate end timecode within this segment (e.g. '03:45').")
+
+    @model_validator(mode="before")
+    @classmethod
+    def clean_leakage(cls, data: Any) -> Any:
+        """Cleans LLM structural leakage from timecodes.
+
+        Args:
+            data: Raw input dictionary.
+
+        Returns:
+            Any: Cleaned input dictionary.
+        """
+        if isinstance(data, dict):
+            for key in ("start", "end"):
+                if key in data and isinstance(data[key], str):
+                    data[key] = clean_timestamp_string(data[key])
+        return data
 
 
 class Subtitles(BaseModel):
@@ -190,8 +192,8 @@ class Subtitles(BaseModel):
 
     start: str = Field(alias="s", description="Start timecode in 'MM:SS.mmm' format.")
     end: str = Field(alias="e", description="End timecode in 'MM:SS.mmm' format.")
-    original: str = Field(alias="og", description="Transcription in original spoken language.")
-    english: str = Field(alias="en", description="Context-aware natural English translation.")
+    original: str = Field(alias="og", description="Transcription in original spoken language or tagged visual text.")
+    english: str = Field(alias="en", description="Context-aware natural English translation with matching visual tag.")
 
     @model_validator(mode="before")
     @classmethod
@@ -231,10 +233,14 @@ class Subtitles(BaseModel):
 
 
 class SubtitleAiResponse(BaseModel):
-    """Structured response schema returned by the model for subtitle generation."""
+    """Structured response schema returned by the model for Pass A subtitle generation."""
 
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
+    detected_musical_performances: list[DetectedMusicalPerformance] = Field(
+        default_factory=list,
+        description="Chronological list of detected vocal musical performances or songs. Empty if none.",
+    )
     subtitles: list[Subtitles] = Field(
         alias="subs",
         description="Chronological synchronized subtitle events.",
