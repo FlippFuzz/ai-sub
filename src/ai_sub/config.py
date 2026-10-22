@@ -166,18 +166,18 @@ class AiSettings(BaseSettings):
     )
     model: str | None = Field(
         default=None,
-        description="Shorthand setting model_subtitles, model_music_refine, and model_summary to the same identifier.",
+        description="Shorthand setting model_subtitles, model_lyrics, and model_summary to the same identifier.",
     )
     model_summary: str = Field(
-        description="AI model for whole-video summary, entity extraction, and chapter indexing (Phase 1).",
+        description="AI model for whole-video summary, entity extraction, and chapter indexing.",
         default="google-gla:gemini-3.5-flash-lite",
     )
     model_subtitles: str = Field(
-        description="AI model for Pass A audio-visual subtitle transcription and alignment.",
+        description="AI model for audio-visual subtitle transcription and alignment.",
         default="google-gla:gemini-3.8-flash",
     )
-    model_music_refine: str = Field(
-        description="AI model for Pass B musical subtitle refinement with agentic video inspection.",
+    model_lyrics: str = Field(
+        description="AI model for musical lyrics search and refinement with agentic video inspection.",
         default="google-gla:gemini-3.5-flash-lite",
     )
     service_tier: ServiceTier | None = Field(
@@ -186,15 +186,15 @@ class AiSettings(BaseSettings):
     )
     service_tier_summary: ServiceTier | None = Field(
         default=None,
-        description="Google Gemini service tier for whole-video summary (Phase 1).",
+        description="Google Gemini service tier for whole-video summary.",
     )
     service_tier_subtitles: ServiceTier | None = Field(
         default=None,
-        description="Google Gemini service tier for subtitle generation (Pass A).",
+        description="Google Gemini service tier for subtitle generation.",
     )
-    service_tier_music_refine: ServiceTier | None = Field(
+    service_tier_lyrics: ServiceTier | None = Field(
         default=None,
-        description="Google Gemini service tier for music refinement (Pass B).",
+        description="Google Gemini service tier for lyrics refinement.",
     )
     rpm: PositiveInt = Field(
         description="Maximum Requests Per Minute (RPM) allowed for the model.",
@@ -245,12 +245,12 @@ class AiSettings(BaseSettings):
         """
         if self.model:
             self.model_summary = self.model
-            self.model_music_refine = self.model
+            self.model_lyrics = self.model
             self.model_subtitles = self.model
 
         for field_name, model_val in (
             ("model_summary", self.model_summary),
-            ("model_music_refine", self.model_music_refine),
+            ("model_lyrics", self.model_lyrics),
             ("model_subtitles", self.model_subtitles),
         ):
             if not model_val.lower().startswith("google-gla:"):
@@ -261,14 +261,14 @@ class AiSettings(BaseSettings):
 
         if self.service_tier is not None:
             self.service_tier_summary = self.service_tier
-            self.service_tier_music_refine = self.service_tier
+            self.service_tier_lyrics = self.service_tier
             self.service_tier_subtitles = self.service_tier
 
         return self
 
 
 class SummaryReEncodeSettings(BaseSettings):
-    """Re-encoding configuration for the whole-video summary proxy (Phase 1)."""
+    """Re-encoding configuration for the whole-video summary proxy."""
 
     model_config = {
         "env_prefix": "AISUB_REENCODE_SUMMARY_",
@@ -302,7 +302,7 @@ class SummaryReEncodeSettings(BaseSettings):
 
 
 class SegmentReEncodeSettings(BaseSettings):
-    """Re-encoding configuration for individual video chunk segments (Passes A & B)."""
+    """Re-encoding configuration for individual video chunk segments."""
 
     model_config = {
         "env_prefix": "AISUB_REENCODE_SEGMENT_",
@@ -348,11 +348,11 @@ class ReEncodeSettings(BaseSettings):
         description="Specific H.264 encoder to use (e.g., 'h264_nvenc', 'libx264'). Auto-detected if null.",
     )
     summary: SummaryReEncodeSettings = Field(
-        description="Re-encoding rules for the whole-video summary proxy (Phase 1).",
+        description="Re-encoding rules for the whole-video summary proxy.",
         default_factory=SummaryReEncodeSettings,
     )
     segment: SegmentReEncodeSettings = Field(
-        description="Re-encoding rules for individual video chunk segments (Passes A & B).",
+        description="Re-encoding rules for individual video chunk segments.",
         default_factory=SegmentReEncodeSettings,
     )
 
@@ -392,15 +392,15 @@ class ConcurrencySettings(BaseSettings):
         default=2,
     )
     summary: NonNegativeInt = Field(
-        description="Number of concurrent summary tasks (Phase 1). Set to 0 to skip this stage.",
+        description="Number of concurrent summary tasks. Set to 0 to skip whole-video summary.",
         default=1,
     )
     subtitles: PositiveInt = Field(
-        description="Number of concurrent subtitle generation tasks (Pass A).",
+        description="Number of concurrent subtitle generation tasks.",
         default=4,
     )
-    music_refine: NonNegativeInt = Field(
-        description="Number of concurrent music refinement tasks (Pass B). Set to 0 to skip refinement.",
+    lyrics: NonNegativeInt = Field(
+        description="Number of concurrent lyrics refinement tasks. Set to 0 to skip lyrics lookup.",
         default=4,
     )
 
@@ -570,7 +570,7 @@ class Settings(BaseSettings):
                 "or the GEMINI_API_KEY / GOOGLE_API_KEY environment variables."
             )
 
-        if self.concurrency.summary > 0 or self.concurrency.music_refine > 0:
+        if self.concurrency.summary > 0 or self.concurrency.lyrics > 0:
             tool = self.ai.search.tool
             if tool in ("ollama", "langsearch", "tinyfish") and self.ai.search.key is None:
                 raise ValueError(

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import re
 
-from ai_sub.jobs.music_refine import MUSIC_REFINE_PROMPT_VERSION
-from ai_sub.jobs.subtitle import SUBTITLES_PROMPT_VERSION
+from ai_sub.jobs.lyrics import LYRICS_PROMPT_VERSION
+from ai_sub.jobs.subtitles import SUBTITLES_PROMPT_VERSION
 from ai_sub.jobs.summary import SUMMARY_PROMPT_VERSION
 
 
@@ -81,40 +81,57 @@ def generate_summary_shortcode(
     return f"{model_code}-{summary_prompt_version:02d}"
 
 
-def generate_music_refine_shortcode(
+def generate_subtitles_shortcode(
     model_name: str,
-    music_refine_prompt_version: int = MUSIC_REFINE_PROMPT_VERSION,
+    subtitles_prompt_version: int = SUBTITLES_PROMPT_VERSION,
 ) -> str:
-    """Combines model shortcode and 2-digit music refinement prompt version tag.
+    """Combines model shortcode and 2-digit subtitles prompt version tag.
 
     Args:
         model_name: Model identifier string.
-        music_refine_prompt_version: Prompt version number. Defaults to MUSIC_REFINE_PROMPT_VERSION.
+        subtitles_prompt_version: Prompt version number. Defaults to SUBTITLES_PROMPT_VERSION.
 
     Returns:
-        str: Tag formatted as '<model_code>-<refine_v>' (e.g., 'g35l-10').
+        str: Tag formatted as '<model_code>-<subtitles_v>' (e.g., 'g38f-19').
     """
     model_code = generate_model_shortcode(model_name)
-    return f"{model_code}-{music_refine_prompt_version:02d}"
+    return f"{model_code}-{subtitles_prompt_version:02d}"
+
+
+def generate_lyrics_shortcode(
+    model_name: str,
+    lyrics_prompt_version: int = LYRICS_PROMPT_VERSION,
+) -> str:
+    """Combines model shortcode and 2-digit lyrics prompt version tag.
+
+    Args:
+        model_name: Model identifier string.
+        lyrics_prompt_version: Prompt version number. Defaults to LYRICS_PROMPT_VERSION.
+
+    Returns:
+        str: Tag formatted as '<model_code>-<lyrics_v>' (e.g., 'g35l-10').
+    """
+    model_code = generate_model_shortcode(model_name)
+    return f"{model_code}-{lyrics_prompt_version:02d}"
 
 
 def generate_full_shortcode(
     model_name: str,
     summary_prompt_version: int = SUMMARY_PROMPT_VERSION,
-    music_refine_prompt_version: int = MUSIC_REFINE_PROMPT_VERSION,
+    lyrics_prompt_version: int = LYRICS_PROMPT_VERSION,
     subtitles_prompt_version: int = SUBTITLES_PROMPT_VERSION,
 ) -> str:
-    """Combines model shortcode with a 6-digit prompt version suffix.
+    """Combines model shortcode with a composite 6-digit prompt version suffix for final output.
 
     Args:
         model_name: Model identifier string.
         summary_prompt_version: Summary prompt version number. Defaults to SUMMARY_PROMPT_VERSION.
-        music_refine_prompt_version: Refinement prompt version number. Defaults to MUSIC_REFINE_PROMPT_VERSION.
+        lyrics_prompt_version: Lyrics prompt version number. Defaults to LYRICS_PROMPT_VERSION.
         subtitles_prompt_version: Subtitle prompt version number. Defaults to SUBTITLES_PROMPT_VERSION.
 
     Returns:
-        str: Tag formatted as '<model_code>-<summary_v><refine_v><sub_v>' (e.g., 'g38f-011019').
+        str: Tag formatted as '<model_code>-<summary_v><lyrics_v><sub_v>' (e.g., 'g38f-011019').
     """
     model_code = generate_model_shortcode(model_name)
-    suffix = f"-{summary_prompt_version:02d}{music_refine_prompt_version:02d}{subtitles_prompt_version:02d}"
+    suffix = f"-{summary_prompt_version:02d}{lyrics_prompt_version:02d}{subtitles_prompt_version:02d}"
     return f"{model_code}{suffix}"

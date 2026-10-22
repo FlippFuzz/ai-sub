@@ -28,11 +28,11 @@ It handles fast Japanese speech, livestream banter, video game terms, and live s
 
 AI Sub breaks down video subtitling into a clean, human-like workflow:
 
-```
+```text
 [Your Video File]
        │
        ▼
- 1. The Big Picture (Global Summary)
+ 1. The Big Picture (Summary)
     The AI takes a quick bird's-eye view of the entire video to learn who is in it,
     what they are doing (chatting, gaming, singing), and any inside jokes or names.
        │
@@ -41,13 +41,13 @@ AI Sub breaks down video subtitling into a clean, human-like workflow:
     Long videos are split into 5-minute pieces so processing is fast and manageable.
        │
        ▼
- 3. Listen & Transcribe (Pass A)
+ 3. Listen & Transcribe (Subtitles)
     The AI listens directly to the audio track down to the millisecond to catch
     exactly when voices speak or sing. It also watches for on-screen signs or text,
     writing dialogue and natural English translations.
        │
        ▼
- 4. Music & Lyrics Polish (Pass B — Only when someone sings!)
+ 4. Music & Lyrics Polish (Lyrics — Only when someone sings!)
     - If the segment was just talking or gaming: This step is skipped completely!
     - If someone sang a song: The AI looks up official lyrics in a music database
       to make sure tricky song lyrics, puns, and song names are spelled and translated
@@ -177,14 +177,14 @@ ai-sub --context-file "notes.txt" "video.mp4"
 If you are subtitling a pure talking/gaming stream with no singing, or if you want to skip the whole-video preview to save time:
 
 ```bash
-# Skip the whole-video summary preview (Phase 1)
+# Skip the whole-video summary preview
 ai-sub --concurrency.summary=0 "video.mp4"
 
-# Skip lyric searches and music refinement (Pass B)
-ai-sub --concurrency.music-refine=0 "video.mp4"
+# Skip lyric searches and music refinement
+ai-sub --concurrency.lyrics=0 "video.mp4"
 
-# Fast dialogue-only mode (skip both preview and music refinement)
-ai-sub --concurrency.summary=0 --concurrency.music-refine=0 "video.mp4"
+# Fast dialogue-only mode (skip both preview and lyrics refinement)
+ai-sub --concurrency.summary=0 --concurrency.lyrics=0 "video.mp4"
 ```
 
 ---
@@ -198,9 +198,18 @@ If your internet drops, your computer shuts down, or an API error occurs, **you 
 - AI Sub will automatically pick up where it left off.
 - It will reuse all completed chunks and only finish the missing pieces.
 
-Once the process finishes, your final subtitle file is saved alongside your video:
+### Comparing Intermediate Subtitles in VLC
 
-```
+Inside the temporary directory (`tmp_<video_name>`), AI Sub generates standalone subtitle files for each video part:
+
+- `part_000.subtitles.g38f-19.srt`: Initial dialogue transcription and timing.
+- `part_000.lyrics.g35l-10.srt`: Song lyrics and translation refinement (generated when singing occurs).
+
+You can open these directly alongside the chunk in media players like VLC to compare before/after lyric lookup.
+
+Once the entire process finishes, the final stitched subtitle file is saved alongside your video with full provenance tracking:
+
+```text
 my_video.mp4
 my_video.g38f-011019.srt  <-- Drag this into your video player!
 ```

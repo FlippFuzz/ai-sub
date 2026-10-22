@@ -26,13 +26,13 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | `--ai.key <key>`                     | `AISUB_AI_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Google Gemini API key.                                                                    | _None_                             |
 | `--ai.base-url <url>`                | `AISUB_AI_BASE_URL`                                  | Optional base URL or proxy for Google Gemini API calls.                                   | _None_                             |
 | `--ai.model <model>`                 | `AISUB_AI_MODEL`                                     | Shorthand setting `model_summary`, `model_lyrics`, and `model_subtitles` at once.         | _None_                             |
-| `--ai.model-summary <model>`         | `AISUB_AI_MODEL_SUMMARY`                             | Gemini model for Phase 1 whole-video summary and entity indexing.                         | `google-gla:gemini-3.5-flash-lite` |
-| `--ai.model-lyrics <model>`          | `AISUB_AI_MODEL_LYRICS`                              | Gemini model for Phase 2 segment scene detection and song lyrics search.                  | `google-gla:gemini-3.5-flash-lite` |
-| `--ai.model-subtitles <model>`       | `AISUB_AI_MODEL_SUBTITLES`                           | Gemini model for Phase 3 subtitle generation and alignment.                               | `google-gla:gemini-3.8-flash`      |
+| `--ai.model-summary <model>`         | `AISUB_AI_MODEL_SUMMARY`                             | Gemini model for whole-video summary and entity indexing.                                 | `google-gla:gemini-3.5-flash-lite` |
+| `--ai.model-subtitles <model>`       | `AISUB_AI_MODEL_SUBTITLES`                           | Gemini model for audio-visual subtitle transcription and timing.                          | `google-gla:gemini-3.8-flash`      |
+| `--ai.model-lyrics <model>`          | `AISUB_AI_MODEL_LYRICS`                              | Gemini model for musical lyrics search and refinement.                                    | `google-gla:gemini-3.5-flash-lite` |
 | `--ai.service-tier <tier>`           | `AISUB_AI_SERVICE_TIER`                              | Shorthand setting service tier across all phases (`auto`, `default`, `flex`, `priority`). | _None_                             |
-| `--ai.service-tier-summary <tier>`   | `AISUB_AI_SERVICE_TIER_SUMMARY`                      | Service tier for Phase 1 whole-video summary.                                             | _None_                             |
-| `--ai.service-tier-lyrics <tier>`    | `AISUB_AI_SERVICE_TIER_LYRICS`                       | Service tier for Phase 2 lyrics and scene detection.                                      | _None_                             |
-| `--ai.service-tier-subtitles <tier>` | `AISUB_AI_SERVICE_TIER_SUBTITLES`                    | Service tier for Phase 3 subtitle generation.                                             | _None_                             |
+| `--ai.service-tier-summary <tier>`   | `AISUB_AI_SERVICE_TIER_SUMMARY`                      | Service tier for whole-video summary.                                                     | _None_                             |
+| `--ai.service-tier-subtitles <tier>` | `AISUB_AI_SERVICE_TIER_SUBTITLES`                    | Service tier for subtitle generation.                                                     | _None_                             |
+| `--ai.service-tier-lyrics <tier>`    | `AISUB_AI_SERVICE_TIER_LYRICS`                       | Service tier for lyrics search and refinement.                                            | _None_                             |
 | `--ai.rpm <int>`                     | `AISUB_AI_RPM`                                       | Maximum Requests Per Minute (RPM) for model endpoints.                                    | `4`                                |
 | `--ai.tpm <int>`                     | `AISUB_AI_TPM`                                       | Maximum Tokens Per Minute (TPM) for model endpoints.                                      | `250000`                           |
 | `--ai.validation-buffer-ms <int>`    | `AISUB_AI_VALIDATION_BUFFER_MS`                      | Allowed tolerance buffer (ms) for timestamps exceeding segment duration.                  | `2000`                             |
@@ -69,11 +69,11 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | :------------------------- | :----------------------- | :-------------------------------------------------------------------------- | :------ |
 | `--reencode.encoder <str>` | `AISUB_REENCODE_ENCODER` | Shared H.264 encoder (e.g. `h264_nvenc`, `libx264`). Auto-detected if null. | _None_  |
 
-### Phase 1 Summary Proxy Settings (`--reencode.summary.*`)
+### Summary Proxy Settings (`--reencode.summary.*`)
 
 | Argument                                         | Environment Variable                           | Description                                                         | Default |
 | :----------------------------------------------- | :--------------------------------------------- | :------------------------------------------------------------------ | :------ |
-| `--reencode.summary.enabled <bool>`              | `AISUB_REENCODE_SUMMARY_ENABLED`               | Whether to compress a whole-video proxy before Phase 1 analysis.    | `True`  |
+| `--reencode.summary.enabled <bool>`              | `AISUB_REENCODE_SUMMARY_ENABLED`               | Whether to compress a whole-video proxy before summary analysis.    | `True`  |
 | `--reencode.summary.threshold-mb <int>`          | `AISUB_REENCODE_SUMMARY_THRESHOLD_MB`          | File size threshold in MB above which the full video is compressed. | `300`   |
 | `--reencode.summary.fps <float>`                 | `AISUB_REENCODE_SUMMARY_FPS`                   | Framerate (FPS) for summary proxy video.                            | `1.0`   |
 | `--reencode.summary.height <int>`                | `AISUB_REENCODE_SUMMARY_HEIGHT`                | Resolution height in pixels for summary proxy.                      | `360`   |
@@ -105,12 +105,12 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ## Concurrency Settings (`--concurrency.*`)
 
-| Argument                        | Environment Variable          | Description                                                              | Default |
-| :------------------------------ | :---------------------------- | :----------------------------------------------------------------------- | :------ |
-| `--concurrency.re-encode <int>` | `AISUB_CONCURRENCY_RE_ENCODE` | Number of concurrent FFmpeg compression processes.                       | `2`     |
-| `--concurrency.summary <int>`   | `AISUB_CONCURRENCY_SUMMARY`   | Number of concurrent summary tasks. Set to `0` to disable Phase 1.       | `1`     |
-| `--concurrency.lyrics <int>`    | `AISUB_CONCURRENCY_LYRICS`    | Number of concurrent lyrics/scene analysis tasks. Set to `0` to disable. | `4`     |
-| `--concurrency.subtitles <int>` | `AISUB_CONCURRENCY_SUBTITLES` | Number of concurrent subtitle generation tasks.                          | `4`     |
+| Argument                        | Environment Variable          | Description                                                          | Default |
+| :------------------------------ | :---------------------------- | :------------------------------------------------------------------- | :------ |
+| `--concurrency.re-encode <int>` | `AISUB_CONCURRENCY_RE_ENCODE` | Number of concurrent FFmpeg compression processes.                   | `2`     |
+| `--concurrency.summary <int>`   | `AISUB_CONCURRENCY_SUMMARY`   | Number of concurrent summary tasks. Set to `0` to disable summary.   | `1`     |
+| `--concurrency.subtitles <int>` | `AISUB_CONCURRENCY_SUBTITLES` | Number of concurrent subtitle generation tasks.                      | `4`     |
+| `--concurrency.lyrics <int>`    | `AISUB_CONCURRENCY_LYRICS`    | Number of concurrent lyrics refinement tasks. Set to `0` to disable. | `4`     |
 
 ---
 
@@ -142,4 +142,4 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | `--log.level <level>`     | `AISUB_LOG_LEVEL`      | Minimum log level (`debug`, `info`, `warning`, `error`).   | `info`  |
 | `--log.timestamps <bool>` | `AISUB_LOG_TIMESTAMPS` | Whether to prefix console log lines with timestamps.       | `False` |
 | `--log.scrub <bool>`      | `AISUB_LOG_SCRUB`      | Whether to scrub sensitive API keys and secrets from logs. | `True`  |
-| `--log.progress <bool>`   | `AISUB_LOG_PROGRESS`   | Whether to render live Rich progress dashboard bars.       | `True`  |
+| `--log.progress <bool>`   | `AISUB_LOG_PROGRESS`   | Whether to display live Rich progress dashboard bars.      | `True`  |

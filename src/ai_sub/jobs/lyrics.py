@@ -1,4 +1,4 @@
-"""Job definition, prompt templates, and schemas for Phase 2 Pass B musical subtitle refinement."""
+"""Job definition, prompt templates, and schemas for musical lyrics subtitle refinement."""
 
 from __future__ import annotations
 
@@ -29,11 +29,11 @@ from ai_sub.jobs.base import (
     serialize_prompt_context,
     validate_duration_bound,
 )
-from ai_sub.jobs.subtitle import Subtitles
+from ai_sub.jobs.subtitles import Subtitles
 
-MUSIC_REFINE_PROMPT_VERSION = 10
+LYRICS_PROMPT_VERSION = 10
 
-_MUSIC_REFINE_SYSTEM_TEMPLATE = dedent(
+_LYRICS_SYSTEM_TEMPLATE = dedent(
     """
     <role>
       You are an expert AI subtitle editor and musical lyric specialist. You refine draft subtitles for musical segments using official song lyrics and agentic video inspection.
@@ -75,7 +75,7 @@ _MUSIC_REFINE_SYSTEM_TEMPLATE = dedent(
 ).strip()
 
 
-def get_music_refine_prompt(
+def get_lyrics_prompt(
     draft_subtitles: list[Subtitles],
     detected_performances: list[Any],
     initial_search_results: str | None = None,
@@ -84,14 +84,14 @@ def get_music_refine_prompt(
     segment_offset_ms: int = 0,
     segment_duration_ms: int = 0,
 ) -> Prompt:
-    """Generates the prompt for Phase 2 Pass B musical subtitle refinement.
+    """Generates the prompt for musical subtitle refinement.
 
     Args:
-        draft_subtitles: List of draft subtitles from Pass A.
-        detected_performances: List of detected musical performances from Pass A.
+        draft_subtitles: List of initial subtitles.
+        detected_performances: List of detected musical performances.
         initial_search_results: Optional pre-fetched lyrics and search text from Python.
         user_context: Optional background text or directives supplied by the user.
-        global_summary: Optional Phase 1 global summary schema or dictionary.
+        global_summary: Optional global summary schema or dictionary.
         segment_offset_ms: Absolute start time offset of this segment in milliseconds.
         segment_duration_ms: Duration of this segment in milliseconds.
 
@@ -157,11 +157,11 @@ def get_music_refine_prompt(
         ]
     )
 
-    return Prompt(system=_MUSIC_REFINE_SYSTEM_TEMPLATE, user="\n".join(parts))
+    return Prompt(system=_LYRICS_SYSTEM_TEMPLATE, user="\n".join(parts))
 
 
-class MusicRefineAiResponse(BaseModel):
-    """Structured response schema returned by the model for Pass B subtitle refinement."""
+class LyricsAiResponse(BaseModel):
+    """Structured response schema returned by the model for musical subtitle refinement."""
 
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
@@ -177,7 +177,7 @@ class MusicRefineAiResponse(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_thoughts(cls, data: Any) -> Any:
-        """Ensures thoughts loaded from legacy state files are converted to a list.
+        """Ensures thoughts loaded from state files are converted to a list.
 
         Args:
             data: Raw input dictionary.
@@ -232,15 +232,15 @@ class MusicRefineAiResponse(BaseModel):
         return self
 
 
-class MusicRefineJob(BaseJob):
+class LyricsJob(BaseJob):
     """Job container holding refined subtitles for a segment with musical performance."""
 
     video_duration_ms: PositiveInt = Field(description="Segment duration in milliseconds.")
-    music_refine_prompt_version: int = Field(
-        default=MUSIC_REFINE_PROMPT_VERSION,
+    lyrics_prompt_version: int = Field(
+        default=LYRICS_PROMPT_VERSION,
         description="Prompt version employed for this refinement response.",
     )
-    response: MusicRefineAiResponse | None = Field(
+    response: LyricsAiResponse | None = Field(
         default=None,
         description="Structured AI output once refined.",
     )
@@ -255,7 +255,7 @@ class MusicRefineJob(BaseJob):
             self.response.get_ssafile().save(str(srt_path))
 
     @classmethod
-    def load(cls, save_path: Path, validation_buffer_ms: int) -> MusicRefineJob | None:
+    def load(cls, save_path: Path, validation_buffer_ms: int) -> LyricsJob | None:
         """Loads and validates a saved YAML state file.
 
         Args:
@@ -263,7 +263,7 @@ class MusicRefineJob(BaseJob):
             validation_buffer_ms: Duration tolerance in milliseconds.
 
         Returns:
-            MusicRefineJob | None: Loaded job instance, or None if invalid or version mismatch.
+            LyricsJob | None: Loaded job instance, or None if invalid or version mismatch.
         """
         if not save_path.is_file():
             return None
@@ -282,10 +282,10 @@ class MusicRefineJob(BaseJob):
                 logfire.warning(f"Validation failed for {save_path.name}: {e}. Re-processing.")
                 return None
 
-        if job.music_refine_prompt_version != MUSIC_REFINE_PROMPT_VERSION:
+        if job.lyrics_prompt_version != LYRICS_PROMPT_VERSION:
             logfire.info(
-                f"Music refine prompt version mismatch for {job.name} "
-                f"(file: v{job.music_refine_prompt_version}, current: v{MUSIC_REFINE_PROMPT_VERSION}). Re-processing."
+                f"Lyrics prompt version mismatch for {job.name} "
+                f"(file: v{job.lyrics_prompt_version}, current: v{LYRICS_PROMPT_VERSION}). Re-processing."
             )
             return None
 

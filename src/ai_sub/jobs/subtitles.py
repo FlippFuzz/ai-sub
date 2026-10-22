@@ -1,4 +1,4 @@
-"""Job definition, prompt templates, and schemas for Phase 2 Pass A audio-visual subtitle transcription."""
+"""Job definition, prompt templates, and schemas for audio-visual subtitle transcription."""
 
 from __future__ import annotations
 
@@ -98,17 +98,17 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
 ).strip()
 
 
-def get_subtitle_prompt(
+def get_subtitles_prompt(
     user_context: str | None = None,
     global_summary: Any | None = None,
     segment_offset_ms: int = 0,
     segment_duration_ms: int = 0,
 ) -> Prompt:
-    """Generates the prompt for Phase 2 Pass A subtitle generation.
+    """Generates the prompt for audio-visual subtitle generation.
 
     Args:
         user_context: Optional background text or directives supplied by the user.
-        global_summary: Optional Phase 1 global summary schema or dictionary.
+        global_summary: Optional global summary schema or dictionary.
         segment_offset_ms: Absolute start time offset of this segment in milliseconds.
         segment_duration_ms: Duration of this segment in milliseconds.
 
@@ -232,8 +232,8 @@ class Subtitles(BaseModel):
         return self
 
 
-class SubtitleAiResponse(BaseModel):
-    """Structured response schema returned by the model for Pass A subtitle generation."""
+class SubtitlesAiResponse(BaseModel):
+    """Structured response schema returned by the model for subtitle generation."""
 
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
@@ -253,7 +253,7 @@ class SubtitleAiResponse(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_thoughts(cls, data: Any) -> Any:
-        """Ensures thoughts loaded from legacy state files are converted to a list.
+        """Ensures thoughts loaded from state files are converted to a list.
 
         Args:
             data: Raw input dictionary.
@@ -308,7 +308,7 @@ class SubtitleAiResponse(BaseModel):
         return self
 
 
-class SubtitleJob(BaseJob):
+class SubtitlesJob(BaseJob):
     """Job container holding generated subtitle state for a video segment."""
 
     video_duration_ms: PositiveInt = Field(description="Segment duration in milliseconds.")
@@ -316,7 +316,7 @@ class SubtitleJob(BaseJob):
         default=SUBTITLES_PROMPT_VERSION,
         description="Prompt version employed for this response.",
     )
-    response: SubtitleAiResponse | None = Field(
+    response: SubtitlesAiResponse | None = Field(
         default=None,
         description="Structured subtitle response once generated.",
     )
@@ -331,7 +331,7 @@ class SubtitleJob(BaseJob):
             self.response.get_ssafile().save(str(srt_path))
 
     @classmethod
-    def load(cls, save_path: Path, validation_buffer_ms: int) -> SubtitleJob | None:
+    def load(cls, save_path: Path, validation_buffer_ms: int) -> SubtitlesJob | None:
         """Loads and validates a saved YAML state file.
 
         Args:
@@ -339,7 +339,7 @@ class SubtitleJob(BaseJob):
             validation_buffer_ms: Duration tolerance in milliseconds.
 
         Returns:
-            SubtitleJob | None: Loaded job instance, or None if invalid or version mismatch.
+            SubtitlesJob | None: Loaded job instance, or None if invalid or version mismatch.
         """
         if not save_path.is_file():
             return None
