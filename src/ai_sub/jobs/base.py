@@ -183,6 +183,7 @@ def _clean_context_item(data: Any) -> Any:
             mode="json",
             exclude={"thoughts": True, "user_context": True},
             exclude_none=True,
+            by_alias=True,
         )
     if isinstance(data, dict):
         return {

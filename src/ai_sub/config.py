@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Literal, Self, cast
@@ -76,6 +77,7 @@ class SearchSettings(BaseSettings):
 
     model_config = {
         "env_prefix": "AISUB_AI_SEARCH_",
+        "enable_decoding": False,
         **_BASE_CONFIG,
     }
 
@@ -176,6 +178,16 @@ class SearchSettings(BaseSettings):
                 raw_tools = ["duckduckgo"]
 
         if isinstance(raw_tools, str):
+            raw_tools_str = raw_tools.strip()
+            if raw_tools_str.startswith("[") and raw_tools_str.endswith("]"):
+                try:
+                    parsed = json.loads(raw_tools_str)
+                    if isinstance(parsed, (list, tuple)):
+                        raw_tools = parsed
+                except Exception:
+                    pass
+
+        if isinstance(raw_tools, str):
             values["tools"] = [t.strip() for t in raw_tools.split(",") if t.strip()]
         elif isinstance(raw_tools, (list, tuple)):
             flattened: list[str] = []
@@ -202,8 +214,6 @@ class SearchSettings(BaseSettings):
             general_key = os.getenv("AISUB_AI_SEARCH_KEY")
             if general_key:
                 values["key"] = general_key.strip().strip('"').strip("'")
-            else:
-                values["key"] = values.get("tinyfish_key") or values.get("langsearch_key") or values.get("ollama_key")
 
         return values
 

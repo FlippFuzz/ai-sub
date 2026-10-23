@@ -410,14 +410,11 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                     current_offset_ms += duration_ms
 
                     is_done = False
-                    if existing_lyrics and existing_lyrics.response:
-                        is_done = True
-                    elif (
-                        existing_sub
-                        and existing_sub.response
-                        and not existing_sub.response.detected_musical_performances
-                    ):
-                        is_done = True
+                    if existing_sub and existing_sub.response:
+                        if use_lyrics and existing_sub.response.detected_musical_performances:
+                            is_done = bool(existing_lyrics and existing_lyrics.response)
+                        else:
+                            is_done = True
 
                     if is_done:
                         if reencode_tid is not None:
