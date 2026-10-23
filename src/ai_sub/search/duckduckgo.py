@@ -5,14 +5,14 @@ from __future__ import annotations
 import asyncio
 import math
 import random
-from typing import Any, Callable, Self
+from typing import Any, Callable
 
 import logfire
 from ddgs import DDGS
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import WebQueryResult, WebSearchResult, normalize_query
+from ai_sub.search.base import BaseSearchProvider, WebQueryResult, WebSearchResult, normalize_query
 
 
 def _fetch_ddgs(query: str, max_results: int = 10) -> list[dict[str, Any]]:
@@ -29,11 +29,9 @@ def _fetch_ddgs(query: str, max_results: int = 10) -> list[dict[str, Any]]:
         return list(ddgs.text(query, max_results=max_results))
 
 
-class DuckDuckGoSearchProvider:
+class DuckDuckGoSearchProvider(BaseSearchProvider):
     """Encapsulates DuckDuckGo search operations with caching and rate limiting."""
 
-    settings: SearchSettings
-    _cache: dict[str, list[WebSearchResult]]
     _limiter: Limiter
 
     def __init__(self, settings: SearchSettings) -> None:
@@ -42,8 +40,7 @@ class DuckDuckGoSearchProvider:
         Args:
             settings: Search configuration settings.
         """
-        self.settings = settings
-        self._cache = {}
+        super().__init__(settings, provider_name="duckduckgo")
 
         if self.settings.qps < 1:
             rate = 1
@@ -54,42 +51,19 @@ class DuckDuckGoSearchProvider:
 
         self._limiter = limiter_factory.create_inmemory_limiter(rate_per_duration=rate, duration=duration)
 
-    async def __aenter__(self) -> Self:
-        """Enters the search provider async context.
-
-        Returns:
-            Self: Active provider instance.
-        """
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: Any,
-    ) -> None:
-        """Exits the search provider async context.
+    async def search_single(self, query: str) -> list[WebSearchResult]:
+        """Performs a single search query returning normalized search results.
 
         Args:
-            exc_type: Exception type if raised.
-            exc_val: Exception value if raised.
-            exc_tb: Traceback if raised.
-        """
-        return None
-
-    async def duckduckgo_search(self, query: str) -> list[dict[str, Any]]:
-        """Perform a single web search query using DuckDuckGo.
-
-        Args:
-            query: The search query string.
+            query: Search query keywords.
 
         Returns:
-            list[dict[str, Any]]: List of matching search results with title, url, and snippet content.
+            list[WebSearchResult]: Formatted search result items.
         """
         cache_key = normalize_query(query)
         if cache_key in self._cache:
             logfire.debug("Using cached DuckDuckGo query result for {query=}", query=query)
-            return [r.model_dump(mode="json") for r in self._cache[cache_key]]
+            return self._cache[cache_key]
 
         max_attempts = self.settings.retries + 1
         raw_results: list[dict[str, Any]] = []
@@ -125,6 +99,18 @@ class DuckDuckGoSearchProvider:
             and len(body) <= self.settings.max_length
         ]
         self._cache[cache_key] = results
+        return results
+
+    async def duckduckgo_search(self, query: str) -> list[dict[str, Any]]:
+        """Perform a single web search query using DuckDuckGo.
+
+        Args:
+            query: The search query string.
+
+        Returns:
+            list[dict[str, Any]]: List of matching search results with title, url, and snippet content.
+        """
+        results = await self.search_single(query)
         return [r.model_dump(mode="json") for r in results]
 
     async def web_search_duckduckgo_multi(self, queries: list[str]) -> list[dict[str, Any]]:
@@ -143,10 +129,10 @@ class DuckDuckGoSearchProvider:
 
         return await asyncio.gather(*(_run(q) for q in queries))
 
-    def get_tools(self) -> list[Callable[..., Any]]:
+    def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
         """Returns tool callables for Gemini model registration.
 
         Returns:
-            list[Callable[..., Any]]: Bound search methods.
+            list[Callable[..., Any] | dict[str, Any]]: Bound search methods.
         """
         return [self.web_search_duckduckgo_multi]

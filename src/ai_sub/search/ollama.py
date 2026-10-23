@@ -33,14 +33,15 @@ class OllamaSearchProvider(BaseHttpSearchProvider):
         Returns:
             dict[str, str]: HTTP request headers.
         """
-        assert self.settings.key is not None
-        return {"Authorization": f"Bearer {self.settings.key.get_secret_value()}"}
+        key = self._get_api_key()
+        assert key is not None
+        return {"Authorization": f"Bearer {key.get_secret_value()}"}
 
-    def get_tools(self) -> list[Callable[..., Any]]:
+    def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
         """Returns tool callables for Gemini model registration.
 
         Returns:
-            list[Callable[..., Any]]: Bound search methods.
+            list[Callable[..., Any] | dict[str, Any]]: Bound search methods.
         """
         return [self.web_search_ollama_multi]
 
@@ -48,7 +49,7 @@ class OllamaSearchProvider(BaseHttpSearchProvider):
         """Performs a single web search against Ollama API.
 
         Args:
-            query: Search query string.
+            query: Search query keywords.
 
         Returns:
             list[WebSearchResult]: Formatted search results.

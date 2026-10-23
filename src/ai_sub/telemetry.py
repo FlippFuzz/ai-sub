@@ -84,7 +84,7 @@ def setup_logging(
     if console is not None and log_cfg.progress:
         output_stream = RichConsoleLogfireWriter(console)
 
-    # 1. Main Logfire client (Handles spans and user logs for the terminal console)
+    # 1. Main Logfire client (Handles high-level spans and user logs for the terminal console)
     logfire.configure(
         console=logfire.ConsoleOptions(
             output=output_stream,
@@ -97,14 +97,9 @@ def setup_logging(
         scrubbing=None if log_cfg.scrub else False,
     )
 
-    if hasattr(logfire, "instrument_google_genai"):
-        try:
-            logfire.instrument_google_genai()
-        except Exception:
-            pass
-
-    # 2. Silent Logfire client for low-level HTTPX tracing
-    silent_http_client = logfire.configure(
+    # 2. Silent Logfire client for low-level SDK and HTTP tracing (Google GenAI, HTTPX)
+    # Telemetry is sent to Logfire cloud if a token is present, but kept off the terminal console
+    silent_telemetry_client = logfire.configure(
         local=True,
         console=False,
         service_name=resolved_service,
@@ -112,4 +107,21 @@ def setup_logging(
         send_to_logfire="if-token-present",
         scrubbing=None if log_cfg.scrub else False,
     )
-    silent_http_client.instrument_httpx(capture_all=True)
+    silent_telemetry_client.instrument_httpx(capture_all=True)
+
+    if hasattr(silent_telemetry_client, "instrument_google_genai"):
+        try:
+            silent_telemetry_client.instrument_google_genai()
+        except Exception:
+            pass
+    elif hasattr(logfire, "instrument_google_genai"):
+        try:
+            tracer_prov = getattr(silent_telemetry_client, "tracer_provider", None) or getattr(
+                silent_telemetry_client, "_tracer_provider", None
+            )
+            if tracer_prov is not None:
+                logfire.instrument_google_genai(tracer_provider=tracer_prov)
+            else:
+                logfire.instrument_google_genai()
+        except Exception:
+            pass

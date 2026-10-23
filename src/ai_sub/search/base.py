@@ -13,7 +13,7 @@ from typing import Any, Callable, Self
 
 import logfire
 from httpx import AsyncClient, HTTPStatusError, Response, TimeoutException, TransportError
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, SecretStr
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
 from ai_sub.config import SearchSettings
@@ -75,14 +75,74 @@ def parse_retry_after(header_value: str | None) -> float | None:
         return None
 
 
-class BaseHttpSearchProvider(ABC):
-    """Abstract base class managing rate limits, HTTP sessions, retries, and caching for search providers."""
+class BaseSearchProvider(ABC):
+    """Abstract base class for all web search and lyrics providers."""
 
     settings: SearchSettings
     provider_name: str
+    _cache: dict[str, Any]
+
+    def __init__(self, settings: SearchSettings, provider_name: str) -> None:
+        """Initializes the search provider.
+
+        Args:
+            settings: Search configuration settings.
+            provider_name: Identifier name of the provider.
+        """
+        self.settings = settings
+        self.provider_name = provider_name
+        self._cache = {}
+
+    async def __aenter__(self) -> Self:
+        """Initializes the provider async context.
+
+        Returns:
+            Self: Active provider instance.
+        """
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        """Closes the provider async context.
+
+        Args:
+            exc_type: Exception type if raised.
+            exc_val: Exception value if raised.
+            exc_tb: Traceback if raised.
+        """
+        return None
+
+    @abstractmethod
+    def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
+        """Returns tool callables or tool specification dictionaries for model registration.
+
+        Returns:
+            list[Callable[..., Any] | dict[str, Any]]: Bound tool callables or Interactions tool dictionaries.
+        """
+        ...
+
+    @abstractmethod
+    async def search_single(self, query: str) -> list[WebSearchResult]:
+        """Performs a single search query returning normalized search results.
+
+        Args:
+            query: Search query keywords.
+
+        Returns:
+            list[WebSearchResult]: Formatted search result items.
+        """
+        ...
+
+
+class BaseHttpSearchProvider(BaseSearchProvider, ABC):
+    """Abstract base class managing rate limits, HTTP sessions, retries, and caching for HTTP providers."""
+
     requires_api_key: bool
     _client: AsyncClient | None
-    _cache: dict[str, Any]
     _limiter: Limiter
 
     def __init__(self, settings: SearchSettings, provider_name: str, requires_api_key: bool = True) -> None:
@@ -93,10 +153,8 @@ class BaseHttpSearchProvider(ABC):
             provider_name: Name identifier of the search provider.
             requires_api_key: Whether an API key is mandatory to initialize the client session.
         """
-        self.settings = settings
-        self.provider_name = provider_name
+        super().__init__(settings, provider_name=provider_name)
         self.requires_api_key = requires_api_key
-        self._cache = {}
         self._client = None
 
         if self.settings.qps < 1:
@@ -108,21 +166,20 @@ class BaseHttpSearchProvider(ABC):
 
         self._limiter = limiter_factory.create_inmemory_limiter(rate_per_duration=rate, duration=duration)
 
+    def _get_api_key(self) -> SecretStr | None:
+        """Resolves the API key for this provider from settings.
+
+        Returns:
+            SecretStr | None: Secret key or None.
+        """
+        return self.settings.get_key_for_provider(self.provider_name)
+
     @abstractmethod
     def _get_headers(self) -> dict[str, str]:
         """Constructs provider-specific HTTP headers including authorization.
 
         Returns:
             dict[str, str]: Header key-value mapping.
-        """
-        ...
-
-    @abstractmethod
-    def get_tools(self) -> list[Callable[..., Any]]:
-        """Returns tool callables for Gemini model registration.
-
-        Returns:
-            list[Callable[..., Any]]: Bound tool methods.
         """
         ...
 
@@ -135,7 +192,7 @@ class BaseHttpSearchProvider(ABC):
         Raises:
             ValueError: If the required API key is missing.
         """
-        if self.requires_api_key and self.settings.key is None:
+        if self.requires_api_key and self._get_api_key() is None:
             raise ValueError(f"{self.provider_name.capitalize()} API key is required but not configured.")
 
         headers = self._get_headers()
@@ -206,17 +263,9 @@ class BaseHttpSearchProvider(ABC):
                     if isinstance(e, HTTPStatusError):
                         retry_after = parse_retry_after(e.response.headers.get("retry-after"))
 
-                    if retry_after is not None:
-                        backoff = min(
-                            self.settings.max_wait_seconds,
-                            max(self.settings.min_wait_seconds, retry_after) + random.uniform(0, 1),
-                        )
-                    else:
-                        backoff = min(
-                            self.settings.max_wait_seconds,
-                            (self.settings.min_wait_seconds * (self.settings.multiplier**attempt))
-                            + random.uniform(0, 1),
-                        )
+                    exp_backoff = self.settings.min_wait_seconds * (self.settings.multiplier**attempt)
+                    effective_backoff = max(exp_backoff, retry_after or 0.0)
+                    backoff = min(self.settings.max_wait_seconds, effective_backoff) + random.uniform(0, 1)
 
                     logfire.warning(
                         f"{self.provider_name.capitalize()} {method} to {url} failed with {e} "

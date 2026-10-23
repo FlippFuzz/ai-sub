@@ -13,6 +13,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    NonNegativeInt,
     PositiveInt,
     ValidationError,
     ValidationInfo,
@@ -24,12 +25,14 @@ from pysubs2 import SSAEvent, SSAFile
 from ai_sub.jobs.base import (
     BaseJob,
     Prompt,
+    WorkerContext,
     clean_timestamp_string,
     format_ms_timestamp,
     parse_timestamp_string_ms,
     serialize_prompt_context,
     validate_duration_bound,
 )
+from ai_sub.jobs.summary import SummaryAiResponse
 
 SUBTITLES_PROMPT_VERSION = 19
 
@@ -312,6 +315,14 @@ class SubtitlesJob(BaseJob):
     """Job container holding generated subtitle state for a video segment."""
 
     video_duration_ms: PositiveInt = Field(description="Segment duration in milliseconds.")
+    segment_offset_ms: NonNegativeInt = Field(
+        default=0,
+        description="Absolute start offset of this segment in milliseconds.",
+    )
+    global_summary: SummaryAiResponse | None = Field(
+        default=None,
+        description="Optional global summary context from phase 1.",
+    )
     subtitles_prompt_version: int = Field(
         default=SUBTITLES_PROMPT_VERSION,
         description="Prompt version employed for this response.",
@@ -320,6 +331,36 @@ class SubtitlesJob(BaseJob):
         default=None,
         description="Structured subtitle response once generated.",
     )
+
+    async def execute(self, ctx: WorkerContext) -> SubtitlesAiResponse:
+        """Generates synchronized bilingual subtitles for this segment.
+
+        Args:
+            ctx: Worker runtime context containing executor.
+
+        Returns:
+            SubtitlesAiResponse: Parsed AI subtitles response.
+        """
+        prompt = get_subtitles_prompt(
+            user_context=self.user_context,
+            global_summary=self.global_summary,
+            segment_offset_ms=self.segment_offset_ms,
+            segment_duration_ms=self.video_duration_ms,
+        )
+        res = await ctx.executor.run_structured(
+            prompt=prompt,
+            media_path=ctx.media_path,
+            video_duration_ms=self.video_duration_ms,
+            response_type=SubtitlesAiResponse,
+            model_name=ctx.executor.ai_settings.model_subtitles,
+            service_tier=ctx.executor.ai_settings.service_tier_subtitles,
+            tools=None,
+            agentic_video=ctx.executor.ai_settings.agentic_video_subtitles,
+            task_label="subtitles",
+        )
+        self.response = res
+        self.total_attempts += 1
+        return res
 
     def save_srt(self, srt_path: Path) -> None:
         """Saves current subtitle response as an SRT file.

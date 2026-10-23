@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any
-
-from google.genai import types
-
 from ai_sub.config import SearchSettings
 from ai_sub.search.base import (
     BaseHttpSearchProvider,
+    BaseSearchProvider,
     WebQueryResult,
     WebSearchResult,
     normalize_query,
     parse_retry_after,
 )
+from ai_sub.search.builtin import GoogleBuiltinSearchProvider
 from ai_sub.search.duckduckgo import DuckDuckGoSearchProvider
 from ai_sub.search.langsearch import LangsearchSearchProvider
 from ai_sub.search.lrclib import LrclibSearchProvider
@@ -21,44 +19,71 @@ from ai_sub.search.ollama import OllamaSearchProvider
 from ai_sub.search.tinyfish import TinyfishSearchProvider
 
 
-def create_search_provider(settings: SearchSettings) -> tuple[Any | None, list[Any]]:
-    """Instantiates the configured search provider and extracts its Gemini tool callables.
+def create_search_provider(tool_name: str, settings: SearchSettings) -> BaseSearchProvider:
+    """Instantiates a single search provider by name.
 
     Args:
+        tool_name: Name of the search provider ('builtin', 'duckduckgo', 'ollama', 'langsearch', 'tinyfish', 'lrclib').
         settings: Search configuration settings.
 
     Returns:
-        tuple[Any | None, list[Any]]: A tuple of (provider_instance, tools_list).
-            provider_instance is an async context manager if it manages an HTTP session, or None.
-            tools_list is the list of callables or types.Tool objects ready for Gemini registration.
+        BaseSearchProvider: Configured search provider instance.
+
+    Raises:
+        ValueError: If tool_name is unknown.
     """
-    tool_type = settings.tool
+    clean_name = tool_name.strip().lower()
+    if clean_name == "tinyfish":
+        return TinyfishSearchProvider(settings)
+    if clean_name == "langsearch":
+        return LangsearchSearchProvider(settings)
+    if clean_name == "ollama":
+        return OllamaSearchProvider(settings)
+    if clean_name == "duckduckgo":
+        return DuckDuckGoSearchProvider(settings)
+    if clean_name == "lrclib":
+        return LrclibSearchProvider(settings)
+    if clean_name == "builtin":
+        return GoogleBuiltinSearchProvider(settings)
 
-    if tool_type == "tinyfish":
-        provider = TinyfishSearchProvider(settings)
-        return provider, provider.get_tools()
+    raise ValueError(
+        f"Unknown search provider: '{tool_name}'. "
+        "Supported providers are: 'builtin', 'duckduckgo', 'ollama', 'langsearch', 'tinyfish', 'lrclib'."
+    )
 
-    if tool_type == "langsearch":
-        provider = LangsearchSearchProvider(settings)
-        return provider, provider.get_tools()
 
-    if tool_type == "ollama":
-        provider = OllamaSearchProvider(settings)
-        return provider, provider.get_tools()
+def create_search_providers(
+    settings: SearchSettings,
+    tools: list[str] | None = None,
+) -> list[BaseSearchProvider]:
+    """Instantiates the configured search providers in order with deduplication.
 
-    if tool_type == "duckduckgo":
-        provider = DuckDuckGoSearchProvider(settings)
-        return provider, provider.get_tools()
+    Args:
+        settings: Search configuration settings.
+        tools: Optional explicit list of tool names to instantiate. Defaults to settings.tools.
 
-    if tool_type == "builtin":
-        return None, [types.Tool(google_search=types.GoogleSearch())]
+    Returns:
+        list[BaseSearchProvider]: Strictly-typed list of instantiated search provider instances.
+    """
+    target_tools = tools if tools is not None else settings.tools
+    providers: list[BaseSearchProvider] = []
+    seen: set[str] = set()
 
-    return None, []
+    for tool in target_tools:
+        clean_name = tool.strip().lower()
+        if not clean_name or clean_name in seen:
+            continue
+        seen.add(clean_name)
+        providers.append(create_search_provider(clean_name, settings))
+
+    return providers
 
 
 __all__ = [
     "BaseHttpSearchProvider",
+    "BaseSearchProvider",
     "DuckDuckGoSearchProvider",
+    "GoogleBuiltinSearchProvider",
     "LangsearchSearchProvider",
     "LrclibSearchProvider",
     "OllamaSearchProvider",
@@ -66,6 +91,7 @@ __all__ = [
     "WebQueryResult",
     "WebSearchResult",
     "create_search_provider",
+    "create_search_providers",
     "normalize_query",
     "parse_retry_after",
 ]

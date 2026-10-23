@@ -21,21 +21,25 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ## AI Settings (`--ai.*`)
 
-| Argument                             | Environment Variable                                 | Description                                                                               | Default                            |
-| :----------------------------------- | :--------------------------------------------------- | :---------------------------------------------------------------------------------------- | :--------------------------------- |
-| `--ai.key <key>`                     | `AISUB_AI_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Google Gemini API key.                                                                    | _None_                             |
-| `--ai.base-url <url>`                | `AISUB_AI_BASE_URL`                                  | Optional base URL or proxy for Google Gemini API calls.                                   | _None_                             |
-| `--ai.model <model>`                 | `AISUB_AI_MODEL`                                     | Shorthand setting `model_summary`, `model_lyrics`, and `model_subtitles` at once.         | _None_                             |
-| `--ai.model-summary <model>`         | `AISUB_AI_MODEL_SUMMARY`                             | Gemini model for whole-video summary and entity indexing.                                 | `google-gla:gemini-3.5-flash-lite` |
-| `--ai.model-subtitles <model>`       | `AISUB_AI_MODEL_SUBTITLES`                           | Gemini model for audio-visual subtitle transcription and timing.                          | `google-gla:gemini-3.8-flash`      |
-| `--ai.model-lyrics <model>`          | `AISUB_AI_MODEL_LYRICS`                              | Gemini model for musical lyrics search and refinement.                                    | `google-gla:gemini-3.5-flash-lite` |
-| `--ai.service-tier <tier>`           | `AISUB_AI_SERVICE_TIER`                              | Shorthand setting service tier across all phases (`auto`, `default`, `flex`, `priority`). | _None_                             |
-| `--ai.service-tier-summary <tier>`   | `AISUB_AI_SERVICE_TIER_SUMMARY`                      | Service tier for whole-video summary.                                                     | _None_                             |
-| `--ai.service-tier-subtitles <tier>` | `AISUB_AI_SERVICE_TIER_SUBTITLES`                    | Service tier for subtitle generation.                                                     | _None_                             |
-| `--ai.service-tier-lyrics <tier>`    | `AISUB_AI_SERVICE_TIER_LYRICS`                       | Service tier for lyrics search and refinement.                                            | _None_                             |
-| `--ai.rpm <int>`                     | `AISUB_AI_RPM`                                       | Maximum Requests Per Minute (RPM) for model endpoints.                                    | `4`                                |
-| `--ai.tpm <int>`                     | `AISUB_AI_TPM`                                       | Maximum Tokens Per Minute (TPM) for model endpoints.                                      | `250000`                           |
-| `--ai.validation-buffer-ms <int>`    | `AISUB_AI_VALIDATION_BUFFER_MS`                      | Allowed tolerance buffer (ms) for timestamps exceeding segment duration.                  | `2000`                             |
+| Argument                              | Environment Variable                                 | Description                                                                               | Default                            |
+| :------------------------------------ | :--------------------------------------------------- | :---------------------------------------------------------------------------------------- | :--------------------------------- |
+| `--ai.key <key>`                      | `AISUB_AI_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Google Gemini API key.                                                                    | _None_                             |
+| `--ai.base-url <url>`                 | `AISUB_AI_BASE_URL`                                  | Optional base URL or proxy for Google Gemini API calls.                                   | _None_                             |
+| `--ai.model <model>`                  | `AISUB_AI_MODEL`                                     | Shorthand setting `model_summary`, `model_lyrics`, and `model_subtitles` at once.         | _None_                             |
+| `--ai.model-summary <model>`          | `AISUB_AI_MODEL_SUMMARY`                             | Gemini model for whole-video summary and entity indexing.                                 | `google-gla:gemini-3.5-flash-lite` |
+| `--ai.model-subtitles <model>`        | `AISUB_AI_MODEL_SUBTITLES`                           | Gemini model for audio-visual subtitle transcription and timing.                          | `google-gla:gemini-3.8-flash`      |
+| `--ai.model-lyrics <model>`           | `AISUB_AI_MODEL_LYRICS`                              | Gemini model for musical lyrics search and refinement.                                    | `google-gla:gemini-3.5-flash-lite` |
+| `--ai.service-tier <tier>`            | `AISUB_AI_SERVICE_TIER`                              | Shorthand setting service tier across all phases (`auto`, `default`, `flex`, `priority`). | _None_                             |
+| `--ai.service-tier-summary <tier>`    | `AISUB_AI_SERVICE_TIER_SUMMARY`                      | Service tier for whole-video summary.                                                     | _None_                             |
+| `--ai.service-tier-subtitles <tier>`  | `AISUB_AI_SERVICE_TIER_SUBTITLES`                    | Service tier for subtitle generation.                                                     | _None_                             |
+| `--ai.service-tier-lyrics <tier>`     | `AISUB_AI_SERVICE_TIER_LYRICS`                       | Service tier for lyrics search and refinement.                                            | _None_                             |
+| `--ai.agentic-video <bool>`           | `AISUB_AI_AGENTIC_VIDEO`                             | Shorthand toggling agentic video understanding across all pipeline phases.                | _None_                             |
+| `--ai.agentic-video-summary <bool>`   | `AISUB_AI_AGENTIC_VIDEO_SUMMARY`                     | Whether to use agentic video understanding for whole-video summary.                       | `True`                             |
+| `--ai.agentic-video-subtitles <bool>` | `AISUB_AI_AGENTIC_VIDEO_SUBTITLES`                   | Whether to use agentic video understanding for subtitle generation.                       | `False`                            |
+| `--ai.agentic-video-lyrics <bool>`    | `AISUB_AI_AGENTIC_VIDEO_LYRICS`                      | Whether to use agentic video understanding for lyrics refinement.                         | `True`                             |
+| `--ai.rpm <int>`                      | `AISUB_AI_RPM`                                       | Maximum Requests Per Minute (RPM) allowed for model endpoints.                            | `4`                                |
+| `--ai.tpm <int>`                      | `AISUB_AI_TPM`                                       | Maximum Tokens Per Minute (TPM) allowed for model endpoints.                              | `250000`                           |
+| `--ai.validation-buffer-ms <int>`     | `AISUB_AI_VALIDATION_BUFFER_MS`                      | Allowed tolerance buffer (ms) for timestamps exceeding segment duration.                  | `2000`                             |
 
 ### Files API Storage Settings (`--ai.storage.*`)
 
@@ -48,26 +52,29 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ### Web Search Settings (`--ai.search.*`)
 
-| Argument                               | Environment Variable                                                                 | Description                                                                      | Default      |
-| :------------------------------------- | :----------------------------------------------------------------------------------- | :------------------------------------------------------------------------------- | :----------- |
-| `--ai.search.tool <tool>`              | `AISUB_AI_SEARCH_TOOL`                                                               | Search provider: `duckduckgo`, `langsearch`, `ollama`, `tinyfish`, or `builtin`. | `duckduckgo` |
-| `--ai.search.key <key>`                | `AISUB_AI_SEARCH_KEY` / `LANGSEARCH_API_KEY` / `OLLAMA_API_KEY` / `TINYFISH_API_KEY` | API key for Langsearch, Ollama, or Tinyfish.                                     | _None_       |
-| `--ai.search.max-turns <int>`          | `AISUB_AI_SEARCH_MAX_TURNS`                                                          | Maximum function-calling search turns allowed per segment.                       | `3`          |
-| `--ai.search.qps <float>`              | `AISUB_AI_SEARCH_QPS`                                                                | Maximum queries per second for web search requests.                              | `0.3`        |
-| `--ai.search.max-length <int>`         | `AISUB_AI_SEARCH_MAX_LENGTH`                                                         | Character cutoff limit per search result snippet or fetched page.                | `4096`       |
-| `--ai.search.timeout <float>`          | `AISUB_AI_SEARCH_TIMEOUT`                                                            | Timeout in seconds for search HTTP requests.                                     | `60.0`       |
-| `--ai.search.retries <int>`            | `AISUB_AI_SEARCH_RETRIES`                                                            | Maximum retries on transient search network errors.                              | `3`          |
-| `--ai.search.min-wait-seconds <float>` | `AISUB_AI_SEARCH_MIN_WAIT_SECONDS`                                                   | Minimum backoff wait time in seconds for search retries.                         | `5.0`        |
-| `--ai.search.max-wait-seconds <float>` | `AISUB_AI_SEARCH_MAX_WAIT_SECONDS`                                                   | Maximum backoff wait time in seconds for search retries.                         | `60.0`       |
-| `--ai.search.multiplier <float>`       | `AISUB_AI_SEARCH_MULTIPLIER`                                                         | Exponential backoff multiplier for search retries.                               | `2.0`        |
+| Argument                               | Environment Variable                                    | Description                                                                                                                 | Default          |
+| :------------------------------------- | :------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------- | :--------------- |
+| `--ai.search.tools <list>`             | `AISUB_AI_SEARCH_TOOLS`                                 | Comma-separated list of search providers to enable (`builtin`, `duckduckgo`, `ollama`, `langsearch`, `tinyfish`, `lrclib`). | `["duckduckgo"]` |
+| `--ai.search.key <key>`                | `AISUB_AI_SEARCH_KEY`                                   | General fallback API key for search services (Ollama, Langsearch, or Tinyfish).                                             | _None_           |
+| `--ai.search.tinyfish-key <key>`       | `AISUB_AI_SEARCH_TINYFISH_KEY` / `TINYFISH_API_KEY`     | Dedicated API key for Tinyfish search.                                                                                      | _None_           |
+| `--ai.search.langsearch-key <key>`     | `AISUB_AI_SEARCH_LANGSEARCH_KEY` / `LANGSEARCH_API_KEY` | Dedicated API key for Langsearch.                                                                                           | _None_           |
+| `--ai.search.ollama-key <key>`         | `AISUB_AI_SEARCH_OLLAMA_KEY` / `OLLAMA_API_KEY`         | Dedicated API key for Ollama search.                                                                                        | _None_           |
+| `--ai.search.max-turns <int>`          | `AISUB_AI_SEARCH_MAX_TURNS`                             | Maximum function-calling search turns allowed per segment.                                                                  | `3`              |
+| `--ai.search.qps <float>`              | `AISUB_AI_SEARCH_QPS`                                   | Maximum queries per second for web search requests.                                                                         | `0.3`            |
+| `--ai.search.max-length <int>`         | `AISUB_AI_SEARCH_MAX_LENGTH`                            | Character cutoff limit per search result snippet or fetched page.                                                           | `4096`           |
+| `--ai.search.timeout <float>`          | `AISUB_AI_SEARCH_TIMEOUT`                               | Timeout in seconds for search HTTP requests.                                                                                | `60.0`           |
+| `--ai.search.retries <int>`            | `AISUB_AI_SEARCH_RETRIES`                               | Maximum retries on transient search network errors.                                                                         | `3`              |
+| `--ai.search.min-wait-seconds <float>` | `AISUB_AI_SEARCH_MIN_WAIT_SECONDS`                      | Minimum backoff wait time in seconds for search retries.                                                                    | `5.0`            |
+| `--ai.search.max-wait-seconds <float>` | `AISUB_AI_SEARCH_MAX_WAIT_SECONDS`                      | Maximum backoff wait time in seconds for search retries.                                                                    | `60.0`           |
+| `--ai.search.multiplier <float>`       | `AISUB_AI_SEARCH_MULTIPLIER`                            | Exponential backoff multiplier for search retries.                                                                          | `2.0`            |
 
 ---
 
 ## Re-Encoding Settings (`--reencode.*`)
 
-| Argument                   | Environment Variable     | Description                                                                 | Default |
-| :------------------------- | :----------------------- | :-------------------------------------------------------------------------- | :------ |
-| `--reencode.encoder <str>` | `AISUB_REENCODE_ENCODER` | Shared H.264 encoder (e.g. `h264_nvenc`, `libx264`). Auto-detected if null. | _None_  |
+| Argument                   | Environment Variable     | Description                                                                   | Default |
+| :------------------------- | :----------------------- | :---------------------------------------------------------------------------- | :------ |
+| `--reencode.encoder <str>` | `AISUB_REENCODE_ENCODER` | Specific H.264 encoder (e.g. `h264_nvenc`, `libx264`). Auto-detected if null. | _None_  |
 
 ### Summary Proxy Settings (`--reencode.summary.*`)
 
@@ -125,13 +132,23 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ## Retry Settings (`--retry.*`)
 
-| Argument                           | Environment Variable           | Description                                                              | Default |
-| :--------------------------------- | :----------------------------- | :----------------------------------------------------------------------- | :------ |
-| `--retry.per-run <int>`            | `AISUB_RETRY_PER_RUN`          | Internal retries by the AI executor on transient API or schema errors.   | `5`     |
-| `--retry.max-runs <int>`           | `AISUB_RETRY_MAX_RUNS`         | Total attempt limit persisted across application executions per segment. | `3`     |
-| `--retry.multiplier <float>`       | `AISUB_RETRY_MULTIPLIER`       | Multiplier for exponential backoff between retries.                      | `2.0`   |
-| `--retry.min-wait-seconds <float>` | `AISUB_RETRY_MIN_WAIT_SECONDS` | Minimum wait time in seconds for a retry backoff.                        | `30.0`  |
-| `--retry.max-wait-seconds <int>`   | `AISUB_RETRY_MAX_WAIT_SECONDS` | Maximum wait time in seconds for a single retry backoff.                 | `300`   |
+| Argument                           | Environment Variable           | Description                                                                              | Default |
+| :--------------------------------- | :----------------------------- | :--------------------------------------------------------------------------------------- | :------ |
+| `--retry.per-run <int>`            | `AISUB_RETRY_PER_RUN`          | Network/transport retries (via Google Gen AI `HttpRetryOptions`) and schema validations. | `5`     |
+| `--retry.max-runs <int>`           | `AISUB_RETRY_MAX_RUNS`         | Total attempt limit persisted across application executions per segment.                 | `3`     |
+| `--retry.multiplier <float>`       | `AISUB_RETRY_MULTIPLIER`       | Multiplier for exponential backoff between retries.                                      | `2.0`   |
+| `--retry.min-wait-seconds <float>` | `AISUB_RETRY_MIN_WAIT_SECONDS` | Minimum backoff wait time in seconds for a retry.                                        | `30.0`  |
+| `--retry.max-wait-seconds <int>`   | `AISUB_RETRY_MAX_WAIT_SECONDS` | Maximum backoff wait time in seconds for a single retry.                                 | `300`   |
+
+---
+
+## Stage Failure & Pipeline Behavior
+
+To prevent wasted API calls and ensure subtitle integrity, stages adhere to the following execution contracts:
+
+1. **Summary Failure**: If the whole-video summary stage is enabled and exhausts its retries without producing a valid response, pipeline execution **halts immediately**.
+2. **Subtitles Failure**: If subtitle generation fails for a particular 5-minute chunk, that chunk **will not continue** to lyrics refinement.
+3. **Lyrics Failure**: If a singing performance is detected but lyrics refinement fails or exhausts retries, the stitcher **will not fall back** to the draft subtitles. Instead, it marks that specific segment with an explicit error line (`Error processing subtitles for this segment.`) in the final `.srt` so omissions can be clearly identified.
 
 ---
 

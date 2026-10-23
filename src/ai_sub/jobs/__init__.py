@@ -3,6 +3,7 @@
 from ai_sub.jobs.base import (
     BaseJob,
     Prompt,
+    WorkerContext,
     clean_timestamp_string,
     format_ms_timestamp,
     parse_timestamp_string_ms,
@@ -14,6 +15,7 @@ from ai_sub.jobs.lyrics import (
     LyricsAiResponse,
     LyricsJob,
     get_lyrics_prompt,
+    prefetch_lyrics,
 )
 from ai_sub.jobs.reencode import ReencodeJob
 from ai_sub.jobs.subtitles import (
@@ -52,12 +54,14 @@ __all__ = [
     "SubtitlesJob",
     "SummaryAiResponse",
     "SummaryJob",
+    "WorkerContext",
     "clean_timestamp_string",
     "format_ms_timestamp",
     "get_lyrics_prompt",
     "get_subtitles_prompt",
     "get_summary_prompt",
     "parse_timestamp_string_ms",
+    "prefetch_lyrics",
     "serialize_prompt_context",
     "validate_duration_bound",
 ]

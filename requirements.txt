@@ -2,7 +2,7 @@ pysubs2
 static-ffmpeg
 pydantic
 pydantic-settings
-google-genai
+google-genai >= 2.3.0
 logfire[google-genai, httpx]
 ddgs
 httpx

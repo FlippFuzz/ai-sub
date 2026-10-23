@@ -34,19 +34,19 @@ from ai_sub.jobs import (
     SUBTITLES_PROMPT_VERSION,
     SUMMARY_PROMPT_VERSION,
     DetectedMusicalPerformance,
-    LyricsAiResponse,
     LyricsJob,
     ReencodeJob,
     Subtitles,
-    SubtitlesAiResponse,
     SubtitlesJob,
     SummaryAiResponse,
     SummaryJob,
-    get_lyrics_prompt,
-    get_subtitles_prompt,
-    get_summary_prompt,
+    WorkerContext,
 )
-from ai_sub.search import LrclibSearchProvider, create_search_provider
+from ai_sub.search import (
+    BaseSearchProvider,
+    create_search_provider,
+    create_search_providers,
+)
 from ai_sub.shortcode import (
     generate_full_shortcode,
     generate_lyrics_shortcode,
@@ -90,58 +90,6 @@ class SegmentTask:
     subtitles_complete: bool = False
 
 
-async def prefetch_lyrics(
-    performances: list[DetectedMusicalPerformance],
-    lrclib_provider: LrclibSearchProvider,
-    search_provider: Any | None,
-) -> str:
-    """Pre-fetches lyrics from LRCLIB and web search in Python to avoid burning LLM search turns.
-
-    Args:
-        performances: List of detected musical performances.
-        lrclib_provider: LRCLIB search provider instance.
-        search_provider: Optional web search provider instance.
-
-    Returns:
-        str: Formatted initial search results text block.
-    """
-    results_parts: list[str] = []
-
-    for perf in performances:
-        if not perf.title or not perf.title.strip():
-            continue
-
-        clean_title = perf.title.strip()
-        clean_artist = perf.artist.strip() if perf.artist else None
-        logfire.info(f"Pre-fetching lyrics for: '{clean_title}' by '{clean_artist or 'Unknown'}'")
-
-        try:
-            lrclib_results = await lrclib_provider.search_lrclib_lyrics_database(
-                track_title=clean_title,
-                artist_name=clean_artist,
-            )
-            if lrclib_results:
-                best = lrclib_results[0]
-                results_parts.append(
-                    f"Official Lyrics for '{best.get('track_name')}' by {best.get('artist_name')}:\n"
-                    f"{best.get('plain_lyrics')}"
-                )
-        except Exception as e:
-            logfire.warning(f"LRCLIB pre-fetch error for '{clean_title}': {e}")
-
-        if not results_parts and search_provider and hasattr(search_provider, "search_single"):
-            try:
-                query = f"{clean_title} {clean_artist or ''} lyrics 歌詞"
-                search_res = await search_provider.search_single(query.strip())
-                if search_res:
-                    snippets = "\n---\n".join(f"[{r.title}]: {r.content}" for r in search_res[:2])
-                    results_parts.append(f"Web Search Results for '{clean_title}':\n{snippets}")
-            except Exception as e:
-                logfire.debug(f"Web search pre-fetch error for '{clean_title}': {e}")
-
-    return "\n\n".join(results_parts)
-
-
 def stitch_subtitles(
     video_splits: list[tuple[Path, int]],
     settings: Settings,
@@ -168,6 +116,7 @@ def stitch_subtitles(
         chunks_to_skip = int((settings.split.start_offset_min * 60) / settings.split.max_seconds)
         offset_ms = sum(d for _, d in video_splits[:chunks_to_skip])
 
+        use_lyrics = settings.concurrency.lyrics > 0
         complete = True
         max_retries_exceeded = False
         any_pending = False
@@ -179,11 +128,21 @@ def stitch_subtitles(
             lyrics_job = LyricsJob.load(lyrics_job_path, settings.ai.validation_buffer_ms)
             sub_job = SubtitlesJob.load(sub_job_path, settings.ai.validation_buffer_ms)
 
-            active_response = (
-                lyrics_job.response
-                if (lyrics_job and lyrics_job.response)
-                else (sub_job.response if (sub_job and sub_job.response) else None)
+            # Determine whether lyrics refinement was required for this segment
+            lyrics_required = bool(
+                use_lyrics and sub_job and sub_job.response and sub_job.response.detected_musical_performances
             )
+
+            active_response = None
+            if lyrics_required:
+                # If lyrics was required, ONLY accept a successful lyrics refinement response.
+                # If lyrics failed or is missing, do NOT fall back to draft subtitles.
+                if lyrics_job and lyrics_job.response:
+                    active_response = lyrics_job.response
+            else:
+                # Lyrics was not required; use initial subtitle response if present.
+                if sub_job and sub_job.response:
+                    active_response = sub_job.response
 
             if active_response:
                 segment_subs = active_response.get_ssafile()
@@ -284,19 +243,26 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
             reencode_dir.mkdir(exist_ok=True)
 
         async with AsyncExitStack() as stack:
-            base_search_tools: list[Any] = []
-            search_provider: Any | None = None
+            web_search_providers: list[BaseSearchProvider] = []
+            lyrics_search_providers: list[BaseSearchProvider] = []
+
             if use_summary or use_lyrics:
-                search_provider, base_search_tools = create_search_provider(settings.ai.search)
-                if search_provider is not None and hasattr(search_provider, "__aenter__"):
-                    await stack.enter_async_context(search_provider)
+                configured_providers = create_search_providers(settings.ai.search)
+                for provider in configured_providers:
+                    await stack.enter_async_context(provider)
 
-            lrclib_provider = LrclibSearchProvider(settings.ai.search)
-            await stack.enter_async_context(lrclib_provider)
+                # Summary phase: general web search providers only (never lrclib)
+                web_search_providers = [p for p in configured_providers if p.provider_name != "lrclib"]
 
-            lyrics_search_tools: list[Any] = list(base_search_tools)
-            if use_lyrics:
-                lyrics_search_tools.extend(lrclib_provider.get_tools())
+                if use_lyrics:
+                    lrclib_candidates = [p for p in configured_providers if p.provider_name == "lrclib"]
+                    if lrclib_candidates:
+                        lrclib_provider = lrclib_candidates[0]
+                    else:
+                        lrclib_provider = create_search_provider("lrclib", settings.ai.search)
+                        await stack.enter_async_context(lrclib_provider)
+
+                    lyrics_search_providers = [lrclib_provider, *web_search_providers]
 
             executor = GeminiExecutor(settings)
 
@@ -346,7 +312,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                 should_reencode_summary = mb >= settings.reencode.summary.threshold_mb
 
                         if should_reencode_summary:
-                            proxy_output = settings.dir.tmp / f"summary_proxy{input_video_path.suffix}"
+                            proxy_output = settings.dir.tmp / "summary_proxy.mp4"
                             with logfire.span("Compressing whole-video summary proxy"):
                                 await reencode_video(
                                     input_path=input_video_path,
@@ -364,33 +330,33 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
 
                         try:
                             with logfire.span("Executing Summary"):
-                                prompt = get_summary_prompt(user_context=user_context)
-                                res = await executor.run_structured(
-                                    prompt=prompt,
+                                ctx = WorkerContext(
+                                    executor=executor,
                                     media_path=summary_media,
-                                    video_duration_ms=summary_duration_ms,
-                                    response_type=SummaryAiResponse,
-                                    model_name=settings.ai.model_summary,
-                                    service_tier=settings.ai.service_tier_summary,
-                                    tools=base_search_tools,
-                                    retry_policy=settings.retry,
-                                    agentic_video=True,
+                                    search_providers=web_search_providers,
                                 )
-                                summary_job.response = res
-                                summary_job.total_attempts += 1
-                                summary_response = res
+                                summary_response = await summary_job.execute(ctx)
                                 logfire.info("Summary completed successfully.")
                         except QuotaExceededError:
                             logfire.warning("Quota exceeded during summary stage.")
                         except Exception as e:
                             summary_job.total_attempts += 1
-                            logfire.warning(f"Summary stage failed: {e}. Proceeding without global summary.")
+                            logfire.error(f"Summary stage failed after retries: {e}")
                         finally:
                             await asyncio.to_thread(summary_job.save, summary_file)
                             progress.update(summary_tid, completed=1)
                     else:
                         logfire.warning("Skipping summary: max attempts reached.")
                         progress.update(summary_tid, completed=1)
+
+                    # Rule: If summary was enabled and failed to produce a response, stop the pipeline immediately.
+                    if summary_response is None:
+                        logfire.error("Summary stage failed or incomplete. Halting pipeline execution.")
+                        return (
+                            AiSubResult.MAX_RETRIES_EXHAUSTED
+                            if summary_job.total_attempts >= settings.retry.max_runs
+                            else AiSubResult.INCOMPLETE
+                        )
 
                 # ------------------------------------------------------------------
                 # Video Segmentation & Segment Setup
@@ -443,7 +409,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                     task_offset_ms = current_offset_ms
                     current_offset_ms += duration_ms
 
-                    # Check if already completed (either lyrics-refined or initial subtitles with no singing)
                     is_done = False
                     if existing_lyrics and existing_lyrics.response:
                         is_done = True
@@ -484,9 +449,12 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                     elif existing_sub and existing_sub.response:
                         task.draft_subtitles = existing_sub.response.subtitles
                         task.detected_performances = existing_sub.response.detected_musical_performances
+                        task.subtitles_complete = True
                         progress.update(subtitles_tid, advance=1)
                         if use_lyrics and task.detected_performances:
                             await lyrics_queue.put(task)
+                        elif lyrics_tid is not None:
+                            progress.update(lyrics_tid, advance=1)
                     else:
                         await subtitles_queue.put(task)
 
@@ -495,7 +463,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                         task = await reencode_queue.get()
                         try:
                             with logfire.span("Reencode: {segment}", segment=task.stem):
-                                out_file = reencode_dir / task.raw_path.with_suffix(".mov").name
+                                out_file = reencode_dir / task.raw_path.with_suffix(".mp4").name
                                 job = ReencodeJob(
                                     name=task.stem,
                                     input_file=task.raw_path,
@@ -535,37 +503,28 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                     job = SubtitlesJob(
                                         name=task.stem,
                                         video_duration_ms=task.duration_ms,
+                                        segment_offset_ms=task.offset_ms,
+                                        global_summary=summary_response,
                                         user_context=user_context,
                                     )
                                 else:
                                     job.user_context = user_context
+                                    job.segment_offset_ms = task.offset_ms
+                                    job.global_summary = summary_response
 
                                 if not job.response and job.total_attempts < settings.retry.max_runs:
                                     try:
-                                        prompt = get_subtitles_prompt(
-                                            user_context=user_context,
-                                            global_summary=summary_response,
-                                            segment_offset_ms=task.offset_ms,
-                                            segment_duration_ms=task.duration_ms,
-                                        )
-                                        res = await executor.run_structured(
-                                            prompt=prompt,
+                                        ctx = WorkerContext(
+                                            executor=executor,
                                             media_path=task.media_path,
-                                            video_duration_ms=task.duration_ms,
-                                            response_type=SubtitlesAiResponse,
-                                            model_name=settings.ai.model_subtitles,
-                                            service_tier=settings.ai.service_tier_subtitles,
-                                            tools=None,
-                                            retry_policy=settings.retry,
-                                            agentic_video=False,
+                                            search_providers=[],
                                         )
-                                        job.response = res
-                                        job.total_attempts += 1
+                                        res = await job.execute(ctx)
                                         task.draft_subtitles = res.subtitles
                                         task.detected_performances = res.detected_musical_performances
+                                        task.subtitles_complete = True
 
-                                        # Save part subtitles SRT for VLC comparison
-                                        srt_path = settings.dir.tmp / f"{task.stem}.subtitles.{subtitles_shortcode}.srt"
+                                        srt_path = settings.dir.tmp / f"{task.stem}.subtitles-{subtitles_shortcode}.srt"
                                         await asyncio.to_thread(job.save_srt, srt_path)
                                     except QuotaExceededError:
                                         logfire.warning(f"Quota exceeded during subtitles pass for {task.stem}.")
@@ -577,13 +536,14 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                 elif job.response:
                                     task.draft_subtitles = job.response.subtitles
                                     task.detected_performances = job.response.detected_musical_performances
+                                    task.subtitles_complete = True
                                 elif job.total_attempts >= settings.retry.max_runs:
                                     logfire.warning(f"Skipping subtitles for {task.stem}: max attempts reached.")
 
                             progress.update(subtitles_tid, advance=1)
 
-                            # Route to Lyrics refinement only if music was detected and lyrics lookup is enabled
-                            if use_lyrics and task.detected_performances:
+                            # Rule: If subtitles failed for this part, DO NOT continue processing this part.
+                            if task.subtitles_complete and use_lyrics and task.detected_performances:
                                 await lyrics_queue.put(task)
                             elif lyrics_tid is not None:
                                 progress.update(lyrics_tid, advance=1)
@@ -601,50 +561,36 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                     job = LyricsJob(
                                         name=task.stem,
                                         video_duration_ms=task.duration_ms,
+                                        segment_offset_ms=task.offset_ms,
+                                        draft_subtitles=task.draft_subtitles or [],
+                                        detected_performances=task.detected_performances or [],
+                                        global_summary=summary_response,
                                         user_context=user_context,
                                     )
                                 else:
                                     job.user_context = user_context
+                                    job.segment_offset_ms = task.offset_ms
+                                    job.global_summary = summary_response
+                                    if task.draft_subtitles:
+                                        job.draft_subtitles = task.draft_subtitles
+                                    if task.detected_performances:
+                                        job.detected_performances = task.detected_performances
 
                                 if (
                                     not job.response
                                     and job.total_attempts < settings.retry.max_runs
-                                    and task.draft_subtitles
-                                    and task.detected_performances
+                                    and job.draft_subtitles
+                                    and job.detected_performances
                                 ):
                                     try:
-                                        prefetched = await prefetch_lyrics(
-                                            performances=task.detected_performances,
-                                            lrclib_provider=lrclib_provider,
-                                            search_provider=search_provider,
-                                        )
-
-                                        prompt = get_lyrics_prompt(
-                                            draft_subtitles=task.draft_subtitles,
-                                            detected_performances=task.detected_performances,
-                                            initial_search_results=prefetched,
-                                            user_context=user_context,
-                                            global_summary=summary_response,
-                                            segment_offset_ms=task.offset_ms,
-                                            segment_duration_ms=task.duration_ms,
-                                        )
-
-                                        res = await executor.run_structured(
-                                            prompt=prompt,
+                                        ctx = WorkerContext(
+                                            executor=executor,
                                             media_path=task.media_path,
-                                            video_duration_ms=task.duration_ms,
-                                            response_type=LyricsAiResponse,
-                                            model_name=settings.ai.model_lyrics,
-                                            service_tier=settings.ai.service_tier_lyrics,
-                                            tools=lyrics_search_tools,
-                                            retry_policy=settings.retry,
-                                            agentic_video=True,
+                                            search_providers=lyrics_search_providers,
                                         )
-                                        job.response = res
-                                        job.total_attempts += 1
+                                        await job.execute(ctx)
 
-                                        # Save part lyrics SRT for VLC comparison
-                                        srt_path = settings.dir.tmp / f"{task.stem}.lyrics.{lyrics_shortcode}.srt"
+                                        srt_path = settings.dir.tmp / f"{task.stem}.lyrics-{lyrics_shortcode}.srt"
                                         await asyncio.to_thread(job.save_srt, srt_path)
                                     except QuotaExceededError:
                                         logfire.warning(f"Quota exceeded during lyrics pass for {task.stem}.")

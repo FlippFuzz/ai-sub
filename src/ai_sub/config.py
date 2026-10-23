@@ -79,13 +79,25 @@ class SearchSettings(BaseSettings):
         **_BASE_CONFIG,
     }
 
-    tool: Literal["builtin", "duckduckgo", "ollama", "langsearch", "tinyfish"] = Field(
-        description="The web search provider to use: 'builtin', 'duckduckgo', 'ollama', 'langsearch', or 'tinyfish'.",
-        default="duckduckgo",
+    tools: list[str] = Field(
+        description="List of search providers to enable (e.g. ['duckduckgo'], ['tinyfish', 'lrclib']). "
+        "Supported: 'builtin', 'duckduckgo', 'ollama', 'langsearch', 'tinyfish', 'lrclib'.",
+        default_factory=lambda: ["duckduckgo"],
     )
     key: SecretStr | None = Field(
-        description="API key for search services (Ollama, Langsearch, or Tinyfish). "
-        "Falls back to OLLAMA_API_KEY, LANGSEARCH_API_KEY, or TINYFISH_API_KEY.",
+        description="Fallback API key for search services (Ollama, Langsearch, or Tinyfish).",
+        default=None,
+    )
+    tinyfish_key: SecretStr | None = Field(
+        description="Dedicated API key for Tinyfish search.",
+        default=None,
+    )
+    langsearch_key: SecretStr | None = Field(
+        description="Dedicated API key for Langsearch.",
+        default=None,
+    )
+    ollama_key: SecretStr | None = Field(
+        description="Dedicated API key for Ollama search.",
         default=None,
     )
     max_turns: PositiveInt = Field(
@@ -121,10 +133,28 @@ class SearchSettings(BaseSettings):
         default=2.0,
     )
 
+    def get_key_for_provider(self, provider_name: str) -> SecretStr | None:
+        """Resolves the API key for a specific search provider.
+
+        Args:
+            provider_name: The provider identifier ('tinyfish', 'langsearch', 'ollama').
+
+        Returns:
+            SecretStr | None: The resolved API key or None if not set.
+        """
+        p = provider_name.strip().lower()
+        if p == "tinyfish":
+            return self.tinyfish_key or self.key
+        if p == "langsearch":
+            return self.langsearch_key or self.key
+        if p == "ollama":
+            return self.ollama_key or self.key
+        return self.key
+
     @model_validator(mode="before")
     @classmethod
-    def load_api_key_from_env(cls, values: dict[str, Any]) -> dict[str, Any]:
-        """Loads provider-specific search keys from ambient environment variables.
+    def load_api_keys_from_env(cls, values: dict[str, Any]) -> dict[str, Any]:
+        """Normalizes tools list and loads provider-specific search keys from environment.
 
         Args:
             values: Raw input dictionary before validation.
@@ -132,20 +162,66 @@ class SearchSettings(BaseSettings):
         Returns:
             dict[str, Any]: Updated input dictionary.
         """
-        if values.get("key") is None:
-            tool = values.get("tool") or os.getenv("AISUB_AI_SEARCH_TOOL") or "duckduckgo"
-            env_key = None
-            if tool == "ollama":
-                env_key = os.getenv("OLLAMA_API_KEY")
-            elif tool == "langsearch":
-                env_key = os.getenv("LANGSEARCH_API_KEY")
-            elif tool == "tinyfish":
-                env_key = os.getenv("TINYFISH_API_KEY")
+        if "tool" in values and values.get("tool"):
+            raw_tool = values.pop("tool")
+            if "tools" not in values:
+                values["tools"] = raw_tool
 
-            if env_key:
-                values["key"] = env_key.strip().strip('"').strip("'")
+        raw_tools = values.get("tools")
+        if raw_tools is None:
+            env_tools = os.getenv("AISUB_AI_SEARCH_TOOLS") or os.getenv("AISUB_AI_SEARCH_TOOL")
+            if env_tools:
+                raw_tools = env_tools
+            else:
+                raw_tools = ["duckduckgo"]
+
+        if isinstance(raw_tools, str):
+            values["tools"] = [t.strip() for t in raw_tools.split(",") if t.strip()]
+        elif isinstance(raw_tools, (list, tuple)):
+            flattened: list[str] = []
+            for item in raw_tools:
+                if isinstance(item, str) and "," in item:
+                    flattened.extend(t.strip() for t in item.split(",") if t.strip())
+                elif isinstance(item, str) and item.strip():
+                    flattened.append(item.strip())
+            values["tools"] = flattened
+
+        if values.get("tinyfish_key") is None:
+            if env_val := os.getenv("TINYFISH_API_KEY"):
+                values["tinyfish_key"] = env_val.strip().strip('"').strip("'")
+
+        if values.get("langsearch_key") is None:
+            if env_val := os.getenv("LANGSEARCH_API_KEY"):
+                values["langsearch_key"] = env_val.strip().strip('"').strip("'")
+
+        if values.get("ollama_key") is None:
+            if env_val := os.getenv("OLLAMA_API_KEY"):
+                values["ollama_key"] = env_val.strip().strip('"').strip("'")
+
+        if values.get("key") is None:
+            general_key = os.getenv("AISUB_AI_SEARCH_KEY")
+            if general_key:
+                values["key"] = general_key.strip().strip('"').strip("'")
+            else:
+                values["key"] = values.get("tinyfish_key") or values.get("langsearch_key") or values.get("ollama_key")
 
         return values
+
+    @model_validator(mode="after")
+    def validate_tools_list(self) -> Self:
+        """Validates that configured search tools are supported.
+
+        Returns:
+            Self: Validated instance.
+
+        Raises:
+            ValueError: If an unknown search tool is specified.
+        """
+        valid_tools = {"builtin", "duckduckgo", "ollama", "langsearch", "tinyfish", "lrclib"}
+        for t in self.tools:
+            if t.lower() not in valid_tools:
+                raise ValueError(f"Unknown search provider '{t}'. Supported providers: {sorted(valid_tools)}")
+        return self
 
 
 class AiSettings(BaseSettings):
@@ -195,6 +271,22 @@ class AiSettings(BaseSettings):
     service_tier_lyrics: ServiceTier | None = Field(
         default=None,
         description="Google Gemini service tier for lyrics refinement.",
+    )
+    agentic_video: bool | None = Field(
+        default=None,
+        description="Shorthand setting agentic video understanding across all pipeline phases.",
+    )
+    agentic_video_summary: bool = Field(
+        default=True,
+        description="Whether to use agentic video understanding for whole-video summary.",
+    )
+    agentic_video_subtitles: bool = Field(
+        default=False,
+        description="Whether to use agentic video understanding for subtitle generation.",
+    )
+    agentic_video_lyrics: bool = Field(
+        default=True,
+        description="Whether to use agentic video understanding for lyrics refinement.",
     )
     rpm: PositiveInt = Field(
         description="Maximum Requests Per Minute (RPM) allowed for the model.",
@@ -263,6 +355,11 @@ class AiSettings(BaseSettings):
             self.service_tier_summary = self.service_tier
             self.service_tier_lyrics = self.service_tier
             self.service_tier_subtitles = self.service_tier
+
+        if self.agentic_video is not None:
+            self.agentic_video_summary = self.agentic_video
+            self.agentic_video_subtitles = self.agentic_video
+            self.agentic_video_lyrics = self.agentic_video
 
         return self
 
@@ -571,12 +668,14 @@ class Settings(BaseSettings):
             )
 
         if self.concurrency.summary > 0 or self.concurrency.lyrics > 0:
-            tool = self.ai.search.tool
-            if tool in ("ollama", "langsearch", "tinyfish") and self.ai.search.key is None:
-                raise ValueError(
-                    f"A search API key must be provided via '--ai.search.key' "
-                    f"or the {tool.upper()}_API_KEY environment variable when using '{tool}'."
-                )
+            for tool in self.ai.search.tools:
+                clean_tool = tool.strip().lower()
+                if clean_tool in ("ollama", "langsearch", "tinyfish"):
+                    if self.ai.search.get_key_for_provider(clean_tool) is None:
+                        raise ValueError(
+                            f"A search API key must be provided for '{clean_tool}' via '--ai.search.{clean_tool}-key', "
+                            f"'--ai.search.key', or the {clean_tool.upper()}_API_KEY environment variable."
+                        )
 
         return self
 

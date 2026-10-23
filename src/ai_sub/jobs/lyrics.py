@@ -13,6 +13,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    NonNegativeInt,
     PositiveInt,
     ValidationError,
     ValidationInfo,
@@ -24,12 +25,16 @@ from pysubs2 import SSAEvent, SSAFile
 from ai_sub.jobs.base import (
     BaseJob,
     Prompt,
+    WorkerContext,
     format_ms_timestamp,
     parse_timestamp_string_ms,
     serialize_prompt_context,
     validate_duration_bound,
 )
-from ai_sub.jobs.subtitles import Subtitles
+from ai_sub.jobs.subtitles import DetectedMusicalPerformance, Subtitles
+from ai_sub.jobs.summary import SummaryAiResponse
+from ai_sub.search.base import BaseSearchProvider
+from ai_sub.search.lrclib import LrclibSearchProvider
 
 LYRICS_PROMPT_VERSION = 10
 
@@ -62,7 +67,9 @@ _LYRICS_SYSTEM_TEMPLATE = dedent(
       <mandate name="SEARCH TOOLS AS FALLBACK">
         Initial search results and lyrics are pre-fetched in `<initial_search_results>`.
         - If the pre-fetched lyrics match the song performed, use them immediately.
-        - If the pre-fetched lyrics are missing, incomplete, or for the wrong song, use your search tools to look up the correct lyrics.
+        - If the pre-fetched lyrics are missing, incomplete, or for the wrong song, use your search tools:
+          * Use `search_lrclib_lyrics_database` first for exact song titles and original-language lyrics.
+          * Use general web search tools if the song is not in the lyrics database or if you need English translation references.
       </mandate>
     </core_mandates>
 
@@ -73,6 +80,68 @@ _LYRICS_SYSTEM_TEMPLATE = dedent(
     </formatting_rules>
     """  # noqa: E501
 ).strip()
+
+
+async def prefetch_lyrics(
+    performances: list[DetectedMusicalPerformance],
+    search_providers: list[BaseSearchProvider],
+) -> str:
+    """Pre-fetches lyrics from LRCLIB and web search providers before the first LLM turn.
+
+    Args:
+        performances: List of detected musical performances.
+        search_providers: Available search providers on the worker.
+
+    Returns:
+        str: Formatted initial search results text block.
+    """
+    results_parts: list[str] = []
+
+    lrclib_provider: LrclibSearchProvider | None = None
+    web_provider: BaseSearchProvider | None = None
+
+    for p in search_providers:
+        if isinstance(p, LrclibSearchProvider):
+            lrclib_provider = p
+        elif p.provider_name not in ("builtin", "lrclib") and web_provider is None:
+            web_provider = p
+
+    for perf in performances:
+        if not perf.title or not perf.title.strip():
+            continue
+
+        clean_title = perf.title.strip()
+        clean_artist = perf.artist.strip() if perf.artist else None
+        logfire.info(f"Pre-fetching lyrics for: '{clean_title}' by '{clean_artist or 'Unknown'}'")
+
+        perf_found = False
+        if lrclib_provider is not None:
+            try:
+                lrclib_results = await lrclib_provider.search_lrclib_lyrics_database(
+                    track_title=clean_title,
+                    artist_name=clean_artist,
+                )
+                if lrclib_results:
+                    best = lrclib_results[0]
+                    results_parts.append(
+                        f"Official Lyrics for '{best.get('track_name')}' by {best.get('artist_name')}:\n"
+                        f"{best.get('plain_lyrics')}"
+                    )
+                    perf_found = True
+            except Exception as e:
+                logfire.warning(f"LRCLIB pre-fetch error for '{clean_title}': {e}")
+
+        if not perf_found and web_provider is not None:
+            try:
+                query = f"{clean_title} {clean_artist or ''} lyrics 歌詞"
+                search_res = await web_provider.search_single(query.strip())
+                if search_res:
+                    snippets = "\n---\n".join(f"[{r.title}]: {r.content}" for r in search_res[:2])
+                    results_parts.append(f"Web Search Results for '{clean_title}':\n{snippets}")
+            except Exception as e:
+                logfire.debug(f"Web search pre-fetch error for '{clean_title}': {e}")
+
+    return "\n\n".join(results_parts)
 
 
 def get_lyrics_prompt(
@@ -236,14 +305,69 @@ class LyricsJob(BaseJob):
     """Job container holding refined subtitles for a segment with musical performance."""
 
     video_duration_ms: PositiveInt = Field(description="Segment duration in milliseconds.")
+    segment_offset_ms: NonNegativeInt = Field(
+        default=0,
+        description="Absolute start offset of this segment in milliseconds.",
+    )
     lyrics_prompt_version: int = Field(
         default=LYRICS_PROMPT_VERSION,
         description="Prompt version employed for this refinement response.",
+    )
+    draft_subtitles: list[Subtitles] = Field(
+        default_factory=list,
+        description="Draft subtitles to refine.",
+    )
+    detected_performances: list[DetectedMusicalPerformance] = Field(
+        default_factory=list,
+        description="Detected singing performances in this segment.",
+    )
+    global_summary: SummaryAiResponse | None = Field(
+        default=None,
+        description="Optional global summary context from phase 1.",
     )
     response: LyricsAiResponse | None = Field(
         default=None,
         description="Structured AI output once refined.",
     )
+
+    async def execute(self, ctx: WorkerContext) -> LyricsAiResponse:
+        """Refines draft subtitles for detected singing performances using lyrics search.
+
+        Args:
+            ctx: Worker runtime context containing executor and search providers.
+
+        Returns:
+            LyricsAiResponse: Refined subtitles response.
+        """
+        prefetched = await prefetch_lyrics(
+            performances=self.detected_performances,
+            search_providers=ctx.search_providers,
+        )
+
+        prompt = get_lyrics_prompt(
+            draft_subtitles=self.draft_subtitles,
+            detected_performances=self.detected_performances,
+            initial_search_results=prefetched,
+            user_context=self.user_context,
+            global_summary=self.global_summary,
+            segment_offset_ms=self.segment_offset_ms,
+            segment_duration_ms=self.video_duration_ms,
+        )
+
+        res = await ctx.executor.run_structured(
+            prompt=prompt,
+            media_path=ctx.media_path,
+            video_duration_ms=self.video_duration_ms,
+            response_type=LyricsAiResponse,
+            model_name=ctx.executor.ai_settings.model_lyrics,
+            service_tier=ctx.executor.ai_settings.service_tier_lyrics,
+            tools=ctx.search_providers,
+            agentic_video=ctx.executor.ai_settings.agentic_video_lyrics,
+            task_label="lyrics",
+        )
+        self.response = res
+        self.total_attempts += 1
+        return res
 
     def save_srt(self, srt_path: Path) -> None:
         """Saves current refined subtitle response as an SRT file.

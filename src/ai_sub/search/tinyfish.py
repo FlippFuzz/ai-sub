@@ -7,7 +7,7 @@ from typing import Any, Callable
 import logfire
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import BaseHttpSearchProvider, normalize_query
+from ai_sub.search.base import BaseHttpSearchProvider, WebSearchResult, normalize_query
 
 
 class TinyfishSearchProvider(BaseHttpSearchProvider):
@@ -27,19 +27,39 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
         Returns:
             dict[str, str]: HTTP request headers.
         """
-        assert self.settings.key is not None
+        key = self._get_api_key()
+        assert key is not None
         return {
-            "X-API-Key": self.settings.key.get_secret_value(),
+            "X-API-Key": key.get_secret_value(),
             "Content-Type": "application/json",
         }
 
-    def get_tools(self) -> list[Callable[..., Any]]:
+    def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
         """Returns search and fetch tool callables for Gemini model registration.
 
         Returns:
-            list[Callable[..., Any]]: Both tinyfish_search and tinyfish_fetch methods.
+            list[Callable[..., Any] | dict[str, Any]]: Both tinyfish_search and tinyfish_fetch methods.
         """
         return [self.tinyfish_search, self.tinyfish_fetch]
+
+    async def search_single(self, query: str) -> list[WebSearchResult]:
+        """Performs a single search query returning normalized search results.
+
+        Args:
+            query: Search query keywords.
+
+        Returns:
+            list[WebSearchResult]: Formatted search result items.
+        """
+        raw_results = await self.tinyfish_search(query)
+        results: list[WebSearchResult] = []
+        for item in raw_results:
+            title = item.get("title")
+            url = item.get("url")
+            snippet = item.get("snippet")
+            if title and url and snippet:
+                results.append(WebSearchResult(title=title, url=url, content=snippet))
+        return results
 
     async def tinyfish_search(
         self,

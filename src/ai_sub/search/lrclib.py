@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import logfire
+from pydantic import HttpUrl
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import BaseHttpSearchProvider, normalize_query
+from ai_sub.search.base import BaseHttpSearchProvider, WebSearchResult, normalize_query
 from ai_sub.telemetry import get_app_version
 
 
@@ -32,11 +33,11 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
             "User-Agent": f"ai-sub {get_app_version()} (https://github.com/FlippFuzz/ai-sub)",
         }
 
-    def get_tools(self) -> list[Callable[..., Any]]:
+    def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
         """Returns tool callables for Gemini model registration.
 
         Returns:
-            list[Callable[..., Any]]: Bound search methods.
+            list[Callable[..., Any] | dict[str, Any]]: Bound search methods.
         """
         return [self.search_lrclib_lyrics_database]
 
@@ -98,7 +99,6 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
 
             results = _extract_valid_results(response.json())
 
-            # If structured track_name search returns no usable results, fall back to keyword query
             if not results:
                 fallback_res = await self._request(
                     "GET",
@@ -109,3 +109,28 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
 
             self._cache[cache_key] = results
             return results
+
+    async def search_single(self, query: str) -> list[WebSearchResult]:
+        """Performs a lyrics search query returning normalized search results.
+
+        Args:
+            query: Song title or lyrics query keywords.
+
+        Returns:
+            list[WebSearchResult]: Formatted search result items containing song lyrics.
+        """
+        raw_results = await self.search_lrclib_lyrics_database(track_title=query)
+        results: list[WebSearchResult] = []
+        for item in raw_results:
+            track = item.get("track_name") or "Unknown Track"
+            artist = item.get("artist_name") or "Unknown Artist"
+            lyrics = item.get("plain_lyrics") or ""
+            if lyrics:
+                results.append(
+                    WebSearchResult(
+                        title=f"{track} - {artist}",
+                        url=HttpUrl("https://lrclib.net"),
+                        content=lyrics,
+                    )
+                )
+        return results

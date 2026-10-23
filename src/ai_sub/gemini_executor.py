@@ -1,9 +1,10 @@
-"""Unified execution engine for Google Gemini models and Files API management."""
+"""Unified execution engine for Google Gemini models and Files API management using the Interactions API."""
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import random
 import re
 from collections.abc import Sequence
@@ -16,14 +17,12 @@ import json_repair
 import logfire
 from google import genai
 from google.genai import types
-from google.genai.errors import APIError
-from httpx import TimeoutException, TransportError
 from pydantic import BaseModel, ValidationError
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
-from ai_sub.config import RetrySettings, ServiceTier, Settings
+from ai_sub.config import AiSettings, RetrySettings, ServiceTier, Settings
 from ai_sub.jobs.base import Prompt
-from ai_sub.search.base import parse_retry_after
+from ai_sub.search.base import BaseSearchProvider
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -102,82 +101,43 @@ def _is_daily_quota_exceeded(e: Exception) -> bool:
     return "429" in err_str and "generaterequestsperdayperprojectpermodel-freetier" in err_str
 
 
-def _is_transient_api_error(e: APIError) -> bool:
-    """Checks whether an API error is transient and eligible for retry.
+def _extract_thought_text(step: Any) -> str | None:
+    """Extracts reasoning text from a thought step in an interaction response.
 
     Args:
-        e: Caught APIError exception.
+        step: Step object from interaction.steps.
 
     Returns:
-        bool: True if the API error is considered transient and safe to retry.
+        str | None: Extracted thought text or None.
     """
-    if _is_daily_quota_exceeded(e):
-        return False
+    summary = getattr(step, "summary", None)
+    if summary:
+        parts: list[str] = []
+        if isinstance(summary, list):
+            for block in summary:
+                if isinstance(block, str):
+                    if block.strip():
+                        parts.append(block.strip())
+                elif hasattr(block, "text") and getattr(block, "text", None):
+                    parts.append(str(block.text).strip())
+                elif isinstance(block, dict) and block.get("text"):
+                    parts.append(str(block["text"]).strip())
+        elif isinstance(summary, str) and summary.strip():
+            parts.append(summary.strip())
+        if parts:
+            return "\n".join(parts)
 
-    code = getattr(e, "code", None)
-    if code is not None:
-        return code in (408, 429, 499, 500, 502, 503, 504)
+    if getattr(step, "text", None):
+        return str(step.text).strip()
 
-    err_str = str(e).lower()
-    transient_indicators = (
-        "408",
-        "429",
-        "499",
-        "500",
-        "502",
-        "503",
-        "504",
-        "unavailable",
-        "resource_exhausted",
-        "deadline_exceeded",
-        "internal",
-        "try again later",
-        "overloaded",
-    )
-    return any(indicator in err_str for indicator in transient_indicators)
-
-
-def _calculate_backoff(
-    e: Exception,
-    attempt: int,
-    policy: RetrySettings,
-) -> float:
-    """Calculates backoff delay in seconds respecting Retry-After headers and exponential policy.
-
-    Args:
-        e: Caught exception.
-        attempt: Zero-based retry attempt number.
-        policy: Configured retry policy settings.
-
-    Returns:
-        float: Computed backoff delay in seconds.
-    """
-    retry_after: float | None = None
-    if isinstance(e, APIError):
-        resp = getattr(e, "response", None)
-        if resp is not None:
-            headers = getattr(resp, "headers", None)
-            if headers:
-                header_val = headers.get("retry-after") or headers.get("Retry-After")
-                if header_val:
-                    retry_after = parse_retry_after(str(header_val))
-
-    if retry_after is not None:
-        return min(
-            float(policy.max_wait_seconds),
-            max(float(policy.min_wait_seconds), retry_after) + random.uniform(0, 1),
-        )
-
-    return min(
-        float(policy.max_wait_seconds),
-        (policy.min_wait_seconds * (policy.multiplier**attempt)) + random.uniform(0, 1),
-    )
+    return None
 
 
 class GeminiExecutor:
-    """Unified client orchestrating Gemini Files API uploads, quota tracking, and generation."""
+    """Unified client orchestrating Gemini Files API uploads, quota tracking, and Interactions generation."""
 
-    settings: Settings
+    ai_settings: AiSettings
+    retry_settings: RetrySettings
     _client: genai.Client
     _quota_exhausted: dict[str, bool]
     _request_limiters: dict[str, Limiter]
@@ -185,30 +145,55 @@ class GeminiExecutor:
     _last_cleanup_time: float
     _cleanup_lock: asyncio.Lock
 
-    def __init__(self, settings: Settings) -> None:
-        """Initializes the Gemini executor.
+    def __init__(
+        self,
+        settings: Settings | AiSettings,
+        retry_settings: RetrySettings | None = None,
+    ) -> None:
+        """Initializes the Gemini executor with native SDK HTTP retries.
 
         Args:
-            settings: Root application configuration settings.
+            settings: Root application configuration or dedicated AiSettings.
+            retry_settings: Optional retry policy settings when AiSettings is supplied directly.
 
         Raises:
             ValueError: If the Google API key is missing.
         """
-        if settings.ai.key is None:
+        if isinstance(settings, Settings):
+            self.ai_settings = settings.ai
+            self.retry_settings = settings.retry
+        else:
+            self.ai_settings = settings
+            self.retry_settings = retry_settings or RetrySettings()
+
+        if self.ai_settings.key is None:
             raise ValueError("Google Gemini API key is missing.")
 
-        api_key = settings.ai.key.get_secret_value()
+        api_key = self.ai_settings.key.get_secret_value()
 
-        self.settings = settings
         self._quota_exhausted = {}
         self._request_limiters = {}
         self._token_limiters = {}
         self._last_cleanup_time = 0.0
         self._cleanup_lock = asyncio.Lock()
 
-        http_options: types.HttpOptions | None = None
-        if self.settings.ai.base_url:
-            http_options = types.HttpOptions(base_url=str(self.settings.ai.base_url))
+        # Delegate network and transient HTTP retries directly to Google SDK HTTP transport
+        retry_options = types.HttpRetryOptions(
+            attempts=self.retry_settings.per_run + 1,
+            initial_delay=float(self.retry_settings.min_wait_seconds),
+            max_delay=float(self.retry_settings.max_wait_seconds),
+            exp_base=float(self.retry_settings.multiplier),
+            jitter=1.0,
+            http_status_codes=[408, 429, 500, 502, 503, 504],
+        )
+
+        http_options_kwargs: dict[str, Any] = {
+            "retry_options": retry_options,
+        }
+        if self.ai_settings.base_url:
+            http_options_kwargs["base_url"] = str(self.ai_settings.base_url)
+
+        http_options = types.HttpOptions(**http_options_kwargs)
 
         self._client = genai.Client(
             api_key=api_key,
@@ -226,17 +211,17 @@ class GeminiExecutor:
         """
         if model_id not in self._request_limiters:
             self._request_limiters[model_id] = limiter_factory.create_inmemory_limiter(
-                rate_per_duration=self.settings.ai.rpm, duration=Duration.MINUTE
+                rate_per_duration=self.ai_settings.rpm, duration=Duration.MINUTE
             )
             self._token_limiters[model_id] = limiter_factory.create_inmemory_limiter(
-                rate_per_duration=self.settings.ai.tpm, duration=Duration.MINUTE
+                rate_per_duration=self.ai_settings.tpm, duration=Duration.MINUTE
             )
         return self._request_limiters[model_id], self._token_limiters[model_id]
 
     async def _cleanup_storage_if_needed(self) -> None:
         """Deletes oldest managed segment files if total storage exceeds high-water mark."""
         now = time()
-        cooldown_seconds = self.settings.ai.storage.cleanup_interval_minutes * 60
+        cooldown_seconds = self.ai_settings.storage.cleanup_interval_minutes * 60
         if (now - self._last_cleanup_time) < cooldown_seconds:
             return
 
@@ -245,8 +230,8 @@ class GeminiExecutor:
                 return
 
             with logfire.span("Storage cleanup check", _level="debug"):
-                max_bytes = int(self.settings.ai.storage.max_gb * 1024 * 1024 * 1024)
-                target_bytes = int(self.settings.ai.storage.target_gb * 1024 * 1024 * 1024)
+                max_bytes = int(self.ai_settings.storage.max_gb * 1024 * 1024 * 1024)
+                target_bytes = int(self.ai_settings.storage.target_gb * 1024 * 1024 * 1024)
 
                 try:
                     files: list[types.File] = []
@@ -260,7 +245,7 @@ class GeminiExecutor:
                     if total_bytes >= max_bytes:
                         logfire.info(
                             f"Files API storage threshold reached ({total_bytes / (1024**3):.2f} GB used). "
-                            f"Cleaning down to {self.settings.ai.storage.target_gb} GB..."
+                            f"Cleaning down to {self.ai_settings.storage.target_gb} GB..."
                         )
                         managed = [
                             f for f in files if f.display_name and MANAGED_PATTERN.match(Path(f.display_name).name)
@@ -293,12 +278,7 @@ class GeminiExecutor:
             types.File: Active remote file handle from the Gemini Files API.
 
         Raises:
-            APIError: If an API error occurs during upload or retries are exhausted.
-            ConnectionError: If network connectivity fails and retries are exhausted.
-            RuntimeError: If file processing fails on the server.
-            TimeoutError: If asynchronous operations time out and retries are exhausted.
-            TimeoutException: If HTTP transport times out and retries are exhausted.
-            TransportError: If transport connectivity fails and retries are exhausted.
+            RuntimeError: If file processing fails on the server or status cannot be retrieved.
         """
         with logfire.span("Gemini Files API: {filename}", filename=file_path.name, _level="debug"):
             await self._cleanup_storage_if_needed()
@@ -329,37 +309,12 @@ class GeminiExecutor:
 
             with logfire.span("Uploading file to Files API", _level="debug"):
                 logfire.debug(f"Uploading {file_path.name} to Gemini Files API...")
-                for upload_attempt in range(self.settings.retry.per_run + 1):
-                    try:
-                        uploaded = await self._client.aio.files.upload(
-                            file=file_path,
-                            config=types.UploadFileConfig(display_name=display_name),
-                        )
-                        break
-                    except APIError as e:
-                        if _is_daily_quota_exceeded(e):
-                            raise
-                        if _is_transient_api_error(e) and upload_attempt < self.settings.retry.per_run:
-                            backoff = _calculate_backoff(e, upload_attempt, self.settings.retry)
-                            logfire.info(
-                                f"Upload API error for {file_path.name} (attempt {upload_attempt + 1}). "
-                                f"Retrying in {backoff:.2f}s: {e}"
-                            )
-                            await asyncio.sleep(backoff)
-                            continue
-                        raise
-                    except (ConnectionError, asyncio.TimeoutError, TransportError, TimeoutException) as e:
-                        if upload_attempt < self.settings.retry.per_run:
-                            backoff = _calculate_backoff(e, upload_attempt, self.settings.retry)
-                            logfire.info(
-                                f"Upload network error for {file_path.name} (attempt {upload_attempt + 1}). "
-                                f"Retrying in {backoff:.2f}s: {e}"
-                            )
-                            await asyncio.sleep(backoff)
-                            continue
-                        raise
+                uploaded = await self._client.aio.files.upload(
+                    file=file_path,
+                    config=types.UploadFileConfig(display_name=display_name),
+                )
 
-            poll_interval = self.settings.ai.storage.polling_interval_seconds
+            poll_interval = self.ai_settings.storage.polling_interval_seconds
             await asyncio.sleep(poll_interval)
 
             with logfire.span("Polling file state until ACTIVE", _level="debug"):
@@ -369,176 +324,125 @@ class GeminiExecutor:
 
                     await asyncio.sleep(poll_interval)
                     if uploaded.name:
-                        try:
-                            uploaded = await self._client.aio.files.get(name=uploaded.name)
-                        except APIError as e:
-                            if _is_transient_api_error(e):
-                                logfire.debug(f"Transient error polling file {uploaded.name}: {e}. Retrying...")
-                                continue
-                            raise
-                        except (ConnectionError, asyncio.TimeoutError, TransportError, TimeoutException) as e:
-                            logfire.debug(f"Network error polling file {uploaded.name}: {e}. Retrying...")
-                            continue
+                        uploaded = await self._client.aio.files.get(name=uploaded.name)
                     else:
                         raise RuntimeError(f"Could not retrieve file '{file_path.name}' status.")
 
             return uploaded
 
-    def _get_thinking_config(self, model_id: str) -> types.ThinkingConfig:
-        """Builds thinking reasoning budget based on model generation.
-
-        Args:
-            model_id: Model identifier.
-
-        Returns:
-            types.ThinkingConfig: Thinking configuration for Google Gen AI.
-        """
-        model_lower = model_id.lower()
-        if model_lower.startswith("gemini-3"):
-            return types.ThinkingConfig(
-                include_thoughts=True,
-                thinking_level=types.ThinkingLevel.HIGH,
-            )
-        if model_lower.startswith("gemini-2.5-pro"):
-            return types.ThinkingConfig(
-                include_thoughts=True,
-                thinking_budget=32768,
-            )
-        return types.ThinkingConfig(
-            include_thoughts=True,
-            thinking_budget=24576,
-        )
-
-    def _get_safety_settings(self) -> list[types.SafetySetting]:
-        """Builds permissive safety settings for multimedia transcription.
-
-        Returns:
-            list[types.SafetySetting]: Configured safety settings.
-        """
-        return [
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-            types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                threshold=types.HarmBlockThreshold.BLOCK_NONE,
-            ),
-        ]
-
     def _setup_tools(
         self,
-        tools: Sequence[Callable[..., Any] | types.Tool] | None,
-    ) -> tuple[list[types.Tool] | None, dict[str, Callable[..., Any]]]:
-        """Builds Gemini tool configurations and local dispatch mapping from tools.
+        tools: Sequence[Callable[..., Any] | dict[str, Any] | BaseSearchProvider] | None,
+    ) -> tuple[list[dict[str, Any]] | None, dict[str, Callable[..., Any]]]:
+        """Builds Interactions API tool configurations and local dispatch mapping.
 
         Args:
-            tools: Sequence of callables (bound methods/functions) or types.Tool instances.
+            tools: Sequence of callable tools, Interactions tool dicts, or BaseSearchProvider instances.
 
         Returns:
-            tuple[list[types.Tool] | None, dict[str, Callable[..., Any]]]:
-                Registered Gemini tools list and execution dispatch dictionary.
+            tuple[list[dict[str, Any]] | None, dict[str, Callable[..., Any]]]:
+                Registered Interactions tools list and execution dispatch dictionary.
         """
         if not tools:
             return None, {}
 
-        declarations: list[types.FunctionDeclaration] = []
         dispatch_map: dict[str, Callable[..., Any]] = {}
-        gemini_tools: list[types.Tool] = []
+        interaction_tools: list[dict[str, Any]] = []
         api_client = self._client._api_client
 
+        unpacked_items: list[Callable[..., Any] | dict[str, Any]] = []
         for item in tools:
-            if isinstance(item, types.Tool):
-                gemini_tools.append(item)
+            if isinstance(item, BaseSearchProvider):
+                unpacked_items.extend(item.get_tools())
+            else:
+                unpacked_items.append(item)
+
+        for item in unpacked_items:
+            if isinstance(item, dict):
+                interaction_tools.append(item)
             elif callable(item):
                 fn_name = getattr(item, "__name__", str(item))
                 decl = types.FunctionDeclaration.from_callable(client=api_client, callable=item)
-                declarations.append(decl)
-                dispatch_map[fn_name] = item
+                params: dict[str, Any] | None = None
+                if decl.parameters is not None:
+                    if hasattr(decl.parameters, "model_dump"):
+                        params = decl.parameters.model_dump(mode="json", exclude_none=True)
+                    elif isinstance(decl.parameters, dict):
+                        params = decl.parameters
 
-        if declarations:
-            gemini_tools.append(types.Tool(function_declarations=declarations))
+                tool_def: dict[str, Any] = {
+                    "type": "function",
+                    "name": decl.name or fn_name,
+                    "description": decl.description or "",
+                }
+                if params is not None:
+                    tool_def["parameters"] = params
 
-        return gemini_tools or None, dispatch_map
+                interaction_tools.append(tool_def)
+                dispatch_map[decl.name or fn_name] = item
 
-    async def _generate_content_with_retry(
+        return interaction_tools or None, dispatch_map
+
+    async def _create_interaction(
         self,
         model_id: str,
-        contents: list[Any],
-        config: types.GenerateContentConfig,
+        input_payload: Any,
+        previous_interaction_id: str | None,
+        system_instruction: str,
+        tools: list[dict[str, Any]] | None,
+        response_format: dict[str, Any] | None,
+        generation_config: dict[str, Any],
+        service_tier: ServiceTier | None,
         token_weight: int,
-        turn: int,
-        policy: RetrySettings,
-    ) -> types.GenerateContentResponse:
-        """Executes a content generation call with rate-limiting and transient error retries.
+    ) -> Any:
+        """Executes an Interactions API call with rate limiter acquisition and daily quota tracking.
 
         Args:
             model_id: Target Gemini model identifier.
-            contents: Multi-turn prompt contents including conversation history.
-            config: Generation configuration settings.
+            input_payload: Current turn input (user prompt, media items, or function_result blocks).
+            previous_interaction_id: Previous interaction ID for stateful turns.
+            system_instruction: System instruction prompt.
+            tools: Registered Interactions API tools for this turn.
+            response_format: Top-level response format schema.
+            generation_config: Generation configuration settings (e.g. thinking_level).
+            service_tier: Optional Gemini service tier.
             token_weight: Token weight for rate limiter acquisition.
-            turn: Current multi-turn conversation turn index.
-            policy: Retry policy settings.
 
         Returns:
-            types.GenerateContentResponse: Response returned by the Gemini API.
+            Any: Interaction response object returned by the Gemini API.
 
         Raises:
-            APIError: If an unretryable API error occurs or retries are exhausted.
-            ConnectionError: If network connectivity fails and retries are exhausted.
             QuotaExceededError: If daily project quota is exhausted.
-            RuntimeError: If retries are exhausted.
-            TimeoutError: If asynchronous operations time out and retries are exhausted.
-            TimeoutException: If HTTP transport times out and retries are exhausted.
-            TransportError: If transport connectivity fails and retries are exhausted.
         """
         req_limiter, tok_limiter = self._get_limiters(model_id)
 
-        for attempt in range(policy.per_run + 1):
-            await req_limiter.try_acquire_async("rpm")
-            await tok_limiter.try_acquire_async("tpm", weight=token_weight)
+        create_kwargs: dict[str, Any] = {
+            "model": model_id,
+            "input": input_payload,
+            "system_instruction": system_instruction,
+            "generation_config": generation_config,
+            "store": True,
+        }
+        if previous_interaction_id is not None:
+            create_kwargs["previous_interaction_id"] = previous_interaction_id
+        if tools is not None:
+            create_kwargs["tools"] = tools
+        if response_format is not None:
+            create_kwargs["response_format"] = response_format
+        if service_tier is not None:
+            create_kwargs["service_tier"] = service_tier
 
-            try:
-                return await self._client.aio.models.generate_content(
-                    model=model_id,
-                    contents=contents,
-                    config=config,
-                )
-            except APIError as e:
-                if _is_daily_quota_exceeded(e):
-                    self._quota_exhausted[model_id] = True
-                    logfire.warning(f"Daily quota exhausted for {model_id}.")
-                    raise QuotaExceededError(str(e)) from e
+        await req_limiter.try_acquire_async("rpm")
+        await tok_limiter.try_acquire_async("tpm", weight=token_weight)
 
-                if _is_transient_api_error(e) and attempt < policy.per_run:
-                    backoff = _calculate_backoff(e, attempt, policy)
-                    logfire.info(
-                        f"API error in {model_id} (turn {turn}, attempt {attempt + 1}). Retrying in {backoff:.2f}s: {e}"
-                    )
-                    await asyncio.sleep(backoff)
-                    continue
-                raise
-
-            except (ConnectionError, asyncio.TimeoutError, TransportError, TimeoutException) as e:
-                if attempt < policy.per_run:
-                    backoff = _calculate_backoff(e, attempt, policy)
-                    logfire.info(
-                        f"Network error in {model_id} (turn {turn}, attempt {attempt + 1}). "
-                        f"Retrying in {backoff:.2f}s: {e}"
-                    )
-                    await asyncio.sleep(backoff)
-                    continue
-                raise
-
-        raise RuntimeError(f"Model generation failed for {model_id} at turn {turn} after {policy.per_run} retries.")
+        try:
+            return await self._client.aio.interactions.create(**create_kwargs)
+        except Exception as e:
+            if _is_daily_quota_exceeded(e):
+                self._quota_exhausted[model_id] = True
+                logfire.warning(f"Daily quota exhausted for {model_id}.")
+                raise QuotaExceededError(str(e)) from e
+            raise
 
     async def run_structured(
         self,
@@ -548,11 +452,11 @@ class GeminiExecutor:
         response_type: type[T],
         model_name: str,
         service_tier: ServiceTier | None = None,
-        tools: Sequence[Callable[..., Any] | types.Tool] | None = None,
-        retry_policy: RetrySettings | None = None,
+        tools: Sequence[Callable[..., Any] | dict[str, Any] | BaseSearchProvider] | None = None,
         agentic_video: bool = False,
+        task_label: str | None = None,
     ) -> T:
-        """Uploads media and generates validated structured outputs with tool turns.
+        """Uploads media and generates validated structured outputs using the Gemini Interactions API.
 
         Args:
             prompt: Instructions containing system and user prompts.
@@ -561,9 +465,9 @@ class GeminiExecutor:
             response_type: Expected Pydantic model response schema.
             model_name: Full model identifier (must begin with 'google-gla:').
             service_tier: Optional Gemini service tier.
-            tools: Sequence of callable tools (bound provider methods) or types.Tool instances.
-            retry_policy: Retry configuration policy (defaults to settings.retry if omitted).
-            agentic_video: Whether to enable Agentic Video Understanding (for whole-video summaries).
+            tools: Sequence of callable tools, tool dicts, or BaseSearchProvider instances.
+            agentic_video: Whether to enable Agentic Video Understanding.
+            task_label: Optional label for display in turn spans (e.g. 'summary', 'subtitles', 'lyrics').
 
         Returns:
             T: Parsed and validated Pydantic model instance.
@@ -581,186 +485,172 @@ class GeminiExecutor:
         if self._quota_exhausted.get(model_id, False):
             raise QuotaExceededError(f"Daily quota previously exhausted for model '{model_id}'.")
 
-        policy = retry_policy or self.settings.retry
+        policy = self.retry_settings
 
-        with logfire.span("Gemini {model_id}: {filename}", model_id=model_id, filename=media_path.name):
-            remote_file = await self.ensure_file_uploaded(media_path)
+        remote_file = await self.ensure_file_uploaded(media_path)
 
-            # Estimate tokens and clamp to bucket capacity so full videos throttle without overflowing the limiter
-            tokens = _calculate_tokens(prompt, video_duration_ms)
-            token_weight = min(tokens, self.settings.ai.tpm)
+        tokens = _calculate_tokens(prompt, video_duration_ms)
+        token_weight = min(tokens, self.ai_settings.tpm)
 
-            # Build media part: Agentic mode uses dynamic timeline inspection; default uses static frames
-            if agentic_video:
-                media_part: Any = types.Part(
-                    file_data=types.FileData(
-                        file_uri=remote_file.uri,
-                        mime_type=remote_file.mime_type,
-                    ),
-                    media_processing="AGENTIC",
-                )
-            else:
-                media_part = remote_file
-
-            gemini_tools, dispatch_map = self._setup_tools(tools)
-            config_kwargs: dict[str, Any] = {
-                "system_instruction": prompt.system,
-                "thinking_config": self._get_thinking_config(model_id),
-                "safety_settings": self._get_safety_settings(),
-                "response_mime_type": "application/json",
-                "response_schema": response_type,
+        if agentic_video:
+            media_input: dict[str, Any] = {
+                "type": "video",
+                "uri": remote_file.uri,
+                "mime_type": remote_file.mime_type,
+                "processing": "agentic",
             }
-            if service_tier is not None:
-                config_kwargs["service_tier"] = service_tier
-            if gemini_tools:
-                config_kwargs["tools"] = gemini_tools
+        else:
+            media_input = {
+                "type": "video",
+                "uri": remote_file.uri,
+                "mime_type": remote_file.mime_type,
+            }
 
-            config = types.GenerateContentConfig(**config_kwargs)
+        initial_input = [media_input, {"type": "text", "text": prompt.user}]
 
-            config_final = config
-            if gemini_tools and dispatch_map:
-                final_kwargs = dict(config_kwargs)
-                final_kwargs["tool_config"] = types.ToolConfig(
-                    function_calling_config=types.FunctionCallingConfig(
-                        mode=types.FunctionCallingConfigMode.NONE,
-                    )
-                )
-                config_final = types.GenerateContentConfig(**final_kwargs)
+        gemini_tools, dispatch_map = self._setup_tools(tools)
+        response_format = {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": response_type.model_json_schema(),
+        }
+        generation_config = {
+            "thinking_level": "high",
+            "thinking_summaries": "auto",
+        }
+        max_turns = self.ai_settings.search.max_turns
+        label = task_label.capitalize() if task_label else "Generation"
 
-            max_turns = self.settings.ai.search.max_turns
+        for attempt in range(policy.per_run + 1):
+            interaction_input: Any = initial_input
+            previous_interaction_id: str | None = None
+            accumulated_thoughts: list[str] = []
+            search_turns = 0
 
-            for attempt in range(policy.per_run + 1):
-                contents: list[Any] = [media_part, prompt.user]
-                search_turns = 0
-                accumulated_thoughts: list[str] = []
+            try:
+                while True:
+                    if search_turns == 0:
+                        span_desc = f"{label}: {media_path.name} {model_id}"
+                    else:
+                        span_desc = f"{label} (Search Turn {search_turns}/{max_turns}): {media_path.name} {model_id}"
 
-                try:
-                    while True:
-                        with logfire.span(
-                            "Turn {turn}: {model_id}",
-                            turn=search_turns,
+                    with logfire.span(
+                        "{span_desc}",
+                        span_desc=span_desc,
+                        task=label,
+                        turn=search_turns,
+                        max_turns=max_turns,
+                        model_id=model_id,
+                        filename=media_path.name,
+                    ):
+                        current_tools = None if search_turns >= max_turns else gemini_tools
+
+                        interaction = await self._create_interaction(
                             model_id=model_id,
-                        ):
-                            active_config = config_final if search_turns >= max_turns else config
-                            response = await self._generate_content_with_retry(
-                                model_id=model_id,
-                                contents=contents,
-                                config=active_config,
-                                token_weight=token_weight,
-                                turn=search_turns,
-                                policy=policy,
+                            input_payload=interaction_input,
+                            previous_interaction_id=previous_interaction_id,
+                            system_instruction=prompt.system,
+                            tools=current_tools,
+                            response_format=response_format,
+                            generation_config=generation_config,
+                            service_tier=service_tier,
+                            token_weight=token_weight,
+                        )
+
+                        for step in getattr(interaction, "steps", []) or []:
+                            if getattr(step, "type", None) == "thought":
+                                if thought_text := _extract_thought_text(step):
+                                    accumulated_thoughts.append(thought_text)
+
+                        function_call_steps = [
+                            s
+                            for s in getattr(interaction, "steps", []) or []
+                            if getattr(s, "type", None) == "function_call" and getattr(s, "name", None) in dispatch_map
+                        ]
+
+                        if function_call_steps and search_turns < max_turns and dispatch_map:
+                            search_turns += 1
+
+                            async def _exec(step: Any) -> dict[str, Any]:
+                                cname = getattr(step, "name", "")
+                                call_id = getattr(step, "id", "")
+                                fn = dispatch_map[cname]
+                                args = getattr(step, "arguments", {}) or {}
+                                try:
+                                    if inspect.iscoroutinefunction(fn):
+                                        cres = await fn(**args)
+                                    else:
+                                        cres = await asyncio.to_thread(fn, **args)
+                                    res_str = (
+                                        json.dumps(cres, ensure_ascii=False) if not isinstance(cres, str) else cres
+                                    )
+                                    return {
+                                        "type": "function_result",
+                                        "name": cname,
+                                        "call_id": call_id,
+                                        "result": [{"type": "text", "text": res_str}],
+                                    }
+                                except Exception as tool_err:
+                                    logfire.warning(f"Tool '{cname}' failed: {tool_err}")
+                                    err_str = json.dumps({"error": f"Tool execution failed: {tool_err}"})
+                                    return {
+                                        "type": "function_result",
+                                        "name": cname,
+                                        "call_id": call_id,
+                                        "result": [{"type": "text", "text": err_str}],
+                                    }
+
+                            results = await asyncio.gather(*(_exec(s) for s in function_call_steps))
+                            interaction_input = results
+                            raw_id = getattr(interaction, "id", None)
+                            previous_interaction_id = raw_id if isinstance(raw_id, str) else None
+                            continue
+
+                        text_content = getattr(interaction, "output_text", "") or ""
+                        if not text_content:
+                            text_parts: list[str] = []
+                            for step in getattr(interaction, "steps", []) or []:
+                                if getattr(step, "type", None) == "model_output":
+                                    for block in getattr(step, "content", []) or []:
+                                        if getattr(block, "type", None) == "text" and getattr(block, "text", None):
+                                            text_parts.append(block.text)
+                            text_content = "".join(text_parts).strip()
+
+                        try:
+                            output = response_type.model_validate_json(
+                                text_content,
+                                context={
+                                    "video_duration_ms": video_duration_ms,
+                                    "validation_buffer_ms": self.ai_settings.validation_buffer_ms,
+                                },
+                            )
+                        except Exception:
+                            repaired = json_repair.loads(text_content)
+                            output = response_type.model_validate(
+                                repaired,
+                                context={
+                                    "video_duration_ms": video_duration_ms,
+                                    "validation_buffer_ms": self.ai_settings.validation_buffer_ms,
+                                },
                             )
 
-                            candidate = response.candidates[0] if response.candidates else None
-                            if candidate is None:
-                                raise ValueError(f"No response candidate returned by {model_id}.")
+                        if hasattr(output, "thoughts") and accumulated_thoughts:
+                            setattr(output, "thoughts", accumulated_thoughts)
 
-                            # Accumulate reasoning traces from this turn
-                            if candidate.content and candidate.content.parts:
-                                turn_thinking = [
-                                    t
-                                    for part in candidate.content.parts
-                                    if getattr(part, "thought", False) and (t := part.text) is not None
-                                ]
-                                if turn_thinking:
-                                    accumulated_thoughts.append("\n".join(turn_thinking))
+                        return output
 
-                            function_calls = response.function_calls
-                            if function_calls and search_turns < max_turns and dispatch_map:
-                                search_turns += 1
-
-                                async def _exec(fc: types.FunctionCall) -> tuple[str, Any]:
-                                    cname = fc.name or ""
-                                    if cname not in dispatch_map:
-                                        logfire.warning(f"Unknown tool requested by model: {cname}")
-                                        return cname, {"error": f"Unknown tool: {cname}"}
-                                    fn = dispatch_map[cname]
-                                    try:
-                                        args = fc.args or {}
-                                        if inspect.iscoroutinefunction(fn):
-                                            cres = await fn(**args)
-                                        else:
-                                            cres = await asyncio.to_thread(fn, **args)
-                                        return cname, {"result": cres}
-                                    except Exception as tool_err:
-                                        logfire.warning(f"Tool '{cname}' failed: {tool_err}")
-                                        return cname, {"error": f"Tool execution failed: {tool_err}"}
-
-                                call_results = await asyncio.gather(*(_exec(fc) for fc in function_calls))
-                                response_parts = [
-                                    types.Part.from_function_response(name=cname, response=resp_data)
-                                    for cname, resp_data in call_results
-                                ]
-
-                                # Sanitize model parts: Exclude internal server-side tool calls/responses
-                                # (e.g. agentic video MEDIA_PROCESSING) which trigger 400 errors when replayed
-                                raw_parts = (
-                                    candidate.content.parts if candidate.content and candidate.content.parts else []
-                                )
-                                clean_model_parts = [
-                                    part
-                                    for part in raw_parts
-                                    if getattr(part, "tool_call", None) is None
-                                    and getattr(part, "tool_response", None) is None
-                                ]
-
-                                contents.append(types.Content(role="model", parts=clean_model_parts))
-                                contents.append(types.Content(role="user", parts=response_parts))
-                                continue
-
-                            # Extract text directly from non-thought/non-call parts to avoid SDK warnings
-                            text_parts: list[str] = []
-                            if candidate.content and candidate.content.parts:
-                                for part in candidate.content.parts:
-                                    if getattr(part, "thought", False):
-                                        continue
-                                    if getattr(part, "function_call", None) is not None:
-                                        continue
-                                    if getattr(part, "tool_call", None) is not None:
-                                        continue
-                                    if getattr(part, "tool_response", None) is not None:
-                                        continue
-                                    if part.text:
-                                        text_parts.append(part.text)
-
-                            text_content = "".join(text_parts).strip()
-                            if not text_content and response.text:
-                                text_content = response.text.strip()
-
-                            try:
-                                output = response_type.model_validate_json(
-                                    text_content,
-                                    context={
-                                        "video_duration_ms": video_duration_ms,
-                                        "validation_buffer_ms": self.settings.ai.validation_buffer_ms,
-                                    },
-                                )
-                            except Exception:
-                                repaired = json_repair.loads(text_content)
-                                output = response_type.model_validate(
-                                    repaired,
-                                    context={
-                                        "video_duration_ms": video_duration_ms,
-                                        "validation_buffer_ms": self.settings.ai.validation_buffer_ms,
-                                    },
-                                )
-
-                            if hasattr(output, "thoughts") and accumulated_thoughts:
-                                setattr(output, "thoughts", accumulated_thoughts)
-
-                            return output
-
-                except (ValidationError, ValueError) as e:
-                    if attempt < policy.per_run:
-                        backoff = min(
-                            float(policy.max_wait_seconds),
-                            (policy.min_wait_seconds * (policy.multiplier**attempt)) + random.uniform(0, 1),
-                        )
-                        logfire.warning(
-                            f"Validation error in {model_id} (attempt {attempt + 1}). Retrying in {backoff:.2f}s: {e}"
-                        )
-                        await asyncio.sleep(backoff)
-                        continue
-                    raise
+            except (ValidationError, ValueError) as e:
+                if attempt < policy.per_run:
+                    backoff = min(
+                        float(policy.max_wait_seconds),
+                        (policy.min_wait_seconds * (policy.multiplier**attempt)) + random.uniform(0, 1),
+                    )
+                    logfire.warning(
+                        f"Validation error in {model_id} (attempt {attempt + 1}/{policy.per_run + 1}). "
+                        f"Retrying in {backoff:.2f}s: {e}"
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
 
         raise RuntimeError(f"Agent execution failed after {policy.per_run} retries.")

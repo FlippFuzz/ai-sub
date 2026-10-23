@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt
+
+if TYPE_CHECKING:
+    from ai_sub.gemini_executor import GeminiExecutor
+    from ai_sub.search.base import BaseSearchProvider
 
 
 class _YamlDumper(yaml.SafeDumper):
@@ -213,6 +218,15 @@ class Prompt(BaseModel):
 
     system: str = Field(description="System instructions for the AI model.")
     user: str = Field(description="User prompt instructions and input context.")
+
+
+@dataclass
+class WorkerContext:
+    """Runtime execution dependencies provided by the worker node."""
+
+    executor: GeminiExecutor
+    media_path: Path
+    search_providers: list[BaseSearchProvider] = field(default_factory=list)
 
 
 class BaseJob(BaseModel):

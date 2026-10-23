@@ -17,7 +17,7 @@ from pydantic import (
 )
 from pydantic.json_schema import SkipJsonSchema
 
-from ai_sub.jobs.base import BaseJob, Prompt, clean_timestamp_string
+from ai_sub.jobs.base import BaseJob, Prompt, WorkerContext, clean_timestamp_string
 
 SUMMARY_PROMPT_VERSION = 1
 
@@ -234,6 +234,31 @@ class SummaryJob(BaseJob):
         default=None,
         description="Structured AI output once processed.",
     )
+
+    async def execute(self, ctx: WorkerContext) -> SummaryAiResponse:
+        """Executes whole-video summary analysis using agentic or static video inspection.
+
+        Args:
+            ctx: Worker runtime context containing executor and search providers.
+
+        Returns:
+            SummaryAiResponse: Parsed AI summary response.
+        """
+        prompt = get_summary_prompt(user_context=self.user_context)
+        res = await ctx.executor.run_structured(
+            prompt=prompt,
+            media_path=ctx.media_path,
+            video_duration_ms=self.video_duration_ms,
+            response_type=SummaryAiResponse,
+            model_name=ctx.executor.ai_settings.model_summary,
+            service_tier=ctx.executor.ai_settings.service_tier_summary,
+            tools=ctx.search_providers,
+            agentic_video=ctx.executor.ai_settings.agentic_video_summary,
+            task_label="summary",
+        )
+        self.response = res
+        self.total_attempts += 1
+        return res
 
     @classmethod
     def load(cls, save_path: Path, validation_buffer_ms: int = 0) -> SummaryJob | None:
