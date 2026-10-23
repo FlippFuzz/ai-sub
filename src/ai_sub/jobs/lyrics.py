@@ -2,37 +2,29 @@
 
 from __future__ import annotations
 
-import string
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Self
+from typing import Any
 
 import logfire
 import yaml
 from pydantic import (
-    BaseModel,
-    ConfigDict,
     Field,
-    NonNegativeInt,
-    PositiveInt,
     ValidationError,
-    ValidationInfo,
-    model_validator,
 )
-from pydantic.json_schema import SkipJsonSchema
-from pysubs2 import SSAEvent, SSAFile
 
 from ai_sub.jobs.base import (
-    BaseJob,
     Prompt,
     WorkerContext,
     format_ms_timestamp,
-    parse_timestamp_string_ms,
     serialize_prompt_context,
-    validate_duration_bound,
 )
-from ai_sub.jobs.subtitles import DetectedMusicalPerformance, Subtitles
-from ai_sub.jobs.summary import SummaryAiResponse
+from ai_sub.jobs.subtitles import (
+    BaseSubtitleAiResponse,
+    BaseSubtitleJob,
+    DetectedMusicalPerformance,
+    Subtitles,
+)
 from ai_sub.search.base import BaseSearchProvider
 from ai_sub.search.lrclib import LrclibSearchProvider
 
@@ -229,86 +221,18 @@ def get_lyrics_prompt(
     return Prompt(system=_LYRICS_SYSTEM_TEMPLATE, user="\n".join(parts))
 
 
-class LyricsAiResponse(BaseModel):
+class LyricsAiResponse(BaseSubtitleAiResponse):
     """Structured response schema returned by the model for musical subtitle refinement."""
-
-    model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
     subtitles: list[Subtitles] = Field(
         alias="subs",
         description="Refined chronological synchronized subtitle events with frozen timestamps.",
     )
-    thoughts: SkipJsonSchema[list[str]] = Field(
-        default_factory=list,
-        description="Model reasoning traces per turn, preserved on disk but omitted from LLM output schemas.",
-    )
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_thoughts(cls, data: Any) -> Any:
-        """Ensures thoughts loaded from state files are converted to a list.
-
-        Args:
-            data: Raw input dictionary.
-
-        Returns:
-            Any: Cleaned dictionary.
-        """
-        if isinstance(data, dict):
-            raw_thoughts = data.get("thoughts")
-            if isinstance(raw_thoughts, str):
-                data["thoughts"] = [raw_thoughts]
-        return data
-
-    def get_ssafile(self) -> SSAFile:
-        """Converts refined subtitles into an SSAFile object.
-
-        Returns:
-            SSAFile: Parsed subtitle file container.
-        """
-        subs = SSAFile()
-        translator = str.maketrans("", "", string.punctuation)
-
-        for item in self.subtitles:
-            start = parse_timestamp_string_ms(item.start)
-            end = parse_timestamp_string_ms(item.end)
-            en_text = item.english.strip()
-            og_text = item.original.strip()
-
-            en_norm = en_text.casefold().translate(translator)
-            og_norm = og_text.casefold().translate(translator)
-
-            text = og_text if en_norm == og_norm else f"{og_text}\n{en_text}"
-            subs.append(SSAEvent(start=start, end=end, text=text))
-
-        return subs
-
-    @model_validator(mode="after")
-    def validate_duration(self, info: ValidationInfo) -> Self:
-        """Validates subtitle bounds against segment duration if context is provided.
-
-        Args:
-            info: Pydantic validation context.
-
-        Returns:
-            Self: Validated instance.
-        """
-        context = info.context or {}
-        duration_ms = context.get("video_duration_ms")
-        buffer_ms = context.get("validation_buffer_ms")
-        if duration_ms is not None and buffer_ms is not None:
-            validate_duration_bound(self.subtitles, duration_ms, buffer_ms, item_label="Subtitle")
-        return self
 
 
-class LyricsJob(BaseJob):
+class LyricsJob(BaseSubtitleJob):
     """Job container holding refined subtitles for a segment with musical performance."""
 
-    video_duration_ms: PositiveInt = Field(description="Segment duration in milliseconds.")
-    segment_offset_ms: NonNegativeInt = Field(
-        default=0,
-        description="Absolute start offset of this segment in milliseconds.",
-    )
     lyrics_prompt_version: int = Field(
         default=LYRICS_PROMPT_VERSION,
         description="Prompt version employed for this refinement response.",
@@ -320,10 +244,6 @@ class LyricsJob(BaseJob):
     detected_performances: list[DetectedMusicalPerformance] = Field(
         default_factory=list,
         description="Detected singing performances in this segment.",
-    )
-    global_summary: SummaryAiResponse | None = Field(
-        default=None,
-        description="Optional global summary context from phase 1.",
     )
     response: LyricsAiResponse | None = Field(
         default=None,
@@ -368,15 +288,6 @@ class LyricsJob(BaseJob):
         self.response = res
         self.total_attempts += 1
         return res
-
-    def save_srt(self, srt_path: Path) -> None:
-        """Saves current refined subtitle response as an SRT file.
-
-        Args:
-            srt_path: Destination file path.
-        """
-        if self.response:
-            self.response.get_ssafile().save(str(srt_path))
 
     @classmethod
     def load(cls, save_path: Path, validation_buffer_ms: int) -> LyricsJob | None:

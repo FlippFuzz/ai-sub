@@ -235,15 +235,11 @@ class Subtitles(BaseModel):
         return self
 
 
-class SubtitlesAiResponse(BaseModel):
-    """Structured response schema returned by the model for subtitle generation."""
+class BaseSubtitleAiResponse(BaseModel):
+    """Base structured response schema for subtitle outputs with timing and SSAFile conversion."""
 
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
-    detected_musical_performances: list[DetectedMusicalPerformance] = Field(
-        default_factory=list,
-        description="Chronological list of detected vocal musical performances or songs. Empty if none.",
-    )
     subtitles: list[Subtitles] = Field(
         alias="subs",
         description="Chronological synchronized subtitle events.",
@@ -311,8 +307,17 @@ class SubtitlesAiResponse(BaseModel):
         return self
 
 
-class SubtitlesJob(BaseJob):
-    """Job container holding generated subtitle state for a video segment."""
+class SubtitlesAiResponse(BaseSubtitleAiResponse):
+    """Structured response schema returned by the model for subtitle generation."""
+
+    detected_musical_performances: list[DetectedMusicalPerformance] = Field(
+        default_factory=list,
+        description="Chronological list of detected vocal musical performances or songs. Empty if none.",
+    )
+
+
+class BaseSubtitleJob(BaseJob):
+    """Base job container holding common subtitle state and export routines."""
 
     video_duration_ms: PositiveInt = Field(description="Segment duration in milliseconds.")
     segment_offset_ms: NonNegativeInt = Field(
@@ -323,6 +328,24 @@ class SubtitlesJob(BaseJob):
         default=None,
         description="Optional global summary context from phase 1.",
     )
+    response: BaseSubtitleAiResponse | None = Field(
+        default=None,
+        description="Structured subtitle response once generated.",
+    )
+
+    def save_srt(self, srt_path: Path) -> None:
+        """Saves current subtitle response as an SRT file.
+
+        Args:
+            srt_path: Destination file path.
+        """
+        if self.response:
+            self.response.get_ssafile().save(str(srt_path))
+
+
+class SubtitlesJob(BaseSubtitleJob):
+    """Job container holding generated subtitle state for a video segment."""
+
     subtitles_prompt_version: int = Field(
         default=SUBTITLES_PROMPT_VERSION,
         description="Prompt version employed for this response.",
@@ -361,15 +384,6 @@ class SubtitlesJob(BaseJob):
         self.response = res
         self.total_attempts += 1
         return res
-
-    def save_srt(self, srt_path: Path) -> None:
-        """Saves current subtitle response as an SRT file.
-
-        Args:
-            srt_path: Destination file path.
-        """
-        if self.response:
-            self.response.get_ssafile().save(str(srt_path))
 
     @classmethod
     def load(cls, save_path: Path, validation_buffer_ms: int) -> SubtitlesJob | None:

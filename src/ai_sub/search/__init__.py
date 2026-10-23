@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from ai_sub.config import SearchSettings
 from ai_sub.search.base import (
     BaseHttpSearchProvider,
@@ -18,6 +20,15 @@ from ai_sub.search.lrclib import LrclibSearchProvider
 from ai_sub.search.ollama import OllamaSearchProvider
 from ai_sub.search.tinyfish import TinyfishSearchProvider
 
+_SEARCH_PROVIDER_REGISTRY: dict[str, Callable[[SearchSettings], BaseSearchProvider]] = {
+    "builtin": GoogleBuiltinSearchProvider,
+    "duckduckgo": DuckDuckGoSearchProvider,
+    "langsearch": LangsearchSearchProvider,
+    "lrclib": LrclibSearchProvider,
+    "ollama": OllamaSearchProvider,
+    "tinyfish": TinyfishSearchProvider,
+}
+
 
 def create_search_provider(tool_name: str, settings: SearchSettings) -> BaseSearchProvider:
     """Instantiates a single search provider by name.
@@ -33,23 +44,11 @@ def create_search_provider(tool_name: str, settings: SearchSettings) -> BaseSear
         ValueError: If tool_name is unknown.
     """
     clean_name = tool_name.strip().lower()
-    if clean_name == "tinyfish":
-        return TinyfishSearchProvider(settings)
-    if clean_name == "langsearch":
-        return LangsearchSearchProvider(settings)
-    if clean_name == "ollama":
-        return OllamaSearchProvider(settings)
-    if clean_name == "duckduckgo":
-        return DuckDuckGoSearchProvider(settings)
-    if clean_name == "lrclib":
-        return LrclibSearchProvider(settings)
-    if clean_name == "builtin":
-        return GoogleBuiltinSearchProvider(settings)
-
-    raise ValueError(
-        f"Unknown search provider: '{tool_name}'. "
-        "Supported providers are: 'builtin', 'duckduckgo', 'ollama', 'langsearch', 'tinyfish', 'lrclib'."
-    )
+    provider_cls = _SEARCH_PROVIDER_REGISTRY.get(clean_name)
+    if provider_cls is None:
+        supported = ", ".join(repr(k) for k in sorted(_SEARCH_PROVIDER_REGISTRY))
+        raise ValueError(f"Unknown search provider: '{tool_name}'. Supported providers are: {supported}.")
+    return provider_cls(settings)
 
 
 def create_search_providers(

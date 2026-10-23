@@ -20,6 +20,8 @@ from ai_sub.jobs.lyrics import (
 from ai_sub.jobs.reencode import ReencodeJob
 from ai_sub.jobs.subtitles import (
     SUBTITLES_PROMPT_VERSION,
+    BaseSubtitleAiResponse,
+    BaseSubtitleJob,
     DetectedMusicalPerformance,
     Subtitles,
     SubtitlesAiResponse,
@@ -38,6 +40,8 @@ from ai_sub.jobs.summary import (
 
 __all__ = [
     "BaseJob",
+    "BaseSubtitleAiResponse",
+    "BaseSubtitleJob",
     "ChapterItem",
     "DetectedMusicalPerformance",
     "EntityItem",
