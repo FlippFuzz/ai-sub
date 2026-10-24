@@ -3,11 +3,142 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
 import logfire
 import static_ffmpeg
+
+_FFMPEG_INITIALIZED: bool = False
+_FFMPEG_PATH: str = "ffmpeg"
+_FFPROBE_PATH: str = "ffprobe"
+
+
+def _find_system_binary(binary_name: str) -> str | None:
+    """Finds an executable in the system PATH, ignoring any static_ffmpeg directory.
+
+    Args:
+        binary_name: Name of the binary to find (e.g., 'ffmpeg', 'ffprobe').
+
+    Returns:
+        str | None: Absolute path to the system binary if found, or None.
+    """
+    path_env = os.environ.get("PATH", "")
+    clean_entries: list[str] = []
+    for entry in path_env.split(os.pathsep):
+        cleaned = entry.strip().strip('"').strip("'")
+        if cleaned and "static_ffmpeg" not in cleaned.lower() and Path(cleaned).is_dir():
+            clean_entries.append(cleaned)
+
+    clean_path = os.pathsep.join(clean_entries)
+
+    for name in (binary_name, f"{binary_name}.exe"):
+        found = shutil.which(name, path=clean_path)
+        if found and Path(found).is_file():
+            return str(Path(found).resolve())
+
+    return None
+
+
+def _probe_binary_info(binary_path: str) -> tuple[str, str]:
+    """Probes version and configuration flags from an FFmpeg or FFprobe binary.
+
+    Args:
+        binary_path: Path to the executable.
+
+    Returns:
+        tuple[str, str]: (version_line, configuration_line).
+    """
+    try:
+        proc = subprocess.run(
+            [binary_path, "-version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+        version_line = "unknown"
+        config_line = "unknown"
+        for line in proc.stdout.splitlines():
+            stripped = line.strip()
+            if not version_line or version_line == "unknown":
+                if stripped.startswith(("ffmpeg version", "ffprobe version")):
+                    version_line = stripped
+            if stripped.startswith("configuration:"):
+                config_line = stripped
+                break
+        return version_line, config_line
+    except Exception as e:
+        return f"error probing version: {e}", "unknown"
+
+
+def ensure_ffmpeg() -> tuple[str, str]:
+    """Ensures ffmpeg and ffprobe are available, preferring system binaries over static-ffmpeg.
+
+    Returns:
+        tuple[str, str]: Absolute or command paths for (ffmpeg, ffprobe).
+    """
+    global _FFMPEG_INITIALIZED, _FFMPEG_PATH, _FFPROBE_PATH
+    if _FFMPEG_INITIALIZED:
+        return _FFMPEG_PATH, _FFPROBE_PATH
+
+    sys_ffmpeg = _find_system_binary("ffmpeg")
+    sys_ffprobe = _find_system_binary("ffprobe")
+
+    if sys_ffmpeg and sys_ffprobe:
+        _FFMPEG_PATH = sys_ffmpeg
+        _FFPROBE_PATH = sys_ffprobe
+    else:
+        try:
+            static_ffmpeg.add_paths(weak=True)
+            resolved_ffmpeg = shutil.which("ffmpeg")
+            resolved_ffprobe = shutil.which("ffprobe")
+            _FFMPEG_PATH = sys_ffmpeg or resolved_ffmpeg or "ffmpeg"
+            _FFPROBE_PATH = sys_ffprobe or resolved_ffprobe or "ffprobe"
+        except Exception as e:
+            logfire.warning(f"Could not load static-ffmpeg fallback: {e}")
+            _FFMPEG_PATH = sys_ffmpeg or "ffmpeg"
+            _FFPROBE_PATH = sys_ffprobe or "ffprobe"
+
+    _FFMPEG_INITIALIZED = True
+    return _FFMPEG_PATH, _FFPROBE_PATH
+
+
+async def init_ffmpeg_engine(requested_encoder: str | None = None) -> tuple[str, str, str]:
+    """Initializes FFmpeg and FFprobe paths and discovers working encoder within a single Logfire span.
+
+    Args:
+        requested_encoder: User-configured encoder if specified, or None for auto-detection.
+
+    Returns:
+        tuple[str, str, str]: (ffmpeg_path, ffprobe_path, working_encoder).
+    """
+    ffmpeg_bin, ffprobe_bin = ensure_ffmpeg()
+    ffmpeg_version, ffmpeg_config = _probe_binary_info(ffmpeg_bin)
+    ffprobe_version, _ = _probe_binary_info(ffprobe_bin)
+
+    with logfire.span(
+        "FFmpeg Setup",
+        ffmpeg_path=ffmpeg_bin,
+        ffmpeg_version=ffmpeg_version,
+        ffmpeg_configuration=ffmpeg_config,
+        ffprobe_path=ffprobe_bin,
+        ffprobe_version=ffprobe_version,
+    ):
+        logfire.info("FFmpeg: {path}", path=ffmpeg_bin, version=ffmpeg_version)
+        logfire.info("FFprobe: {path}", path=ffprobe_bin, version=ffprobe_version)
+
+        if requested_encoder:
+            encoder = requested_encoder
+        else:
+            encoder = await get_working_encoder()
+
+        logfire.info("Encoder: {encoder}", encoder=encoder)
+
+    return ffmpeg_bin, ffprobe_bin, encoder
 
 
 async def _run_ffmpeg(cmd: list[str]) -> str:
@@ -24,6 +155,7 @@ async def _run_ffmpeg(cmd: list[str]) -> str:
     """
     process = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -57,10 +189,10 @@ async def get_video_duration_ms(video_path: Path) -> int:
     Raises:
         RuntimeError: If the duration cannot be probed.
     """
-    static_ffmpeg.add_paths(weak=True)
+    _, ffprobe_bin = ensure_ffmpeg()
     try:
         cmd = [
-            "ffprobe",
+            ffprobe_bin,
             "-v",
             "error",
             "-show_entries",
@@ -88,10 +220,10 @@ async def get_video_fps(video_path: Path) -> float:
     Raises:
         RuntimeError: If the framerate cannot be determined.
     """
-    static_ffmpeg.add_paths(weak=True)
+    _, ffprobe_bin = ensure_ffmpeg()
     try:
         cmd = [
-            "ffprobe",
+            ffprobe_bin,
             "-v",
             "error",
             "-select_streams",
@@ -116,14 +248,18 @@ async def get_working_encoder() -> str:
     Returns:
         str: Preferred encoder name, falling back to 'libx264'.
     """
-    static_ffmpeg.add_paths(weak=True)
+    ffmpeg_bin, _ = ensure_ffmpeg()
     candidates = ["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox", "h264_mf"]
 
     for encoder in candidates:
         try:
             await _run_ffmpeg(
                 cmd=[
-                    "ffmpeg",
+                    ffmpeg_bin,
+                    "-nostdin",
+                    "-y",
+                    "-loglevel",
+                    "error",
                     "-f",
                     "lavfi",
                     "-i",
@@ -196,12 +332,16 @@ async def split_video(
         except Exception:
             logfire.warning(f"Re-splitting {input_video.name}: existing segments verification failed.")
 
-    static_ffmpeg.add_paths(weak=True)
+    ffmpeg_bin, _ = ensure_ffmpeg()
     escaped_dir = str(output_dir).replace("%", "%%")
     full_output_pattern = str(Path(escaped_dir) / f"{output_pattern}{ext}")
 
     cmd = [
-        "ffmpeg",
+        ffmpeg_bin,
+        "-nostdin",
+        "-y",
+        "-loglevel",
+        "error",
         "-i",
         str(input_video),
         "-c",
@@ -234,6 +374,7 @@ async def reencode_video(
     bitrate_kb: int,
     encoder: str,
     duration_tolerance_ms: int = 100,
+    keyframe_only: bool = False,
 ) -> None:
     """Compresses a video segment or full video using low framerates and downscaled resolution.
 
@@ -245,6 +386,7 @@ async def reencode_video(
         bitrate_kb: Target bitrate in Kilobytes per second.
         encoder: Encoder codec to employ.
         duration_tolerance_ms: Allowed duration variance in milliseconds.
+        keyframe_only: Whether to decode only keyframes from the input video.
 
     Raises:
         subprocess.CalledProcessError: If FFmpeg re-encoding fails.
@@ -263,7 +405,7 @@ async def reencode_video(
         except Exception:
             pass
 
-    static_ffmpeg.add_paths(weak=True)
+    ffmpeg_bin, _ = ensure_ffmpeg()
     video_bytes_per_sec = bitrate_kb * 1024
 
     # Container-aware audio encoding: .mov supports pcm_u8; .mp4 requires aac
@@ -272,13 +414,21 @@ async def reencode_video(
     else:
         audio_args = ["-c:a", "pcm_u8", "-ac", "1", "-ar", "16000"]
 
+    input_args = ["-skip_frame", "nokey"] if keyframe_only else []
+    vf_filter = f"scale=-2:{height},fps={fps}" if keyframe_only else f"fps={fps},scale=-2:{height}"
+
     cmd = [
-        "ffmpeg",
+        ffmpeg_bin,
+        "-nostdin",
         "-y",
+        "-loglevel",
+        "error",
+        "-nostats",
+        *input_args,
         "-i",
         str(input_path),
         "-vf",
-        f"fps={fps},scale=-2:{height}",
+        vf_filter,
         "-c:v",
         encoder,
         "-g",

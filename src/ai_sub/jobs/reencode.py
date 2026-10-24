@@ -25,6 +25,10 @@ class ReencodeJob(BaseJob):
         default=None,
         description="Hardware or software encoder to use.",
     )
+    keyframe_only: bool = Field(
+        default=False,
+        description="Whether to decode only keyframes from the input video.",
+    )
 
     async def execute(self) -> Path:
         """Executes FFmpeg re-encoding for this segment.
@@ -40,5 +44,6 @@ class ReencodeJob(BaseJob):
             bitrate_kb=self.bitrate_kb,
             encoder=self.encoder or "libx264",
             duration_tolerance_ms=self.duration_tolerance_ms,
+            keyframe_only=self.keyframe_only,
         )
         return self.output_file

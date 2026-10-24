@@ -56,7 +56,7 @@ from ai_sub.shortcode import (
 from ai_sub.telemetry import get_app_version, setup_logging
 from ai_sub.video import (
     get_video_duration_ms,
-    get_working_encoder,
+    init_ffmpeg_engine,
     reencode_video,
     split_video,
 )
@@ -227,9 +227,9 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
         if user_context:
             logfire.info(f"Loaded user context ({len(user_context)} characters).")
 
-        if (settings.reencode.summary.enabled or settings.reencode.segment.enabled) and not settings.reencode.encoder:
-            settings.reencode.encoder = await get_working_encoder()
-            logfire.info(f"Using encoder: {settings.reencode.encoder}")
+        if settings.reencode.summary.enabled or settings.reencode.segment.enabled:
+            _, _, encoder = await init_ffmpeg_engine(settings.reencode.encoder)
+            settings.reencode.encoder = encoder
 
         use_summary = settings.concurrency.summary > 0
         use_lyrics = settings.concurrency.lyrics > 0
@@ -322,6 +322,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                     bitrate_kb=settings.reencode.summary.bitrate_kb,
                                     encoder=settings.reencode.encoder or "libx264",
                                     duration_tolerance_ms=settings.reencode.summary.duration_tolerance_ms,
+                                    keyframe_only=settings.reencode.summary.keyframe_only,
                                 )
                                 summary_media = proxy_output
 
@@ -470,6 +471,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                     bitrate_kb=settings.reencode.segment.bitrate_kb,
                                     duration_tolerance_ms=settings.reencode.segment.duration_tolerance_ms,
                                     encoder=settings.reencode.encoder,
+                                    keyframe_only=settings.reencode.segment.keyframe_only,
                                     user_context=user_context,
                                 )
                                 compressed_path = await job.execute()

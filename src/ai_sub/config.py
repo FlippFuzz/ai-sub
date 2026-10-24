@@ -390,6 +390,10 @@ class SummaryReEncodeSettings(BaseSettings):
         default=300,
         description="File size threshold in MB above which the full video is compressed. 0 compresses unconditionally.",
     )
+    keyframe_only: bool = Field(
+        default=True,
+        description="Whether to decode only keyframes from the input video for faster summary proxy re-encoding.",
+    )
     fps: PositiveFloat = Field(
         default=1.0,
         description="Target framerate (FPS) for the summary proxy video.",
@@ -423,6 +427,10 @@ class SegmentReEncodeSettings(BaseSettings):
     threshold_mb: NonNegativeInt = Field(
         default=20,
         description="File size threshold in MB above which chunks are compressed. 0 compresses unconditionally.",
+    )
+    keyframe_only: bool = Field(
+        default=False,
+        description="Whether to decode only keyframes from the input video for segment chunk re-encoding.",
     )
     fps: PositiveFloat = Field(
         default=1.0,
