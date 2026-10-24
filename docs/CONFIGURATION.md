@@ -45,7 +45,7 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 | Argument                                        | Environment Variable                        | Description                                                        | Default |
 | :---------------------------------------------- | :------------------------------------------ | :----------------------------------------------------------------- | :------ |
-| `--ai.storage.max-gb <float>`                   | `AISUB_AI_STORAGE_MAX_GB`                   | High-water mark in GB triggering cleanup of old managed segments.  | `15.0`  |
+| `--ai.storage.max-gb <float>`                   | `AISUB_AI_STORAGE_MAX_GB`                   | High-water mark in GB triggering managed file cleanup.             | `15.0`  |
 | `--ai.storage.target-gb <float>`                | `AISUB_AI_STORAGE_TARGET_GB`                | Low-water mark in GB to delete down to during storage cleanup.     | `10.0`  |
 | `--ai.storage.cleanup-interval-minutes <int>`   | `AISUB_AI_STORAGE_CLEANUP_INTERVAL_MINUTES` | Cooldown period in minutes between storage cleanup checks.         | `30`    |
 | `--ai.storage.polling-interval-seconds <float>` | `AISUB_AI_STORAGE_POLLING_INTERVAL_SECONDS` | Interval in seconds between upload status checks while processing. | `10.0`  |
@@ -148,7 +148,7 @@ To prevent wasted API calls and ensure subtitle integrity, stages adhere to the 
 
 1. **Summary Failure**: If the whole-video summary stage is enabled and exhausts its retries without producing a valid response, pipeline execution **halts immediately**.
 2. **Subtitles Failure**: If subtitle generation fails for a particular 5-minute chunk, that chunk **will not continue** to lyrics refinement.
-3. **Lyrics Failure**: If a singing performance is detected but lyrics refinement fails or exhausts retries, the stitcher **will not fall back** to the draft subtitles. Instead, it marks that specific segment with an explicit error line (`Error processing subtitles for this segment.`) in the final `.srt` so omissions can be clearly identified.
+3. **Lyrics Failure**: If a singing performance is detected but lyrics refinement completely fails to execute (e.g. crashes or exhausts retries without producing a response), the stitcher **will not fall back** to the draft subtitles. Instead, it marks that specific segment with an explicit error line (`Error processing subtitles for this segment.`) in the final `.srt` so omissions can be clearly identified. _(Note: If the model completes its execution successfully but verifies that official song lyrics are mismatched or unavailable, it gracefully preserves the draft subtitles without producing an error line)._
 
 ---
 

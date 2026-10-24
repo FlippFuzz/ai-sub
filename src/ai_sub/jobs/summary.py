@@ -43,26 +43,34 @@ _SUMMARY_SYSTEM_TEMPLATE = dedent(
       <target name="chapters">
         A chronological list of chapters dividing the video naturally wherever major activity, gameplay, or topic transitions occur.
         - Note approximate start/end timestamps and a concise title and description of each activity.
-        - If a chapter represents a musical performance and the song title/artist is recognizable, announced, or displayed on screen, record `song_title` and `song_artist`. For non-musical chapters or unknown songs, leave them as null. NEVER invent song titles.
+        - Musical Performances:
+          * If a chapter represents a musical performance and the song title or artist is recognizable from memory, announced, or displayed on screen, record `song_title` and/or `song_artist` in official native script (e.g. Japanese Kanji/Kana, Korean Hangul).
+          * NEVER translate or romanize Japanese/Korean song titles unless the official commercial release uses Latin script.
+          * `song_title` and `song_artist` are independent: record whichever is known, and leave the unknown one as null.
+          * If unknown or non-musical, leave them as null. NEVER invent song titles.
       </target>
       <target name="entities">
-        All key participants, speakers, avatars, or characters. Include standardized English names, native script (Kanji/Kana/Hangul), visual cues (appearance, clothing, avatar layout), and affiliations.
+        All key participants, speakers, avatars, or characters. Include standardized English names, native script (Kanji/Kana/Hangul), visual cues (appearance, clothing, avatar layout), affiliations, persona/character lore (species, backstory, occupation), and verbal speech ticks or catchphrases (語尾 like -のじゃ, -ぺこ).
       </target>
       <target name="domain_glossary">
-        Domain terminology, game mechanics, character/item names, recurring jokes, slang, or catchphrases mapped to their meanings.
+        Domain terminology, game mechanics, UI terms, character/item names, recurring jokes, community slang, or catchphrases mapped to their meanings.
       </target>
     </extraction_targets>
 
     <search_rules>
-      <rule name="PARALLEL BATCH SEARCHING">
-        Execute all search queries concurrently in a single turn.
-        - Emit multiple function calls simultaneously in your initial turn rather than searching sequentially across multiple turns.
-        - If verifying multiple entities, game terms, or lore items, bundle all queries into one parallel batch.
+      <rule name="LORE AND ENTITY DISCOVERY">
+        Use web search to uncover backgrounds, official agency profiles, character personas, lore, and verbal ticks (語尾) for newly debuted or unfamiliar participants.
+        For gameplay or specialized content, search for game mechanics, franchise-specific terminology, skills/items, and streamer memes to ensure downstream subtitles translate them accurately.
       </rule>
-      <rule name="SEARCH SCOPE">
-        - Use web search ONLY for global stream context, main participant identities, or unfamiliar game/franchise terminology.
-        - DO NOT execute individual search queries for every song in a long tracklist or karaoke setlist; rely on on-screen titles and audio announcements.
-        - Search non-English terms using their original script or official Romaji.
+      <rule name="PARALLEL BATCH SEARCHING">
+        Execute all search queries concurrently using your multi-query search tool.
+        - Bundle all uncertain entities, lore questions, game terms, or participant backgrounds into multi-query batches rather than searching one by one across multiple turns.
+      </rule>
+      <rule name="NO LYRIC SNIPPET SEARCHING">
+        DO NOT use web search with lyric fragments or sung audio snippets to reverse-search song titles during Summary.
+        - Rely solely on on-screen text, spoken announcements, or memory for song titles.
+        - If a song title is unknown, record it as null.
+        - Reserve your search turns exclusively for participant lore, stream context, and domain glossary.
       </rule>
     </search_rules>
     """  # noqa: E501
@@ -82,7 +90,8 @@ def get_summary_prompt(user_context: str | None = None) -> Prompt:
         "<task>",
         "  Analyze the provided video using your agentic video exploration capabilities.",
         "  Build the global summary, divide the video into natural chapters, identify participants and domain terms,",
-        "  and verify spellings and terminology using your web search tool in parallel batches.",
+        "  research participant lore, species/roles, and verbal ticks using web search in parallel batches,",
+        "  and compile game mechanics and glossary terminology for accurate downstream subtitle translation.",
         "</task>",
     ]
     if user_context and user_context.strip():
@@ -105,11 +114,11 @@ class ChapterItem(BaseModel):
     description: str = Field(description="Overview of topics, activities, gameplay events, or performance.")
     song_title: str | None = Field(
         default=None,
-        description="Song title if this chapter is a singing performance and title is known; otherwise null.",
+        description="Official song title in original native script (Kanji/Kana/Hangul) if known; otherwise null. Do not translate or romanize.",  # noqa: E501
     )
     song_artist: str | None = Field(
         default=None,
-        description="Original artist, group, or composer if known; otherwise null.",
+        description="Original artist, group, or composer in native script if known; otherwise null. Independent of song_title.",  # noqa: E501
     )
 
     @model_validator(mode="before")
@@ -141,6 +150,14 @@ class EntityItem(BaseModel):
     role_or_affiliation: str | None = Field(
         default=None,
         description="Role, channel affiliation, agency, or fictional character identity.",
+    )
+    persona_lore: str | None = Field(
+        default=None,
+        description="Character backstory, species/race (e.g. 'salamander firefighter'), archetype, occupation, or channel lore.",  # noqa: E501
+    )
+    speech_patterns_or_ticks: str | None = Field(
+        default=None,
+        description="Verbal ticks (e.g. 語尾 like -のじゃ, -ぺこ), signature catchphrases, sentence endings, or speech registers.",  # noqa: E501
     )
     visual_cues: str | None = Field(
         default=None,

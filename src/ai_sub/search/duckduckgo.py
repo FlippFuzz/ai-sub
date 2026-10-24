@@ -101,18 +101,6 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
         self._cache[cache_key] = results
         return results
 
-    async def duckduckgo_search(self, query: str) -> list[dict[str, Any]]:
-        """Perform a single web search query using DuckDuckGo.
-
-        Args:
-            query: The search query string.
-
-        Returns:
-            list[dict[str, Any]]: List of matching search results with title, url, and snippet content.
-        """
-        results = await self.search_single(query)
-        return [r.model_dump(mode="json") for r in results]
-
     async def web_search_duckduckgo_multi(self, queries: list[str]) -> list[dict[str, Any]]:
         """Perform multiple web search queries in parallel using DuckDuckGo.
 
@@ -124,7 +112,7 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
         """
 
         async def _run(q: str) -> dict[str, Any]:
-            res = await self.duckduckgo_search(q)
+            res = await self.search_single(q)
             return WebQueryResult.model_validate({"query": q, "results": res}).model_dump(mode="json")
 
         return await asyncio.gather(*(_run(q) for q in queries))

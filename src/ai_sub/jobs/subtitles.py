@@ -47,7 +47,7 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
          - Audio Waveform (16kHz): The SOLE authority for vocal start ('s') and end ('e') timestamps. Video frames are sampled coarsely (1 FPS) and CANNOT determine millisecond audio timing.
          - Video Frames: Used strictly for visual translation context (speaker identities, pronouns, physical actions) and determining the duration of on-screen text.
       2. User Directives: Follow `<user_provided_context>` for participant names, pronouns, and translation style.
-      3. Background Context: Use `<global_video_summary>` to understand overarching stream lore, participants, and chapter progression.
+      3. Background Context: Use `<global_video_summary>` to understand overarching stream lore, participants, and chapter progression. Treat macroscopic chapter song titles as unverified hints; ground musical performances strictly in what is heard and seen in this segment.
     </input_priority_and_modality_separation>
 
     <subtitle_generation_pipeline>
@@ -78,7 +78,8 @@ _SUBTITLES_SYSTEM_TEMPLATE = dedent(
 
     <musical_performance_detection>
       In the `detected_musical_performances` field, list all vocal musical performances or singing detected in this segment:
-      - Record the song title and artist if displayed on screen, announced, or recognizable; otherwise set them to null.
+      - Record the official song title and artist in their original native script (Kanji/Kana/Hangul) if displayed on screen, announced, or recognizable; otherwise set them to null. NEVER translate or romanize Japanese/Korean titles unless the official title uses Latin script.
+      - Title and artist are independent: record whichever is known, and leave the unknown field as null.
       - Record approximate start and end timestamps.
       - If NO singing or vocal music occurs in this segment (e.g. pure gaming, talk, or background BGM only), leave `detected_musical_performances` empty ([]).
     </musical_performance_detection>
@@ -161,11 +162,11 @@ class DetectedMusicalPerformance(BaseModel):
 
     title: str | None = Field(
         default=None,
-        description="Song title if identified on screen, announced, or recognized; otherwise null.",
+        description="Official song title in original native script (Kanji/Kana/Hangul) if identified; otherwise null. Do not translate or romanize.",  # noqa: E501
     )
     artist: str | None = Field(
         default=None,
-        description="Original artist or composer if known; otherwise null.",
+        description="Original artist, group, or composer in native script if known; otherwise null. Independent of title.",  # noqa: E501
     )
     start: str = Field(description="Approximate start timecode within this segment (e.g. '00:15').")
     end: str = Field(description="Approximate end timecode within this segment (e.g. '03:45').")

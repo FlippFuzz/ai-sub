@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import random
 import re
+import urllib.parse
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -44,9 +46,43 @@ def _get_unique_display_name(file_path: Path) -> str:
         str: Display name formatted as 'workspace/filename.ext' or 'workspace/reencoded/filename.ext'.
     """
     resolved = file_path.resolve()
+    safe_name = urllib.parse.quote(resolved.name, safe=".-_")
+    safe_parent = urllib.parse.quote(resolved.parent.name, safe=".-_")
     if resolved.parent.name == "reencoded":
-        return f"{resolved.parent.parent.name}/reencoded/{resolved.name}"
-    return f"{resolved.parent.name}/{resolved.name}"
+        safe_grandparent = urllib.parse.quote(resolved.parent.parent.name, safe=".-_")
+        return f"{safe_grandparent}/reencoded/{safe_name}"
+    return f"{safe_parent}/{safe_name}"
+
+
+def _get_candidate_display_names(file_path: Path) -> set[str]:
+    """Generates all possible display name variants for backward compatibility.
+
+    Args:
+        file_path: Path to the local file.
+
+    Returns:
+        set[str]: Set of matching display name candidates.
+    """
+    resolved = file_path.resolve()
+    raw_parent = resolved.parent.name
+    raw_name = resolved.name
+    quoted_parent = urllib.parse.quote(raw_parent, safe=".-_")
+    quoted_name = urllib.parse.quote(raw_name, safe=".-_")
+
+    candidates = {
+        f"{raw_parent}/{raw_name}",
+        f"{quoted_parent}/{quoted_name}",
+        raw_name,
+        quoted_name,
+    }
+
+    if resolved.parent.name == "reencoded":
+        raw_gp = resolved.parent.parent.name
+        quoted_gp = urllib.parse.quote(raw_gp, safe=".-_")
+        candidates.add(f"{raw_gp}/reencoded/{raw_name}")
+        candidates.add(f"{quoted_gp}/reencoded/{quoted_name}")
+
+    return candidates
 
 
 def _get_file_timestamp(remote_file: types.File) -> float:
@@ -284,49 +320,85 @@ class GeminiExecutor:
             await self._cleanup_storage_if_needed()
 
             display_name = _get_unique_display_name(file_path)
+            candidate_names = _get_candidate_display_names(file_path)
+
+            existing_active: types.File | None = None
+            existing_processing: types.File | None = None
 
             try:
                 with logfire.span("Check existing remote file", _level="debug"):
                     async for remote_file in await self._client.aio.files.list(
                         config=types.ListFilesConfig(page_size=100)
                     ):
-                        if remote_file.display_name == display_name:
+                        if remote_file.display_name in candidate_names:
                             if remote_file.state == types.FileState.ACTIVE:
-                                logfire.debug(
-                                    "Reusing existing remote file: {name} ({file_id})",
-                                    name=file_path.name,
-                                    file_id=remote_file.name,
-                                )
-                                return remote_file
-                            elif remote_file.state == types.FileState.FAILED:
-                                if remote_file.name:
-                                    try:
-                                        await self._client.aio.files.delete(name=remote_file.name)
-                                    except Exception:
-                                        pass
+                                existing_active = remote_file
+                                break
+                            if remote_file.state == types.FileState.PROCESSING and existing_processing is None:
+                                existing_processing = remote_file
+                            elif remote_file.state == types.FileState.FAILED and remote_file.name:
+                                try:
+                                    await self._client.aio.files.delete(name=remote_file.name)
+                                except Exception:
+                                    pass
             except Exception as e:
                 logfire.debug(f"Remote file search error for {file_path.name}: {e}")
 
-            with logfire.span("Uploading file to Files API", _level="debug"):
-                logfire.debug(f"Uploading {file_path.name} to Gemini Files API...")
-                uploaded = await self._client.aio.files.upload(
-                    file=file_path,
-                    config=types.UploadFileConfig(display_name=display_name),
-                )
+            if existing_active:
+                logfire.info(f"Reusing existing remote file: {file_path.name} ({existing_active.name})")
+                return existing_active
 
             poll_interval = self.ai_settings.storage.polling_interval_seconds
-            await asyncio.sleep(poll_interval)
 
-            with logfire.span("Polling file state until ACTIVE", _level="debug"):
-                while uploaded.state != types.FileState.ACTIVE:
-                    if uploaded.state == types.FileState.FAILED:
-                        raise RuntimeError(f"File {file_path.name} failed to process on Gemini server.")
+            if existing_processing:
+                uploaded = existing_processing
+            else:
+                upload_path = file_path
+                temp_link: Path | None = None
 
-                    await asyncio.sleep(poll_interval)
-                    if uploaded.name:
-                        uploaded = await self._client.aio.files.get(name=uploaded.name)
-                    else:
-                        raise RuntimeError(f"Could not retrieve file '{file_path.name}' status.")
+                if not file_path.name.isascii():
+                    temp_link = file_path.parent / f"_upload_temp_{int(time())}{file_path.suffix}"
+                    if temp_link.exists():
+                        try:
+                            temp_link.unlink()
+                        except OSError:
+                            pass
+                    try:
+                        os.link(file_path, temp_link)
+                        upload_path = temp_link
+                    except OSError:
+                        try:
+                            os.symlink(file_path, temp_link)
+                            upload_path = temp_link
+                        except OSError:
+                            pass
+
+                try:
+                    with logfire.span("Uploading {filename} to Gemini Files API", filename=file_path.name):
+                        uploaded = await self._client.aio.files.upload(
+                            file=upload_path,
+                            config=types.UploadFileConfig(display_name=display_name),
+                        )
+                finally:
+                    if temp_link and temp_link.exists():
+                        try:
+                            temp_link.unlink()
+                        except OSError:
+                            pass
+
+                await asyncio.sleep(poll_interval)
+
+            if uploaded.state != types.FileState.ACTIVE:
+                with logfire.span("Waiting for Gemini to process {filename}", filename=file_path.name):
+                    while uploaded.state != types.FileState.ACTIVE:
+                        if uploaded.state == types.FileState.FAILED:
+                            raise RuntimeError(f"File {file_path.name} failed to process on Gemini server.")
+
+                        await asyncio.sleep(poll_interval)
+                        if uploaded.name:
+                            uploaded = await self._client.aio.files.get(name=uploaded.name)
+                        else:
+                            raise RuntimeError(f"Could not retrieve file '{file_path.name}' status.")
 
             return uploaded
 

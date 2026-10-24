@@ -43,16 +43,22 @@ _LYRICS_SYSTEM_TEMPLATE = dedent(
         - DO NOT add, delete, shift, or stretch timestamps. Your job is to refine text content ('og' and 'en'), NOT to re-align timing.
       </mandate>
 
+      <mandate name="PHONETIC COMPATIBILITY CHECK & DRAFT PRESERVATION">
+        Before applying any lyrics or search results, verify that the lyrics actually match the vocal phonetics heard in the segment.
+        - If pre-fetched lyrics do not match the song actually performed, DISCARD THEM IMMEDIATELY.
+        - If matching official lyrics cannot be located via search, DO NOT force-fit mismatched lyrics or alter dialogue to fit the wrong song. PRESERVE the draft subtitles ('og' and 'en') untouched as transcribed.
+      </mandate>
+
       <mandate name="LYRIC & KANJI REFINEMENT (og)">
-        Review draft lines that correspond to musical performances against the provided lyrics:
+        Review draft lines that correspond to musical performances against verified official lyrics:
         - Correct phonetic mis-transcriptions, puns, and homophones using official song lyrics (e.g. replace misheard words with official Kanji).
         - Keep live spoken callouts, stage banter, and crowd greetings exactly as heard in the draft.
       </mandate>
 
       <mandate name="TRANSLATION POLISH (en)">
-        Update English translations to reflect the corrected lyric meaning:
-        - Inspect the video frames to verify visual context, speaker identity, and staging.
-        - Maintain semantic continuity across sentence breaks (use ellipses "..." where thoughts carry over).
+        Update English translations to reflect the corrected Kanji meaning:
+        - Inspect video frames to verify visual context, speaker identity, and staging.
+        - Polish the English line ONLY when the corrected original Kanji alters the semantic meaning of that line. Maintain narrative continuity and ellipses "..." across line breaks.
         - Retain identical visual tags if present (e.g. `[Sign: ...]`, `[Title: ...]`).
       </mandate>
 
