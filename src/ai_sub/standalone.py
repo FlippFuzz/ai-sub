@@ -234,8 +234,14 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
         use_summary = settings.concurrency.summary > 0
         use_lyrics = settings.concurrency.lyrics > 0
         summary_shortcode = generate_summary_shortcode(settings.ai.model_summary)
-        subtitles_shortcode = generate_subtitles_shortcode(settings.ai.model_subtitles)
-        lyrics_shortcode = generate_lyrics_shortcode(settings.ai.model_lyrics)
+        subtitles_shortcode = generate_subtitles_shortcode(
+            model_name=settings.ai.model_subtitles,
+            summary_shortcode=summary_shortcode if use_summary else None,
+        )
+        lyrics_shortcode = generate_lyrics_shortcode(
+            lyrics_model_name=settings.ai.model_lyrics,
+            subtitles_shortcode=subtitles_shortcode,
+        )
         full_shortcode = generate_full_shortcode(settings.ai.model_subtitles)
 
         reencode_dir = settings.dir.tmp / "reencoded"

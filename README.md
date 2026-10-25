@@ -213,14 +213,14 @@ If your internet drops, your computer shuts down, or an API error occurs, **you 
 
 ### Comparing Intermediate Subtitles in VLC
 
-Inside the temporary directory (`tmp_<video_name>`), AI Sub generates standalone subtitle files for each video part:
+Inside the temporary directory (`tmp_<video_name>`), AI Sub generates standalone subtitle files for each video part with complete upstream lineage:
 
-- `part_000.subtitles-g38f-19.srt`: Initial dialogue transcription and timing.
-- `part_000.lyrics-g35l-10.srt`: Song lyrics and translation refinement (generated when singing occurs).
+- `part_000.subtitles-g35l-01_g38f-19.srt`: Initial dialogue transcription and timing (linked to the summary model).
+- `part_000.lyrics-g35l-01_g38f-19_g35l-10.srt`: Song lyrics and translation refinement (linked to both summary and subtitle models).
 
-When opened in VLC or MPV alongside the video chunk, the subtitle tracks are labeled as `subtitles-g38f-19` and `lyrics-g35l-10` for easy comparison.
+When opened in VLC or MPV alongside the video chunk, the subtitle tracks are labeled with their full lineage for easy comparison.
 
-Once the entire process finishes, the final stitched subtitle file is saved alongside your video with full provenance tracking:
+Once the entire process finishes, the final stitched subtitle file is saved alongside your video with a clean, concise filename:
 
 ```text
 my_video.mp4

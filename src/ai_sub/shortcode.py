@@ -83,36 +83,48 @@ def generate_summary_shortcode(
 
 def generate_subtitles_shortcode(
     model_name: str,
+    summary_shortcode: str | None = None,
     subtitles_prompt_version: int = SUBTITLES_PROMPT_VERSION,
 ) -> str:
-    """Combines model shortcode and 2-digit subtitles prompt version tag.
+    """Combines model shortcode and 2-digit subtitles prompt version tag with optional summary lineage.
+
+    If summary_shortcode is provided, prepends it so changes to the upstream summary model
+    automatically invalidate downstream subtitle caches.
 
     Args:
         model_name: Model identifier string.
+        summary_shortcode: Optional upstream summary tag (e.g. 'g35l-01').
         subtitles_prompt_version: Prompt version number. Defaults to SUBTITLES_PROMPT_VERSION.
 
     Returns:
-        str: Tag formatted as '<model_code>-<subtitles_v>' (e.g., 'g38f-19').
+        str: Tag formatted as '[<summary_code>_]<model_code>-<subtitles_v>'
+            (e.g., 'g35l-01_g38f-19' or 'g38f-19').
     """
     model_code = generate_model_shortcode(model_name)
-    return f"{model_code}-{subtitles_prompt_version:02d}"
+    sub_tag = f"{model_code}-{subtitles_prompt_version:02d}"
+    if summary_shortcode:
+        return f"{summary_shortcode}_{sub_tag}"
+    return sub_tag
 
 
 def generate_lyrics_shortcode(
-    model_name: str,
+    lyrics_model_name: str,
+    subtitles_shortcode: str,
     lyrics_prompt_version: int = LYRICS_PROMPT_VERSION,
 ) -> str:
-    """Combines model shortcode and 2-digit lyrics prompt version tag.
+    """Combines upstream subtitles shortcode and lyrics model tag with prompt version.
 
     Args:
-        model_name: Model identifier string.
-        lyrics_prompt_version: Prompt version number. Defaults to LYRICS_PROMPT_VERSION.
+        lyrics_model_name: Lyrics model identifier string.
+        subtitles_shortcode: Full upstream subtitles shortcode representing the transcription lineage.
+        lyrics_prompt_version: Lyrics prompt version number. Defaults to LYRICS_PROMPT_VERSION.
 
     Returns:
-        str: Tag formatted as '<model_code>-<lyrics_v>' (e.g., 'g35l-10').
+        str: Tag formatted as '<subtitles_shortcode>_<lyrics_code>-<lyrics_v>'
+            (e.g., 'g35l-01_g38f-19_g35l-10' or 'g38f-19_g35l-10').
     """
-    model_code = generate_model_shortcode(model_name)
-    return f"{model_code}-{lyrics_prompt_version:02d}"
+    lyrics_code = generate_model_shortcode(lyrics_model_name)
+    return f"{subtitles_shortcode}_{lyrics_code}-{lyrics_prompt_version:02d}"
 
 
 def generate_full_shortcode(
