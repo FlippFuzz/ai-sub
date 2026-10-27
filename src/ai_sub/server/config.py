@@ -78,6 +78,10 @@ class SourcesConfig(BaseModel):
         default=Path("channels.json"),
         description="Path to the YouTube channel ID to uploader handle mapping JSON cache.",
     )
+    max_title_bytes: int = Field(
+        default=100,
+        description="Maximum byte length of the video title prefix in downloaded filenames.",
+    )
     enable_pot_provider: bool = Field(
         default=True,
         description="Whether to automatically clone, update, and build bgutil-ytdlp-pot-provider.",

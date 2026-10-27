@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 import logfire
 from pysubs2 import SSAEvent, SSAFile
+from yt_dlp.utils import sanitize_filename
 
 from ai_sub.config import ReEncodeSettings, SearchSettings, SplittingSettings
 from ai_sub.jobs.lyrics import (
@@ -262,6 +263,7 @@ class ComboPipeline:
         """
         job_dir = self.work_dir / video_id
         job_dir.mkdir(parents=True, exist_ok=True)
+        filename_stem = sanitize_filename(raw_video_path.stem)
 
         with logfire.span(
             "Prepare Video: {video_id}",
@@ -279,6 +281,8 @@ class ComboPipeline:
                 "uploader": uploader,
                 "channel_name": channel_name,
                 "title": title,
+                "filename_stem": filename_stem,
+                "raw_filename": raw_video_path.name,
                 "source_type": source_type,
                 "duration_ms": total_duration_ms,
                 "raw_size_mb": round(raw_size_mb, 2),
@@ -362,6 +366,7 @@ class ComboPipeline:
                 uploader=uploader,
                 channel_name=channel_name,
                 title=title,
+                filename_stem=filename_stem,
                 source_type=source_type,
                 job_dir=job_dir,
                 raw_path=raw_video_path,
@@ -699,20 +704,20 @@ class ComboPipeline:
                     if s_job and s_job.response:
                         active_resp = s_job.response
 
-            if active_resp:
-                seg_subs = active_resp.get_ssafile()
-                seg_subs.shift(ms=current_offset_ms)
-                all_subs += seg_subs
-            else:
-                all_subs.append(
-                    SSAEvent(
-                        start=current_offset_ms,
-                        end=current_offset_ms + seg_dur_ms,
-                        text="Error processing subtitles for this segment.",
+                if active_resp:
+                    seg_subs = active_resp.get_ssafile()
+                    seg_subs.shift(ms=current_offset_ms)
+                    all_subs += seg_subs
+                else:
+                    all_subs.append(
+                        SSAEvent(
+                            start=current_offset_ms,
+                            end=current_offset_ms + seg_dur_ms,
+                            text="Error processing subtitles for this segment.",
+                        )
                     )
-                )
 
-            current_offset_ms += seg_dur_ms
+                current_offset_ms += seg_dur_ms
 
             metadata = {
                 "ai_sub_version": get_app_version(),
@@ -767,6 +772,8 @@ class ComboPipeline:
                 uploader = str(meta.get("uploader", "unknown"))
                 channel_name = meta.get("channel_name")
                 title = str(meta.get("title", job_dir.name))
+                filename_stem = str(meta.get("filename_stem", ""))
+                raw_filename = meta.get("raw_filename")
                 source_type = meta.get("source_type", "youtube")
             except Exception as e:
                 logfire.warning(f"Could not load {meta_file.name}: {e}. Skipping resume.")
@@ -783,9 +790,21 @@ class ComboPipeline:
                 return False
 
             proxy_path = job_dir / "summary_proxy.mp4"
+            raw_video_path = job_dir / str(raw_filename) if raw_filename else None
+
+            if not raw_video_path or not raw_video_path.is_file():
+                raw_candidates = [
+                    p
+                    for p in job_dir.glob(f"*{video_id}*.*")
+                    if p.is_file() and not p.name.startswith("part_") and p.suffix.lower() in valid_extensions
+                ]
+                raw_video_path = raw_candidates[0] if raw_candidates else segment_files[0]
+
             if not proxy_path.is_file():
-                raw_candidates = [p for p in job_dir.glob(f"{video_id}.*") if p.is_file()]
-                proxy_path = raw_candidates[0] if raw_candidates else segment_files[0]
+                proxy_path = raw_video_path
+
+            if not filename_stem:
+                filename_stem = sanitize_filename(raw_video_path.stem)
 
             durations = await asyncio.gather(*(get_video_duration_ms(p) for p in segment_files))
             total_duration_ms = sum(durations)
@@ -802,9 +821,10 @@ class ComboPipeline:
                 uploader=uploader,
                 channel_name=channel_name,
                 title=title,
+                filename_stem=filename_stem,
                 source_type=source_type,
                 job_dir=job_dir,
-                raw_path=proxy_path,
+                raw_path=raw_video_path,
                 duration_ms=total_duration_ms,
                 summary_proxy_path=proxy_path,
                 segment_paths=segment_files,
@@ -815,7 +835,6 @@ class ComboPipeline:
             active = self.active_video
             self.tasks.clear()
 
-            # Always start background chunk re-encoding on resume
             self._reencode_task = asyncio.create_task(self._reencode_segments_background())
 
             summary_file = job_dir / f"summary.{self.summary_shortcode}.yaml"

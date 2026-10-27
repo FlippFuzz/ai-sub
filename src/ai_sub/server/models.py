@@ -77,6 +77,7 @@ class ActiveVideo(BaseModel):
     uploader: str = Field(description="Channel or uploader handle/identifier.")
     channel_name: str | None = Field(default=None, description="Display name of the channel.")
     title: str = Field(description="Display title of the video.")
+    filename_stem: str = Field(description="Filesystem-safe base name for output files.")
     source_type: Literal["local", "youtube"] = Field(default="local", description="Ingestion source type.")
     user_context: str | None = Field(default=None, description="Generated context string passed to LLM prompts.")
     job_dir: Path = Field(description="Subdirectory containing all files for this video job.")

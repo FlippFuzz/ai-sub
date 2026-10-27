@@ -25,6 +25,7 @@ sources:
     - "https://www.youtube.com/playlist?list=PLxxxxxxxxxxxxxxxx"
     - "https://www.youtube.com/@ChannelName/videos"
   channels_file: "channels.json"
+  max_title_bytes: 100
   proxy: "http://127.0.0.1:40000"
   cookie_file: "/home/ubuntu/ai-sub-server/cookie.txt"
 

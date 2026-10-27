@@ -21,6 +21,7 @@ from ai_sub.server.config import SourcesConfig
 from ai_sub.server.coordinator import PipelineCoordinator
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.pipeline import ComboPipeline
+from ai_sub.video import ensure_ffmpeg
 
 
 def ensure_pot_provider(pot_dir: Path, check_updates: bool = False) -> Path | None:
@@ -71,7 +72,6 @@ def ensure_pot_provider(pot_dir: Path, check_updates: bool = False) -> Path | No
                 )
                 needs_build = True
 
-        # If compiled artifacts are missing, force build
         build_output = server_dir / "build"
         dist_output = server_dir / "dist"
         if not build_output.exists() and not dist_output.exists():
@@ -154,7 +154,6 @@ class IngestionManager:
             pot_dir = base_work_dir / pot_dir
 
         self.pot_dir = pot_dir
-        # On server boot: only clone/build if missing, do not run network git-fetch
         self.pot_server_dir = ensure_pot_provider(pot_dir, check_updates=False) if config.enable_pot_provider else None
 
         self.test_download_dir = base_work_dir / "tmp_test"
@@ -168,7 +167,7 @@ class IngestionManager:
         self._scan_lock = asyncio.Lock()
 
     def _get_base_ytdlp_opts(self) -> dict[str, Any]:
-        """Constructs base yt-dlp parameters including PO token server and node runtime.
+        """Constructs base yt-dlp parameters including PO token server, node runtime, and FFmpeg path.
 
         Returns:
             dict[str, Any]: Base yt-dlp configuration options dictionary.
@@ -179,12 +178,15 @@ class IngestionManager:
         if self.pot_server_dir and self.pot_server_dir.exists():
             extractor_args["youtubepot-bgutilscript"] = {"server_home": str(self.pot_server_dir)}
 
+        ffmpeg_bin, _ = ensure_ffmpeg()
+
         opts: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
             "ignoreerrors": True,
             "windowsfilenames": True,
             "js_runtimes": {"node": {}},
+            "ffmpeg_location": ffmpeg_bin,
             "extractor_args": extractor_args,
         }
         if self.config.proxy:
@@ -362,7 +364,7 @@ class IngestionManager:
             return False
 
     async def download_youtube_to_combo_dir(self, video: DiscoveredVideo, combo_work_dir: Path) -> Path:
-        """Downloads a video stream directly into work/<combo>/<video_id>/<video_id>.ext.
+        """Downloads a video stream directly into work/<combo>/<video_id>/<title> [<id>].ext.
 
         Args:
             video: Discovered video metadata.
@@ -379,7 +381,7 @@ class IngestionManager:
 
         ydl_opts = self._get_base_ytdlp_opts()
         ydl_opts["format"] = "bestvideo[height<=360]+bestaudio/best[height<=360]/best"
-        ydl_opts["outtmpl"] = str(job_dir / f"{video.video_id}.%(ext)s")
+        ydl_opts["outtmpl"] = str(job_dir / f"%(title).{self.config.max_title_bytes}B [%(id)s].%(ext)s")
 
         loop = asyncio.get_running_loop()
 
@@ -406,7 +408,11 @@ class IngestionManager:
         ):
             downloaded = await loop.run_in_executor(None, _do_download)
             if not downloaded.is_file():
-                matches = list(job_dir.glob(f"{video.video_id}.*"))
+                matches = [
+                    p
+                    for p in job_dir.glob(f"*{video.video_id}*.*")
+                    if p.is_file() and not p.name.startswith("part_") and not p.name.endswith(".json")
+                ]
                 if matches:
                     return matches[0]
                 raise RuntimeError(f"Downloaded file not found for {video.title}")
@@ -523,7 +529,7 @@ class IngestionManager:
                 vid = pipe.active_video
                 logfire.info(f"Pipeline '{pipe.config.name}' finished all segments for '{vid.title}'. Finalizing...")
 
-                srt_filename = f"{vid.title}.{pipe.full_shortcode}.srt"
+                srt_filename = f"{vid.filename_stem}.{pipe.full_shortcode}.srt"
                 temp_srt = vid.job_dir / srt_filename
                 pipe.stitch_final_subtitles(temp_srt)
 
@@ -572,7 +578,6 @@ class IngestionManager:
             logfire.debug("Running periodic source rescan...")
             self.consecutive_failures = 0
             try:
-                # Check for POT provider git updates rarely (once every pot_update_interval_hours)
                 if self.config.enable_pot_provider:
                     now = time()
                     interval_sec = self.config.pot_update_interval_hours * 3600
