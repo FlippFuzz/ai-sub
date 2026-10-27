@@ -20,6 +20,10 @@ dependencies = [
     "pyrate-limiter",
     "rich",
     "pyyaml",
+    "fastapi",
+    "uvicorn",
+    "yt-dlp[default]",
+    "gitpython",
 ]
 
 [project.urls]
@@ -28,6 +32,8 @@ dependencies = [
 
 [project.scripts]
 ai-sub = "ai_sub.standalone:main"
+ai-sub-server = "ai_sub.server.main:main"
+ai-sub-worker = "ai_sub.worker.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

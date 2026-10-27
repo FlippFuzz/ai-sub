@@ -1,0 +1,85 @@
+# ==============================================================================
+# AI Sub Server Configuration (server.yaml)
+# ==============================================================================
+
+# Core HTTP Server and Task Orchestration Options
+server:
+  host: "127.0.0.1"
+  port: 8000
+  work_dir: "./work"
+  heartbeat_timeout_seconds: 300
+  rescan_interval_minutes: 15
+  validation_buffer_ms: 2000
+
+# Git Repository Synchronization Settings
+git:
+  repo_url: "https://github.com/YourUsername/subtitles-archive.git"
+  branch: "main"
+  pat: "ghp_your_github_token_here"
+
+# Media Intake Sources and Downloader Settings
+sources:
+  watch_folders:
+    - "/home/ubuntu/videos/intake"
+  youtube:
+    - "https://www.youtube.com/playlist?list=PLxxxxxxxxxxxxxxxx"
+    - "https://www.youtube.com/@ChannelName/videos"
+  channels_file: "channels.json"
+  proxy: "http://127.0.0.1:40000"
+  cookie_file: "/home/ubuntu/ai-sub-server/cookie.txt"
+
+  # PO token provider settings:
+  enable_pot_provider: true
+  pot_dir: "bgutil-ytdlp-pot-provider"
+  pot_update_interval_hours: 24
+
+  download_test_duration_s: 10
+  max_consecutive_failures: 3
+
+# Video Re-encoding and Compression Controls
+reencode:
+  encoder: null
+
+  summary:
+    enabled: true
+    threshold_mb: 300
+    keyframe_only: true
+    fps: 1.0
+    height: 360
+    bitrate_kb: 35
+
+  segment:
+    enabled: false
+    threshold_mb: 20
+    fps: 1.0
+    height: 360
+    bitrate_kb: 35
+
+# Auxiliary Web Search and Lyric Provider Settings
+search:
+  tools:
+    - "tinyfish"
+    - "lrclib"
+    - "duckduckgo"
+
+# Segmentation / Splitting Settings
+split:
+  max_seconds: 300
+  duration_tolerance_ms: 100
+
+# Active Pipeline Combinations (Capped at 1 active video per combination)
+pipelines:
+  - name: "combo_38f"
+    summary_model: "google-gla:gemini-3.5-flash-lite"
+    subtitles_model: "google-gla:gemini-3.8-flash"
+    lyrics_model: "google-gla:gemini-3.5-flash-lite"
+
+  - name: "combo_36f"
+    summary_model: "google-gla:gemini-3.5-flash-lite"
+    subtitles_model: "google-gla:gemini-3.6-flash"
+    lyrics_model: "google-gla:gemini-3.5-flash-lite"
+
+  - name: "combo_35l"
+    summary_model: "google-gla:gemini-3.5-flash-lite"
+    subtitles_model: "google-gla:gemini-3.5-flash-lite"
+    lyrics_model: "google-gla:gemini-3.5-flash-lite"

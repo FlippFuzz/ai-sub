@@ -14,6 +14,29 @@ import static_ffmpeg
 _FFMPEG_INITIALIZED: bool = False
 _FFMPEG_PATH: str = "ffmpeg"
 _FFPROBE_PATH: str = "ffprobe"
+_FFMPEG_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def set_ffmpeg_concurrency(max_concurrent: int) -> None:
+    """Sets the maximum number of concurrent FFmpeg operations.
+
+    Args:
+        max_concurrent: Maximum concurrent FFmpeg subprocesses allowed.
+    """
+    global _FFMPEG_SEMAPHORE
+    _FFMPEG_SEMAPHORE = asyncio.Semaphore(max_concurrent)
+
+
+def _get_ffmpeg_semaphore() -> asyncio.Semaphore:
+    """Retrieves or initializes the global FFmpeg concurrency semaphore.
+
+    Returns:
+        asyncio.Semaphore: Global semaphore instance.
+    """
+    global _FFMPEG_SEMAPHORE
+    if _FFMPEG_SEMAPHORE is None:
+        _FFMPEG_SEMAPHORE = asyncio.Semaphore(1)
+    return _FFMPEG_SEMAPHORE
 
 
 def _find_system_binary(binary_name: str) -> str | None:
@@ -357,11 +380,13 @@ async def split_video(
         full_output_pattern,
     ]
 
-    try:
-        await _run_ffmpeg(cmd)
-    except subprocess.CalledProcessError as e:
-        logfire.exception(f"FFmpeg split failed. Stdout: {e.stdout}, Stderr: {e.stderr}")
-        raise
+    sem = _get_ffmpeg_semaphore()
+    async with sem:
+        try:
+            await _run_ffmpeg(cmd)
+        except subprocess.CalledProcessError as e:
+            logfire.exception(f"FFmpeg split failed. Stdout: {e.stdout}, Stderr: {e.stderr}")
+            raise
 
     return sorted(output_dir.glob(glob_pattern))
 
@@ -443,8 +468,10 @@ async def reencode_video(
         str(output_path),
     ]
 
-    try:
-        await _run_ffmpeg(cmd)
-    except subprocess.CalledProcessError as e:
-        logfire.exception(f"FFmpeg re-encoding failed for {input_path.name}. Stderr: {e.stderr}")
-        raise
+    sem = _get_ffmpeg_semaphore()
+    async with sem:
+        try:
+            await _run_ffmpeg(cmd)
+        except subprocess.CalledProcessError as e:
+            logfire.exception(f"FFmpeg re-encoding failed for {input_path.name}. Stderr: {e.stderr}")
+            raise

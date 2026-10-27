@@ -6,7 +6,6 @@ import asyncio
 import json
 import sys
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
 from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
@@ -58,6 +57,7 @@ from ai_sub.video import (
     get_video_duration_ms,
     init_ffmpeg_engine,
     reencode_video,
+    set_ffmpeg_concurrency,
     split_video,
 )
 
@@ -75,7 +75,6 @@ class AiSubResult(IntEnum):
     """One or more segments exhausted the persistent retry limit."""
 
 
-@dataclass
 class SegmentTask:
     """Internal task tracking container for a single video segment."""
 
@@ -84,10 +83,45 @@ class SegmentTask:
     duration_ms: int
     stem: str
     media_path: Path
-    offset_ms: int = 0
-    draft_subtitles: list[Subtitles] | None = None
-    detected_performances: list[DetectedMusicalPerformance] | None = None
-    subtitles_complete: bool = False
+    offset_ms: int
+    draft_subtitles: list[Subtitles] | None
+    detected_performances: list[DetectedMusicalPerformance] | None
+    subtitles_complete: bool
+
+    def __init__(
+        self,
+        index: int,
+        raw_path: Path,
+        duration_ms: int,
+        stem: str,
+        media_path: Path,
+        offset_ms: int = 0,
+        draft_subtitles: list[Subtitles] | None = None,
+        detected_performances: list[DetectedMusicalPerformance] | None = None,
+        subtitles_complete: bool = False,
+    ) -> None:
+        """Initializes a segment task tracker.
+
+        Args:
+            index: Segment sequence index.
+            raw_path: Path to the raw video chunk.
+            duration_ms: Segment duration in milliseconds.
+            stem: File stem identifier.
+            media_path: Active media path (raw or re-encoded).
+            offset_ms: Start time offset in milliseconds. Defaults to 0.
+            draft_subtitles: Initial subtitles generated in subtitles pass. Defaults to None.
+            detected_performances: Identified musical singing events. Defaults to None.
+            subtitles_complete: Whether subtitle transcription finished. Defaults to False.
+        """
+        self.index = index
+        self.raw_path = raw_path
+        self.duration_ms = duration_ms
+        self.stem = stem
+        self.media_path = media_path
+        self.offset_ms = offset_ms
+        self.draft_subtitles = draft_subtitles
+        self.detected_performances = detected_performances
+        self.subtitles_complete = subtitles_complete
 
 
 def stitch_subtitles(
@@ -223,6 +257,8 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
     input_video_path = cast(Path, settings.input_video_file)
     user_context = settings.get_resolved_user_context()
 
+    set_ffmpeg_concurrency(settings.concurrency.re_encode)
+
     with logfire.span("Pipeline: {video_file}", video_file=input_video_path.name):
         if user_context:
             logfire.info(f"Loaded user context ({len(user_context)} characters).")
@@ -256,7 +292,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                 configured_providers = create_search_providers(settings.ai.search)
                 for provider in configured_providers:
                     await stack.enter_async_context(provider)
-
                 # Summary phase: general web search providers only (never lrclib)
                 web_search_providers = [p for p in configured_providers if p.provider_name != "lrclib"]
 
@@ -286,9 +321,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
             summary_response: SummaryAiResponse | None = None
 
             with progress:
-                # ------------------------------------------------------------------
-                # Summary: Macro Summary & Chapter Indexing
-                # ------------------------------------------------------------------
                 if use_summary:
                     summary_tid = progress.add_task("[yellow]Summary", total=1)
                     summary_file = settings.dir.tmp / f"summary.{summary_shortcode}.yaml"
@@ -356,7 +388,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                         logfire.warning("Skipping summary: max attempts reached.")
                         progress.update(summary_tid, completed=1)
 
-                    # Rule: If summary was enabled and failed to produce a response, stop the pipeline immediately.
                     if summary_response is None:
                         logfire.error("Summary stage failed or incomplete. Halting pipeline execution.")
                         return (
@@ -365,9 +396,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                             else AiSubResult.INCOMPLETE
                         )
 
-                # ------------------------------------------------------------------
-                # Video Segmentation & Segment Setup
-                # ------------------------------------------------------------------
                 video_splits_paths = await split_video(
                     input_video=input_video_path,
                     output_dir=settings.dir.tmp,
@@ -379,6 +407,14 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                 semaphore = asyncio.Semaphore(8)
 
                 async def _probe(p: Path) -> int:
+                    """Probes video duration with concurrency control.
+
+                    Args:
+                        p: Video path.
+
+                    Returns:
+                        int: Duration in milliseconds.
+                    """
                     async with semaphore:
                         return await get_video_duration_ms(p)
 
@@ -463,6 +499,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                         await subtitles_queue.put(task)
 
                 async def _reencode_worker() -> None:
+                    """Worker draining reencode_queue."""
                     while True:
                         task = await reencode_queue.get()
                         try:
@@ -498,6 +535,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                             reencode_queue.task_done()
 
                 async def _subtitles_worker() -> None:
+                    """Worker draining subtitles_queue."""
                     while True:
                         task = await subtitles_queue.get()
                         try:
@@ -547,7 +585,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
 
                             progress.update(subtitles_tid, advance=1)
 
-                            # Rule: If subtitles failed for this part, DO NOT continue processing this part.
                             if task.subtitles_complete and use_lyrics and task.detected_performances:
                                 await lyrics_queue.put(task)
                             elif lyrics_tid is not None:
@@ -556,6 +593,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                             subtitles_queue.task_done()
 
                 async def _lyrics_worker() -> None:
+                    """Worker draining lyrics_queue."""
                     while True:
                         task = await lyrics_queue.get()
                         try:
@@ -645,7 +683,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
 
 
 def main() -> None:
-    """CLI entrypoint for the AI Sub subtitle generation pipeline."""
+    """CLI entrypoint for the AI Sub standalone subtitle generation pipeline."""
     settings = CliApp.run(Settings)
     sys.exit(asyncio.run(run_pipeline(settings)).value)
 

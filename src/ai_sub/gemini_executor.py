@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import mimetypes
 import os
 import random
 import re
@@ -373,11 +374,18 @@ class GeminiExecutor:
                         except OSError:
                             pass
 
+                # Resolve MIME type with safe fallback
+                content_type, _ = mimetypes.guess_type(str(file_path))
+                resolved_mime = content_type or "video/mp4"
+
                 try:
                     with logfire.span("Uploading {filename} to Gemini Files API", filename=file_path.name):
                         uploaded = await self._client.aio.files.upload(
                             file=upload_path,
-                            config=types.UploadFileConfig(display_name=display_name),
+                            config=types.UploadFileConfig(
+                                display_name=display_name,
+                                mime_type=resolved_mime,
+                            ),
                         )
                 finally:
                     if temp_link and temp_link.exists():

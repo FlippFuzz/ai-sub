@@ -6,7 +6,7 @@ import io
 import os
 import socket
 import warnings
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import version
 from typing import Any
 
 import logfire
@@ -50,10 +50,7 @@ def get_app_version() -> str:
     Returns:
         str: Package version or fallback identifier.
     """
-    try:
-        return version("ai-sub")
-    except PackageNotFoundError:
-        return "4.0.0"
+    return version("ai-sub")
 
 
 def setup_logging(
@@ -95,10 +92,13 @@ def setup_logging(
         service_version=app_version,
         send_to_logfire="if-token-present",
         scrubbing=None if log_cfg.scrub else False,
+        distributed_tracing=True,
     )
 
+    # Completely suppress noisy FastAPI instrumentation
+    logfire.suppress_scopes("fastapi")
+
     # 2. Silent Logfire client for low-level SDK and HTTP tracing (Google GenAI, HTTPX)
-    # Telemetry is sent to Logfire cloud if a token is present, but kept off the terminal console
     silent_telemetry_client = logfire.configure(
         local=True,
         console=False,
@@ -106,22 +106,8 @@ def setup_logging(
         service_version=app_version,
         send_to_logfire="if-token-present",
         scrubbing=None if log_cfg.scrub else False,
+        distributed_tracing=True,
     )
-    silent_telemetry_client.instrument_httpx(capture_all=True)
 
-    if hasattr(silent_telemetry_client, "instrument_google_genai"):
-        try:
-            silent_telemetry_client.instrument_google_genai()
-        except Exception:
-            pass
-    elif hasattr(logfire, "instrument_google_genai"):
-        try:
-            tracer_prov = getattr(silent_telemetry_client, "tracer_provider", None) or getattr(
-                silent_telemetry_client, "_tracer_provider", None
-            )
-            if tracer_prov is not None:
-                logfire.instrument_google_genai(tracer_provider=tracer_prov)
-            else:
-                logfire.instrument_google_genai()
-        except Exception:
-            pass
+    silent_telemetry_client.instrument_httpx(capture_all=True)
+    silent_telemetry_client.instrument_google_genai()

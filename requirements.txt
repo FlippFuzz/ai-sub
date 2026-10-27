@@ -10,3 +10,7 @@ json_repair
 pyrate-limiter
 rich
 pyyaml
+fastapi
+uvicorn
+yt-dlp[default]
+gitpython
