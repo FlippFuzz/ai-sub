@@ -16,7 +16,6 @@ server:
   port: 8000
   work_dir: "./work"
   heartbeat_timeout_seconds: 300
-  rescan_interval_minutes: 15
 
 git:
   repo_url: "https://github.com/YourUsername/subtitles-archive.git"
@@ -24,13 +23,20 @@ git:
   pat: "ghp_your_personal_access_token"
 
 sources:
-  watch_folders:
-    - "/home/ubuntu/videos/intake"
+  files:
+    folders:
+      - "/home/ubuntu/videos/intake"
+    rescan_interval_minutes: 2
+
   youtube:
-    - "https://www.youtube.com/playlist?list=PLxxxxxxxxxxxxxxxx"
-    - "https://www.youtube.com/@ChannelName/videos"
-  proxy: "http://127.0.0.1:40000"
-  cookie_file: "/home/ubuntu/ai-sub-server/cookie.txt"
+    urls:
+      - "https://www.youtube.com/playlist?list=PLxxxxxxxxxxxxxxxx"
+      - "https://www.youtube.com/@ChannelName/videos"
+    rescan_interval_minutes: 60
+    rescan_jitter_minutes: 15
+    channel_delay_seconds: 5.0
+    proxy: "http://127.0.0.1:40000"
+    cookie_file: "/home/ubuntu/ai-sub-server/cookie.txt"
 
 pipelines:
   - name: "combo_38f"

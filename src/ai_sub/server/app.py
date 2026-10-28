@@ -370,7 +370,8 @@ def create_app(settings: ServerSettings) -> FastAPI:
         """
         git_sync.ensure_repo()
         await coordinator.start()
-        await ingestion.start(settings.server.rescan_interval_minutes)
+        # Ingestion intervals are now managed directly via settings.sources configuration
+        await ingestion.start()
         logfire.info(f"ai-sub-server started on {settings.server.host}:{settings.server.port}")
         yield
         await ingestion.stop()

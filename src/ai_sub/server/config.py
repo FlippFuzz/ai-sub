@@ -58,18 +58,41 @@ class GitConfig(BaseModel):
         return self.pat.get_secret_value()
 
 
-class SourcesConfig(BaseModel):
-    """Intake sources configuration (watched folders, YouTube feeds, and PO token setup)."""
+class FilesSourceConfig(BaseModel):
+    """Local filesystem intake configuration."""
 
     model_config = ConfigDict(extra="ignore")
 
-    watch_folders: list[Path] = Field(
+    folders: list[Path] = Field(
         default_factory=list,
-        description="Local filesystem directories scanned recursively for video files.",
+        description="Local filesystem directories scanned recursively for video media files.",
     )
-    youtube: list[str] = Field(
+    rescan_interval_minutes: int = Field(
+        default=2,
+        description="Background polling interval in minutes to discover newly added local media files.",
+    )
+
+
+class YoutubeSourceConfig(BaseModel):
+    """YouTube intake, anti-bot pacing, and download configuration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    urls: list[str] = Field(
         default_factory=list,
         description="YouTube playlist, channel, or video URLs to ingest.",
+    )
+    rescan_interval_minutes: int = Field(
+        default=60,
+        description="Base interval in minutes between full YouTube channel and playlist intake scans.",
+    )
+    rescan_jitter_minutes: int = Field(
+        default=15,
+        description="Maximum additive random delay in minutes added to the YouTube rescan interval (e.g. 60-75m).",
+    )
+    channel_delay_seconds: float = Field(
+        default=5.0,
+        description="Target delay in seconds between scraping individual YouTube channels or playlists.",
     )
     proxy: HttpUrl | None = Field(
         default=None,
@@ -109,6 +132,15 @@ class SourcesConfig(BaseModel):
     )
 
 
+class SourcesConfig(BaseModel):
+    """Container for distinct intake source categories (local filesystem and YouTube)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    files: FilesSourceConfig = Field(default_factory=FilesSourceConfig)
+    youtube: YoutubeSourceConfig = Field(default_factory=YoutubeSourceConfig)
+
+
 class ServerOptions(BaseModel):
     """HTTP server and filesystem orchestration options."""
 
@@ -120,10 +152,6 @@ class ServerOptions(BaseModel):
     heartbeat_timeout_seconds: int = Field(
         default=300,
         description="Seconds before an unresponsive worker lease expires (10 missed 30s heartbeats = 300s).",
-    )
-    rescan_interval_minutes: int = Field(
-        default=15,
-        description="Background polling interval in minutes to discover new files/uploads when pipelines are idle.",
     )
     validation_buffer_ms: int = Field(
         default=2000,

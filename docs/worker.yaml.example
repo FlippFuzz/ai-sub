@@ -5,7 +5,7 @@
 # Server Connection
 server_url: "https://sub.yourdomain.com"
 server_auth: "worker_user:your_secure_password"
-worker_id: "oracle-e2-worker-1" # Defaults to machine hostname if omitted
+worker_id: "test-worker-1" # Defaults to machine hostname if omitted
 
 # Concurrency & Work Limits
 concurrency: 2 # Number of video chunk tasks to process simultaneously (Default: 2)
@@ -27,10 +27,10 @@ search:
     - "tinyfish"
     - "lrclib"
     - "duckduckgo"
-  tinyfish_key: "tf-your-tinyfish-api-key"
+  tinyfish_key: "sk-tinyfish-your-tinyfish-api-key"
   # langsearch_key: "your-langsearch-key"
   # ollama_key: "your-ollama-key"
 
 # Local Storage & Tracking Files
 quota_file: ".ai-sub-quota.json"
-temp_dir: "/tmp/ai_sub_worker"
+temp_dir: "./ai_sub_worker"

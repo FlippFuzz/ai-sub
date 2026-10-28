@@ -1,5 +1,5 @@
 # ==============================================================================
-# AI Sub Server Configuration (server.yaml)
+# AI Sub Server Configuration (server.yaml or <hostname>.server.yaml)
 # ==============================================================================
 
 # Core HTTP Server and Task Orchestration Options
@@ -8,7 +8,6 @@ server:
   port: 8000
   work_dir: "./work"
   heartbeat_timeout_seconds: 300
-  rescan_interval_minutes: 15
   validation_buffer_ms: 2000
 
 # Task Execution and Distributed Retry Controls
@@ -25,25 +24,34 @@ git:
   branch: "main"
   pat: "ghp_your_github_token_here"
 
-# Media Intake Sources and Downloader Settings
+# Media Intake Sources
 sources:
-  watch_folders:
-    - "/home/ubuntu/videos/intake"
+  # Local Filesystem Intake
+  files:
+    folders:
+      - "/home/ubuntu/videos/intake"
+    rescan_interval_minutes: 2
+
+  # YouTube Feed Intake
   youtube:
-    - "https://www.youtube.com/playlist?list=PLxxxxxxxxxxxxxxxx"
-    - "https://www.youtube.com/@ChannelName/videos"
-  channels_file: "channels.json"
-  max_title_bytes: 100
-  proxy: "http://127.0.0.1:40000"
-  cookie_file: "/home/ubuntu/ai-sub-server/cookie.txt"
+    urls:
+      - "https://www.youtube.com/playlist?list=PLxxxxxxxxxxxxxxxx"
+      - "https://www.youtube.com/@ChannelName/videos"
+    rescan_interval_minutes: 60  # Base interval between YouTube scans
+    rescan_jitter_minutes: 15    # Additive random delay (e.g., 60-75 mins total)
+    channel_delay_seconds: 5.0   # Jittered pause between scraping individual channels
 
-  # PO token provider settings:
-  enable_pot_provider: true
-  pot_dir: "bgutil-ytdlp-pot-provider"
-  pot_update_interval_hours: 24
+    channels_file: "channels.json"
+    max_title_bytes: 100
+    # proxy: "http://127.0.0.1:40000"
+    cookie_file: "/home/ubuntu/ai-sub-server/cookie.txt"
 
-  download_test_duration_s: 10
-  max_consecutive_failures: 3
+    enable_pot_provider: true
+    pot_dir: "bgutil-ytdlp-pot-provider"
+    pot_update_interval_hours: 24
+
+    download_test_duration_s: 10
+    max_consecutive_failures: 3
 
 # Video Re-encoding and Compression Controls
 reencode:
@@ -51,15 +59,15 @@ reencode:
 
   summary:
     enabled: true
-    threshold_mb: 300
+    threshold_mb: 500
     keyframe_only: true
     fps: 1.0
     height: 360
     bitrate_kb: 35
 
   segment:
-    enabled: false
-    threshold_mb: 20
+    enabled: true
+    threshold_mb: 50
     fps: 1.0
     height: 360
     bitrate_kb: 35
@@ -69,14 +77,13 @@ search:
   tools:
     - "tinyfish"
     - "lrclib"
-    - "duckduckgo"
 
 # Segmentation / Splitting Settings
 split:
   max_seconds: 300
   duration_tolerance_ms: 100
 
-# Active Pipeline Combinations (Capped at 1 active video per combination)
+# Active Pipeline Combinations
 pipelines:
   - name: "combo_38f"
     summary_model: "google-gla:gemini-3.5-flash-lite"

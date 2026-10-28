@@ -3,11 +3,13 @@
 from ai_sub.server.app import create_app
 from ai_sub.server.channel_mapping import ChannelInfo, ChannelMap, ChannelMapper
 from ai_sub.server.config import (
+    FilesSourceConfig,
     GitConfig,
     PipelineConfig,
     ServerOptions,
     ServerSettings,
     SourcesConfig,
+    YoutubeSourceConfig,
 )
 from ai_sub.server.coordinator import PipelineCoordinator
 from ai_sub.server.git_sync import GitSyncManager
@@ -29,6 +31,7 @@ __all__ = [
     "ChannelMapper",
     "ComboPipeline",
     "DiscoveredVideo",
+    "FilesSourceConfig",
     "GitConfig",
     "GitSyncManager",
     "IngestionManager",
@@ -39,6 +42,7 @@ __all__ = [
     "ServerTask",
     "SourcesConfig",
     "TaskStatus",
+    "YoutubeSourceConfig",
     "create_app",
     "ensure_pot_provider",
     "generate_w3c_traceparent",
