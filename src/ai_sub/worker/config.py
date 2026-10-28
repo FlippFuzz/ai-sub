@@ -1,4 +1,4 @@
-"""Configuration settings for ai-sub-worker using Pydantic Settings."""
+"""Configuration settings for ai-sub-worker strictly loaded from YAML via pydantic-settings."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import socket
 from pathlib import Path
 from typing import Self
 
-from pydantic import AliasChoices, Field, HttpUrl, SecretStr
+from pydantic import Field, HttpUrl, PositiveInt, SecretStr
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -21,11 +21,6 @@ class WorkerSettings(BaseSettings):
     """Central configuration for an ephemeral ai-sub-worker node."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        env_prefix="AISUB_WORKER_",
-        env_nested_delimiter="__",
-        case_sensitive=False,
         extra="ignore",
     )
 
@@ -41,6 +36,10 @@ class WorkerSettings(BaseSettings):
         default_factory=socket.gethostname,
         description="Unique worker node identifier.",
     )
+    concurrency: PositiveInt = Field(
+        default=2,
+        description="Number of concurrent worker task execution slots.",
+    )
     models: list[str] = Field(
         default_factory=lambda: [
             "google-gla:gemini-3.8-flash",
@@ -51,13 +50,7 @@ class WorkerSettings(BaseSettings):
     )
     gemini_key: SecretStr | None = Field(
         default=None,
-        validation_alias=AliasChoices(
-            "aisub_worker_gemini_key",
-            "gemini_api_key",
-            "google_api_key",
-            "gemini_key",
-        ),
-        description="Google Gemini API key (reads GEMINI_API_KEY, GOOGLE_API_KEY, or AISUB_WORKER_GEMINI_KEY).",
+        description="Google Gemini API key.",
     )
     search: SearchSettings = Field(
         default_factory=SearchSettings,
@@ -108,7 +101,7 @@ class WorkerSettings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Customizes settings source loading order, preferring YAML if present.
+        """Customizes settings source loading order, ignoring environment variables in favor of pure YAML.
 
         Args:
             settings_cls: BaseSettings class type.
@@ -122,15 +115,12 @@ class WorkerSettings(BaseSettings):
         """
         return (
             init_settings,
-            env_settings,
-            dotenv_settings,
-            file_secret_settings,
             YamlConfigSettingsSource(settings_cls),
         )
 
     @classmethod
     def from_yaml(cls, yaml_path: Path | str) -> Self:
-        """Loads worker settings from a specified YAML file path.
+        """Loads worker settings strictly from a YAML file path via pydantic-settings.
 
         Args:
             yaml_path: Filesystem path to the worker configuration YAML file.
@@ -145,9 +135,5 @@ class WorkerSettings(BaseSettings):
         if not path.is_file():
             raise FileNotFoundError(f"Worker configuration file not found: {path}")
 
-        import yaml
-
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-
-        return cls.model_validate(data)
+        yaml_source = YamlConfigSettingsSource(cls, yaml_file=path)
+        return cls.model_validate(yaml_source())

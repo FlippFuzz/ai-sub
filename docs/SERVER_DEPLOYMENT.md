@@ -6,7 +6,9 @@ This guide covers setting up `ai-sub-server` for 24/7 orchestration on an Oracle
 
 ## 1. Server Configuration (`server.yaml`)
 
-Place `server.yaml` in your server workspace directory (e.g. `/home/ubuntu/ai-sub-server/server.yaml`):
+Both the server and worker use strict YAML configuration files without hidden environment variables or CLI flags.
+
+Place `server.yaml` (or `<hostname>.server.yaml`) in your server workspace directory (e.g. `/home/ubuntu/ai-sub-server/server.yaml`):
 
 ```yaml
 server:
@@ -19,7 +21,7 @@ server:
 git:
   repo_url: "https://github.com/YourUsername/subtitles-archive.git"
   branch: "main"
-  pat_env: "GITHUB_PAT"
+  pat: "ghp_your_personal_access_token"
 
 sources:
   watch_folders:
@@ -101,29 +103,7 @@ sudo systemctl reload nginx
 
 ---
 
-## 3. Fail2ban Setup for Nginx Basic Auth
-
-Create `/etc/fail2ban/jail.d/nginx-auth.local`:
-
-```ini
-[nginx-http-auth]
-enabled = true
-port    = http,https
-logpath = %(nginx_error_log)s
-maxretry = 5
-bantime  = 86400
-findtime = 600
-```
-
-Restart Fail2ban:
-
-```bash
-sudo systemctl restart fail2ban
-```
-
----
-
-## 4. Running the Server (Systemd Service)
+## 3. Running the Server (Systemd Service)
 
 Create `/etc/systemd/system/ai-sub-server.service`:
 
@@ -136,7 +116,6 @@ After=network.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/ai-sub-server
-Environment="GITHUB_PAT=your_github_token_here"
 Environment="PATH=/home/ubuntu/ai-sub-server/venv/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=/home/ubuntu/ai-sub-server/venv/bin/ai-sub-server server.yaml
 Restart=always
@@ -157,31 +136,62 @@ sudo journalctl -u ai-sub-server -f
 
 ---
 
-## 5. Remote Worker Setup (Ephemeral / Cron)
+## 4. Remote Worker Setup (Ephemeral / Multi-Server / Cron)
 
 Workers only need Python 3.11+ and the `ai-sub` package.
 
-### Worker Environment (`.env` or export):
+### Configuration (`worker.yaml` or `<servername>.worker.yaml`)
 
-```bash
-export GEMINI_API_KEY="your_gemini_key_for_this_worker"
-export TINYFISH_API_KEY="your_tinyfish_key_for_this_worker"
+Copy `docs/worker.yaml.example` to `worker.yaml` (or `<servername>.worker.yaml`):
+
+```yaml
+server_url: "https://sub.yourdomain.com"
+server_auth: "worker_user:your_secure_password"
+worker_id: "oracle-e2-worker-1"
+concurrency: 2
+
+gemini_key: "AIzaSy..."
+
+models:
+  - "google-gla:gemini-3.8-flash"
+  - "google-gla:gemini-3.6-flash"
+  - "google-gla:gemini-3.5-flash-lite"
+
+search:
+  tools:
+    - "tinyfish"
+    - "lrclib"
+    - "duckduckgo"
+  tinyfish_key: "tf-..."
 ```
 
-### Manual Run:
+### File Resolution Order
+
+When running `ai-sub-worker`, the configuration is discovered in this exact sequence:
+
+1. Positional argument: `ai-sub-worker sub.yourdomain.com.worker.yaml`
+2. `<hostname>.worker.yaml`
+3. `worker.yaml`
+
+### Running the Worker
+
+#### Manual Invocation:
 
 ```bash
-ai-sub-worker \
-  --server-url "https://sub.yourdomain.com" \
-  --server-auth "worker_user:your_secure_password"
+# Auto-discovers <hostname>.worker.yaml or worker.yaml
+ai-sub-worker
+
+# Or explicitly specify a server config file
+ai-sub-worker sub.yourdomain.com.worker.yaml
 ```
 
-### Automated Crontab (e.g. Run Every 15 Minutes):
+#### Automated Crontab (e.g. Run Every 15 Minutes):
 
 ```cron
-*/15 * * * * cd /home/ubuntu/worker && export GEMINI_API_KEY="AIzaSy..." && export TINYFISH_API_KEY="tf-..." && ./venv/bin/ai-sub-worker --server-url "https://sub.yourdomain.com" --server-auth "worker_user:password" >> /tmp/ai-sub-worker.log 2>&1
+*/15 * * * * cd /home/ubuntu/worker && ./venv/bin/ai-sub-worker sub.yourdomain.com.worker.yaml >> /tmp/ai-sub-worker.log 2>&1
 ```
 
-- When the queue is empty, the worker exits cleanly in ~1 second.
-- When daily quotas are exhausted (429), it records the event in `.ai-sub-quota.json` (resetting at 00:00 Pacific Time) and exits cleanly.
-- While processing, it sends a heartbeat ping every 30 seconds to hold the lease.
+- When the server queue is empty, all slots exit cleanly in ~1 second.
+- Processes multiple video chunks in parallel based on `concurrency: 2`.
+- When daily quotas are exhausted (HTTP 429), the worker records the event in `.ai-sub-quota.json` (resetting at 00:00 Pacific Time), drops that model from claiming, and continues running tasks for unexhausted models.
+- While processing, each active task runs its own independent background heartbeat every 30 seconds to maintain its lease.

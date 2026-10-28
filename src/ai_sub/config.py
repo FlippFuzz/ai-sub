@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from pathlib import Path
 from typing import Any, Literal, Self, cast
 
@@ -27,6 +28,62 @@ _BASE_CONFIG: SettingsConfigDict = {
 }
 
 ServiceTier = Literal["auto", "default", "flex", "priority"]
+
+
+def find_config_file(kind: Literal["server", "worker"], cli_arg: str | Path | None = None) -> Path:
+    """Resolves configuration YAML file path following strict discovery rules.
+
+    Resolution order:
+    1. Explicit positional CLI argument supplied by user.
+    2. <hostname>.<kind>.yaml (and .yml)
+    3. <short_hostname>.<kind>.yaml (and .yml) if hostname contains domain dots
+    4. <kind>.yaml (and .yml)
+
+    Args:
+        kind: Configuration type ('server' or 'worker').
+        cli_arg: Optional explicit path passed as CLI argument.
+
+    Returns:
+        Path: Resolved, existing configuration file path.
+
+    Raises:
+        FileNotFoundError: If no matching configuration file exists on disk.
+    """
+    if cli_arg:
+        path = Path(cli_arg)
+        if not path.is_file():
+            raise FileNotFoundError(f"Specified {kind} configuration file not found: {path}")
+        return path
+
+    hostname = socket.gethostname()
+    candidates: list[Path] = [
+        Path(f"{hostname}.{kind}.yaml"),
+        Path(f"{hostname}.{kind}.yml"),
+    ]
+    if "." in hostname:
+        short_host = hostname.split(".")[0]
+        candidates.extend(
+            [
+                Path(f"{short_host}.{kind}.yaml"),
+                Path(f"{short_host}.{kind}.yml"),
+            ]
+        )
+    candidates.extend(
+        [
+            Path(f"{kind}.yaml"),
+            Path(f"{kind}.yml"),
+        ]
+    )
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    checked_str = ", ".join(repr(str(c)) for c in candidates)
+    raise FileNotFoundError(
+        f"No {kind} configuration file found. Checked: {checked_str}. "
+        f"Please create '{kind}.yaml' or pass a configuration file path."
+    )
 
 
 class StorageSettings(BaseSettings):

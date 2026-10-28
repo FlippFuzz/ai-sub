@@ -1,0 +1,36 @@
+# ==============================================================================
+# AI Sub Worker Configuration (worker.yaml or <hostname>.worker.yaml)
+# ==============================================================================
+
+# Server Connection
+server_url: "https://sub.yourdomain.com"
+server_auth: "worker_user:your_secure_password"
+worker_id: "oracle-e2-worker-1" # Defaults to machine hostname if omitted
+
+# Concurrency & Work Limits
+concurrency: 2 # Number of video chunk tasks to process simultaneously (Default: 2)
+max_tasks: 0 # Exit after N tasks (0 runs until queue is empty or quotas exhausted)
+heartbeat_interval_seconds: 30.0
+
+# Gemini API Configuration
+gemini_key: "AIzaSyYourGeminiApiKeyHere"
+
+# Gemini Models Supported by This Worker
+models:
+  - "google-gla:gemini-3.8-flash"
+  - "google-gla:gemini-3.6-flash"
+  - "google-gla:gemini-3.5-flash-lite"
+
+# Auxiliary Search & Lyrics Providers
+search:
+  tools:
+    - "tinyfish"
+    - "lrclib"
+    - "duckduckgo"
+  tinyfish_key: "tf-your-tinyfish-api-key"
+  # langsearch_key: "your-langsearch-key"
+  # ollama_key: "your-ollama-key"
+
+# Local Storage & Tracking Files
+quota_file: ".ai-sub-quota.json"
+temp_dir: "/tmp/ai_sub_worker"
