@@ -10,6 +10,7 @@ import os
 import random
 import re
 import urllib.parse
+import uuid
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -353,7 +354,7 @@ class GeminiExecutor:
                 temp_link: Path | None = None
 
                 if not file_path.name.isascii():
-                    temp_link = file_path.parent / f"_upload_temp_{int(time())}{file_path.suffix}"
+                    temp_link = file_path.parent / f"_upload_temp_{uuid.uuid4().hex}{file_path.suffix}"
                     if temp_link.exists():
                         try:
                             temp_link.unlink()

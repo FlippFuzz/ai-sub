@@ -8,6 +8,7 @@ import math
 import random
 import string
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Callable, Self
@@ -18,6 +19,29 @@ from pydantic import BaseModel, Field, HttpUrl, SecretStr
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
 from ai_sub.config import SearchSettings
+
+
+class _BoundedCache(OrderedDict[str, Any]):
+    """Thread-safe bounded in-memory cache with FIFO eviction."""
+
+    max_size: int
+
+    def __init__(self, max_size: int = 1000) -> None:
+        """Initializes the bounded cache.
+
+        Args:
+            max_size: Maximum entries before evicting oldest item. Defaults to 1000.
+        """
+        super().__init__()
+        self.max_size = max_size
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Sets a key, moving it to the end or evicting oldest when capacity is exceeded."""
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        if len(self) > self.max_size:
+            self.popitem(last=False)
 
 
 class WebSearchResult(BaseModel):
@@ -81,7 +105,7 @@ class BaseSearchProvider(ABC):
 
     settings: SearchSettings
     provider_name: str
-    _cache: dict[str, Any]
+    _cache: _BoundedCache
 
     def __init__(self, settings: SearchSettings, provider_name: str) -> None:
         """Initializes the search provider.
@@ -92,7 +116,7 @@ class BaseSearchProvider(ABC):
         """
         self.settings = settings
         self.provider_name = provider_name
-        self._cache = {}
+        self._cache = _BoundedCache(max_size=1000)
 
     async def __aenter__(self) -> Self:
         """Initializes the provider async context.

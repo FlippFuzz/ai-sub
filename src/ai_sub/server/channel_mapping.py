@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -54,12 +55,19 @@ class ChannelMapper:
             logfire.warning(f"Could not load channel mapping file {self.mapping_file.name}: {e}")
 
     def save(self) -> None:
-        """Saves current channel mappings to disk in human-readable UTF-8 JSON format."""
+        """Saves current channel mappings atomically to disk in human-readable UTF-8 JSON format."""
+        temp_file = self.mapping_file.with_name(f"{self.mapping_file.name}.tmp.{os.getpid()}")
         try:
             self.mapping_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.mapping_file, "w", encoding="utf-8") as f:
+            with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(self.mapping.model_dump(), f, indent=2, sort_keys=True, ensure_ascii=False)
+            os.replace(temp_file, self.mapping_file)
         except Exception as e:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
             logfire.warning(f"Failed to save channel mapping file {self.mapping_file.name}: {e}")
 
     def update_from_entries(self, entries: Mapping[str, Any] | Sequence[Mapping[str, Any]]) -> None:

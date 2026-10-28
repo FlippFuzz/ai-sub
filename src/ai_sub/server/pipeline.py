@@ -129,6 +129,23 @@ class ComboPipeline:
         """
         return self.active_video is None
 
+    def is_task_ready_for_claim(self, task: ServerTask) -> bool:
+        """Determines if a task is eligible to be claimed by a worker.
+
+        Prevents subtitle tasks from being dispatched while their corresponding
+        video chunk is actively queued or undergoing background FFmpeg compression.
+
+        Args:
+            task: Candidate server task.
+
+        Returns:
+            bool: True if task is ready for pickup; False otherwise.
+        """
+        if task.task_type == TaskType.SUBTITLES and self.reencode_settings.segment.enabled:
+            if task.segment_index is not None and self.active_video is not None:
+                return task.segment_index in self.active_video.reencoded_segment_paths
+        return True
+
     def _build_user_context(self) -> str | None:
         """Constructs background user context from video metadata.
 
@@ -409,6 +426,7 @@ class ComboPipeline:
             pipeline_name=self.config.name,
             video_id=active.video_id,
             model=self.config.summary_model,
+            service_tier=self.config.service_tier_summary,
             media_path=proxy_path,
             video_duration_ms=active.duration_ms,
             prompt=prompt,
@@ -456,6 +474,7 @@ class ComboPipeline:
                     video_id=active.video_id,
                     segment_index=idx,
                     model=self.config.subtitles_model,
+                    service_tier=self.config.service_tier_subtitles,
                     media_path=media_file,
                     video_duration_ms=seg_dur_ms,
                     prompt=prompt,
@@ -505,6 +524,7 @@ class ComboPipeline:
             video_id=active.video_id,
             segment_index=seg_idx,
             model=self.config.lyrics_model,
+            service_tier=self.config.service_tier_lyrics,
             media_path=seg_path,
             video_duration_ms=seg_dur_ms,
             prompt=prompt,
@@ -907,6 +927,7 @@ class ComboPipeline:
                         video_id=video_id,
                         segment_index=idx,
                         model=self.config.subtitles_model,
+                        service_tier=self.config.service_tier_subtitles,
                         media_path=media_file,
                         video_duration_ms=seg_dur_ms,
                         prompt=prompt,

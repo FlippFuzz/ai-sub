@@ -22,6 +22,7 @@ from ai_sub.config import (
     ReEncodeSettings,
     RetrySettings,
     SearchSettings,
+    ServiceTier,
     SplittingSettings,
     StringList,
     YamlFileSettings,
@@ -45,6 +46,18 @@ class PipelineConfig(BaseModel):
     lyrics_model: str = Field(
         default="google-gla:gemini-3.5-flash-lite",
         description="Model to use for lyrics refinement.",
+    )
+    service_tier_summary: ServiceTier | None = Field(
+        default=None,
+        description="Optional Google Gemini service tier for whole-video summary.",
+    )
+    service_tier_subtitles: ServiceTier | None = Field(
+        default=None,
+        description="Optional Google Gemini service tier for subtitle transcription.",
+    )
+    service_tier_lyrics: ServiceTier | None = Field(
+        default=None,
+        description="Optional Google Gemini service tier for lyrics refinement.",
     )
     search_tools: list[str] | None = Field(
         default=None,

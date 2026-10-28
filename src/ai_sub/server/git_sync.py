@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import random
 import shutil
@@ -36,10 +37,11 @@ def _handle_readonly_rmtree(func: Any, path: str, exc_info: Any) -> None:
 
 
 class GitSyncManager:
-    """Manages cloning, updating, and pushing completed subtitles to Git."""
+    """Manages cloning, updating, and pushing completed subtitles to Git with mutex concurrency control."""
 
     config: GitConfig | None
     local_repo_dir: Path
+    _lock: asyncio.Lock
 
     def __init__(self, config: GitConfig | None, base_work_dir: Path) -> None:
         """Initializes the Git synchronization manager.
@@ -49,6 +51,7 @@ class GitSyncManager:
             base_work_dir: Base directory where the local repository will be cloned.
         """
         self.config = config
+        self._lock = asyncio.Lock()
         repo_name = "subtitles-archive"
         if config:
             url_str = str(config.repo_url).rstrip("/")
@@ -78,8 +81,8 @@ class GitSyncManager:
             return auth_url
         return raw_url
 
-    def ensure_repo(self) -> None:
-        """Clones or updates the local Git repository checkout."""
+    def _ensure_repo_sync(self) -> None:
+        """Synchronous implementation of cloning or updating the local repository."""
         if not self.config:
             return
 
@@ -107,6 +110,13 @@ class GitSyncManager:
         repo.git.checkout(branch)
         logfire.info("Git repository successfully cloned.")
 
+    async def ensure_repo(self) -> None:
+        """Clones or updates the local Git repository checkout under mutex protection."""
+        if not self.config:
+            return
+        async with self._lock:
+            await asyncio.to_thread(self._ensure_repo_sync)
+
     def is_video_completed(self, uploader: str, video_id: str, full_shortcode: str) -> bool:
         """Checks if completed subtitles for a video and shortcode exist in the repository.
 
@@ -127,7 +137,7 @@ class GitSyncManager:
                 return True
         return False
 
-    def finalize_and_push(
+    def _finalize_and_push_sync(
         self,
         uploader: str,
         video_id: str,
@@ -135,18 +145,7 @@ class GitSyncManager:
         srt_files: Sequence[Path] | Path,
         yaml_files: list[Path],
     ) -> None:
-        """Moves subtitle files and YAML traces into the repository, then commits and pushes.
-
-        Primary finalized subtitles go into `<uploader>/<video_id>/`, while raw dialogue
-        subtitles (.raw-*.srt) and intermediate YAML state files go into `<uploader>/<video_id>/.int/<full_shortcode>/`.
-
-        Args:
-            uploader: Channel or uploader identifier.
-            video_id: Video identifier.
-            full_shortcode: Model shortcode.
-            srt_files: One or more generated subtitle files to commit.
-            yaml_files: List of intermediate YAML state files.
-        """
+        """Synchronous implementation of committing and pushing finalized subtitles."""
         video_dir = self.local_repo_dir / uploader / video_id
         video_dir.mkdir(parents=True, exist_ok=True)
 
@@ -194,8 +193,9 @@ class GitSyncManager:
                 break
             except GitCommandError as e:
                 if attempt < 4:
-                    logfire.warning(f"Git push failed ({e}). Retrying with pull --rebase...")
-                    time.sleep(random.randint(1, 15))
+                    backoff = random.uniform(1.0, 10.0)
+                    logfire.warning(f"Git push failed ({e}). Retrying in {backoff:.1f}s with pull --rebase...")
+                    time.sleep(backoff)
                     try:
                         repo.git.pull("origin", self.config.branch, "--rebase")
                     except Exception:
@@ -206,3 +206,30 @@ class GitSyncManager:
                 else:
                     logfire.error(f"Git push exhausted retries: {e}")
                     raise
+
+    async def finalize_and_push(
+        self,
+        uploader: str,
+        video_id: str,
+        full_shortcode: str,
+        srt_files: Sequence[Path] | Path,
+        yaml_files: list[Path],
+    ) -> None:
+        """Moves subtitle files and YAML traces into the repository, then commits and pushes under lock.
+
+        Args:
+            uploader: Channel or uploader identifier.
+            video_id: Video identifier.
+            full_shortcode: Model shortcode.
+            srt_files: One or more generated subtitle files to commit.
+            yaml_files: List of intermediate YAML state files.
+        """
+        async with self._lock:
+            await asyncio.to_thread(
+                self._finalize_and_push_sync,
+                uploader,
+                video_id,
+                full_shortcode,
+                srt_files,
+                yaml_files,
+            )

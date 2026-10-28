@@ -49,7 +49,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
         Yields:
             None: Context during application execution.
         """
-        git_sync.ensure_repo()
+        await git_sync.ensure_repo()
         await coordinator.start()
         await ingestion.start()
         logfire.info(f"ai-sub-server started on {settings.server.host}:{settings.server.port}")

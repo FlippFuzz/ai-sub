@@ -29,6 +29,7 @@ class PipelineCoordinator:
     pipelines: dict[str, ComboPipeline]
     activity_log: deque[ActivityEvent]
     _lock: asyncio.Lock
+    _finalizing_pipes: set[str]
     _sweep_task: asyncio.Task[None] | None
 
     def __init__(self, settings: ServerSettings, git_sync: GitSyncManager | None = None) -> None:
@@ -43,6 +44,7 @@ class PipelineCoordinator:
         self.pipelines = {}
         self.activity_log = deque(maxlen=50)
         self._lock = asyncio.Lock()
+        self._finalizing_pipes = set()
         self._sweep_task = None
 
         work_base = settings.server.work_dir
@@ -182,6 +184,10 @@ class PipelineCoordinator:
                         if task.status != TaskStatus.PENDING:
                             continue
 
+                        # Check if chunk re-encoding is still pending for this task
+                        if not pipe.is_task_ready_for_claim(task):
+                            continue
+
                         if task.model.lower() not in available_models:
                             continue
 
@@ -221,6 +227,7 @@ class PipelineCoordinator:
                             traceparent=task.traceparent,
                             search_tools=task.search_tools,
                             agentic_video=task.agentic_video,
+                            service_tier=task.service_tier,
                             detected_performances=task.detected_performances,
                             retry=self.settings.retry,
                         )
@@ -393,17 +400,28 @@ class PipelineCoordinator:
         Returns:
             bool: True if pipeline was completed and finalized; False otherwise.
         """
-        if not pipe.is_idle() and pipe.is_video_complete() and pipe.active_video:
+        async with self._lock:
+            if pipe.config.name in self._finalizing_pipes:
+                return False
+            if pipe.is_idle() or not pipe.is_video_complete() or not pipe.active_video:
+                return False
+
+            self._finalizing_pipes.add(pipe.config.name)
+
+        try:
             vid = pipe.active_video
+            assert vid is not None
             logfire.info(f"Pipeline '{pipe.config.name}' finished all segments for '{vid.title}'. Finalizing...")
 
             srt_filename = f"{vid.filename_stem}.{pipe.full_shortcode}.srt"
             temp_srt = vid.job_dir / srt_filename
-            generated_srts = pipe.stitch_final_subtitles(temp_srt)
+
+            # Run synchronous subtitle stitching off the event loop
+            generated_srts = await asyncio.to_thread(pipe.stitch_final_subtitles, temp_srt)
 
             yaml_files = list(vid.job_dir.glob("*.yaml"))
             if self.git_sync:
-                self.git_sync.finalize_and_push(
+                await self.git_sync.finalize_and_push(
                     uploader=vid.uploader,
                     video_id=vid.video_id,
                     full_shortcode=pipe.full_shortcode,
@@ -411,11 +429,13 @@ class PipelineCoordinator:
                     yaml_files=yaml_files,
                 )
 
-            pipe.clear_active_video()
-            logfire.info(f"Pipeline '{pipe.config.name}' cleared and ready for next video.")
-            return True
-
-        return False
+            async with self._lock:
+                pipe.clear_active_video()
+                logfire.info(f"Pipeline '{pipe.config.name}' cleared and ready for next video.")
+                return True
+        finally:
+            async with self._lock:
+                self._finalizing_pipes.discard(pipe.config.name)
 
     async def check_and_finalize_completed_pipelines(self) -> list[ComboPipeline]:
         """Inspects all pipelines, finalizing any that have reached completion.
@@ -424,7 +444,7 @@ class PipelineCoordinator:
             list[ComboPipeline]: List of pipelines that completed and were reset.
         """
         finalized: list[ComboPipeline] = []
-        for pipe in self.pipelines.values():
+        for pipe in list(self.pipelines.values()):
             if await self.finalize_pipeline_if_complete(pipe):
                 finalized.append(pipe)
         return finalized

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import zoneinfo
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -106,12 +107,19 @@ class WorkerQuotaTracker:
         return self
 
     def save(self) -> None:
-        """Persists the current quota state to disk."""
+        """Persists current quota state atomically to disk."""
+        temp_file = self.quota_file.with_name(f"{self.quota_file.name}.tmp.{os.getpid()}")
         try:
             self.quota_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.quota_file, "w", encoding="utf-8") as f:
+            with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(self.state.model_dump(by_alias=True, mode="json"), f, indent=2)
+            os.replace(temp_file, self.quota_file)
         except Exception as e:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
             logfire.warning(f"Failed to write quota file {self.quota_file.name}: {e}")
 
     def is_model_exhausted(self, model: str) -> bool:

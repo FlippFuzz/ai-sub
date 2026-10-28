@@ -57,6 +57,7 @@ class ServerTask(BaseModel):
 
     search_tools: list[str] = Field(default_factory=list, description="Permitted search tool names.")
     agentic_video: bool = Field(default=False, description="Whether agentic video inspection is enabled.")
+    service_tier: str | None = Field(default=None, description="Optional Google Gemini service tier.")
     traceparent: str = Field(default_factory=generate_w3c_traceparent, description="Distributed traceparent header.")
 
     detected_performances: list[dict[str, Any]] = Field(
