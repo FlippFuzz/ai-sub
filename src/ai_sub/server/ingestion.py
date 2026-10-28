@@ -260,7 +260,6 @@ class IngestionManager:
         discovered: list[DiscoveredVideo] = []
         with YoutubeDL(cast(Any, ydl_opts)) as ydl:
             for idx, url in enumerate(self.config.youtube.urls):
-                # Apply human-like anti-bot pause between individual channel/playlist requests
                 if idx > 0 and self.config.youtube.channel_delay_seconds > 0:
                     base_delay = self.config.youtube.channel_delay_seconds
                     jittered_delay = random.uniform(0.5 * base_delay, 1.5 * base_delay)
@@ -430,14 +429,6 @@ class IngestionManager:
         loop = asyncio.get_running_loop()
 
         def _do_download() -> Path:
-            """Performs synchronous yt-dlp download in a worker thread.
-
-            Returns:
-                Path: Path to the downloaded media file.
-
-            Raises:
-                RuntimeError: If extraction info cannot be retrieved.
-            """
             with YoutubeDL(cast(Any, ydl_opts)) as ydl:
                 info = ydl.extract_info(video.source_ref, download=True)
                 if not info:
@@ -566,39 +557,12 @@ class IngestionManager:
                     logfire.warning("Circuit breaker tripped: pausing ingestion until next rescan cycle.")
                     return
 
-    async def check_and_finalize_completed_pipelines(self) -> None:
-        """Checks for pipelines that finished all tasks, stitches subtitles, pushes to Git, and resets them."""
-        for pipe in self.coordinator.pipelines.values():
-            if not pipe.is_idle() and pipe.is_video_complete() and pipe.active_video:
-                vid = pipe.active_video
-                logfire.info(f"Pipeline '{pipe.config.name}' finished all segments for '{vid.title}'. Finalizing...")
-
-                srt_filename = f"{vid.filename_stem}.{pipe.full_shortcode}.srt"
-                temp_srt = vid.job_dir / srt_filename
-                generated_srts = pipe.stitch_final_subtitles(temp_srt)
-
-                yaml_files = list(vid.job_dir.glob("*.yaml"))
-                self.git_sync.finalize_and_push(
-                    uploader=vid.uploader,
-                    video_id=vid.video_id,
-                    full_shortcode=pipe.full_shortcode,
-                    srt_files=generated_srts,
-                    yaml_files=yaml_files,
-                )
-
-                pipe.clear_active_video()
-                logfire.info(f"Pipeline '{pipe.config.name}' cleared and ready for next video.")
-
-                await self.feed_idle_pipelines()
-
     async def start(self) -> None:
         """Starts the ingestion manager and the decoupled periodic intake background loops."""
-        # Initial scan of both sources and immediate pipeline seeding
         await self.scan_watch_folders_async()
         await self.scan_youtube_sources_async()
         await self.feed_idle_pipelines()
 
-        # Start decoupled background loops
         self._files_rescan_task = asyncio.create_task(self._periodic_files_loop())
         self._youtube_rescan_task = asyncio.create_task(self._periodic_youtube_loop())
 
@@ -622,7 +586,7 @@ class IngestionManager:
             try:
                 logfire.debug("Running periodic watch folder scan...")
                 await self.scan_watch_folders_async()
-                await self.check_and_finalize_completed_pipelines()
+                await self.coordinator.check_and_finalize_completed_pipelines()
                 await self.feed_idle_pipelines()
             except Exception as e:
                 logfire.warning(f"Error during periodic watch folder scan: {e}")
@@ -654,7 +618,7 @@ class IngestionManager:
 
                 logfire.debug("Running periodic YouTube rescan...")
                 await self.scan_youtube_sources_async()
-                await self.check_and_finalize_completed_pipelines()
+                await self.coordinator.check_and_finalize_completed_pipelines()
                 await self.feed_idle_pipelines()
             except Exception as e:
                 logfire.warning(f"Error during periodic YouTube rescan: {e}")

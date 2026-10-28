@@ -6,10 +6,11 @@ import json
 import os
 import socket
 from pathlib import Path
-from typing import Any, Literal, Self, cast
+from typing import Annotated, Any, ClassVar, Literal, Self, cast
 
 from logfire import LevelName
 from pydantic import (
+    BeforeValidator,
     Field,
     FilePath,
     HttpUrl,
@@ -19,7 +20,14 @@ from pydantic import (
     SecretStr,
     model_validator,
 )
-from pydantic_settings import BaseSettings, CliPositionalArg, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    CliPositionalArg,
+    NoDecode,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    YamlConfigSettingsSource,
+)
 
 _BASE_CONFIG: SettingsConfigDict = {
     "env_file": ".env",
@@ -28,6 +36,156 @@ _BASE_CONFIG: SettingsConfigDict = {
 }
 
 ServiceTier = Literal["auto", "default", "flex", "priority"]
+
+
+def parse_string_list(val: Any) -> list[str]:
+    """Parses a list of strings from a Python list, JSON array, or comma-separated string.
+
+    Args:
+        val: Raw input value from environment variable or YAML.
+
+    Returns:
+        list[str]: Normalized list of strings.
+    """
+    if isinstance(val, str):
+        v = val.strip()
+        if v.startswith("[") and v.endswith("]"):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, (list, tuple)):
+                    return [str(m).strip() for m in parsed if str(m).strip()]
+            except Exception:
+                pass
+        return [m.strip() for m in v.split(",") if m.strip()]
+    if isinstance(val, (list, tuple)):
+        out: list[str] = []
+        for m in val:
+            if isinstance(m, str) and "," in m:
+                out.extend(sub.strip() for sub in m.split(",") if sub.strip())
+            elif isinstance(m, str) and m.strip():
+                out.append(m.strip())
+        return out
+    return val
+
+
+def parse_path_list(val: Any) -> list[Path]:
+    """Parses a list of Paths from a Python list, JSON array, or comma-separated string.
+
+    Args:
+        val: Raw input value from environment variable or YAML.
+
+    Returns:
+        list[Path]: Normalized list of Path objects.
+    """
+    raw_list = parse_string_list(val)
+    return [Path(p) for p in raw_list]
+
+
+StringList = Annotated[list[str], NoDecode, BeforeValidator(parse_string_list)]
+PathList = Annotated[list[Path], NoDecode, BeforeValidator(parse_path_list)]
+
+
+class EnvPrioritySettings(BaseSettings):
+    """Base settings class for sub-components where environment variables override YAML kwargs."""
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Ensures environment variables take precedence over kwargs passed from parent YAML.
+
+        Args:
+            settings_cls: BaseSettings class type.
+            init_settings: Injected initial settings kwargs.
+            env_settings: Environment variable settings source.
+            dotenv_settings: Dotenv settings source (ignored).
+            file_secret_settings: File secrets settings source (ignored).
+
+        Returns:
+            tuple[PydanticBaseSettingsSource, ...]: Custom source loading sequence.
+        """
+        return (env_settings, init_settings)
+
+
+class YamlFileSettings(BaseSettings):
+    """Base class for settings loaded from a YAML configuration file with ENV variable overrides."""
+
+    _yaml_path: ClassVar[Path | None] = None
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Configures settings sources order: init arguments, environment variables, YAML file.
+
+        Args:
+            settings_cls: BaseSettings class type.
+            init_settings: Injected initial settings kwargs.
+            env_settings: Environment variable settings source.
+            dotenv_settings: Dotenv settings source (ignored).
+            file_secret_settings: File secrets settings source (ignored).
+
+        Returns:
+            tuple[PydanticBaseSettingsSource, ...]: Ordered settings sources.
+        """
+        yaml_file = getattr(settings_cls, "_yaml_path", None)
+        yaml_source = (
+            YamlConfigSettingsSource(settings_cls, yaml_file=yaml_file)
+            if yaml_file
+            else YamlConfigSettingsSource(settings_cls)
+        )
+        return (
+            init_settings,
+            env_settings,
+            yaml_source,
+        )
+
+    @classmethod
+    def from_yaml(cls, yaml_path: Path | str) -> Self:
+        """Loads settings from a YAML file path with environment variable overrides.
+
+        Args:
+            yaml_path: Filesystem path to the YAML configuration file.
+
+        Returns:
+            Self: Instantiated and validated settings object.
+
+        Raises:
+            FileNotFoundError: If the specified configuration file does not exist.
+        """
+        path = Path(yaml_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Configuration file not found: {path}")
+
+        class _LoadedSettings(cls):
+            _yaml_path: ClassVar[Path | None] = path
+
+            @classmethod
+            def settings_customise_sources(
+                cls,
+                settings_cls: type[BaseSettings],
+                init_settings: PydanticBaseSettingsSource,
+                env_settings: PydanticBaseSettingsSource,
+                dotenv_settings: PydanticBaseSettingsSource,
+                file_secret_settings: PydanticBaseSettingsSource,
+            ) -> tuple[PydanticBaseSettingsSource, ...]:
+                return (
+                    init_settings,
+                    env_settings,
+                    YamlConfigSettingsSource(settings_cls, yaml_file=path),
+                )
+
+        return cast(Self, _LoadedSettings())
 
 
 def find_config_file(kind: Literal["server", "worker"], cli_arg: str | Path | None = None) -> Path:
@@ -221,15 +379,9 @@ class SearchSettings(BaseSettings):
         Returns:
             dict[str, Any]: Updated input dictionary.
         """
-        if "tool" in values and values.get("tool"):
-            raw_tool = values.pop("tool")
-            if "tools" not in values:
-                values["tools"] = raw_tool
-
         raw_tools = values.get("tools")
         if raw_tools is None:
-            env_tools = os.getenv("AISUB_AI_SEARCH_TOOLS") or os.getenv("AISUB_AI_SEARCH_TOOL")
-            if env_tools:
+            if env_tools := os.getenv("AISUB_AI_SEARCH_TOOLS"):
                 raw_tools = env_tools
             else:
                 raw_tools = ["duckduckgo"]
@@ -255,22 +407,14 @@ class SearchSettings(BaseSettings):
                     flattened.append(item.strip())
             values["tools"] = flattened
 
-        if values.get("tinyfish_key") is None:
-            if env_val := os.getenv("TINYFISH_API_KEY"):
-                values["tinyfish_key"] = env_val.strip().strip('"').strip("'")
-
-        if values.get("langsearch_key") is None:
-            if env_val := os.getenv("LANGSEARCH_API_KEY"):
-                values["langsearch_key"] = env_val.strip().strip('"').strip("'")
-
-        if values.get("ollama_key") is None:
-            if env_val := os.getenv("OLLAMA_API_KEY"):
-                values["ollama_key"] = env_val.strip().strip('"').strip("'")
-
-        if values.get("key") is None:
-            general_key = os.getenv("AISUB_AI_SEARCH_KEY")
-            if general_key:
-                values["key"] = general_key.strip().strip('"').strip("'")
+        for key_field, env_var in (
+            ("tinyfish_key", "TINYFISH_API_KEY"),
+            ("langsearch_key", "LANGSEARCH_API_KEY"),
+            ("ollama_key", "OLLAMA_API_KEY"),
+            ("key", "AISUB_AI_SEARCH_KEY"),
+        ):
+            if values.get(key_field) is None and (env_val := os.getenv(env_var)):
+                values[key_field] = env_val.strip().strip('"').strip("'")
 
         return values
 

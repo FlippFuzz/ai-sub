@@ -211,7 +211,6 @@ class GeminiExecutor:
         self._last_cleanup_time = 0.0
         self._cleanup_lock = asyncio.Lock()
 
-        # Initialize the client once with attempts=1 to delegate retry handling to our custom logic
         self._init_client()
 
     def _init_client(self) -> None:
@@ -489,7 +488,6 @@ class GeminiExecutor:
         Raises:
             QuotaExceededError: If daily project quota is exhausted.
         """
-        # Pre-emptive check: avoid calling Google API if this model was already exhausted
         if self._quota_exhausted.get(model_id, False):
             raise QuotaExceededError(f"Daily quota previously exhausted for model '{model_id}'.")
 
@@ -522,6 +520,286 @@ class GeminiExecutor:
                 logfire.warning(f"Daily quota exhausted for {model_id}.")
                 raise QuotaExceededError(str(e)) from e
             raise
+
+    async def _execute_turn_with_retry(
+        self,
+        model_id: str,
+        input_payload: Any,
+        previous_interaction_id: str | None,
+        system_instruction: str,
+        tools: list[dict[str, Any]] | None,
+        response_format: dict[str, Any] | None,
+        generation_config: dict[str, Any],
+        service_tier: ServiceTier | None,
+        token_weight: int,
+        search_turns: int,
+        retry: RetrySettings,
+    ) -> Any:
+        """Executes a single search turn with exponential backoff on transient network or 5xx errors.
+
+        Args:
+            model_id: Target Gemini model identifier.
+            input_payload: Search turn input payload.
+            previous_interaction_id: Previous interaction ID for stateful turns.
+            system_instruction: System instruction prompt.
+            tools: Registered Interactions API tools for this turn.
+            response_format: Target response format schema.
+            generation_config: Thinking and temperature generation configuration.
+            service_tier: Optional Gemini service tier.
+            token_weight: Token weight for rate limiter acquisition.
+            search_turns: Current search turn index.
+            retry: Effective retry settings for backoff intervals.
+
+        Returns:
+            Any: Successful interaction response object.
+
+        Raises:
+            QuotaExceededError: If daily project quota is reached.
+            RuntimeError: If turn retries are exhausted.
+        """
+        turn_max_attempts = retry.per_run + 1
+
+        for search_turn_attempt in range(turn_max_attempts):
+            try:
+                return await self._create_interaction(
+                    model_id=model_id,
+                    input_payload=input_payload,
+                    previous_interaction_id=previous_interaction_id,
+                    system_instruction=system_instruction,
+                    tools=tools,
+                    response_format=response_format,
+                    generation_config=generation_config,
+                    service_tier=service_tier,
+                    token_weight=token_weight,
+                )
+            except QuotaExceededError:
+                raise
+            except Exception as err:
+                if _is_daily_quota_exceeded(err):
+                    self._quota_exhausted[model_id] = True
+                    logfire.warning(f"Daily quota exhausted for {model_id}: {err}")
+                    raise QuotaExceededError(str(err)) from err
+
+                is_retryable = _is_retryable_error(err)
+                if is_retryable and search_turn_attempt < retry.per_run:
+                    backoff = min(
+                        float(retry.max_wait_seconds),
+                        float(retry.min_wait_seconds) * (float(retry.multiplier) ** search_turn_attempt),
+                    ) + random.uniform(0, 1)
+
+                    logfire.warning(
+                        f"Transient error on {model_id} search turn {search_turns} "
+                        f"(attempt {search_turn_attempt + 1}/{turn_max_attempts}): {err}. "
+                        f"Retrying search turn in {backoff:.2f}s..."
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+
+                logfire.error(f"Search turn {search_turns} failed permanently on {model_id}: {err}")
+                raise
+
+        raise RuntimeError(f"Turn execution failed on {model_id} after {turn_max_attempts} attempts.")
+
+    async def _execute_function_calls(
+        self,
+        steps: list[Any],
+        dispatch_map: dict[str, Callable[..., Any]],
+    ) -> list[dict[str, Any]]:
+        """Dispatches model-requested tool calls concurrently and formats function_result blocks.
+
+        Args:
+            steps: List of step objects from the interaction response.
+            dispatch_map: Map of tool names to their registered callables.
+
+        Returns:
+            list[dict[str, Any]]: List of serialized function_result dictionaries for the next turn.
+        """
+
+        async def _exec(step: Any) -> dict[str, Any]:
+            cname = getattr(step, "name", "")
+            call_id = getattr(step, "id", "")
+            fn = dispatch_map[cname]
+            args = getattr(step, "arguments", {}) or {}
+            try:
+                if inspect.iscoroutinefunction(fn):
+                    cres = await fn(**args)
+                else:
+                    cres = await asyncio.to_thread(fn, **args)
+                res_str = json.dumps(cres, ensure_ascii=False) if not isinstance(cres, str) else cres
+                return {
+                    "type": "function_result",
+                    "name": cname,
+                    "call_id": call_id,
+                    "result": [{"type": "text", "text": res_str}],
+                }
+            except Exception as tool_err:
+                logfire.warning(f"Tool '{cname}' failed: {tool_err}")
+                err_str = json.dumps({"error": f"Tool execution failed: {tool_err}"})
+                return {
+                    "type": "function_result",
+                    "name": cname,
+                    "call_id": call_id,
+                    "result": [{"type": "text", "text": err_str}],
+                }
+
+        return await asyncio.gather(*(_exec(s) for s in steps))
+
+    def _extract_interaction_text(self, interaction: Any) -> str:
+        """Extracts candidate output text from an interaction response or its constituent steps.
+
+        Args:
+            interaction: Interaction response object.
+
+        Returns:
+            str: Normalized output text.
+        """
+        if text_content := getattr(interaction, "output_text", None):
+            return str(text_content).strip()
+
+        text_parts: list[str] = []
+        for step in getattr(interaction, "steps", []) or []:
+            if getattr(step, "type", None) == "model_output":
+                for block in getattr(step, "content", []) or []:
+                    if getattr(block, "type", None) == "text" and getattr(block, "text", None):
+                        text_parts.append(str(block.text))
+
+        return "".join(text_parts).strip()
+
+    def _parse_and_validate_structured_output(
+        self,
+        text_content: str,
+        response_type: type[T],
+        video_duration_ms: int,
+        accumulated_thoughts: list[str],
+    ) -> T:
+        """Parses output text into the target Pydantic schema, applying json_repair fallback if needed.
+
+        Args:
+            text_content: Raw text returned by the model.
+            response_type: Target Pydantic model class.
+            video_duration_ms: Duration in milliseconds for timestamp context validation.
+            accumulated_thoughts: Collected reasoning traces to attach to the output.
+
+        Returns:
+            T: Validated Pydantic model instance.
+        """
+        validation_context = {
+            "video_duration_ms": video_duration_ms,
+            "validation_buffer_ms": self.ai_settings.validation_buffer_ms,
+        }
+
+        try:
+            output = response_type.model_validate_json(text_content, context=validation_context)
+        except Exception:
+            repaired = json_repair.loads(text_content)
+            output = response_type.model_validate(repaired, context=validation_context)
+
+        if hasattr(output, "thoughts") and accumulated_thoughts:
+            setattr(output, "thoughts", accumulated_thoughts)
+
+        return output
+
+    async def _run_interaction_session(
+        self,
+        model_id: str,
+        initial_input: Any,
+        prompt: Prompt,
+        response_type: type[T],
+        gemini_tools: list[dict[str, Any]] | None,
+        dispatch_map: dict[str, Callable[..., Any]],
+        response_format: dict[str, Any],
+        generation_config: dict[str, Any],
+        service_tier: ServiceTier | None,
+        token_weight: int,
+        label: str,
+        media_name: str,
+        video_duration_ms: int,
+        retry: RetrySettings,
+    ) -> T:
+        """Executes a single end-to-end multi-turn interaction session until final model output is validated.
+
+        Args:
+            model_id: Gemini model identifier.
+            initial_input: Initial multimodal payload.
+            prompt: Prompt container with system and user instructions.
+            response_type: Target Pydantic model response schema.
+            gemini_tools: Tool declarations registered with Gemini.
+            dispatch_map: Mapping of function names to callables.
+            response_format: Expected JSON response schema format.
+            generation_config: Thinking and temperature generation settings.
+            service_tier: Optional Gemini service tier.
+            token_weight: Token weight for rate limiter acquisition.
+            label: Task category label for telemetry spans.
+            media_name: Filename of the media chunk.
+            video_duration_ms: Segment duration in milliseconds.
+            retry: Effective retry settings for turn execution.
+
+        Returns:
+            T: Parsed and validated Pydantic model instance.
+        """
+        interaction_input: Any = initial_input
+        previous_interaction_id: str | None = None
+        accumulated_thoughts: list[str] = []
+        search_turns = 0
+        max_search_turns = self.ai_settings.search.max_turns
+
+        while True:
+            if search_turns == 0:
+                span_desc = f"{label}: {media_name} {model_id}"
+            else:
+                span_desc = f"{label} (Search Turn {search_turns}/{max_search_turns}): {media_name} {model_id}"
+
+            with logfire.span(
+                "{span_desc}",
+                span_desc=span_desc,
+                task=label,
+                search_turn=search_turns,
+                max_search_turns=max_search_turns,
+                model_id=model_id,
+                filename=media_name,
+            ):
+                current_tools = None if search_turns >= max_search_turns else gemini_tools
+
+                interaction = await self._execute_turn_with_retry(
+                    model_id=model_id,
+                    input_payload=interaction_input,
+                    previous_interaction_id=previous_interaction_id,
+                    system_instruction=prompt.system,
+                    tools=current_tools,
+                    response_format=response_format,
+                    generation_config=generation_config,
+                    service_tier=service_tier,
+                    token_weight=token_weight,
+                    search_turns=search_turns,
+                    retry=retry,
+                )
+
+                for step in getattr(interaction, "steps", []) or []:
+                    if getattr(step, "type", None) == "thought":
+                        if thought_text := _extract_thought_text(step):
+                            accumulated_thoughts.append(thought_text)
+
+                function_call_steps = [
+                    s
+                    for s in getattr(interaction, "steps", []) or []
+                    if getattr(s, "type", None) == "function_call" and getattr(s, "name", None) in dispatch_map
+                ]
+
+                # Advance to next turn if tools were called and turns remain
+                if function_call_steps and search_turns < max_search_turns and dispatch_map:
+                    search_turns += 1
+                    interaction_input = await self._execute_function_calls(function_call_steps, dispatch_map)
+                    raw_id = getattr(interaction, "id", None)
+                    previous_interaction_id = raw_id if isinstance(raw_id, str) else None
+                    continue
+
+                text_content = self._extract_interaction_text(interaction)
+                return self._parse_and_validate_structured_output(
+                    text_content=text_content,
+                    response_type=response_type,
+                    video_duration_ms=video_duration_ms,
+                    accumulated_thoughts=accumulated_thoughts,
+                )
 
     async def run_structured(
         self,
@@ -570,11 +848,9 @@ class GeminiExecutor:
 
         model_id = model_name.split(":", 1)[-1]
 
-        # Pre-emptive check: avoid uploading video or calling API if model is already exhausted
         if self._quota_exhausted.get(model_id, False):
             raise QuotaExceededError(f"Daily quota previously exhausted for model '{model_id}'.")
 
-        # Resolve local effective retry policy without mutating shared instance state
         effective_retry = retry_settings or getattr(self, "default_retry_settings", None) or RetrySettings()
 
         remote_file = await self.ensure_file_uploaded(media_path)
@@ -582,22 +858,15 @@ class GeminiExecutor:
         tokens = _calculate_tokens(prompt, video_duration_ms)
         token_weight = min(tokens, self.ai_settings.tpm)
 
+        media_input: dict[str, Any] = {
+            "type": "video",
+            "uri": remote_file.uri,
+            "mime_type": remote_file.mime_type,
+        }
         if agentic_video:
-            media_input: dict[str, Any] = {
-                "type": "video",
-                "uri": remote_file.uri,
-                "mime_type": remote_file.mime_type,
-                "processing": "agentic",
-            }
-        else:
-            media_input = {
-                "type": "video",
-                "uri": remote_file.uri,
-                "mime_type": remote_file.mime_type,
-            }
+            media_input["processing"] = "agentic"
 
         initial_input = [media_input, {"type": "text", "text": prompt.user}]
-
         gemini_tools, dispatch_map = self._setup_tools(tools)
         response_format = {
             "type": "text",
@@ -608,182 +877,34 @@ class GeminiExecutor:
             "thinking_level": "high",
             "thinking_summaries": "auto",
         }
-        # Max search turns governed by SearchSettings.max_turns
-        max_search_turns = self.ai_settings.search.max_turns
         label = task_label.capitalize() if task_label else "Generation"
         max_outer_attempts = effective_retry.per_run + 1
 
-        # Tier 2: Outer Loop for Pydantic Schema Validation Failures (Clean Slate Restart)
         for outer_attempt in range(max_outer_attempts):
-            interaction_input: Any = initial_input
-            previous_interaction_id: str | None = None
-            accumulated_thoughts: list[str] = []
-            search_turns = 0
-
             try:
-                while True:
-                    if search_turns == 0:
-                        span_desc = f"{label}: {media_path.name} {model_id}"
-                    else:
-                        span_desc = (
-                            f"{label} (Search Turn {search_turns}/{max_search_turns}): {media_path.name} {model_id}"
-                        )
-
-                    with logfire.span(
-                        "{span_desc}",
-                        span_desc=span_desc,
-                        task=label,
-                        search_turn=search_turns,
-                        max_search_turns=max_search_turns,
-                        model_id=model_id,
-                        filename=media_path.name,
-                    ):
-                        current_tools = None if search_turns >= max_search_turns else gemini_tools
-
-                        # Tier 1: Inner Loop for Transient Network / 5xx / Rate Limit Retries on THIS Search Turn
-                        turn_max_attempts = effective_retry.per_run + 1
-                        interaction = None
-
-                        for search_turn_attempt in range(turn_max_attempts):
-                            try:
-                                interaction = await self._create_interaction(
-                                    model_id=model_id,
-                                    input_payload=interaction_input,
-                                    previous_interaction_id=previous_interaction_id,
-                                    system_instruction=prompt.system,
-                                    tools=current_tools,
-                                    response_format=response_format,
-                                    generation_config=generation_config,
-                                    service_tier=service_tier,
-                                    token_weight=token_weight,
-                                )
-                                break  # Search turn API call succeeded
-                            except QuotaExceededError:
-                                raise  # Daily quota limits must never be retried with backoff
-                            except Exception as err:
-                                if _is_daily_quota_exceeded(err):
-                                    self._quota_exhausted[model_id] = True
-                                    logfire.warning(f"Daily quota exhausted for {model_id}: {err}")
-                                    raise QuotaExceededError(str(err)) from err
-
-                                is_retryable = _is_retryable_error(err)
-                                if is_retryable and search_turn_attempt < effective_retry.per_run:
-                                    backoff = min(
-                                        float(effective_retry.max_wait_seconds),
-                                        (
-                                            float(effective_retry.min_wait_seconds)
-                                            * (float(effective_retry.multiplier) ** search_turn_attempt)
-                                        ),
-                                    ) + random.uniform(0, 1)
-
-                                    logfire.warning(
-                                        f"Transient error on {model_id} search turn {search_turns} "
-                                        f"(attempt {search_turn_attempt + 1}/{turn_max_attempts}): {err}. "
-                                        f"Retrying search turn in {backoff:.2f}s..."
-                                    )
-                                    await asyncio.sleep(backoff)
-                                    continue
-
-                                logfire.error(f"Search turn {search_turns} failed permanently on {model_id}: {err}")
-                                raise
-
-                        assert interaction is not None
-
-                        for step in getattr(interaction, "steps", []) or []:
-                            if getattr(step, "type", None) == "thought":
-                                if thought_text := _extract_thought_text(step):
-                                    accumulated_thoughts.append(thought_text)
-
-                        function_call_steps = [
-                            s
-                            for s in getattr(interaction, "steps", []) or []
-                            if getattr(s, "type", None) == "function_call" and getattr(s, "name", None) in dispatch_map
-                        ]
-
-                        # Handle parallel tool execution for this search turn
-                        if function_call_steps and search_turns < max_search_turns and dispatch_map:
-                            search_turns += 1
-
-                            async def _exec(step: Any) -> dict[str, Any]:
-                                cname = getattr(step, "name", "")
-                                call_id = getattr(step, "id", "")
-                                fn = dispatch_map[cname]
-                                args = getattr(step, "arguments", {}) or {}
-                                try:
-                                    if inspect.iscoroutinefunction(fn):
-                                        cres = await fn(**args)
-                                    else:
-                                        cres = await asyncio.to_thread(fn, **args)
-                                    res_str = (
-                                        json.dumps(cres, ensure_ascii=False) if not isinstance(cres, str) else cres
-                                    )
-                                    return {
-                                        "type": "function_result",
-                                        "name": cname,
-                                        "call_id": call_id,
-                                        "result": [{"type": "text", "text": res_str}],
-                                    }
-                                except Exception as tool_err:
-                                    logfire.warning(f"Tool '{cname}' failed: {tool_err}")
-                                    err_str = json.dumps({"error": f"Tool execution failed: {tool_err}"})
-                                    return {
-                                        "type": "function_result",
-                                        "name": cname,
-                                        "call_id": call_id,
-                                        "result": [{"type": "text", "text": err_str}],
-                                    }
-
-                            results = await asyncio.gather(*(_exec(s) for s in function_call_steps))
-                            interaction_input = results
-                            raw_id = getattr(interaction, "id", None)
-                            previous_interaction_id = raw_id if isinstance(raw_id, str) else None
-                            continue  # Advance to next search turn
-
-                        # All search turns concluded; parse model output text
-                        text_content = getattr(interaction, "output_text", "") or ""
-                        if not text_content:
-                            text_parts: list[str] = []
-                            for step in getattr(interaction, "steps", []) or []:
-                                if getattr(step, "type", None) == "model_output":
-                                    for block in getattr(step, "content", []) or []:
-                                        if getattr(block, "type", None) == "text" and getattr(block, "text", None):
-                                            text_parts.append(block.text)
-                            text_content = "".join(text_parts).strip()
-
-                        # Validate structured response against expected Pydantic schema
-                        try:
-                            output = response_type.model_validate_json(
-                                text_content,
-                                context={
-                                    "video_duration_ms": video_duration_ms,
-                                    "validation_buffer_ms": self.ai_settings.validation_buffer_ms,
-                                },
-                            )
-                        except Exception:
-                            repaired = json_repair.loads(text_content)
-                            output = response_type.model_validate(
-                                repaired,
-                                context={
-                                    "video_duration_ms": video_duration_ms,
-                                    "validation_buffer_ms": self.ai_settings.validation_buffer_ms,
-                                },
-                            )
-
-                        if hasattr(output, "thoughts") and accumulated_thoughts:
-                            setattr(output, "thoughts", accumulated_thoughts)
-
-                        return output
-
+                return await self._run_interaction_session(
+                    model_id=model_id,
+                    initial_input=initial_input,
+                    prompt=prompt,
+                    response_type=response_type,
+                    gemini_tools=gemini_tools,
+                    dispatch_map=dispatch_map,
+                    response_format=response_format,
+                    generation_config=generation_config,
+                    service_tier=service_tier,
+                    token_weight=token_weight,
+                    label=label,
+                    media_name=media_path.name,
+                    video_duration_ms=video_duration_ms,
+                    retry=effective_retry,
+                )
             except QuotaExceededError:
                 raise
             except (ValidationError, ValueError) as val_err:
                 if outer_attempt < effective_retry.per_run:
                     backoff = min(
                         float(effective_retry.max_wait_seconds),
-                        (
-                            float(effective_retry.min_wait_seconds)
-                            * (float(effective_retry.multiplier) ** outer_attempt)
-                        ),
+                        float(effective_retry.min_wait_seconds) * (float(effective_retry.multiplier) ** outer_attempt),
                     ) + random.uniform(0, 1)
                     logfire.warning(
                         f"Schema validation failure on {model_id} "

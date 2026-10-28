@@ -12,7 +12,7 @@ from ddgs import DDGS
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import BaseSearchProvider, WebQueryResult, WebSearchResult, normalize_query
+from ai_sub.search.base import BaseSearchProvider, WebSearchResult, normalize_query
 
 
 def _fetch_ddgs(query: str, max_results: int = 10) -> list[dict[str, Any]]:
@@ -90,14 +90,17 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
                     logfire.error(f"DuckDuckGo search for '{query}' exhausted all {max_attempts} attempts: {e}")
                     return []
 
-        results = [
-            WebSearchResult(title=title, url=url, content=body)
-            for item in raw_results
-            if (title := item.get("title"))
-            and (url := item.get("href"))
-            and (body := item.get("body"))
-            and len(body) <= self.settings.max_length
-        ]
+        results: list[WebSearchResult] = []
+        for item in raw_results:
+            title = item.get("title")
+            url = item.get("href")
+            body = item.get("body")
+            if title and url and body and len(body) <= self.settings.max_length:
+                try:
+                    results.append(WebSearchResult(title=title, url=url, content=body))
+                except Exception:
+                    continue
+
         self._cache[cache_key] = results
         return results
 
@@ -110,12 +113,7 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
         Returns:
             list[dict[str, Any]]: List of search results grouped by their original queries.
         """
-
-        async def _run(q: str) -> dict[str, Any]:
-            res = await self.search_single(q)
-            return WebQueryResult.model_validate({"query": q, "results": res}).model_dump(mode="json")
-
-        return await asyncio.gather(*(_run(q) for q in queries))
+        return await self._gather_multi_search(queries)
 
     def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
         """Returns tool callables for Gemini model registration.

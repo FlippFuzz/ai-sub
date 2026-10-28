@@ -5,12 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
 import logfire
-from pysubs2 import SSAEvent, SSAFile
 from yt_dlp.utils import sanitize_filename
 
 from ai_sub.config import (
@@ -20,13 +18,11 @@ from ai_sub.config import (
     SplittingSettings,
 )
 from ai_sub.jobs.lyrics import (
-    LYRICS_PROMPT_VERSION,
     LyricsAiResponse,
     LyricsJob,
     get_lyrics_prompt,
 )
 from ai_sub.jobs.subtitles import (
-    SUBTITLES_PROMPT_VERSION,
     DetectedMusicalPerformance,
     Subtitles,
     SubtitlesAiResponse,
@@ -34,7 +30,6 @@ from ai_sub.jobs.subtitles import (
     get_subtitles_prompt,
 )
 from ai_sub.jobs.summary import (
-    SUMMARY_PROMPT_VERSION,
     SummaryAiResponse,
     SummaryJob,
     get_summary_prompt,
@@ -48,7 +43,7 @@ from ai_sub.shortcode import (
     generate_subtitles_shortcode,
     generate_summary_shortcode,
 )
-from ai_sub.telemetry import get_app_version
+from ai_sub.stitching import stitch_subtitles
 from ai_sub.video import (
     get_video_duration_ms,
     reencode_video,
@@ -682,8 +677,44 @@ class ComboPipeline:
 
         return True
 
+    def _build_settings_metadata(self) -> dict[str, Any]:
+        """Constructs metadata dictionary capturing active pipeline settings for Event 0.
+
+        Returns:
+            dict[str, Any]: Settings dictionary embedded in finalized subtitles.
+        """
+        assert self.active_video is not None
+        search_dump = self.search_settings.model_dump(
+            mode="json",
+            exclude={
+                "key": True,
+                "tinyfish_key": True,
+                "langsearch_key": True,
+                "ollama_key": True,
+            },
+        )
+        if self.config.search_tools is not None:
+            search_dump["tools"] = self.config.search_tools
+
+        return {
+            "ai": {
+                "model_summary": self.config.summary_model,
+                "model_subtitles": self.config.subtitles_model,
+                "model_lyrics": self.config.lyrics_model,
+                "search": search_dump,
+                "agentic_video_summary": True,
+                "agentic_video_subtitles": False,
+                "agentic_video_lyrics": True,
+                "validation_buffer_ms": self.validation_buffer_ms,
+            },
+            "reencode": self.reencode_settings.model_dump(mode="json"),
+            "split": self.split_settings.model_dump(mode="json"),
+            "retry": self.retry_settings.model_dump(mode="json"),
+            "context": self.active_video.user_context,
+        }
+
     def stitch_final_subtitles(self, output_path: Path) -> list[Path]:
-        """Stitches completed segment subtitles into unified SRT files.
+        """Stitches completed segment subtitles into unified SRT files using the shared stitching engine.
 
         Produces the primary subtitle file and, if musical performances were refined,
         an additional raw subtitles file (<stem>.raw-<full_shortcode>.srt).
@@ -701,7 +732,10 @@ class ComboPipeline:
             raise RuntimeError(f"Cannot stitch subtitles: {self.config.name} video processing is incomplete.")
 
         active = self.active_video
-        generated_files: list[Path] = []
+        raw_output_path = output_path.parent / f"{active.filename_stem}.raw-{self.full_shortcode}.srt"
+
+        has_failures = any(t.status == TaskStatus.FAILED for t in self.tasks.values())
+        status_str = "RetriesExceeded" if has_failures else "Completed"
 
         with logfire.span(
             "Stitch Subtitles: {video_id}",
@@ -709,143 +743,35 @@ class ComboPipeline:
             video_id=active.video_id,
             output_file=output_path.name,
         ) as stitch_span:
-            all_subs = SSAFile()
-            current_offset_ms = 0
-            lyrics_refined_any = False
+            segments = [
+                (seg_path.stem, seg_dur_ms)
+                for seg_path, seg_dur_ms in zip(active.segment_paths, active.segment_durations_ms, strict=True)
+            ]
 
-            for idx, (seg_path, seg_dur_ms) in enumerate(
-                zip(active.segment_paths, active.segment_durations_ms, strict=True)
-            ):
-                lyrics_file = active.job_dir / f"{seg_path.stem}.lyrics.{self.lyrics_shortcode}.yaml"
-                sub_file = active.job_dir / f"{seg_path.stem}.subtitles.{self.subtitles_shortcode}.yaml"
-
-                active_resp = None
-                if lyrics_file.is_file():
-                    lyr_job = LyricsJob.load(lyrics_file, self.validation_buffer_ms)
-                    if lyr_job and lyr_job.response:
-                        active_resp = lyr_job.response
-                        lyrics_refined_any = True
-                elif sub_file.is_file():
-                    s_job = SubtitlesJob.load(sub_file, self.validation_buffer_ms)
-                    if s_job and s_job.response:
-                        active_resp = s_job.response
-
-                if active_resp:
-                    seg_subs = active_resp.get_ssafile()
-                    seg_subs.shift(ms=current_offset_ms)
-                    all_subs += seg_subs
-                else:
-                    all_subs.append(
-                        SSAEvent(
-                            start=current_offset_ms,
-                            end=current_offset_ms + seg_dur_ms,
-                            text="Error processing subtitles for this segment.",
-                        )
-                    )
-
-                current_offset_ms += seg_dur_ms
-
-            has_failures = any(t.status == TaskStatus.FAILED for t in self.tasks.values())
-            status_str = "RetriesExceeded" if has_failures else "Completed"
-
-            search_dump = self.search_settings.model_dump(
-                mode="json",
-                exclude={
-                    "key": True,
-                    "tinyfish_key": True,
-                    "langsearch_key": True,
-                    "ollama_key": True,
-                },
+            result = stitch_subtitles(
+                segments=segments,
+                state_dir=active.job_dir,
+                output_primary_path=output_path,
+                output_raw_path=raw_output_path,
+                subtitles_shortcode=self.subtitles_shortcode,
+                lyrics_shortcode=self.lyrics_shortcode,
+                validation_buffer_ms=self.validation_buffer_ms,
+                settings_dump=self._build_settings_metadata(),
+                max_runs=self.retry_settings.max_runs,
+                status_override=status_str,
+                summary_available=self.summary_response is not None,
             )
-            if self.config.search_tools is not None:
-                search_dump["tools"] = self.config.search_tools
 
-            reencode_dump = self.reencode_settings.model_dump(mode="json")
-            split_dump = self.split_settings.model_dump(mode="json")
-            retry_dump = self.retry_settings.model_dump(mode="json")
-
-            settings_dict = {
-                "ai": {
-                    "model_summary": self.config.summary_model,
-                    "model_subtitles": self.config.subtitles_model,
-                    "model_lyrics": self.config.lyrics_model,
-                    "search": search_dump,
-                    "agentic_video_summary": True,
-                    "agentic_video_subtitles": False,
-                    "agentic_video_lyrics": True,
-                    "validation_buffer_ms": self.validation_buffer_ms,
-                },
-                "reencode": reencode_dump,
-                "split": split_dump,
-                "retry": retry_dump,
-                "context": active.user_context,
-            }
-
-            metadata = {
-                "ai_sub_version": get_app_version(),
-                "generated_at": datetime.now().isoformat(),
-                "summary_prompt_version": SUMMARY_PROMPT_VERSION,
-                "subtitles_prompt_version": SUBTITLES_PROMPT_VERSION,
-                "lyrics_prompt_version": LYRICS_PROMPT_VERSION,
-                "status": status_str,
-                "settings": settings_dict,
-            }
-            # ensure_ascii=False preserves literal Unicode characters (e.g. 【MV】, Japanese, Korean)
-            info_str = json.dumps(metadata, indent=2, ensure_ascii=False).replace("{", "(").replace("}", ")")
-            all_subs.insert(0, SSAEvent(start=0, end=1, text=info_str))
-
-            if len(all_subs) > 1 and all_subs[1].start < 1:
-                all_subs[1].start = 1
-
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            all_subs.save(str(output_path))
-            generated_files.append(output_path)
-
-            stitch_span.set_attribute("total_events", len(all_subs))
-            stitch_span.set_attribute("duration_ms", current_offset_ms)
+            stitch_span.set_attribute("total_events", result.total_events)
+            stitch_span.set_attribute("duration_ms", result.duration_ms)
             logfire.info(
-                f"[{self.config.name}] Stitched {len(all_subs)} subtitle events across "
+                f"[{self.config.name}] Stitched {result.total_events} subtitle events across "
                 f"{len(active.segment_paths)} chunks to {output_path.name}."
             )
-
-            # Generate raw pre-lyrics subtitle track if singing occurred and lyrics were refined
-            if lyrics_refined_any:
-                raw_subs = SSAFile()
-                raw_offset_ms = 0
-                for idx, (seg_path, seg_dur_ms) in enumerate(
-                    zip(active.segment_paths, active.segment_durations_ms, strict=True)
-                ):
-                    sub_file = active.job_dir / f"{seg_path.stem}.subtitles.{self.subtitles_shortcode}.yaml"
-                    sub_resp = None
-                    if sub_file.is_file():
-                        s_job = SubtitlesJob.load(sub_file, self.validation_buffer_ms)
-                        if s_job and s_job.response:
-                            sub_resp = s_job.response
-
-                    if sub_resp:
-                        seg_raw_subs = sub_resp.get_ssafile()
-                        seg_raw_subs.shift(ms=raw_offset_ms)
-                        raw_subs += seg_raw_subs
-                    else:
-                        raw_subs.append(
-                            SSAEvent(
-                                start=raw_offset_ms,
-                                end=raw_offset_ms + seg_dur_ms,
-                                text="Error processing subtitles for this segment.",
-                            )
-                        )
-                    raw_offset_ms += seg_dur_ms
-
-                raw_subs.insert(0, SSAEvent(start=0, end=1, text=info_str))
-                if len(raw_subs) > 1 and raw_subs[1].start < 1:
-                    raw_subs[1].start = 1
-
-                raw_output_path = output_path.parent / f"{active.filename_stem}.raw-{self.full_shortcode}.srt"
-                raw_subs.save(str(raw_output_path))
-                generated_files.append(raw_output_path)
+            if result.lyrics_refined and raw_output_path.is_file():
                 logfire.info(f"[{self.config.name}] Stitched raw dialogue subtitles to {raw_output_path.name}.")
 
-            return generated_files
+            return result.generated_files
 
     async def resume_from_disk(self) -> bool:
         """Inspects work/<combo>/ to restore in-progress video subdirectories upon server boot.

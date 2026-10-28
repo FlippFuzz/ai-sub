@@ -123,7 +123,7 @@ class GitSyncManager:
             return False
 
         for srt_path in video_dir.glob(f"*.{full_shortcode}.srt"):
-            if not srt_path.name.startswith("part_") and ".raw-" not in srt_path.name and srt_path.stat().st_size > 0:
+            if not srt_path.name.startswith("part_") and srt_path.stat().st_size > 0:
                 return True
         return False
 
@@ -137,6 +137,9 @@ class GitSyncManager:
     ) -> None:
         """Moves subtitle files and YAML traces into the repository, then commits and pushes.
 
+        Primary finalized subtitles go into `<uploader>/<video_id>/`, while raw dialogue
+        subtitles (.raw-*.srt) and intermediate YAML state files go into `<uploader>/<video_id>/.int/<full_shortcode>/`.
+
         Args:
             uploader: Channel or uploader identifier.
             video_id: Video identifier.
@@ -147,14 +150,15 @@ class GitSyncManager:
         video_dir = self.local_repo_dir / uploader / video_id
         video_dir.mkdir(parents=True, exist_ok=True)
 
+        int_dir = video_dir / ".int" / full_shortcode
+        int_dir.mkdir(parents=True, exist_ok=True)
+
         files_list = [srt_files] if isinstance(srt_files, Path) else srt_files
         for sf in files_list:
-            target_srt = video_dir / sf.name
+            target_srt = int_dir / sf.name if ".raw-" in sf.name else video_dir / sf.name
             shutil.copy2(sf, target_srt)
             logfire.info(f"Copied finalized subtitles to {target_srt}")
 
-        int_dir = video_dir / ".int" / full_shortcode
-        int_dir.mkdir(parents=True, exist_ok=True)
         for yf in yaml_files:
             shutil.copy2(yf, int_dir / yf.name)
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Callable
 
 import logfire
@@ -10,7 +9,6 @@ import logfire
 from ai_sub.config import SearchSettings
 from ai_sub.search.base import (
     BaseHttpSearchProvider,
-    WebQueryResult,
     WebSearchResult,
     normalize_query,
 )
@@ -87,7 +85,10 @@ class LangsearchSearchProvider(BaseHttpSearchProvider):
                 raw_content = item.get("text") or item.get("summary")
                 if name and url and raw_content:
                     content = str(raw_content)[:max_length]
-                    results.append(WebSearchResult(title=name, url=url, content=content))
+                    try:
+                        results.append(WebSearchResult(title=name, url=url, content=content))
+                    except Exception:
+                        continue
 
             self._cache[cache_key] = results
             return results
@@ -101,9 +102,4 @@ class LangsearchSearchProvider(BaseHttpSearchProvider):
         Returns:
             list[dict[str, Any]]: List of search results grouped by their original queries.
         """
-
-        async def _run(q: str) -> dict[str, Any]:
-            res = await self.search_single(q)
-            return WebQueryResult.model_validate({"query": q, "results": res}).model_dump(mode="json")
-
-        return await asyncio.gather(*(_run(q) for q in queries))
+        return await self._gather_multi_search(queries)

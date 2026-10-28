@@ -204,40 +204,6 @@ class SummaryAiResponse(BaseModel):
         """
         return {item.term: item.meaning for item in self.domain_glossary}
 
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_glossary(cls, data: Any) -> Any:
-        """Normalizes legacy dictionary format to a list of GlossaryItem objects.
-
-        Args:
-            data: Raw input dictionary.
-
-        Returns:
-            Any: Cleaned input dictionary.
-        """
-        if isinstance(data, dict):
-            raw = data.get("domain_glossary")
-            if isinstance(raw, dict):
-                data["domain_glossary"] = [{"term": k, "meaning": str(v)} for k, v in raw.items()]
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_thoughts(cls, data: Any) -> Any:
-        """Ensures thoughts loaded from legacy state files are converted to a list.
-
-        Args:
-            data: Raw input dictionary.
-
-        Returns:
-            Any: Cleaned dictionary.
-        """
-        if isinstance(data, dict):
-            raw_thoughts = data.get("thoughts")
-            if isinstance(raw_thoughts, str):
-                data["thoughts"] = [raw_thoughts]
-        return data
-
 
 class SummaryJob(BaseJob):
     """Job container holding global summary state for an entire video."""

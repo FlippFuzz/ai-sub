@@ -16,6 +16,7 @@ from ai_sub.protocol import (
     TaskType,
 )
 from ai_sub.server.config import ServerSettings
+from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.models import ActivityEvent, ServerTask, TaskStatus
 from ai_sub.server.pipeline import ComboPipeline
 
@@ -24,18 +25,21 @@ class PipelineCoordinator:
     """Orchestrates in-memory pipeline runners, worker task leases, and dashboard telemetry."""
 
     settings: ServerSettings
+    git_sync: GitSyncManager | None
     pipelines: dict[str, ComboPipeline]
     activity_log: deque[ActivityEvent]
     _lock: asyncio.Lock
     _sweep_task: asyncio.Task[None] | None
 
-    def __init__(self, settings: ServerSettings) -> None:
+    def __init__(self, settings: ServerSettings, git_sync: GitSyncManager | None = None) -> None:
         """Initializes the central pipeline coordinator.
 
         Args:
             settings: Server settings model.
+            git_sync: Optional Git synchronization manager for pushing completed subtitles. Defaults to None.
         """
         self.settings = settings
+        self.git_sync = git_sync
         self.pipelines = {}
         self.activity_log = deque(maxlen=50)
         self._lock = asyncio.Lock()
@@ -218,7 +222,6 @@ class PipelineCoordinator:
                             search_tools=task.search_tools,
                             agentic_video=task.agentic_video,
                             detected_performances=task.detected_performances,
-                            # Pass server-configured retry and backoff timing to worker
                             retry=self.settings.retry,
                         )
 
@@ -340,7 +343,6 @@ class PipelineCoordinator:
                             task.claimed_at = None
                             task.last_heartbeat = None
 
-                            # Non-quota errors burn an attempt toward max_runs
                             if reason != "QUOTA_EXHAUSTED":
                                 task.attempts += 1
                                 max_runs = self.settings.retry.max_runs
@@ -381,6 +383,51 @@ class PipelineCoordinator:
                 if task.media_path.is_file():
                     return task.media_path
         return None
+
+    async def finalize_pipeline_if_complete(self, pipe: ComboPipeline) -> bool:
+        """Checks if a pipeline has finished all segments, stitches subtitles, pushes to Git, and clears it.
+
+        Args:
+            pipe: Pipeline instance to check and finalize.
+
+        Returns:
+            bool: True if pipeline was completed and finalized; False otherwise.
+        """
+        if not pipe.is_idle() and pipe.is_video_complete() and pipe.active_video:
+            vid = pipe.active_video
+            logfire.info(f"Pipeline '{pipe.config.name}' finished all segments for '{vid.title}'. Finalizing...")
+
+            srt_filename = f"{vid.filename_stem}.{pipe.full_shortcode}.srt"
+            temp_srt = vid.job_dir / srt_filename
+            generated_srts = pipe.stitch_final_subtitles(temp_srt)
+
+            yaml_files = list(vid.job_dir.glob("*.yaml"))
+            if self.git_sync:
+                self.git_sync.finalize_and_push(
+                    uploader=vid.uploader,
+                    video_id=vid.video_id,
+                    full_shortcode=pipe.full_shortcode,
+                    srt_files=generated_srts,
+                    yaml_files=yaml_files,
+                )
+
+            pipe.clear_active_video()
+            logfire.info(f"Pipeline '{pipe.config.name}' cleared and ready for next video.")
+            return True
+
+        return False
+
+    async def check_and_finalize_completed_pipelines(self) -> list[ComboPipeline]:
+        """Inspects all pipelines, finalizing any that have reached completion.
+
+        Returns:
+            list[ComboPipeline]: List of pipelines that completed and were reset.
+        """
+        finalized: list[ComboPipeline] = []
+        for pipe in self.pipelines.values():
+            if await self.finalize_pipeline_if_complete(pipe):
+                finalized.append(pipe)
+        return finalized
 
     def get_dashboard_data(self, pipeline_queues: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
         """Gathers macroscopic metrics and active states for the live WebUI dashboard.

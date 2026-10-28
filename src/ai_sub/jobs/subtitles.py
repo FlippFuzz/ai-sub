@@ -250,23 +250,6 @@ class BaseSubtitleAiResponse(BaseModel):
         description="Model reasoning traces per turn, preserved on disk but omitted from LLM output schemas.",
     )
 
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_thoughts(cls, data: Any) -> Any:
-        """Ensures thoughts loaded from state files are converted to a list.
-
-        Args:
-            data: Raw input dictionary.
-
-        Returns:
-            Any: Cleaned dictionary.
-        """
-        if isinstance(data, dict):
-            raw_thoughts = data.get("thoughts")
-            if isinstance(raw_thoughts, str):
-                data["thoughts"] = [raw_thoughts]
-        return data
-
     def get_ssafile(self) -> SSAFile:
         """Converts subtitles into an SSAFile object.
 

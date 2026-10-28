@@ -3,17 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from contextlib import AsyncExitStack
-from datetime import datetime
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, cast
 
 import logfire
 from pydantic_settings import CliApp
-from pysubs2 import SSAEvent, SSAFile
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -29,9 +26,6 @@ from rich.progress import (
 from ai_sub.config import Settings
 from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError
 from ai_sub.jobs import (
-    LYRICS_PROMPT_VERSION,
-    SUBTITLES_PROMPT_VERSION,
-    SUMMARY_PROMPT_VERSION,
     DetectedMusicalPerformance,
     LyricsJob,
     ReencodeJob,
@@ -52,7 +46,8 @@ from ai_sub.shortcode import (
     generate_subtitles_shortcode,
     generate_summary_shortcode,
 )
-from ai_sub.telemetry import get_app_version, setup_logging
+from ai_sub.stitching import stitch_subtitles as stitch_subtitles_engine
+from ai_sub.telemetry import setup_logging
 from ai_sub.video import (
     get_video_duration_ms,
     init_ffmpeg_engine,
@@ -132,10 +127,7 @@ def stitch_subtitles(
     full_shortcode: str,
     summary_available: bool,
 ) -> AiSubResult:
-    """Assembles segment subtitles into final merged SRT files.
-
-    Generates the primary subtitle file and, if musical performances were refined,
-    an additional raw subtitles file (<stem>.raw-<full_shortcode>.srt).
+    """Assembles segment subtitles into final merged SRT files using the unified stitching engine.
 
     Args:
         video_splits: Ordered list of segment paths and durations in milliseconds.
@@ -149,62 +141,9 @@ def stitch_subtitles(
         AiSubResult: Pipeline result status code.
     """
     with logfire.span("Stitching final SRT file"):
-        all_subs = SSAFile()
         chunks_to_skip = int((settings.split.start_offset_min * 60) / settings.split.max_seconds)
         offset_ms = sum(d for _, d in video_splits[:chunks_to_skip])
-
-        use_lyrics = settings.concurrency.lyrics > 0
-        any_failed = False
-        max_retries_exceeded = False
-        any_pending = False
-        lyrics_refined_any = False
-
-        for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
-            lyrics_job_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{lyrics_shortcode}.yaml"
-            sub_job_path = settings.dir.tmp / f"{video_path.stem}.subtitles.{subtitles_shortcode}.yaml"
-
-            lyrics_job = LyricsJob.load(lyrics_job_path, settings.ai.validation_buffer_ms)
-            sub_job = SubtitlesJob.load(sub_job_path, settings.ai.validation_buffer_ms)
-
-            lyrics_required = bool(
-                use_lyrics and sub_job and sub_job.response and sub_job.response.detected_musical_performances
-            )
-
-            active_response = None
-            if lyrics_required:
-                if lyrics_job and lyrics_job.response:
-                    active_response = lyrics_job.response
-                    lyrics_refined_any = True
-            else:
-                if sub_job and sub_job.response:
-                    active_response = sub_job.response
-
-            if active_response:
-                segment_subs = active_response.get_ssafile()
-                segment_subs.shift(ms=offset_ms)
-                all_subs += segment_subs
-            else:
-                all_subs.append(
-                    SSAEvent(
-                        start=offset_ms,
-                        end=offset_ms + video_duration_ms,
-                        text="Error processing subtitles for this segment.",
-                    )
-                )
-                any_failed = True
-                attempts = max(
-                    lyrics_job.total_attempts if lyrics_job else 0,
-                    sub_job.total_attempts if sub_job else 0,
-                )
-
-                if attempts >= settings.retry.max_runs:
-                    max_retries_exceeded = True
-                else:
-                    any_pending = True
-
-            offset_ms += video_duration_ms
-
-        status_str = "Completed" if not any_failed else ("RetriesExceeded" if max_retries_exceeded else "InProgress")
+        splits_to_process = video_splits[chunks_to_skip:]
 
         settings_dump = settings.model_dump(
             mode="json",
@@ -226,58 +165,34 @@ def stitch_subtitles(
         )
         settings_dump["context"] = settings.get_resolved_user_context()
 
-        metadata = {
-            "ai_sub_version": get_app_version(),
-            "generated_at": datetime.now().isoformat(),
-            "summary_prompt_version": SUMMARY_PROMPT_VERSION if summary_available else None,
-            "subtitles_prompt_version": SUBTITLES_PROMPT_VERSION,
-            "lyrics_prompt_version": LYRICS_PROMPT_VERSION,
-            "status": status_str,
-            "settings": settings_dump,
-        }
-        # ensure_ascii=False preserves literal Unicode characters (e.g. 【MV】, Japanese, Korean)
-        info_str = json.dumps(metadata, indent=2, ensure_ascii=False).replace("{", "(").replace("}", ")")
-        all_subs.insert(0, SSAEvent(start=0, end=1, text=info_str))
-
-        if len(all_subs) > 1 and all_subs[1].start < 1:
-            all_subs[1].start = 1
-
         input_video_path = cast(Path, settings.input_video_file)
         out_srt = settings.dir.out / f"{input_video_path.stem}.{full_shortcode}.srt"
-        all_subs.save(str(out_srt))
+        raw_out_srt = settings.dir.out / f"{input_video_path.stem}.raw-{full_shortcode}.srt"
+
+        segments = [(p.stem, d) for p, d in splits_to_process]
+
+        result = stitch_subtitles_engine(
+            segments=segments,
+            state_dir=settings.dir.tmp,
+            output_primary_path=out_srt,
+            output_raw_path=raw_out_srt,
+            subtitles_shortcode=subtitles_shortcode,
+            lyrics_shortcode=lyrics_shortcode,
+            validation_buffer_ms=settings.ai.validation_buffer_ms,
+            settings_dump=settings_dump,
+            max_runs=settings.retry.max_runs,
+            summary_available=summary_available,
+            initial_offset_ms=offset_ms,
+            use_lyrics=settings.concurrency.lyrics > 0,
+        )
+
         logfire.info(f"Subtitles written to {out_srt.name}")
-
-        if lyrics_refined_any:
-            raw_subs = SSAFile()
-            raw_offset_ms = sum(d for _, d in video_splits[:chunks_to_skip])
-            for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
-                sub_job_path = settings.dir.tmp / f"{video_path.stem}.subtitles.{subtitles_shortcode}.yaml"
-                sub_job = SubtitlesJob.load(sub_job_path, settings.ai.validation_buffer_ms)
-                if sub_job and sub_job.response:
-                    seg_raw_subs = sub_job.response.get_ssafile()
-                    seg_raw_subs.shift(ms=raw_offset_ms)
-                    raw_subs += seg_raw_subs
-                else:
-                    raw_subs.append(
-                        SSAEvent(
-                            start=raw_offset_ms,
-                            end=raw_offset_ms + video_duration_ms,
-                            text="Error processing subtitles for this segment.",
-                        )
-                    )
-                raw_offset_ms += video_duration_ms
-
-            raw_subs.insert(0, SSAEvent(start=0, end=1, text=info_str))
-            if len(raw_subs) > 1 and raw_subs[1].start < 1:
-                raw_subs[1].start = 1
-
-            raw_out_srt = settings.dir.out / f"{input_video_path.stem}.raw-{full_shortcode}.srt"
-            raw_subs.save(str(raw_out_srt))
+        if result.lyrics_refined and raw_out_srt.is_file():
             logfire.info(f"Raw subtitles written to {raw_out_srt.name}")
 
-        if any_pending:
+        if result.any_pending:
             return AiSubResult.IN_PROGRESS
-        if max_retries_exceeded:
+        if result.max_retries_exceeded:
             return AiSubResult.RETRIES_EXCEEDED
         return AiSubResult.COMPLETED
 

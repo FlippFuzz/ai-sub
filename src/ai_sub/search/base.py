@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import math
 import random
 import string
@@ -136,6 +137,39 @@ class BaseSearchProvider(ABC):
             list[WebSearchResult]: Formatted search result items.
         """
         ...
+
+    async def _gather_multi_search(
+        self,
+        queries: list[str],
+        search_fn: Callable[[str], Any] | None = None,
+        max_queries: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Gathers search results for multiple queries concurrently into standardized query-result dicts.
+
+        Args:
+            queries: A list of search query strings to execute concurrently.
+            search_fn: Optional custom callable taking a single query. Defaults to self.search_single.
+            max_queries: Optional limit on the number of queries to process. Defaults to None.
+
+        Returns:
+            list[dict[str, Any]]: List of serialized WebQueryResult dictionaries.
+        """
+        clean_queries = [q.strip() for q in queries if q and q.strip()]
+        if max_queries is not None:
+            clean_queries = clean_queries[:max_queries]
+        if not clean_queries:
+            return []
+
+        async def _run(q: str) -> dict[str, Any]:
+            if search_fn is not None:
+                res = search_fn(q)
+                if inspect.isawaitable(res):
+                    res = await res
+            else:
+                res = await self.search_single(q)
+            return WebQueryResult.model_validate({"query": q, "results": res}).model_dump(mode="json")
+
+        return await asyncio.gather(*(_run(q) for q in clean_queries))
 
 
 class BaseHttpSearchProvider(BaseSearchProvider, ABC):

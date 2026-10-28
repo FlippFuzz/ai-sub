@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import os
 import socket
 from pathlib import Path
-from typing import Annotated, Any, ClassVar, Self, cast
 
 from pydantic import (
-    BeforeValidator,
     Field,
     HttpUrl,
     NonNegativeFloat,
@@ -18,78 +15,17 @@ from pydantic import (
     PositiveInt,
     SecretStr,
 )
-from pydantic_settings import (
-    BaseSettings,
-    NoDecode,
-    PydanticBaseSettingsSource,
-    SettingsConfigDict,
-    YamlConfigSettingsSource,
+from pydantic_settings import SettingsConfigDict
+
+from ai_sub.config import (
+    EnvPrioritySettings,
+    SearchSettings,
+    StringList,
+    YamlFileSettings,
 )
 
-from ai_sub.config import SearchSettings
 
-
-def _parse_models_list(val: Any) -> list[str]:
-    """Parses candidate model list from Python list, JSON array, or comma-separated string.
-
-    Args:
-        val: Raw input value from environment variable or YAML.
-
-    Returns:
-        list[str]: Normalized list of model identifier strings.
-    """
-    if isinstance(val, str):
-        v = val.strip()
-        if v.startswith("[") and v.endswith("]"):
-            try:
-                parsed = json.loads(v)
-                if isinstance(parsed, (list, tuple)):
-                    return [str(m).strip() for m in parsed if str(m).strip()]
-            except Exception:
-                pass
-        return [m.strip() for m in v.split(",") if m.strip()]
-    if isinstance(val, (list, tuple)):
-        out: list[str] = []
-        for m in val:
-            if isinstance(m, str) and "," in m:
-                out.extend(sub.strip() for sub in m.split(",") if sub.strip())
-            elif isinstance(m, str) and m.strip():
-                out.append(m.strip())
-        return out
-    return val
-
-
-ModelsList = Annotated[list[str], NoDecode, BeforeValidator(_parse_models_list)]
-
-
-class _BaseWorkerSettings(BaseSettings):
-    """Base settings class for worker sub-components where ENV overrides YAML kwargs."""
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Ensures environment variables take precedence over kwargs passed from parent YAML.
-
-        Args:
-            settings_cls: BaseSettings class type.
-            init_settings: Injected initial settings kwargs.
-            env_settings: Environment variable settings source.
-            dotenv_settings: Dotenv settings source (ignored).
-            file_secret_settings: File secrets settings source (ignored).
-
-        Returns:
-            tuple[PydanticBaseSettingsSource, ...]: Custom source loading sequence.
-        """
-        return (env_settings, init_settings)
-
-
-class WorkerSearchSettings(SearchSettings, _BaseWorkerSettings):
+class WorkerSearchSettings(EnvPrioritySettings, SearchSettings):
     """Worker web search configuration with AISUB_WORKER_SEARCH_ prefix."""
 
     model_config = SettingsConfigDict(
@@ -98,7 +34,7 @@ class WorkerSearchSettings(SearchSettings, _BaseWorkerSettings):
     )
 
 
-class WorkerSettings(BaseSettings):
+class WorkerSettings(YamlFileSettings):
     """Central configuration for an ephemeral ai-sub-worker node."""
 
     model_config = SettingsConfigDict(
@@ -122,7 +58,7 @@ class WorkerSettings(BaseSettings):
         default=2,
         description="Number of concurrent worker task execution slots.",
     )
-    models: ModelsList = Field(
+    models: StringList = Field(
         default_factory=lambda: [
             "google-gla:gemini-3.8-flash",
             "google-gla:gemini-3.6-flash",
@@ -187,85 +123,3 @@ class WorkerSettings(BaseSettings):
         ):
             return SecretStr(env_k.strip().strip('"').strip("'"))
         return None
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Customizes settings source loading order, allowing strictly ENV and YAML sources.
-
-        Args:
-            settings_cls: BaseSettings class type.
-            init_settings: Injected initial settings kwargs.
-            env_settings: Environment variable settings source.
-            dotenv_settings: Dotenv settings source (ignored).
-            file_secret_settings: File secrets settings source (ignored).
-
-        Returns:
-            tuple[PydanticBaseSettingsSource, ...]: Ordered settings sources.
-        """
-        yaml_file = getattr(settings_cls, "_yaml_path", None)
-        yaml_source = (
-            YamlConfigSettingsSource(settings_cls, yaml_file=yaml_file)
-            if yaml_file
-            else YamlConfigSettingsSource(settings_cls)
-        )
-        return (
-            init_settings,
-            env_settings,
-            yaml_source,
-        )
-
-    @classmethod
-    def from_yaml(cls, yaml_path: Path | str) -> Self:
-        """Loads worker settings from a YAML file path with environment variable overrides.
-
-        Args:
-            yaml_path: Filesystem path to the worker configuration YAML file.
-
-        Returns:
-            Self: Instantiated and validated WorkerSettings object.
-
-        Raises:
-            FileNotFoundError: If the specified configuration file does not exist.
-        """
-        path = Path(yaml_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"Worker configuration file not found: {path}")
-
-        class _LoadedWorkerSettings(cls):
-            _yaml_path: ClassVar[Path | None] = path
-
-            @classmethod
-            def settings_customise_sources(
-                cls,
-                settings_cls: type[BaseSettings],
-                init_settings: PydanticBaseSettingsSource,
-                env_settings: PydanticBaseSettingsSource,
-                dotenv_settings: PydanticBaseSettingsSource,
-                file_secret_settings: PydanticBaseSettingsSource,
-            ) -> tuple[PydanticBaseSettingsSource, ...]:
-                """Customizes settings source loading order for loaded worker settings.
-
-                Args:
-                    settings_cls: BaseSettings class type.
-                    init_settings: Injected initial settings kwargs.
-                    env_settings: Environment variable settings source.
-                    dotenv_settings: Dotenv settings source (ignored).
-                    file_secret_settings: File secrets settings source (ignored).
-
-                Returns:
-                    tuple[PydanticBaseSettingsSource, ...]: Ordered settings sources.
-                """
-                return (
-                    init_settings,
-                    env_settings,
-                    YamlConfigSettingsSource(settings_cls, yaml_file=path),
-                )
-
-        return cast(Self, _LoadedWorkerSettings())

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Callable
 
 import logfire
@@ -10,7 +9,6 @@ import logfire
 from ai_sub.config import SearchSettings
 from ai_sub.search.base import (
     BaseHttpSearchProvider,
-    WebQueryResult,
     WebSearchResult,
     normalize_query,
 )
@@ -121,15 +119,11 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
         Returns:
             list[dict[str, Any]]: List of search results grouped by their originating queries.
         """
-        valid_queries = [q.strip() for q in queries if q and q.strip()][:5]
-        if not valid_queries:
-            return []
-
-        async def _run(q: str) -> dict[str, Any]:
-            res = await self.search_single(query=q, purpose=purpose, language=language)
-            return WebQueryResult.model_validate({"query": q, "results": res}).model_dump(mode="json")
-
-        return await asyncio.gather(*(_run(q) for q in valid_queries))
+        return await self._gather_multi_search(
+            queries=queries,
+            search_fn=lambda q: self.search_single(query=q, purpose=purpose, language=language),
+            max_queries=5,
+        )
 
     async def tinyfish_fetch(
         self,

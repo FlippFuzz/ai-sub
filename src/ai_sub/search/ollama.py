@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Callable
 
 import logfire
@@ -10,7 +9,6 @@ import logfire
 from ai_sub.config import SearchSettings
 from ai_sub.search.base import (
     BaseHttpSearchProvider,
-    WebQueryResult,
     WebSearchResult,
     normalize_query,
 )
@@ -63,14 +61,19 @@ class OllamaSearchProvider(BaseHttpSearchProvider):
             response = await self._request("POST", "https://ollama.com/api/web_search", json={"query": query})
             data = response.json()
 
-            results = [
-                WebSearchResult(title=title, url=url, content=content[: self.settings.max_length])
-                for item in (data.get("results") or [])
-                if (title := item.get("title"))
-                and (url := item.get("url"))
-                and (content := item.get("content"))
-                and len(content) <= self.settings.max_length
-            ]
+            results: list[WebSearchResult] = []
+            for item in data.get("results") or []:
+                title = item.get("title")
+                url = item.get("url")
+                content = item.get("content")
+                if title and url and content and len(content) <= self.settings.max_length:
+                    try:
+                        results.append(
+                            WebSearchResult(title=title, url=url, content=content[: self.settings.max_length])
+                        )
+                    except Exception:
+                        continue
+
             self._cache[cache_key] = results
             return results
 
@@ -83,9 +86,4 @@ class OllamaSearchProvider(BaseHttpSearchProvider):
         Returns:
             list[dict[str, Any]]: List of search results grouped by their original queries.
         """
-
-        async def _run(q: str) -> dict[str, Any]:
-            res = await self.search_single(q)
-            return WebQueryResult.model_validate({"query": q, "results": res}).model_dump(mode="json")
-
-        return await asyncio.gather(*(_run(q) for q in queries))
+        return await self._gather_multi_search(queries)

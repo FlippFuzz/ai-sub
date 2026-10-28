@@ -2,108 +2,30 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
-from typing import Annotated, Any, ClassVar, Self, cast
+from typing import Any
 
 from pydantic import (
     BaseModel,
-    BeforeValidator,
     ConfigDict,
     Field,
     HttpUrl,
     SecretStr,
     model_validator,
 )
-from pydantic_settings import (
-    BaseSettings,
-    NoDecode,
-    PydanticBaseSettingsSource,
-    SettingsConfigDict,
-    YamlConfigSettingsSource,
-)
+from pydantic_settings import SettingsConfigDict
 
 from ai_sub.config import (
+    EnvPrioritySettings,
+    PathList,
     ReEncodeSettings,
     RetrySettings,
     SearchSettings,
     SplittingSettings,
+    StringList,
+    YamlFileSettings,
 )
-
-
-def _parse_string_list(val: Any) -> list[str]:
-    """Parses list of strings from Python list, JSON array, or comma-separated string.
-
-    Args:
-        val: Raw input value from environment variable or YAML.
-
-    Returns:
-        list[str]: Normalized list of strings.
-    """
-    if isinstance(val, str):
-        v = val.strip()
-        if v.startswith("[") and v.endswith("]"):
-            try:
-                parsed = json.loads(v)
-                if isinstance(parsed, (list, tuple)):
-                    return [str(m).strip() for m in parsed if str(m).strip()]
-            except Exception:
-                pass
-        return [m.strip() for m in v.split(",") if m.strip()]
-    if isinstance(val, (list, tuple)):
-        out: list[str] = []
-        for m in val:
-            if isinstance(m, str) and "," in m:
-                out.extend(sub.strip() for sub in m.split(",") if sub.strip())
-            elif isinstance(m, str) and m.strip():
-                out.append(m.strip())
-        return out
-    return val
-
-
-def _parse_path_list(val: Any) -> list[Path]:
-    """Parses list of Paths from Python list, JSON array, or comma-separated string.
-
-    Args:
-        val: Raw input value from environment variable or YAML.
-
-    Returns:
-        list[Path]: Normalized list of Path objects.
-    """
-    raw_list = _parse_string_list(val)
-    return [Path(p) for p in raw_list]
-
-
-StringList = Annotated[list[str], NoDecode, BeforeValidator(_parse_string_list)]
-PathList = Annotated[list[Path], NoDecode, BeforeValidator(_parse_path_list)]
-
-
-class _BaseServerSettings(BaseSettings):
-    """Base settings class for server components where ENV overrides YAML kwargs."""
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Ensures environment variables take precedence over kwargs passed from parent YAML.
-
-        Args:
-            settings_cls: BaseSettings class type.
-            init_settings: Injected initial settings kwargs.
-            env_settings: Environment variable settings source.
-            dotenv_settings: Dotenv settings source (ignored).
-            file_secret_settings: File secrets settings source (ignored).
-
-        Returns:
-            tuple[PydanticBaseSettingsSource, ...]: Custom source loading sequence.
-        """
-        return (env_settings, init_settings)
 
 
 class PipelineConfig(BaseModel):
@@ -130,7 +52,7 @@ class PipelineConfig(BaseModel):
     )
 
 
-class GitConfig(_BaseServerSettings):
+class GitConfig(EnvPrioritySettings):
     """Git repository synchronization settings."""
 
     model_config = SettingsConfigDict(
@@ -151,7 +73,7 @@ class GitConfig(_BaseServerSettings):
         return self.pat.get_secret_value()
 
 
-class FilesSourceConfig(_BaseServerSettings):
+class FilesSourceConfig(EnvPrioritySettings):
     """Local filesystem intake configuration."""
 
     model_config = SettingsConfigDict(
@@ -169,7 +91,7 @@ class FilesSourceConfig(_BaseServerSettings):
     )
 
 
-class YoutubeSourceConfig(_BaseServerSettings):
+class YoutubeSourceConfig(EnvPrioritySettings):
     """YouTube intake, anti-bot pacing, and download configuration."""
 
     model_config = SettingsConfigDict(
@@ -231,7 +153,7 @@ class YoutubeSourceConfig(_BaseServerSettings):
     )
 
 
-class SourcesConfig(_BaseServerSettings):
+class SourcesConfig(EnvPrioritySettings):
     """Container for distinct intake source categories (local filesystem and YouTube)."""
 
     model_config = SettingsConfigDict(
@@ -243,7 +165,7 @@ class SourcesConfig(_BaseServerSettings):
     youtube: YoutubeSourceConfig = Field(default_factory=YoutubeSourceConfig)
 
 
-class ServerOptions(_BaseServerSettings):
+class ServerOptions(EnvPrioritySettings):
     """HTTP server and filesystem orchestration options."""
 
     model_config = SettingsConfigDict(
@@ -264,7 +186,7 @@ class ServerOptions(_BaseServerSettings):
     )
 
 
-class ServerReEncodeSettings(ReEncodeSettings, _BaseServerSettings):
+class ServerReEncodeSettings(EnvPrioritySettings, ReEncodeSettings):
     """Server video re-encoding configuration with AISUB_SERVER_REENCODE_ prefix."""
 
     model_config = SettingsConfigDict(
@@ -273,7 +195,7 @@ class ServerReEncodeSettings(ReEncodeSettings, _BaseServerSettings):
     )
 
 
-class ServerSearchSettings(SearchSettings, _BaseServerSettings):
+class ServerSearchSettings(EnvPrioritySettings, SearchSettings):
     """Server search provider configuration with AISUB_SERVER_SEARCH_ prefix."""
 
     model_config = SettingsConfigDict(
@@ -282,7 +204,7 @@ class ServerSearchSettings(SearchSettings, _BaseServerSettings):
     )
 
 
-class ServerSplittingSettings(SplittingSettings, _BaseServerSettings):
+class ServerSplittingSettings(EnvPrioritySettings, SplittingSettings):
     """Server video splitting configuration with AISUB_SERVER_SPLIT_ prefix."""
 
     model_config = SettingsConfigDict(
@@ -291,7 +213,7 @@ class ServerSplittingSettings(SplittingSettings, _BaseServerSettings):
     )
 
 
-class ServerRetrySettings(RetrySettings, _BaseServerSettings):
+class ServerRetrySettings(EnvPrioritySettings, RetrySettings):
     """Server task retry policy configuration with AISUB_SERVER_RETRY_ prefix."""
 
     model_config = SettingsConfigDict(
@@ -328,7 +250,7 @@ def _get_default_pipelines() -> list[PipelineConfig]:
     ]
 
 
-class ServerSettings(BaseSettings):
+class ServerSettings(YamlFileSettings):
     """Central configuration settings model for ai-sub-server loaded from YAML with ENV overrides."""
 
     model_config = SettingsConfigDict(
@@ -360,85 +282,3 @@ class ServerSettings(BaseSettings):
             if values.get("git") is None and os.getenv("AISUB_SERVER_GIT_REPO_URL"):
                 values["git"] = {}
         return values
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Customizes settings source loading order, allowing strictly ENV and YAML sources.
-
-        Args:
-            settings_cls: BaseSettings class type.
-            init_settings: Injected initial settings kwargs.
-            env_settings: Environment variable settings source.
-            dotenv_settings: Dotenv settings source (ignored).
-            file_secret_settings: File secrets settings source (ignored).
-
-        Returns:
-            tuple[PydanticBaseSettingsSource, ...]: Ordered settings sources.
-        """
-        yaml_file = getattr(settings_cls, "_yaml_path", None)
-        yaml_source = (
-            YamlConfigSettingsSource(settings_cls, yaml_file=yaml_file)
-            if yaml_file
-            else YamlConfigSettingsSource(settings_cls)
-        )
-        return (
-            init_settings,
-            env_settings,
-            yaml_source,
-        )
-
-    @classmethod
-    def from_yaml(cls, yaml_path: Path | str) -> Self:
-        """Loads server settings from a YAML file path with environment variable overrides.
-
-        Args:
-            yaml_path: Filesystem path to the server.yaml file.
-
-        Returns:
-            Self: Instantiated and validated ServerSettings object.
-
-        Raises:
-            FileNotFoundError: If the configuration file does not exist.
-        """
-        path = Path(yaml_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"Server configuration file not found: {path}")
-
-        class _LoadedServerSettings(cls):
-            _yaml_path: ClassVar[Path | None] = path
-
-            @classmethod
-            def settings_customise_sources(
-                cls,
-                settings_cls: type[BaseSettings],
-                init_settings: PydanticBaseSettingsSource,
-                env_settings: PydanticBaseSettingsSource,
-                dotenv_settings: PydanticBaseSettingsSource,
-                file_secret_settings: PydanticBaseSettingsSource,
-            ) -> tuple[PydanticBaseSettingsSource, ...]:
-                """Customizes settings source loading order for loaded server settings.
-
-                Args:
-                    settings_cls: BaseSettings class type.
-                    init_settings: Injected initial settings kwargs.
-                    env_settings: Environment variable settings source.
-                    dotenv_settings: Dotenv settings source (ignored).
-                    file_secret_settings: File secrets settings source (ignored).
-
-                Returns:
-                    tuple[PydanticBaseSettingsSource, ...]: Ordered settings sources.
-                """
-                return (
-                    init_settings,
-                    env_settings,
-                    YamlConfigSettingsSource(settings_cls, yaml_file=path),
-                )
-
-        return cast(Self, _LoadedServerSettings())
