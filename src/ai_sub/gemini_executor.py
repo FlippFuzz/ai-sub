@@ -125,15 +125,14 @@ def _is_retryable_error(e: Exception) -> bool:
     if isinstance(e, (TransportError, TimeoutException, ConnectionError, asyncio.TimeoutError, TimeoutError)):
         return True
 
-    # Google API status codes
+    # Google API status codes (authoritative when present as an integer)
     status_code = getattr(e, "code", None)
-    if isinstance(status_code, int) and status_code in (408, 429, 500, 502, 503, 504):
-        return True
+    if isinstance(status_code, int):
+        return status_code in (408, 429, 500, 502, 503, 504)
 
     err_str = str(e).lower()
-    for code in ("503", "502", "504", "500", "408"):
-        if code in err_str:
-            return True
+    if re.search(r"\b(408|500|502|503|504)\b", err_str):
+        return True
     if "connection" in err_str or "timeout" in err_str or "temporarily unavailable" in err_str:
         return True
 

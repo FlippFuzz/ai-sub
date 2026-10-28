@@ -105,7 +105,11 @@ class PipelineCoordinator:
             start_span.set_attribute("resumed_pipelines", resumed_count)
 
             # Immediately flush and push any videos found 100% complete on disk during boot
-            await self.check_and_finalize_completed_pipelines()
+            try:
+                await self.check_and_finalize_completed_pipelines()
+            except Exception as e:
+                logfire.exception(f"Error checking and finalizing completed pipelines on startup: {e}")
+
             self._sweep_task = asyncio.create_task(self._lease_sweeper_loop())
 
     async def stop(self) -> None:
@@ -173,7 +177,10 @@ class PipelineCoordinator:
                     sweep_span.set_attribute("expired_leases", expired_count)
 
             # Check if any pipeline reached completion due to expired/failed tasks
-            await self.check_and_finalize_completed_pipelines()
+            try:
+                await self.check_and_finalize_completed_pipelines()
+            except Exception as e:
+                logfire.exception(f"Error checking and finalizing completed pipelines in lease sweeper: {e}")
 
     async def claim_task(
         self,
@@ -277,6 +284,53 @@ class PipelineCoordinator:
                         return True
         return False
 
+    def _fail_task_locked(
+        self,
+        task: ServerTask,
+        worker_id: str,
+        reason: str,
+        error_message: str | None = None,
+    ) -> bool:
+        """Processes task failure and updates lease state while lock is held.
+
+        Args:
+            task: Affected server task.
+            worker_id: Worker reporting the failure.
+            reason: Error code (e.g. 'QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').
+            error_message: Optional error details. Defaults to None.
+
+        Returns:
+            bool: True indicating the task failure was processed.
+        """
+        detail = f"[{reason}] {error_message or 'No message provided'}"
+        self._log_activity(
+            event_type="fail",
+            task=task,
+            worker_id=worker_id,
+            detail=detail,
+        )
+        task.worker_id = None
+        task.claimed_at = None
+        task.last_heartbeat = None
+
+        if reason != "QUOTA_EXHAUSTED":
+            task.attempts += 1
+            max_runs = self.settings.retry.max_runs
+            if task.attempts >= max_runs:
+                task.status = TaskStatus.FAILED
+                logfire.error(
+                    f"Task '{task.task_id}' marked FAILED after exhausting "
+                    f"{task.attempts}/{max_runs} runs. Reason: {reason}."
+                )
+                return True
+
+        task.status = TaskStatus.PENDING
+        logfire.warning(
+            f"Task '{task.task_id}' failed by worker '{worker_id}' (reason: {reason}). "
+            f"Details: {error_message or 'none'}. Returning to PENDING."
+        )
+        return True
+
     async def complete_task(
         self,
         task_id: str,
@@ -300,7 +354,21 @@ class PipelineCoordinator:
                         task = pipe.tasks[task_id]
                         if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
                             duration = time() - (task.claimed_at or time())
-                            pipe.on_task_completed(task_id, result)
+                            try:
+                                pipe.on_task_completed(task_id, result)
+                            except Exception as val_err:
+                                logfire.warning(
+                                    f"Task '{task_id}' completion validation failed: {val_err}. Routing to fail."
+                                )
+                                comp_span.set_attribute("result", "validation_failed")
+                                comp_span.set_attribute("error", str(val_err))
+                                self._fail_task_locked(
+                                    task=task,
+                                    worker_id=worker_id,
+                                    reason="EXECUTION_ERROR",
+                                    error_message=f"Server validation error: {val_err}",
+                                )
+                                return False
 
                             detail = None
                             if task.task_type == TaskType.SUMMARY:
@@ -362,38 +430,15 @@ class PipelineCoordinator:
                     if task_id in pipe.tasks:
                         task = pipe.tasks[task_id]
                         if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
-                            detail = f"[{reason}] {error_message or 'No message provided'}"
-                            self._log_activity(
-                                event_type="fail",
+                            success = self._fail_task_locked(
                                 task=task,
                                 worker_id=worker_id,
-                                detail=detail,
+                                reason=reason,
+                                error_message=error_message,
                             )
-                            task.worker_id = None
-                            task.claimed_at = None
-                            task.last_heartbeat = None
-
-                            if reason != "QUOTA_EXHAUSTED":
-                                task.attempts += 1
-                                max_runs = self.settings.retry.max_runs
-                                if task.attempts >= max_runs:
-                                    task.status = TaskStatus.FAILED
-                                    fail_span.set_attribute("result", "permanently_failed")
-                                    fail_span.set_attribute("attempts", task.attempts)
-                                    logfire.error(
-                                        f"Task '{task_id}' marked FAILED after exhausting "
-                                        f"{task.attempts}/{max_runs} runs. Reason: {reason}."
-                                    )
-                                    return True
-
-                            task.status = TaskStatus.PENDING
-                            fail_span.set_attribute("result", "returned_to_pending")
+                            fail_span.set_attribute("result", task.status.value)
                             fail_span.set_attribute("attempts", task.attempts)
-                            logfire.warning(
-                                f"Task '{task_id}' failed by worker '{worker_id}' (reason: {reason}). "
-                                f"Details: {error_message or 'none'}. Returning to PENDING."
-                            )
-                            return True
+                            return success
 
                 fail_span.set_attribute("result", "task_not_found")
                 return False
@@ -443,7 +488,13 @@ class PipelineCoordinator:
             temp_srt = vid.job_dir / srt_filename
 
             # Run synchronous subtitle stitching off the event loop
-            generated_srts = await asyncio.to_thread(pipe.stitch_final_subtitles, temp_srt)
+            try:
+                generated_srts = await asyncio.to_thread(pipe.stitch_final_subtitles, temp_srt)
+            except Exception as e:
+                logfire.error(f"Subtitle stitching failed for '{pipe.config.name}' ({vid.video_id}): {e}")
+                async with self._lock:
+                    pipe.status = PipelineStatus.PUSH_FAILED
+                return False
 
             yaml_files = list(vid.job_dir.glob("*.yaml"))
             if self.git_sync:
@@ -467,6 +518,11 @@ class PipelineCoordinator:
                 pipe.clear_active_video()
                 logfire.info(f"Pipeline '{pipe.config.name}' cleared and ready for next video.")
                 return True
+        except Exception as e:
+            logfire.exception(f"Unexpected error finalizing pipeline '{pipe.config.name}': {e}")
+            async with self._lock:
+                pipe.status = PipelineStatus.PUSH_FAILED
+            return False
         finally:
             async with self._lock:
                 self._finalizing_pipes.discard(pipe.config.name)

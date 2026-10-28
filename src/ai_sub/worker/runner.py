@@ -78,6 +78,8 @@ class WorkerRunner:
             except asyncio.TimeoutError:
                 if not stop_event.is_set():
                     acked = await self.client.send_heartbeat(task_id, self.settings.worker_id)
+                    if acked is None:
+                        continue  # transient error; lease still valid server-side
                     if not acked:
                         logfire.warning(
                             f"Heartbeat for task '{task_id}' was rejected (lease revoked or expired). "

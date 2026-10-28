@@ -109,6 +109,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <script>
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
     let currentData = null;
     let selectedPipelineIndex = 0;
 
@@ -134,8 +138,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         const pStatus = p.status || (p.idle ? 'idle' : 'processing');
         return `
           <button class="tab-btn ${idx === selectedPipelineIndex ? 'active' : ''}" onclick="selectTab(${idx})">
-            ${p.name}
-            <span class="badge badge-${pStatus}">${pStatus}</span>
+            ${esc(p.name)}
+            <span class="badge badge-${esc(pStatus)}">${esc(pStatus)}</span>
           </button>
         `;
       }).join('');
@@ -173,18 +177,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               <div>
                 <div style="display:flex; gap: 8px; align-items:center; margin-bottom: 6px;">
                   <span class="badge badge-complete">Active Video</span>
-                  <span class="badge badge-${v.source_type}">${v.source_type}</span>
-                  <span class="badge badge-${pipe.status || 'processing'}">${pipe.status || 'processing'}</span>
+                  <span class="badge badge-${esc(v.source_type)}">${esc(v.source_type)}</span>
+                  <span class="badge badge-${esc(pipe.status || 'processing')}">${esc(pipe.status || 'processing')}</span>
                 </div>
-                <h3 style="margin-bottom: 4px;">${v.title}</h3>
+                <h3 style="margin-bottom: 4px;">${esc(v.title)}</h3>
                 <div style="color: var(--muted); font-size: 13px;">
-                  Channel: <b>${v.channel_name || v.uploader}</b> (@${v.uploader}) | Duration: ${durationFormatted}
+                  Channel: <b>${esc(v.channel_name || v.uploader)}</b> (@${esc(v.uploader)}) | Duration: ${durationFormatted}
                 </div>
               </div>
               <div style="text-align: right; display: flex; flex-direction: column; gap: 4px;">
-                <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Summary:</span> ${pipe.models.summary.split(':').pop()}</div>
-                <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Subtitles:</span> ${pipe.models.subtitles.split(':').pop()}</div>
-                <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Lyrics:</span> ${pipe.models.lyrics.split(':').pop()}</div>
+                <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Summary:</span> ${esc(pipe.models.summary.split(':').pop())}</div>
+                <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Subtitles:</span> ${esc(pipe.models.subtitles.split(':').pop())}</div>
+                <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Lyrics:</span> ${esc(pipe.models.lyrics.split(':').pop())}</div>
               </div>
             </div>
 
@@ -207,7 +211,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                   </div>
                 </div>
                 <div style="font-size: 11px; color: var(--muted); margin-top: 4px;">
-                  ${sum.done > 0 ? 'Macro knowledge index & chapters ready.' : (sum.in_progress > 0 ? `Running by worker <b>${sum.worker_id}</b> (${sum.elapsed_s}s)` : 'Waiting for worker pickup.')}
+                  ${sum.done > 0 ? 'Macro knowledge index & chapters ready.' : (sum.in_progress > 0 ? `Running by worker <b>${esc(sum.worker_id)}</b> (${sum.elapsed_s}s)` : 'Waiting for worker pickup.')}
                 </div>
               </div>
 
@@ -283,7 +287,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                       : (lyr.status === 'skipped'
                           ? 'No vocal singing detected across all chunks.'
                           : (lyr.in_progress > 0
-                              ? lyr.active_leases.map(l => `Refining with <b>${l.worker_id}</b> (${l.elapsed_s}s)`).join(', ')
+                              ? lyr.active_leases.map(l => `Refining with <b>${esc(l.worker_id)}</b> (${l.elapsed_s}s)`).join(', ')
                               : (lyr.done === lyr.total ? 'All singing chunks refined.' : 'Waiting for worker pickup.')))
                   }
                 </div>
@@ -296,7 +300,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 const parts = t.task_id.split('::');
                 const lastPart = parts.pop();
                 const taskLabel = lastPart === t.type ? t.type : `${t.type} ${lastPart}`;
-                return `<span class="badge badge-claim mono">${taskLabel} (${t.worker_id}) [${t.elapsed_s}s]</span>`;
+                return `<span class="badge badge-claim mono">${esc(taskLabel)} (${esc(t.worker_id)}) [${t.elapsed_s}s]</span>`;
               }).join(' ') || '<span style="color:var(--muted);">No active worker leases at this moment</span>'}
             </div>
           </div>
@@ -319,12 +323,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         activeSection = `
           <div class="card" style="margin-bottom: 20px; padding: 36px; text-align: center;">
             <div style="margin-bottom: 10px;">
-              <span class="badge badge-${pipe.status || 'idle'}">${pipe.status || 'idle'}</span>
+              <span class="badge badge-${esc(pipe.status || 'idle')}">${esc(pipe.status || 'idle')}</span>
             </div>
-            <h3 style="margin-bottom: 6px;">${statusTitle}</h3>
-            <p style="color: var(--muted); margin: 0;">${statusDesc}</p>
+            <h3 style="margin-bottom: 6px;">${esc(statusTitle)}</h3>
+            <p style="color: var(--muted); margin: 0;">${esc(statusDesc)}</p>
             <div class="mono" style="font-size: 12px; margin-top: 14px; color: var(--muted);">
-              Models: ${pipe.models.summary.split(':').pop()} / ${pipe.models.subtitles.split(':').pop()} / ${pipe.models.lyrics.split(':').pop()}
+              Models: ${esc(pipe.models.summary.split(':').pop())} / ${esc(pipe.models.subtitles.split(':').pop())} / ${esc(pipe.models.lyrics.split(':').pop())}
             </div>
           </div>
         `;
@@ -332,16 +336,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       const queueTable = (pipe.next_in_queue || []).map(q => `
         <tr>
-          <td>${q.title}</td>
-          <td><b>${q.channel_name || q.uploader}</b> <span class="mono" style="color:var(--muted);">(@${q.uploader})</span></td>
-          <td><span class="badge badge-${q.source_type}">${q.source_type}</span></td>
+          <td>${esc(q.title)}</td>
+          <td><b>${esc(q.channel_name || q.uploader)}</b> <span class="mono" style="color:var(--muted);">(@${esc(q.uploader)})</span></td>
+          <td><span class="badge badge-${esc(q.source_type)}">${esc(q.source_type)}</span></td>
         </tr>
       `).join('') || '<tr><td colspan="3" style="color: var(--muted);">No pending videos in queue for this pipeline.</td></tr>';
 
       document.getElementById('tab-content').innerHTML = `
         ${activeSection}
         <div class="card">
-          <h3>Next In Queue for ${pipe.name}</h3>
+          <h3>Next In Queue for ${esc(pipe.name)}</h3>
           <table>
             <thead><tr><th>Video Title</th><th>Channel / Uploader</th><th>Source</th></tr></thead>
             <tbody>${queueTable}</tbody>
@@ -365,16 +369,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           const cleanTaskId = parts.length > 2 ? parts.slice(2).join(' ') : (parts[1] || a.task_id);
           return `
             <tr>
-              <td class="mono">${a.time_str}</td>
-              <td class="mono"><b>${a.worker_id}</b></td>
-              <td class="mono">${a.pipeline}</td>
-              <td class="mono">${cleanTaskId}</td>
-              <td><span class="badge badge-${a.event_type}">${a.event_type} ${a.duration_s ? a.duration_s + 's' : ''}</span></td>
+              <td class="mono">${esc(a.time_str)}</td>
+              <td class="mono"><b>${esc(a.worker_id)}</b></td>
+              <td class="mono">${esc(a.pipeline)}</td>
+              <td class="mono">${esc(cleanTaskId)}</td>
+              <td><span class="badge badge-${esc(a.event_type)}">${esc(a.event_type)} ${a.duration_s ? a.duration_s + 's' : ''}</span></td>
               <td>${a.detail ? `<button class="expand-btn" onclick="toggleDetail(${idx})">Details</button>` : '-'}</td>
             </tr>
             ${a.detail ? `
               <tr class="detail-row" id="detail-${idx}">
-                <td colspan="6"><div class="detail-box ${a.event_type === 'fail' ? 'detail-box-fail' : ''}">${a.detail}</div></td>
+                <td colspan="6"><div class="detail-box ${a.event_type === 'fail' ? 'detail-box-fail' : ''}">${esc(a.detail)}</div></td>
               </tr>
             ` : ''}
           `;

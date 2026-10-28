@@ -318,6 +318,7 @@ class ComboPipeline:
                 "title": title,
                 "filename_stem": filename_stem,
                 "raw_filename": raw_video_path.name,
+                "raw_path": str(raw_video_path.resolve()),
                 "source_type": source_type,
                 "duration_ms": total_duration_ms,
                 "raw_size_mb": round(raw_size_mb, 2),
@@ -574,9 +575,7 @@ class ComboPipeline:
             task_id=task_id,
             task_type=task.task_type.value,
         ) as cascade_span:
-            task.status = TaskStatus.COMPLETED
-            task.result = result_data
-
+            # Validate output schemas first before altering in-memory task status
             if task.task_type == TaskType.SUMMARY:
                 resp = SummaryAiResponse.model_validate(
                     result_data,
@@ -595,6 +594,9 @@ class ComboPipeline:
                 )
                 summary_file = active.job_dir / f"summary.{self.summary_shortcode}.yaml"
                 summary_job.save(summary_file)
+
+                task.status = TaskStatus.COMPLETED
+                task.result = result_data
 
                 cascade_span.set_attribute("chapters_count", len(resp.chapters))
                 cascade_span.set_attribute("entities_count", len(resp.entities))
@@ -632,6 +634,9 @@ class ComboPipeline:
                 )
                 sub_file = active.job_dir / f"{seg_path.stem}.subtitles.{self.subtitles_shortcode}.yaml"
                 sub_job.save(sub_file)
+
+                task.status = TaskStatus.COMPLETED
+                task.result = result_data
 
                 cascade_span.set_attribute("subtitles_count", len(resp.subtitles))
                 cascade_span.set_attribute("music_count", len(resp.detected_musical_performances))
@@ -674,6 +679,9 @@ class ComboPipeline:
                 )
                 lyrics_file = active.job_dir / f"{seg_path.stem}.lyrics.{self.lyrics_shortcode}.yaml"
                 lyrics_job.save(lyrics_file)
+
+                task.status = TaskStatus.COMPLETED
+                task.result = result_data
 
                 cascade_span.set_attribute("refined_subtitles_count", len(resp.subtitles))
                 logfire.info(
@@ -850,6 +858,7 @@ class ComboPipeline:
                 title = str(meta.get("title", job_dir.name))
                 filename_stem = str(meta.get("filename_stem", ""))
                 raw_filename = meta.get("raw_filename")
+                raw_path_meta = meta.get("raw_path")
                 source_type = meta.get("source_type", "youtube")
             except Exception as e:
                 logfire.warning(f"Could not load {meta_file.name}: {e}. Skipping resume.")
@@ -868,7 +877,11 @@ class ComboPipeline:
                 return False
 
             proxy_path = job_dir / "summary_proxy.mp4"
-            raw_video_path = job_dir / str(raw_filename) if raw_filename else None
+            raw_video_path: Path | None = None
+            if raw_path_meta and Path(raw_path_meta).is_file():
+                raw_video_path = Path(raw_path_meta)
+            elif raw_filename and (job_dir / str(raw_filename)).is_file():
+                raw_video_path = job_dir / str(raw_filename)
 
             if not raw_video_path or not raw_video_path.is_file():
                 raw_candidates = [

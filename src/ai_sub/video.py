@@ -24,7 +24,7 @@ def set_ffmpeg_concurrency(max_concurrent: int) -> None:
         max_concurrent: Maximum concurrent FFmpeg subprocesses allowed.
     """
     global _FFMPEG_SEMAPHORE
-    _FFMPEG_SEMAPHORE = asyncio.Semaphore(max_concurrent)
+    _FFMPEG_SEMAPHORE = asyncio.Semaphore(max(1, max_concurrent))
 
 
 def _get_ffmpeg_semaphore() -> asyncio.Semaphore:

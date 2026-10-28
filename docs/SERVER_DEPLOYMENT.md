@@ -29,7 +29,7 @@ Install Python 3, virtual environment tools, Nginx, Certbot, Fail2ban, and Apach
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip git nginx certbot python3-certbot-nginx fail2ban apache2-utils
+sudo apt install -y python3 python3-venv python3-pip git nginx certbot python3-certbot-nginx fail2ban apache2-utils wget
 ```
 
 ### Step 2: Set Up Directory and Python Environment
@@ -48,20 +48,20 @@ pip install ai-sub
 
 ### Step 3: Configure `server.yaml`
 
-Copy the example configuration file `docs/server.yaml.example` to `/home/ubuntu/ai-sub-server/server.yaml` and configure your Git archive, intake paths, and pipelines:
+Download the example configuration file and configure your Git archive, intake paths, and pipelines:
 
 ```bash
-cp docs/server.yaml.example /home/ubuntu/ai-sub-server/server.yaml
-nano /home/ubuntu/ai-sub-server/server.yaml
+wget -O server.yaml https://raw.githubusercontent.com/FlippFuzz/ai-sub/main/docs/server.yaml.example
+nano server.yaml
 ```
 
 ### Step 4: Configure Auto-Updating Launcher (`server.sh`)
 
-Copy `docs/server.sh` to `/home/ubuntu/ai-sub-server/server.sh` and make it executable:
+Download `server.sh` and make it executable:
 
 ```bash
-cp docs/server.sh /home/ubuntu/ai-sub-server/server.sh
-chmod +x /home/ubuntu/ai-sub-server/server.sh
+wget -O server.sh https://raw.githubusercontent.com/FlippFuzz/ai-sub/main/docs/server.sh
+chmod +x server.sh
 ```
 
 ### Step 5: Configure Nginx with Basic Auth
@@ -135,10 +135,10 @@ sudo fail2ban-client status nginx-http-auth
 
 ### Step 8: Start Server as a Systemd Service
 
-Copy `docs/ai-sub-server.service` into `/etc/systemd/system/`:
+Download the systemd service file into `/etc/systemd/system/`:
 
 ```bash
-sudo cp docs/ai-sub-server.service /etc/systemd/system/
+sudo wget -O /etc/systemd/system/ai-sub-server.service https://raw.githubusercontent.com/FlippFuzz/ai-sub/main/docs/ai-sub-server.service
 sudo systemctl daemon-reload
 sudo systemctl enable ai-sub-server
 sudo systemctl start ai-sub-server
@@ -155,7 +155,7 @@ Workers are ephemeral and can run on any machine with Python 3.11+.
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip
+sudo apt install -y python3 python3-venv python3-pip wget
 
 mkdir -p /home/ubuntu/ai-sub-worker
 cd /home/ubuntu/ai-sub-worker
@@ -168,20 +168,20 @@ pip install ai-sub
 
 ### Step 2: Configure `worker.yaml`
 
-Copy the example configuration file `docs/worker.yaml.example` to `/home/ubuntu/ai-sub-worker/worker.yaml` and set your server URL, HTTP Basic Auth credentials, and API keys:
+Download the example configuration file and set your server URL, HTTP Basic Auth credentials, and API keys:
 
 ```bash
-cp docs/worker.yaml.example /home/ubuntu/ai-sub-worker/worker.yaml
-nano /home/ubuntu/ai-sub-worker/worker.yaml
+wget -O worker.yaml https://raw.githubusercontent.com/FlippFuzz/ai-sub/main/docs/worker.yaml.example
+nano worker.yaml
 ```
 
 ### Step 3: Configure Auto-Updating Launcher (`worker.sh`)
 
-Copy `docs/worker.sh` to `/home/ubuntu/ai-sub-worker/worker.sh` and make it executable:
+Download `worker.sh` and make it executable:
 
 ```bash
-cp docs/worker.sh /home/ubuntu/ai-sub-worker/worker.sh
-chmod +x /home/ubuntu/ai-sub-worker/worker.sh
+wget -O worker.sh https://raw.githubusercontent.com/FlippFuzz/ai-sub/main/docs/worker.sh
+chmod +x worker.sh
 ```
 
 ### Step 4: Scheduled Execution via Crontab
@@ -199,7 +199,7 @@ Add scheduled runs:
 7 */4 * * * cd /home/ubuntu/ai-sub-worker && AISUB_WORKER_MODELS='google-gla:gemini-3.5-flash-lite' AISUB_WORKER_MAX_TASKS=50 AISUB_WORKER_MAX_DURATION_MINUTES=180 ./worker.sh > /tmp/ai-sub-worker.log 2>&1
 
 # Daily at 21:00 UTC: Offer gemini-3.8-flash during peak availability window
-0 21 * * * cd /home/ubuntu/ai-sub-worker && AISUB_WORKER_MODELS='google-gla:gemini-3.8-flash' AISUB_WORKER_MAX_DURATION_MINUTES=180 ./worker.sh > /tmp/ai-sub-worker-38f.log 2>&1
+0 21 * * * cd /home/ubuntu/ai-sub-worker && AISUB_WORKER_MODELS='google-gla:gemini-3.8-flash,google-gla:gemini-3.6-flash' AISUB_WORKER_MAX_DURATION_MINUTES=180 ./worker.sh > /tmp/ai-sub-worker-38f.log 2>&1
 ```
 
 - When the server queue is empty, the worker exits cleanly in ~1 second.

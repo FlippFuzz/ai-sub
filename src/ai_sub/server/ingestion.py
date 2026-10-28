@@ -431,12 +431,39 @@ class IngestionManager:
             with YoutubeDL(cast(Any, test_opts)) as ydl:
                 info = ydl.extract_info(video.source_ref, download=True)
                 if info:
-                    fn = Path(ydl.prepare_filename(info))
-                    if fn.exists():
-                        fn.unlink()
+                    found_file: Path | None = None
+                    req_downloads = info.get("requested_downloads")
+                    if req_downloads and isinstance(req_downloads, list) and len(req_downloads) > 0:
+                        fp = req_downloads[0].get("filepath")
+                        if fp and Path(fp).is_file():
+                            found_file = Path(fp)
+
+                    if not found_file:
+                        fn = Path(ydl.prepare_filename(info))
+                        if fn.is_file():
+                            found_file = fn
+
+                    if not found_file:
+                        test_files = list(self.test_download_dir.glob(f"test_{video.video_id}.*"))
+                        if test_files and test_files[0].is_file():
+                            found_file = test_files[0]
+
+                    # Clean up all matching temporary test files
+                    for p in self.test_download_dir.glob(f"test_{video.video_id}.*"):
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
+
+                    if found_file:
                         return True
             return False
         except Exception as e:
+            for p in self.test_download_dir.glob(f"test_{video.video_id}.*"):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
             logfire.warning(f"Availability check failed for {video.title} ({video.video_id}): {e}")
             return False
 
@@ -592,6 +619,8 @@ class IngestionManager:
                     )
                 except Exception as e:
                     pipe.status = PipelineStatus.IDLE
+                    pipe.active_video = None
+                    shutil.rmtree(pipe.work_dir / candidate.video_id, ignore_errors=True)
                     self.consecutive_failures += 1
                     self.failed_video_counts[candidate.video_id] = (
                         self.failed_video_counts.get(candidate.video_id, 0) + 1

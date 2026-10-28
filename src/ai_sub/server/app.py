@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import mimetypes
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
@@ -169,9 +170,16 @@ def create_app(settings: ServerSettings) -> FastAPI:
                 detail="Task was not assigned to this worker or has already completed.",
             )
 
-        finalized = await coordinator.check_and_finalize_completed_pipelines()
-        if finalized:
-            await ingestion.feed_idle_pipelines()
+        # Run finalization and feeding in background so worker response returns immediately
+        async def _finalize_and_feed() -> None:
+            try:
+                finalized = await coordinator.check_and_finalize_completed_pipelines()
+                if finalized:
+                    await ingestion.feed_idle_pipelines()
+            except Exception as e:
+                logfire.exception(f"Background finalization and pipeline feed error: {e}")
+
+        asyncio.create_task(_finalize_and_feed())
 
         return {"status": "ok"}
 
