@@ -11,6 +11,14 @@ server:
   rescan_interval_minutes: 15
   validation_buffer_ms: 2000
 
+# Task Execution and Distributed Retry Controls
+retry:
+  per_run: 5          # Internal retries on worker before surrendering task lease
+  max_runs: 3         # Maximum total worker attempts before marking task permanently FAILED
+  multiplier: 2.0
+  min_wait_seconds: 30.0
+  max_wait_seconds: 300
+
 # Git Repository Synchronization Settings
 git:
   repo_url: "https://github.com/YourUsername/subtitles-archive.git"

@@ -20,6 +20,7 @@ import json_repair
 import logfire
 from google import genai
 from google.genai import types
+from httpx import TimeoutException, TransportError
 from pydantic import BaseModel, ValidationError
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
@@ -53,37 +54,6 @@ def _get_unique_display_name(file_path: Path) -> str:
         safe_grandparent = urllib.parse.quote(resolved.parent.parent.name, safe=".-_")
         return f"{safe_grandparent}/reencoded/{safe_name}"
     return f"{safe_parent}/{safe_name}"
-
-
-def _get_candidate_display_names(file_path: Path) -> set[str]:
-    """Generates all possible display name variants for backward compatibility.
-
-    Args:
-        file_path: Path to the local file.
-
-    Returns:
-        set[str]: Set of matching display name candidates.
-    """
-    resolved = file_path.resolve()
-    raw_parent = resolved.parent.name
-    raw_name = resolved.name
-    quoted_parent = urllib.parse.quote(raw_parent, safe=".-_")
-    quoted_name = urllib.parse.quote(raw_name, safe=".-_")
-
-    candidates = {
-        f"{raw_parent}/{raw_name}",
-        f"{quoted_parent}/{quoted_name}",
-        raw_name,
-        quoted_name,
-    }
-
-    if resolved.parent.name == "reencoded":
-        raw_gp = resolved.parent.parent.name
-        quoted_gp = urllib.parse.quote(raw_gp, safe=".-_")
-        candidates.add(f"{raw_gp}/reencoded/{raw_name}")
-        candidates.add(f"{quoted_gp}/reencoded/{quoted_name}")
-
-    return candidates
 
 
 def _get_file_timestamp(remote_file: types.File) -> float:
@@ -126,7 +96,7 @@ def _calculate_tokens(text_prompt: Prompt, video_duration_ms: int) -> int:
 
 
 def _is_daily_quota_exceeded(e: Exception) -> bool:
-    """Checks whether an API error represents Google free tier daily quota exhaustion.
+    """Checks whether an API error represents Google Free Tier daily request limit exhaustion.
 
     Args:
         e: Caught exception.
@@ -136,6 +106,37 @@ def _is_daily_quota_exceeded(e: Exception) -> bool:
     """
     err_str = str(e).lower()
     return "429" in err_str and "generaterequestsperdayperprojectpermodel-freetier" in err_str
+
+
+def _is_retryable_error(e: Exception) -> bool:
+    """Determines if an error is a transient network or server error eligible for search turn retry.
+
+    Args:
+        e: Caught exception.
+
+    Returns:
+        bool: True if error can be retried on the same search turn.
+    """
+    if _is_daily_quota_exceeded(e):
+        return False
+
+    # Network transport or timeout failures
+    if isinstance(e, (TransportError, TimeoutException, ConnectionError, asyncio.TimeoutError, TimeoutError)):
+        return True
+
+    # Google API status codes
+    status_code = getattr(e, "code", None)
+    if isinstance(status_code, int) and status_code in (408, 429, 500, 502, 503, 504):
+        return True
+
+    err_str = str(e).lower()
+    for code in ("503", "502", "504", "500", "408"):
+        if code in err_str:
+            return True
+    if "connection" in err_str or "timeout" in err_str or "temporarily unavailable" in err_str:
+        return True
+
+    return False
 
 
 def _extract_thought_text(step: Any) -> str | None:
@@ -174,7 +175,7 @@ class GeminiExecutor:
     """Unified client orchestrating Gemini Files API uploads, quota tracking, and Interactions generation."""
 
     ai_settings: AiSettings
-    retry_settings: RetrySettings
+    default_retry_settings: RetrySettings
     _client: genai.Client
     _quota_exhausted: dict[str, bool]
     _request_limiters: dict[str, Limiter]
@@ -185,28 +186,24 @@ class GeminiExecutor:
     def __init__(
         self,
         settings: Settings | AiSettings,
-        retry_settings: RetrySettings | None = None,
     ) -> None:
-        """Initializes the Gemini executor with native SDK HTTP retries.
+        """Initializes the Gemini executor with disabled SDK retries for custom orchestration.
 
         Args:
             settings: Root application configuration or dedicated AiSettings.
-            retry_settings: Optional retry policy settings when AiSettings is supplied directly.
 
         Raises:
             ValueError: If the Google API key is missing.
         """
         if isinstance(settings, Settings):
             self.ai_settings = settings.ai
-            self.retry_settings = settings.retry
+            self.default_retry_settings = settings.retry
         else:
             self.ai_settings = settings
-            self.retry_settings = retry_settings or RetrySettings()
+            self.default_retry_settings = RetrySettings()
 
         if self.ai_settings.key is None:
             raise ValueError("Google Gemini API key is missing.")
-
-        api_key = self.ai_settings.key.get_secret_value()
 
         self._quota_exhausted = {}
         self._request_limiters = {}
@@ -214,15 +211,15 @@ class GeminiExecutor:
         self._last_cleanup_time = 0.0
         self._cleanup_lock = asyncio.Lock()
 
-        # Delegate network and transient HTTP retries directly to Google SDK HTTP transport
-        retry_options = types.HttpRetryOptions(
-            attempts=self.retry_settings.per_run + 1,
-            initial_delay=float(self.retry_settings.min_wait_seconds),
-            max_delay=float(self.retry_settings.max_wait_seconds),
-            exp_base=float(self.retry_settings.multiplier),
-            jitter=1.0,
-            http_status_codes=[408, 429, 500, 502, 503, 504],
-        )
+        # Initialize the client once with attempts=1 to delegate retry handling to our custom logic
+        self._init_client()
+
+    def _init_client(self) -> None:
+        """Initializes genai.Client with attempts=1 to delegate retry handling to our custom logic."""
+        api_key = self.ai_settings.key.get_secret_value() if self.ai_settings.key else ""
+
+        # Setting attempts=1 disables Google SDK's internal retries so all retries are orchestrated explicitly
+        retry_options = types.HttpRetryOptions(attempts=1)
 
         http_options_kwargs: dict[str, Any] = {
             "retry_options": retry_options,
@@ -321,7 +318,6 @@ class GeminiExecutor:
             await self._cleanup_storage_if_needed()
 
             display_name = _get_unique_display_name(file_path)
-            candidate_names = _get_candidate_display_names(file_path)
 
             existing_active: types.File | None = None
             existing_processing: types.File | None = None
@@ -331,7 +327,7 @@ class GeminiExecutor:
                     async for remote_file in await self._client.aio.files.list(
                         config=types.ListFilesConfig(page_size=100)
                     ):
-                        if remote_file.display_name in candidate_names:
+                        if remote_file.display_name == display_name:
                             if remote_file.state == types.FileState.ACTIVE:
                                 existing_active = remote_file
                                 break
@@ -374,7 +370,6 @@ class GeminiExecutor:
                         except OSError:
                             pass
 
-                # Resolve MIME type with safe fallback
                 content_type, _ = mimetypes.guess_type(str(file_path))
                 resolved_mime = content_type or "video/mp4"
 
@@ -475,11 +470,11 @@ class GeminiExecutor:
         service_tier: ServiceTier | None,
         token_weight: int,
     ) -> Any:
-        """Executes an Interactions API call with rate limiter acquisition and daily quota tracking.
+        """Executes a single search turn call to Gemini Interactions API with rate limiter acquisition.
 
         Args:
             model_id: Target Gemini model identifier.
-            input_payload: Current turn input (user prompt, media items, or function_result blocks).
+            input_payload: Current search turn input (user prompt, media items, or function_result blocks).
             previous_interaction_id: Previous interaction ID for stateful turns.
             system_instruction: System instruction prompt.
             tools: Registered Interactions API tools for this turn.
@@ -494,6 +489,10 @@ class GeminiExecutor:
         Raises:
             QuotaExceededError: If daily project quota is exhausted.
         """
+        # Pre-emptive check: avoid calling Google API if this model was already exhausted
+        if self._quota_exhausted.get(model_id, False):
+            raise QuotaExceededError(f"Daily quota previously exhausted for model '{model_id}'.")
+
         req_limiter, tok_limiter = self._get_limiters(model_id)
 
         create_kwargs: dict[str, Any] = {
@@ -535,8 +534,15 @@ class GeminiExecutor:
         tools: Sequence[Callable[..., Any] | dict[str, Any] | BaseSearchProvider] | None = None,
         agentic_video: bool = False,
         task_label: str | None = None,
+        retry_settings: RetrySettings | None = None,
     ) -> T:
         """Uploads media and generates validated structured outputs using the Gemini Interactions API.
+
+        Implements a two-tier retry hierarchy:
+        1. Inner Loop (Search Turn Level): Retries transient network, server (5xx/408), and transient 429
+           errors on the CURRENT search turn without repeating earlier search turns or re-running tool calls.
+        2. Outer Loop (Schema Validation Level): If the final model output fails Pydantic schema validation,
+           restarts the interaction from Turn 1 with a clean slate (bounded by effective_retry.per_run).
 
         Args:
             prompt: Instructions containing system and user prompts.
@@ -548,6 +554,7 @@ class GeminiExecutor:
             tools: Sequence of callable tools, tool dicts, or BaseSearchProvider instances.
             agentic_video: Whether to enable Agentic Video Understanding.
             task_label: Optional label for display in turn spans (e.g. 'summary', 'subtitles', 'lyrics').
+            retry_settings: Optional task-specific retry policy overriding default settings.
 
         Returns:
             T: Parsed and validated Pydantic model instance.
@@ -555,17 +562,20 @@ class GeminiExecutor:
         Raises:
             QuotaExceededError: If daily quota is exhausted for the model.
             RuntimeError: If media fails to process or retries are exhausted.
-            ValidationError: If model output validation fails and retries are exhausted.
+            ValidationError: If model output validation fails and outer retries are exhausted.
             ValueError: If input arguments or model identifiers are invalid.
         """
         if not model_name.lower().startswith("google-gla:"):
             raise ValueError(f"Model identifier '{model_name}' must start with 'google-gla:'.")
 
         model_id = model_name.split(":", 1)[-1]
+
+        # Pre-emptive check: avoid uploading video or calling API if model is already exhausted
         if self._quota_exhausted.get(model_id, False):
             raise QuotaExceededError(f"Daily quota previously exhausted for model '{model_id}'.")
 
-        policy = self.retry_settings
+        # Resolve local effective retry policy without mutating shared instance state
+        effective_retry = retry_settings or getattr(self, "default_retry_settings", None) or RetrySettings()
 
         remote_file = await self.ensure_file_uploaded(media_path)
 
@@ -598,10 +608,13 @@ class GeminiExecutor:
             "thinking_level": "high",
             "thinking_summaries": "auto",
         }
-        max_turns = self.ai_settings.search.max_turns
+        # Max search turns governed by SearchSettings.max_turns
+        max_search_turns = self.ai_settings.search.max_turns
         label = task_label.capitalize() if task_label else "Generation"
+        max_outer_attempts = effective_retry.per_run + 1
 
-        for attempt in range(policy.per_run + 1):
+        # Tier 2: Outer Loop for Pydantic Schema Validation Failures (Clean Slate Restart)
+        for outer_attempt in range(max_outer_attempts):
             interaction_input: Any = initial_input
             previous_interaction_id: str | None = None
             accumulated_thoughts: list[str] = []
@@ -612,30 +625,69 @@ class GeminiExecutor:
                     if search_turns == 0:
                         span_desc = f"{label}: {media_path.name} {model_id}"
                     else:
-                        span_desc = f"{label} (Search Turn {search_turns}/{max_turns}): {media_path.name} {model_id}"
+                        span_desc = (
+                            f"{label} (Search Turn {search_turns}/{max_search_turns}): {media_path.name} {model_id}"
+                        )
 
                     with logfire.span(
                         "{span_desc}",
                         span_desc=span_desc,
                         task=label,
-                        turn=search_turns,
-                        max_turns=max_turns,
+                        search_turn=search_turns,
+                        max_search_turns=max_search_turns,
                         model_id=model_id,
                         filename=media_path.name,
                     ):
-                        current_tools = None if search_turns >= max_turns else gemini_tools
+                        current_tools = None if search_turns >= max_search_turns else gemini_tools
 
-                        interaction = await self._create_interaction(
-                            model_id=model_id,
-                            input_payload=interaction_input,
-                            previous_interaction_id=previous_interaction_id,
-                            system_instruction=prompt.system,
-                            tools=current_tools,
-                            response_format=response_format,
-                            generation_config=generation_config,
-                            service_tier=service_tier,
-                            token_weight=token_weight,
-                        )
+                        # Tier 1: Inner Loop for Transient Network / 5xx / Rate Limit Retries on THIS Search Turn
+                        turn_max_attempts = effective_retry.per_run + 1
+                        interaction = None
+
+                        for search_turn_attempt in range(turn_max_attempts):
+                            try:
+                                interaction = await self._create_interaction(
+                                    model_id=model_id,
+                                    input_payload=interaction_input,
+                                    previous_interaction_id=previous_interaction_id,
+                                    system_instruction=prompt.system,
+                                    tools=current_tools,
+                                    response_format=response_format,
+                                    generation_config=generation_config,
+                                    service_tier=service_tier,
+                                    token_weight=token_weight,
+                                )
+                                break  # Search turn API call succeeded
+                            except QuotaExceededError:
+                                raise  # Daily quota limits must never be retried with backoff
+                            except Exception as err:
+                                if _is_daily_quota_exceeded(err):
+                                    self._quota_exhausted[model_id] = True
+                                    logfire.warning(f"Daily quota exhausted for {model_id}: {err}")
+                                    raise QuotaExceededError(str(err)) from err
+
+                                is_retryable = _is_retryable_error(err)
+                                if is_retryable and search_turn_attempt < effective_retry.per_run:
+                                    backoff = min(
+                                        float(effective_retry.max_wait_seconds),
+                                        (
+                                            float(effective_retry.min_wait_seconds)
+                                            * (float(effective_retry.multiplier) ** search_turn_attempt)
+                                        ),
+                                    ) + random.uniform(0, 1)
+
+                                    logfire.warning(
+                                        f"Transient error on {model_id} search turn {search_turns} "
+                                        f"(attempt {search_turn_attempt + 1}/{turn_max_attempts}): {err}. "
+                                        f"Retrying search turn in {backoff:.2f}s..."
+                                    )
+                                    await asyncio.sleep(backoff)
+                                    continue
+
+                                logfire.error(f"Search turn {search_turns} failed permanently on {model_id}: {err}")
+                                raise
+
+                        assert interaction is not None
 
                         for step in getattr(interaction, "steps", []) or []:
                             if getattr(step, "type", None) == "thought":
@@ -648,7 +700,8 @@ class GeminiExecutor:
                             if getattr(s, "type", None) == "function_call" and getattr(s, "name", None) in dispatch_map
                         ]
 
-                        if function_call_steps and search_turns < max_turns and dispatch_map:
+                        # Handle parallel tool execution for this search turn
+                        if function_call_steps and search_turns < max_search_turns and dispatch_map:
                             search_turns += 1
 
                             async def _exec(step: Any) -> dict[str, Any]:
@@ -684,8 +737,9 @@ class GeminiExecutor:
                             interaction_input = results
                             raw_id = getattr(interaction, "id", None)
                             previous_interaction_id = raw_id if isinstance(raw_id, str) else None
-                            continue
+                            continue  # Advance to next search turn
 
+                        # All search turns concluded; parse model output text
                         text_content = getattr(interaction, "output_text", "") or ""
                         if not text_content:
                             text_parts: list[str] = []
@@ -696,6 +750,7 @@ class GeminiExecutor:
                                             text_parts.append(block.text)
                             text_content = "".join(text_parts).strip()
 
+                        # Validate structured response against expected Pydantic schema
                         try:
                             output = response_type.model_validate_json(
                                 text_content,
@@ -719,18 +774,27 @@ class GeminiExecutor:
 
                         return output
 
-            except (ValidationError, ValueError) as e:
-                if attempt < policy.per_run:
+            except QuotaExceededError:
+                raise
+            except (ValidationError, ValueError) as val_err:
+                if outer_attempt < effective_retry.per_run:
                     backoff = min(
-                        float(policy.max_wait_seconds),
-                        (policy.min_wait_seconds * (policy.multiplier**attempt)) + random.uniform(0, 1),
-                    )
+                        float(effective_retry.max_wait_seconds),
+                        (
+                            float(effective_retry.min_wait_seconds)
+                            * (float(effective_retry.multiplier) ** outer_attempt)
+                        ),
+                    ) + random.uniform(0, 1)
                     logfire.warning(
-                        f"Validation error in {model_id} (attempt {attempt + 1}/{policy.per_run + 1}). "
-                        f"Retrying in {backoff:.2f}s: {e}"
+                        f"Schema validation failure on {model_id} "
+                        f"(outer attempt {outer_attempt + 1}/{max_outer_attempts}): {val_err}. "
+                        f"Restarting interaction from scratch in {backoff:.2f}s..."
                     )
                     await asyncio.sleep(backoff)
                     continue
+                logfire.error(
+                    f"Schema validation exhausted all {max_outer_attempts} outer attempts on {model_id}: {val_err}"
+                )
                 raise
 
-        raise RuntimeError(f"Agent execution failed after {policy.per_run} retries.")
+        raise RuntimeError(f"Agent execution failed after {effective_retry.per_run} retries.")

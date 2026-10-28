@@ -8,7 +8,12 @@ from typing import Any, Self
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, SecretStr
 
-from ai_sub.config import ReEncodeSettings, SearchSettings, SplittingSettings
+from ai_sub.config import (
+    ReEncodeSettings,
+    RetrySettings,
+    SearchSettings,
+    SplittingSettings,
+)
 
 
 class PipelineConfig(BaseModel):
@@ -165,6 +170,8 @@ class ServerSettings(BaseModel):
     reencode: ReEncodeSettings = Field(default_factory=ReEncodeSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     split: SplittingSettings = Field(default_factory=SplittingSettings)
+    # Unified retry settings: per_run sent to workers, max_runs tracked by server coordinator
+    retry: RetrySettings = Field(default_factory=RetrySettings)
     pipelines: list[PipelineConfig] = Field(default_factory=_get_default_pipelines)
 
     @classmethod

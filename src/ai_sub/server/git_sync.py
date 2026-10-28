@@ -7,6 +7,7 @@ import random
 import shutil
 import stat
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,6 @@ from git.exc import GitCommandError, InvalidGitRepositoryError
 
 from ai_sub.server.config import GitConfig
 
-# Prevent interactive prompts in headless server environments
 os.environ["GIT_TERMINAL_PROMPT"] = "0"
 
 
@@ -123,13 +123,8 @@ class GitSyncManager:
             return False
 
         for srt_path in video_dir.glob(f"*.{full_shortcode}.srt"):
-            try:
-                with open(srt_path, "r", encoding="utf-8") as f:
-                    header = f.read(4096)
-                    if '"complete": true' in header:
-                        return True
-            except Exception:
-                pass
+            if not srt_path.name.startswith("part_") and ".raw-" not in srt_path.name and srt_path.stat().st_size > 0:
+                return True
         return False
 
     def finalize_and_push(
@@ -137,7 +132,7 @@ class GitSyncManager:
         uploader: str,
         video_id: str,
         full_shortcode: str,
-        srt_file: Path,
+        srt_files: Sequence[Path] | Path,
         yaml_files: list[Path],
     ) -> None:
         """Moves subtitle files and YAML traces into the repository, then commits and pushes.
@@ -146,15 +141,17 @@ class GitSyncManager:
             uploader: Channel or uploader identifier.
             video_id: Video identifier.
             full_shortcode: Model shortcode.
-            srt_file: Path to the generated SRT file.
+            srt_files: One or more generated subtitle files to commit.
             yaml_files: List of intermediate YAML state files.
         """
         video_dir = self.local_repo_dir / uploader / video_id
         video_dir.mkdir(parents=True, exist_ok=True)
 
-        target_srt = video_dir / srt_file.name
-        shutil.copy2(srt_file, target_srt)
-        logfire.info(f"Copied finalized subtitles to {target_srt}")
+        files_list = [srt_files] if isinstance(srt_files, Path) else srt_files
+        for sf in files_list:
+            target_srt = video_dir / sf.name
+            shutil.copy2(sf, target_srt)
+            logfire.info(f"Copied finalized subtitles to {target_srt}")
 
         int_dir = video_dir / ".int" / full_shortcode
         int_dir.mkdir(parents=True, exist_ok=True)

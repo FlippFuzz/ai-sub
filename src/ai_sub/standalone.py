@@ -65,13 +65,13 @@ from ai_sub.video import (
 class AiSubResult(IntEnum):
     """Application exit status codes."""
 
-    COMPLETE = 0
+    COMPLETED = 0
     """All video segments processed successfully."""
 
-    INCOMPLETE = -1
+    IN_PROGRESS = -1
     """One or more segments failed and can be retried on a subsequent run."""
 
-    MAX_RETRIES_EXHAUSTED = -2
+    RETRIES_EXCEEDED = -2
     """One or more segments exhausted the persistent retry limit."""
 
 
@@ -132,7 +132,10 @@ def stitch_subtitles(
     full_shortcode: str,
     summary_available: bool,
 ) -> AiSubResult:
-    """Assembles segment subtitles (lyrics-refined or initial) into the final merged SRT file.
+    """Assembles segment subtitles into final merged SRT files.
+
+    Generates the primary subtitle file and, if musical performances were refined,
+    an additional raw subtitles file (<stem>.raw-<full_shortcode>.srt).
 
     Args:
         video_splits: Ordered list of segment paths and durations in milliseconds.
@@ -151,9 +154,10 @@ def stitch_subtitles(
         offset_ms = sum(d for _, d in video_splits[:chunks_to_skip])
 
         use_lyrics = settings.concurrency.lyrics > 0
-        complete = True
+        any_failed = False
         max_retries_exceeded = False
         any_pending = False
+        lyrics_refined_any = False
 
         for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
             lyrics_job_path = settings.dir.tmp / f"{video_path.stem}.lyrics.{lyrics_shortcode}.yaml"
@@ -162,19 +166,16 @@ def stitch_subtitles(
             lyrics_job = LyricsJob.load(lyrics_job_path, settings.ai.validation_buffer_ms)
             sub_job = SubtitlesJob.load(sub_job_path, settings.ai.validation_buffer_ms)
 
-            # Determine whether lyrics refinement was required for this segment
             lyrics_required = bool(
                 use_lyrics and sub_job and sub_job.response and sub_job.response.detected_musical_performances
             )
 
             active_response = None
             if lyrics_required:
-                # If lyrics was required, ONLY accept a successful lyrics refinement response.
-                # If lyrics failed or is missing, do NOT fall back to draft subtitles.
                 if lyrics_job and lyrics_job.response:
                     active_response = lyrics_job.response
+                    lyrics_refined_any = True
             else:
-                # Lyrics was not required; use initial subtitle response if present.
                 if sub_job and sub_job.response:
                     active_response = sub_job.response
 
@@ -190,7 +191,7 @@ def stitch_subtitles(
                         text="Error processing subtitles for this segment.",
                     )
                 )
-                complete = False
+                any_failed = True
                 attempts = max(
                     lyrics_job.total_attempts if lyrics_job else 0,
                     sub_job.total_attempts if sub_job else 0,
@@ -203,13 +204,24 @@ def stitch_subtitles(
 
             offset_ms += video_duration_ms
 
+        status_str = "Completed" if not any_failed else ("RetriesExceeded" if max_retries_exceeded else "InProgress")
+
         settings_dump = settings.model_dump(
             mode="json",
             exclude={
                 "input_video_file": True,
                 "context_file": True,
                 "dir": True,
-                "ai": {"key": True, "base_url": True, "search": {"key": True}},
+                "ai": {
+                    "key": True,
+                    "base_url": True,
+                    "search": {
+                        "key": True,
+                        "tinyfish_key": True,
+                        "langsearch_key": True,
+                        "ollama_key": True,
+                    },
+                },
             },
         )
         settings_dump["context"] = settings.get_resolved_user_context()
@@ -218,14 +230,13 @@ def stitch_subtitles(
             "ai_sub_version": get_app_version(),
             "generated_at": datetime.now().isoformat(),
             "summary_prompt_version": SUMMARY_PROMPT_VERSION if summary_available else None,
-            "lyrics_prompt_version": LYRICS_PROMPT_VERSION,
             "subtitles_prompt_version": SUBTITLES_PROMPT_VERSION,
-            "complete": complete,
-            "max_retries_exceeded": max_retries_exceeded,
-            "any_pending": any_pending,
+            "lyrics_prompt_version": LYRICS_PROMPT_VERSION,
+            "status": status_str,
             "settings": settings_dump,
         }
-        info_str = json.dumps(metadata, indent=2).replace("{", "(").replace("}", ")")
+        # ensure_ascii=False preserves literal Unicode characters (e.g. 【MV】, Japanese, Korean)
+        info_str = json.dumps(metadata, indent=2, ensure_ascii=False).replace("{", "(").replace("}", ")")
         all_subs.insert(0, SSAEvent(start=0, end=1, text=info_str))
 
         if len(all_subs) > 1 and all_subs[1].start < 1:
@@ -236,11 +247,39 @@ def stitch_subtitles(
         all_subs.save(str(out_srt))
         logfire.info(f"Subtitles written to {out_srt.name}")
 
+        if lyrics_refined_any:
+            raw_subs = SSAFile()
+            raw_offset_ms = sum(d for _, d in video_splits[:chunks_to_skip])
+            for video_path, video_duration_ms in video_splits[chunks_to_skip:]:
+                sub_job_path = settings.dir.tmp / f"{video_path.stem}.subtitles.{subtitles_shortcode}.yaml"
+                sub_job = SubtitlesJob.load(sub_job_path, settings.ai.validation_buffer_ms)
+                if sub_job and sub_job.response:
+                    seg_raw_subs = sub_job.response.get_ssafile()
+                    seg_raw_subs.shift(ms=raw_offset_ms)
+                    raw_subs += seg_raw_subs
+                else:
+                    raw_subs.append(
+                        SSAEvent(
+                            start=raw_offset_ms,
+                            end=raw_offset_ms + video_duration_ms,
+                            text="Error processing subtitles for this segment.",
+                        )
+                    )
+                raw_offset_ms += video_duration_ms
+
+            raw_subs.insert(0, SSAEvent(start=0, end=1, text=info_str))
+            if len(raw_subs) > 1 and raw_subs[1].start < 1:
+                raw_subs[1].start = 1
+
+            raw_out_srt = settings.dir.out / f"{input_video_path.stem}.raw-{full_shortcode}.srt"
+            raw_subs.save(str(raw_out_srt))
+            logfire.info(f"Raw subtitles written to {raw_out_srt.name}")
+
         if any_pending:
-            return AiSubResult.INCOMPLETE
+            return AiSubResult.IN_PROGRESS
         if max_retries_exceeded:
-            return AiSubResult.MAX_RETRIES_EXHAUSTED
-        return AiSubResult.COMPLETE
+            return AiSubResult.RETRIES_EXCEEDED
+        return AiSubResult.COMPLETED
 
 
 async def run_pipeline(settings: Settings) -> AiSubResult:
@@ -292,7 +331,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                 configured_providers = create_search_providers(settings.ai.search)
                 for provider in configured_providers:
                     await stack.enter_async_context(provider)
-                # Summary phase: general web search providers only (never lrclib)
                 web_search_providers = [p for p in configured_providers if p.provider_name != "lrclib"]
 
                 if use_lyrics:
@@ -391,9 +429,9 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                     if summary_response is None:
                         logfire.error("Summary stage failed or incomplete. Halting pipeline execution.")
                         return (
-                            AiSubResult.MAX_RETRIES_EXHAUSTED
+                            AiSubResult.RETRIES_EXCEEDED
                             if summary_job.total_attempts >= settings.retry.max_runs
-                            else AiSubResult.INCOMPLETE
+                            else AiSubResult.IN_PROGRESS
                         )
 
                 video_splits_paths = await split_video(
@@ -407,14 +445,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                 semaphore = asyncio.Semaphore(8)
 
                 async def _probe(p: Path) -> int:
-                    """Probes video duration with concurrency control.
-
-                    Args:
-                        p: Video path.
-
-                    Returns:
-                        int: Duration in milliseconds.
-                    """
                     async with semaphore:
                         return await get_video_duration_ms(p)
 
@@ -499,7 +529,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                         await subtitles_queue.put(task)
 
                 async def _reencode_worker() -> None:
-                    """Worker draining reencode_queue."""
                     while True:
                         task = await reencode_queue.get()
                         try:
@@ -535,7 +564,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                             reencode_queue.task_done()
 
                 async def _subtitles_worker() -> None:
-                    """Worker draining subtitles_queue."""
                     while True:
                         task = await subtitles_queue.get()
                         try:
@@ -593,7 +621,6 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                             subtitles_queue.task_done()
 
                 async def _lyrics_worker() -> None:
-                    """Worker draining lyrics_queue."""
                     while True:
                         task = await lyrics_queue.get()
                         try:

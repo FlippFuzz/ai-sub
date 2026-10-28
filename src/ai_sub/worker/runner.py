@@ -9,7 +9,7 @@ from typing import Any
 
 import logfire
 
-from ai_sub.config import AiSettings, RetrySettings
+from ai_sub.config import AiSettings
 from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError
 from ai_sub.jobs.base import Prompt
 from ai_sub.jobs.lyrics import LyricsAiResponse
@@ -70,7 +70,7 @@ class WorkerRunner:
         """Downloads media, runs GeminiExecutor, and returns validated output dictionary.
 
         Args:
-            task: Assigned task details from the server.
+            task: Assigned task details from the server including retry policy.
             executor: Configured GeminiExecutor instance.
             search_providers: Active search provider instances.
 
@@ -104,6 +104,7 @@ class WorkerRunner:
 
             active_tools = [p for p in search_providers if p.provider_name in task.search_tools]
 
+            # Execute with the dynamic server-directed retry and backoff policy
             res = await executor.run_structured(
                 prompt=prompt,
                 media_path=chunk_path,
@@ -114,6 +115,7 @@ class WorkerRunner:
                 tools=active_tools if active_tools else None,
                 agentic_video=task.agentic_video,
                 task_label=task.task_type.value,
+                retry_settings=task.retry,
             )
 
             return res.model_dump(mode="json")
@@ -147,8 +149,7 @@ class WorkerRunner:
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
 
         ai_settings = AiSettings(key=gemini_key, search=self.settings.search)
-        retry_settings = RetrySettings(per_run=3)
-        executor = GeminiExecutor(ai_settings, retry_settings=retry_settings)
+        executor = GeminiExecutor(ai_settings)
 
         tasks_completed = 0
         max_tasks = self.settings.max_tasks

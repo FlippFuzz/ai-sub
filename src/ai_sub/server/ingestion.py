@@ -531,14 +531,14 @@ class IngestionManager:
 
                 srt_filename = f"{vid.filename_stem}.{pipe.full_shortcode}.srt"
                 temp_srt = vid.job_dir / srt_filename
-                pipe.stitch_final_subtitles(temp_srt)
+                generated_srts = pipe.stitch_final_subtitles(temp_srt)
 
                 yaml_files = list(vid.job_dir.glob("*.yaml"))
                 self.git_sync.finalize_and_push(
                     uploader=vid.uploader,
                     video_id=vid.video_id,
                     full_shortcode=pipe.full_shortcode,
-                    srt_file=temp_srt,
+                    srt_files=generated_srts,
                     yaml_files=yaml_files,
                 )
 

@@ -49,6 +49,7 @@ class PipelineCoordinator:
                 reencode_settings=settings.reencode,
                 search_settings=settings.search,
                 split_settings=settings.split,
+                retry_settings=settings.retry,
                 validation_buffer_ms=settings.server.validation_buffer_ms,
             )
 
@@ -217,6 +218,8 @@ class PipelineCoordinator:
                             search_tools=task.search_tools,
                             agentic_video=task.agentic_video,
                             detected_performances=task.detected_performances,
+                            # Pass server-configured retry and backoff timing to worker
+                            retry=self.settings.retry,
                         )
 
                 claim_span.set_attribute("result", "none_available")
@@ -304,7 +307,7 @@ class PipelineCoordinator:
         reason: str,
         error_message: str | None = None,
     ) -> bool:
-        """Handles task failure, releasing the lease and returning it to PENDING.
+        """Handles task failure, releasing the lease or marking permanently failed if max_runs reached.
 
         Args:
             task_id: Unique task identifier.
@@ -333,18 +336,31 @@ class PipelineCoordinator:
                                 worker_id=worker_id,
                                 detail=detail,
                             )
+                            task.worker_id = None
+                            task.claimed_at = None
+                            task.last_heartbeat = None
+
+                            # Non-quota errors burn an attempt toward max_runs
+                            if reason != "QUOTA_EXHAUSTED":
+                                task.attempts += 1
+                                max_runs = self.settings.retry.max_runs
+                                if task.attempts >= max_runs:
+                                    task.status = TaskStatus.FAILED
+                                    fail_span.set_attribute("result", "permanently_failed")
+                                    fail_span.set_attribute("attempts", task.attempts)
+                                    logfire.error(
+                                        f"Task '{task_id}' marked FAILED after exhausting "
+                                        f"{task.attempts}/{max_runs} runs. Reason: {reason}."
+                                    )
+                                    return True
+
+                            task.status = TaskStatus.PENDING
                             fail_span.set_attribute("result", "returned_to_pending")
-                            fail_span.set_attribute("attempts", task.attempts + 1)
+                            fail_span.set_attribute("attempts", task.attempts)
                             logfire.warning(
                                 f"Task '{task_id}' failed by worker '{worker_id}' (reason: {reason}). "
                                 f"Details: {error_message or 'none'}. Returning to PENDING."
                             )
-                            task.status = TaskStatus.PENDING
-                            task.worker_id = None
-                            task.claimed_at = None
-                            task.last_heartbeat = None
-                            if reason != "QUOTA_EXHAUSTED":
-                                task.attempts += 1
                             return True
 
                 fail_span.set_attribute("result", "task_not_found")
@@ -395,7 +411,6 @@ class PipelineCoordinator:
                     "duration_ms": pipe.active_video.duration_ms,
                 }
 
-                # Granular Stage Progress Breakdown
                 summary_task = next((t for t in pipe.tasks.values() if t.task_type == TaskType.SUMMARY), None)
                 sub_tasks = [t for t in pipe.tasks.values() if t.task_type == TaskType.SUBTITLES]
                 lyr_tasks = [t for t in pipe.tasks.values() if t.task_type == TaskType.LYRICS]

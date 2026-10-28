@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ai_sub.config import RetrySettings
+
 
 class TaskType(str, Enum):
     """Types of distributed tasks executed by workers."""
@@ -49,6 +51,11 @@ class TaskClaimResponse(BaseModel):
     detected_performances: list[dict[str, Any]] = Field(
         default_factory=list,
         description="Serialized list of detected singing performances for lyrics refinement.",
+    )
+    # Server-directed retry and backoff policy applied during worker execution
+    retry: RetrySettings = Field(
+        default_factory=RetrySettings,
+        description="Task execution retry and backoff policy configured by the server.",
     )
 
 
