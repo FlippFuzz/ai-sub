@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
@@ -51,6 +52,16 @@ from ai_sub.video import (
 )
 
 
+class PipelineStatus(str, Enum):
+    """Lifecycle execution status of a combination pipeline."""
+
+    IDLE = "idle"
+    PREPARING = "preparing"
+    PROCESSING = "processing"
+    FINALIZING = "finalizing"
+    PUSH_FAILED = "push_failed"
+
+
 class ComboPipeline:
     """Manages an independent combination pipeline restricted to 1 active video."""
 
@@ -68,6 +79,7 @@ class ComboPipeline:
     lyrics_shortcode: str
     full_shortcode: str
 
+    status: PipelineStatus
     active_video: ActiveVideo | None
     tasks: dict[str, ServerTask]
     summary_response: SummaryAiResponse | None
@@ -116,6 +128,7 @@ class ComboPipeline:
         )
         self.full_shortcode = generate_full_shortcode(config.subtitles_model)
 
+        self.status = PipelineStatus.IDLE
         self.active_video = None
         self.tasks = {}
         self.summary_response = None
@@ -125,9 +138,9 @@ class ComboPipeline:
         """Checks if the pipeline is idle and ready to accept a new video.
 
         Returns:
-            bool: True if no video is currently active; False otherwise.
+            bool: True if pipeline status is IDLE; False otherwise.
         """
-        return self.active_video is None
+        return self.status == PipelineStatus.IDLE
 
     def is_task_ready_for_claim(self, task: ServerTask) -> bool:
         """Determines if a task is eligible to be claimed by a worker.
@@ -282,6 +295,7 @@ class ComboPipeline:
             channel_name: Human-readable channel display name. Defaults to None.
             source_type: Ingestion source type ('local' or 'youtube'). Defaults to 'local'.
         """
+        self.status = PipelineStatus.PREPARING
         job_dir = self.work_dir / video_id
         job_dir.mkdir(parents=True, exist_ok=True)
         filename_stem = sanitize_filename(raw_video_path.stem)
@@ -400,6 +414,7 @@ class ComboPipeline:
             self.tasks.clear()
             self.summary_response = None
 
+            self.status = PipelineStatus.PROCESSING
             self._queue_summary_task()
             self._reencode_task = asyncio.create_task(self._reencode_segments_background())
 
@@ -670,22 +685,28 @@ class ComboPipeline:
         """Checks if all segments for the active video have finished processing.
 
         Returns True when all queued tasks have reached a terminal state (COMPLETED or FAILED)
-        and no tasks remain pending or claimed.
+        and no tasks remain pending or claimed, or when all chunk files on disk are verified.
 
         Returns:
             bool: True if video processing is finished; False otherwise.
         """
-        if not self.active_video or not self.tasks:
+        if not self.active_video:
             return False
 
-        # Must not have any active or waiting leases
-        if any(t.status in (TaskStatus.PENDING, TaskStatus.CLAIMED) for t in self.tasks.values()):
+        if self.status == PipelineStatus.PREPARING:
             return False
+
+        if self.status in (PipelineStatus.FINALIZING, PipelineStatus.PUSH_FAILED):
+            return True
 
         # If summary failed permanently, pipeline halts
         summary_task = next((t for t in self.tasks.values() if t.task_type == TaskType.SUMMARY), None)
         if summary_task and summary_task.status == TaskStatus.FAILED:
             return True
+
+        # Must not have any active or waiting leases
+        if any(t.status in (TaskStatus.PENDING, TaskStatus.CLAIMED) for t in self.tasks.values()):
+            return False
 
         if self.summary_response is None:
             return False
@@ -796,6 +817,8 @@ class ComboPipeline:
     async def resume_from_disk(self) -> bool:
         """Inspects work/<combo>/ to restore in-progress video subdirectories upon server boot.
 
+        Accurately reconstructs all tasks in memory—preserving completed stages from disk.
+
         Returns:
             bool: True if an active video was successfully restored; False otherwise.
         """
@@ -804,6 +827,7 @@ class ComboPipeline:
         with logfire.span("Disk Resume Check: {combo}", combo=self.config.name) as resume_span:
             job_dirs = [d for d in self.work_dir.iterdir() if d.is_dir() and d.name != "reencoded"]
             if not job_dirs:
+                self.status = PipelineStatus.IDLE
                 resume_span.set_attribute("result", "idle")
                 logfire.debug(f"[{self.config.name}] No active job subdirectories found. Pipeline is idle.")
                 return False
@@ -813,6 +837,7 @@ class ComboPipeline:
             if not meta_file.is_file():
                 logfire.warning(f"[{self.config.name}] Job folder '{job_dir.name}' lacks video_meta.json. Cleaning.")
                 shutil.rmtree(job_dir, ignore_errors=True)
+                self.status = PipelineStatus.IDLE
                 resume_span.set_attribute("result", "purged_invalid_folder")
                 return False
 
@@ -828,6 +853,7 @@ class ComboPipeline:
                 source_type = meta.get("source_type", "youtube")
             except Exception as e:
                 logfire.warning(f"Could not load {meta_file.name}: {e}. Skipping resume.")
+                self.status = PipelineStatus.IDLE
                 resume_span.set_attribute("result", "corrupt_metadata")
                 return False
 
@@ -837,6 +863,7 @@ class ComboPipeline:
             if not segment_files:
                 logfire.warning(f"[{self.config.name}] Job '{video_id}' has no split chunks. Cleaning.")
                 shutil.rmtree(job_dir, ignore_errors=True)
+                self.status = PipelineStatus.IDLE
                 resume_span.set_attribute("result", "no_chunks")
                 return False
 
@@ -891,15 +918,32 @@ class ComboPipeline:
             summary_file = job_dir / f"summary.{self.summary_shortcode}.yaml"
             loaded_summary_job = SummaryJob.load(summary_file, self.validation_buffer_ms)
 
+            sum_task_id = f"{self.config.name}::{video_id}::summary"
             if not loaded_summary_job or not loaded_summary_job.response:
                 logfire.info(
                     f"[{self.config.name}] Resuming: summary incomplete for '{video_id}'. Queueing summary task."
                 )
+                self.status = PipelineStatus.PROCESSING
                 self._queue_summary_task()
                 resume_span.set_attribute("result", "resumed_summary_pending")
                 return True
 
             self.summary_response = loaded_summary_job.response
+            # Register completed summary task in memory so coordinator metrics stay consistent
+            self.tasks[sum_task_id] = ServerTask(
+                task_id=sum_task_id,
+                task_type=TaskType.SUMMARY,
+                pipeline_name=self.config.name,
+                video_id=video_id,
+                model=self.config.summary_model,
+                service_tier=self.config.service_tier_summary,
+                media_path=proxy_path,
+                video_duration_ms=total_duration_ms,
+                prompt=get_summary_prompt(user_context=active.user_context),
+                response_schema_name="SummaryAiResponse",
+                status=TaskStatus.COMPLETED,
+                result=loaded_summary_job.response.model_dump(mode="json"),
+            )
             logfire.info(f"[{self.config.name}] Resuming: loaded valid summary for '{video_id}'.")
 
             current_offset_ms = 0
@@ -911,17 +955,18 @@ class ComboPipeline:
                 loaded_lyrics_job = LyricsJob.load(lyrics_file, self.validation_buffer_ms)
 
                 media_file = reencoded_paths.get(idx) or seg_path
+                sub_task_id = f"{self.config.name}::{video_id}::subtitles::{idx:03d}"
+                sub_prompt = get_subtitles_prompt(
+                    user_context=active.user_context,
+                    global_summary=self.summary_response,
+                    segment_offset_ms=current_offset_ms,
+                    segment_duration_ms=seg_dur_ms,
+                )
 
-                if not loaded_sub_job or not loaded_sub_job.response:
-                    task_id = f"{self.config.name}::{video_id}::subtitles::{idx:03d}"
-                    prompt = get_subtitles_prompt(
-                        user_context=active.user_context,
-                        global_summary=self.summary_response,
-                        segment_offset_ms=current_offset_ms,
-                        segment_duration_ms=seg_dur_ms,
-                    )
-                    self.tasks[task_id] = ServerTask(
-                        task_id=task_id,
+                if loaded_sub_job and loaded_sub_job.response:
+                    # Register completed subtitle task in memory
+                    self.tasks[sub_task_id] = ServerTask(
+                        task_id=sub_task_id,
                         task_type=TaskType.SUBTITLES,
                         pipeline_name=self.config.name,
                         video_id=video_id,
@@ -930,18 +975,77 @@ class ComboPipeline:
                         service_tier=self.config.service_tier_subtitles,
                         media_path=media_file,
                         video_duration_ms=seg_dur_ms,
-                        prompt=prompt,
+                        prompt=sub_prompt,
                         response_schema_name="SubtitlesAiResponse",
+                        status=TaskStatus.COMPLETED,
+                        result=loaded_sub_job.response.model_dump(mode="json"),
                     )
-                elif loaded_sub_job.response.detected_musical_performances:
-                    if not loaded_lyrics_job or not loaded_lyrics_job.response:
+                else:
+                    self.tasks[sub_task_id] = ServerTask(
+                        task_id=sub_task_id,
+                        task_type=TaskType.SUBTITLES,
+                        pipeline_name=self.config.name,
+                        video_id=video_id,
+                        segment_index=idx,
+                        model=self.config.subtitles_model,
+                        service_tier=self.config.service_tier_subtitles,
+                        media_path=media_file,
+                        video_duration_ms=seg_dur_ms,
+                        prompt=sub_prompt,
+                        response_schema_name="SubtitlesAiResponse",
+                        status=TaskStatus.PENDING,
+                    )
+
+                # Check lyrics refinement for singing performances
+                if loaded_sub_job and loaded_sub_job.response and loaded_sub_job.response.detected_musical_performances:
+                    lyr_task_id = f"{self.config.name}::{video_id}::lyrics::{idx:03d}"
+                    lyr_prompt = get_lyrics_prompt(
+                        draft_subtitles=loaded_sub_job.response.subtitles,
+                        detected_performances=loaded_sub_job.response.detected_musical_performances,
+                        user_context=active.user_context,
+                        global_summary=self.summary_response,
+                        segment_offset_ms=current_offset_ms,
+                        segment_duration_ms=seg_dur_ms,
+                    )
+                    if loaded_lyrics_job and loaded_lyrics_job.response:
+                        # Register completed lyrics task in memory
+                        self.tasks[lyr_task_id] = ServerTask(
+                            task_id=lyr_task_id,
+                            task_type=TaskType.LYRICS,
+                            pipeline_name=self.config.name,
+                            video_id=video_id,
+                            segment_index=idx,
+                            model=self.config.lyrics_model,
+                            service_tier=self.config.service_tier_lyrics,
+                            media_path=media_file,
+                            video_duration_ms=seg_dur_ms,
+                            prompt=lyr_prompt,
+                            response_schema_name="LyricsAiResponse",
+                            status=TaskStatus.COMPLETED,
+                            result=loaded_lyrics_job.response.model_dump(mode="json"),
+                        )
+                    else:
                         self._queue_lyrics_task(idx, loaded_sub_job.response)
 
                 current_offset_ms += seg_dur_ms
 
-            resume_span.set_attribute("result", "resumed_subtitles_pending")
-            resume_span.set_attribute("pending_tasks", len(self.tasks))
-            logfire.info(f"[{self.config.name}] Resumed '{video_id}' from disk with {len(self.tasks)} pending tasks.")
+            has_pending = any(t.status in (TaskStatus.PENDING, TaskStatus.CLAIMED) for t in self.tasks.values())
+            if not has_pending:
+                # All chunks are already complete on disk; mark as ready for finalization immediately
+                self.status = PipelineStatus.FINALIZING
+                resume_span.set_attribute("result", "resumed_all_chunks_complete")
+                logfire.info(
+                    f"[{self.config.name}] Resumed '{video_id}': all segments completed on disk. Ready to finalize."
+                )
+            else:
+                self.status = PipelineStatus.PROCESSING
+                resume_span.set_attribute("result", "resumed_subtitles_pending")
+                pending_count = sum(1 for t in self.tasks.values() if t.status == TaskStatus.PENDING)
+                resume_span.set_attribute("pending_tasks", pending_count)
+                logfire.info(
+                    f"[{self.config.name}] Resumed '{video_id}' from disk with {pending_count} pending task(s)."
+                )
+
             return True
 
     def clear_active_video(self) -> None:
@@ -963,4 +1067,5 @@ class ComboPipeline:
             self.active_video = None
             self.tasks.clear()
             self.summary_response = None
+            self.status = PipelineStatus.IDLE
             logfire.info(f"[{self.config.name}] Job directory cleared. Pipeline is idle.")

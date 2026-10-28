@@ -22,7 +22,7 @@ from ai_sub.server.channel_mapping import ChannelMapper
 from ai_sub.server.config import SourcesConfig
 from ai_sub.server.coordinator import PipelineCoordinator
 from ai_sub.server.git_sync import GitSyncManager
-from ai_sub.server.pipeline import ComboPipeline
+from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
 from ai_sub.video import ensure_ffmpeg
 
 
@@ -127,6 +127,7 @@ class IngestionManager:
     _files_rescan_task: asyncio.Task[None] | None
     _youtube_rescan_task: asyncio.Task[None] | None
     _scan_lock: asyncio.Lock
+    _feed_lock: asyncio.Lock
 
     def __init__(
         self,
@@ -175,6 +176,7 @@ class IngestionManager:
         self._files_rescan_task = None
         self._youtube_rescan_task = None
         self._scan_lock = asyncio.Lock()
+        self._feed_lock = asyncio.Lock()
 
     def _get_base_ytdlp_opts(self) -> dict[str, Any]:
         """Constructs base yt-dlp parameters including PO token server, node runtime, and FFmpeg path.
@@ -245,8 +247,11 @@ class IngestionManager:
                     )
         return discovered
 
-    def scan_youtube_sources(self) -> list[DiscoveredVideo]:
-        """Fetches metadata for configured YouTube playlists, channels, and video links with anti-bot delays.
+    def scan_youtube_sources(self, deep_scan: bool = False) -> list[DiscoveredVideo]:
+        """Fetches metadata for YouTube sources. Performs deep scan on boot and delta lookback thereafter.
+
+        Args:
+            deep_scan: If True, crawls full channel history; if False, applies lookback window cutoff.
 
         Returns:
             list[DiscoveredVideo]: Discovered YouTube video items.
@@ -257,7 +262,14 @@ class IngestionManager:
         ydl_opts = self._get_base_ytdlp_opts()
         ydl_opts["extract_flat"] = True
 
+        # Search lookback window: twice the rescan interval + jitter (in seconds)
+        lookback_seconds = int(
+            (2 * self.config.youtube.rescan_interval_minutes + self.config.youtube.rescan_jitter_minutes) * 60
+        )
+        cutoff_ts = int(time()) - lookback_seconds if not deep_scan else 0
+
         discovered: list[DiscoveredVideo] = []
+
         with YoutubeDL(cast(Any, ydl_opts)) as ydl:
             for idx, url in enumerate(self.config.youtube.urls):
                 if idx > 0 and self.config.youtube.channel_delay_seconds > 0:
@@ -272,35 +284,19 @@ class IngestionManager:
                     result = ydl.extract_info(url, download=False)
                     if not result:
                         continue
+
                     entries_raw = result.get("entries")
                     if entries_raw is None:
-                        entries_list = [result]
+                        entries_iterator = [result]
                     else:
-                        entries_list = list(cast(Any, entries_raw))
+                        entries_iterator = entries_raw
 
-                    self.channel_mapper.update_from_entries(entries_list)
+                    entries_processed = []
 
-                    for entry in entries_list:
+                    # Stream entries lazily without materializing entire generator into memory
+                    for entry in entries_iterator:
                         if not entry:
                             continue
-                        vid = entry.get("id")
-                        if not vid:
-                            continue
-
-                        title = str(entry.get("title") or "Unknown")
-                        if title in ["[Deleted video]", "[Private video]", "[Unavailable video]"]:
-                            continue
-
-                        uploader = self.channel_mapper.get_uploader_id(entry)
-                        if not uploader:
-                            uploader = str(entry.get("uploader") or "youtube")
-                        uploader = uploader.strip("@")[:20]
-
-                        ch_name = self.channel_mapper.get_channel_name(entry)
-
-                        web_url = (
-                            entry.get("webpage_url") or entry.get("url") or f"https://www.youtube.com/watch?v={vid}"
-                        )
 
                         raw_ts = entry.get("timestamp") or entry.get("release_timestamp") or 0
                         try:
@@ -315,6 +311,34 @@ class IngestionManager:
                             except ValueError:
                                 ts = 0
 
+                        # Delta early-exit condition: if past the lookback window, stop paginating
+                        if not deep_scan and ts > 0 and ts < cutoff_ts:
+                            logfire.debug(
+                                f"Encountered video timestamp ({ts}) older than lookback cutoff ({cutoff_ts}). "
+                                f"Stopping delta scan for {url}."
+                            )
+                            break
+
+                        entries_processed.append(entry)
+
+                        vid = entry.get("id")
+                        if not vid:
+                            continue
+
+                        title = str(entry.get("title") or "Unknown")
+                        if title in ["[Deleted video]", "[Private video]", "[Unavailable video]"]:
+                            continue
+
+                        uploader = self.channel_mapper.get_uploader_id(entry)
+                        if not uploader:
+                            uploader = str(entry.get("uploader") or "youtube")
+                        uploader = uploader.strip("@")[:20]
+
+                        ch_name = self.channel_mapper.get_channel_name(entry)
+                        web_url = (
+                            entry.get("webpage_url") or entry.get("url") or f"https://www.youtube.com/watch?v={vid}"
+                        )
+
                         discovered.append(
                             DiscoveredVideo(
                                 video_id=vid,
@@ -326,6 +350,9 @@ class IngestionManager:
                                 timestamp=ts,
                             )
                         )
+
+                    self.channel_mapper.update_from_entries(entries_processed)
+
                 except Exception as e:
                     logfire.warning(f"Error scanning YouTube source {url}: {e}")
 
@@ -344,27 +371,34 @@ class IngestionManager:
             self._update_combined_cache()
             return discovered
 
-    async def scan_youtube_sources_async(self) -> list[DiscoveredVideo]:
-        """Scans YouTube playlists/channels off-thread and updates the in-memory cache.
+    async def scan_youtube_sources_async(self, deep_scan: bool = False) -> list[DiscoveredVideo]:
+        """Scans YouTube sources off-thread and updates the in-memory cache.
+
+        Args:
+            deep_scan: If True, crawls full channel history; if False, applies lookback window cutoff.
 
         Returns:
             list[DiscoveredVideo]: Discovered YouTube video items.
         """
         async with self._scan_lock:
             loop = asyncio.get_running_loop()
-            discovered = await loop.run_in_executor(None, self.scan_youtube_sources)
-            self.cached_youtube_videos = {v.video_id: v for v in discovered}
+            discovered = await loop.run_in_executor(None, self.scan_youtube_sources, deep_scan)
+            # Update cache to preserve older in-memory items during delta scans
+            self.cached_youtube_videos.update({v.video_id: v for v in discovered})
             self._update_combined_cache()
             return discovered
 
-    async def scan_all_sources(self) -> list[DiscoveredVideo]:
-        """Executes full rescan of both local watch folders and YouTube sources off-thread.
+    async def scan_all_sources(self, deep_scan: bool = False) -> list[DiscoveredVideo]:
+        """Executes rescan of both local watch folders and YouTube sources off-thread.
+
+        Args:
+            deep_scan: If True, crawls full channel history on YouTube. Defaults to False.
 
         Returns:
             list[DiscoveredVideo]: List of all discovered videos sorted newest-first.
         """
         await self.scan_watch_folders_async()
-        await self.scan_youtube_sources_async()
+        await self.scan_youtube_sources_async(deep_scan=deep_scan)
         return self.cached_videos
 
     def check_video_availability(self, video: DiscoveredVideo) -> bool:
@@ -490,77 +524,88 @@ class IngestionManager:
         return {name: self.get_pipeline_queue(pipe) for name, pipe in self.coordinator.pipelines.items()}
 
     async def feed_idle_pipelines(self) -> None:
-        """Inspects all pipelines, finds uncompleted videos, and feeds idle pipelines."""
-        if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
-            logfire.warning(
-                f"Halting intake feed: reached {self.consecutive_failures} consecutive download failures. "
-                "Will retry on next scheduled rescan."
-            )
-            return
-
-        idle_pipelines: list[ComboPipeline] = [p for p in self.coordinator.pipelines.values() if p.is_idle()]
-        if not idle_pipelines:
-            return
-
-        if not self.cached_videos:
-            await self.scan_all_sources()
-
-        for pipe in idle_pipelines:
-            candidate: DiscoveredVideo | None = None
-            for v in self.cached_videos:
-                if self.failed_video_counts.get(v.video_id, 0) >= 3:
-                    continue
-                if not self.git_sync.is_video_completed(v.uploader, v.video_id, pipe.full_shortcode):
-                    candidate = v
-                    break
-
-            if not candidate:
-                continue
-
-            loop = asyncio.get_running_loop()
-            is_available = await loop.run_in_executor(None, self.check_video_availability, candidate)
-            if not is_available:
+        """Inspects all pipelines, finds uncompleted videos, and feeds idle pipelines under mutex lock."""
+        async with self._feed_lock:
+            if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
                 logfire.warning(
-                    f"Video {candidate.video_id} ('{candidate.title}') failed pre-flight availability check."
+                    f"Halting intake feed: reached {self.consecutive_failures} consecutive download failures. "
+                    "Will retry on next scheduled rescan."
                 )
-                self.consecutive_failures += 1
-                self.failed_video_counts[candidate.video_id] = self.failed_video_counts.get(candidate.video_id, 0) + 1
-                if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
-                    logfire.warning("Circuit breaker tripped: pausing ingestion until next rescan cycle.")
-                    return
-                continue
+                return
 
-            try:
-                if candidate.source_type == "local" and candidate.local_path:
-                    media_path = candidate.local_path
-                else:
-                    media_path = await self.download_youtube_to_combo_dir(candidate, pipe.work_dir)
+            idle_pipelines: list[ComboPipeline] = [p for p in self.coordinator.pipelines.values() if p.is_idle()]
+            if not idle_pipelines:
+                return
 
-                self.consecutive_failures = 0
+            if not self.cached_videos:
+                await self.scan_all_sources(deep_scan=False)
 
-                logfire.info(
-                    f"Feeding pipeline '{pipe.config.name}' with video '{candidate.title}' ({candidate.video_id})."
-                )
-                await pipe.prepare_and_set_video(
-                    video_id=candidate.video_id,
-                    uploader=candidate.uploader,
-                    title=candidate.title,
-                    raw_video_path=media_path,
-                    channel_name=candidate.channel_name,
-                    source_type=candidate.source_type,
-                )
-            except Exception as e:
-                self.consecutive_failures += 1
-                self.failed_video_counts[candidate.video_id] = self.failed_video_counts.get(candidate.video_id, 0) + 1
-                logfire.error(f"Failed to prepare video {candidate.video_id} for pipeline {pipe.config.name}: {e}")
-                if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
-                    logfire.warning("Circuit breaker tripped: pausing ingestion until next rescan cycle.")
-                    return
+            for pipe in idle_pipelines:
+                candidate: DiscoveredVideo | None = None
+                for v in self.cached_videos:
+                    if self.failed_video_counts.get(v.video_id, 0) >= 3:
+                        continue
+                    if not self.git_sync.is_video_completed(v.uploader, v.video_id, pipe.full_shortcode):
+                        candidate = v
+                        break
+
+                if not candidate:
+                    continue
+
+                # Immediately claim the pipeline to prevent concurrent feed collisions
+                pipe.status = PipelineStatus.PREPARING
+
+                loop = asyncio.get_running_loop()
+                is_available = await loop.run_in_executor(None, self.check_video_availability, candidate)
+                if not is_available:
+                    logfire.warning(
+                        f"Video {candidate.video_id} ('{candidate.title}') failed pre-flight availability check."
+                    )
+                    pipe.status = PipelineStatus.IDLE
+                    self.consecutive_failures += 1
+                    self.failed_video_counts[candidate.video_id] = (
+                        self.failed_video_counts.get(candidate.video_id, 0) + 1
+                    )
+                    if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
+                        logfire.warning("Circuit breaker tripped: pausing ingestion until next rescan cycle.")
+                        return
+                    continue
+
+                try:
+                    if candidate.source_type == "local" and candidate.local_path:
+                        media_path = candidate.local_path
+                    else:
+                        media_path = await self.download_youtube_to_combo_dir(candidate, pipe.work_dir)
+
+                    self.consecutive_failures = 0
+
+                    logfire.info(
+                        f"Feeding pipeline '{pipe.config.name}' with video '{candidate.title}' ({candidate.video_id})."
+                    )
+                    await pipe.prepare_and_set_video(
+                        video_id=candidate.video_id,
+                        uploader=candidate.uploader,
+                        title=candidate.title,
+                        raw_video_path=media_path,
+                        channel_name=candidate.channel_name,
+                        source_type=candidate.source_type,
+                    )
+                except Exception as e:
+                    pipe.status = PipelineStatus.IDLE
+                    self.consecutive_failures += 1
+                    self.failed_video_counts[candidate.video_id] = (
+                        self.failed_video_counts.get(candidate.video_id, 0) + 1
+                    )
+                    logfire.error(f"Failed to prepare video {candidate.video_id} for pipeline {pipe.config.name}: {e}")
+                    if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
+                        logfire.warning("Circuit breaker tripped: pausing ingestion until next rescan cycle.")
+                        return
 
     async def start(self) -> None:
-        """Starts the ingestion manager and the decoupled periodic intake background loops."""
+        """Starts the ingestion manager with a deep scan on boot, followed by periodic delta intake loops."""
         await self.scan_watch_folders_async()
-        await self.scan_youtube_sources_async()
+        # Full deep crawl on boot to populate the complete historical video catalog in RAM
+        await self.scan_youtube_sources_async(deep_scan=True)
         await self.feed_idle_pipelines()
 
         self._files_rescan_task = asyncio.create_task(self._periodic_files_loop())
@@ -592,14 +637,14 @@ class IngestionManager:
                 logfire.warning(f"Error during periodic watch folder scan: {e}")
 
     async def _periodic_youtube_loop(self) -> None:
-        """Periodically scans YouTube sources with additive jitter and anti-bot pacing."""
+        """Periodically scans YouTube sources using time-based delta lookback and anti-bot pacing."""
         while True:
             base_sec = self.config.youtube.rescan_interval_minutes * 60
             jitter_sec = max(0.0, self.config.youtube.rescan_jitter_minutes * 60.0)
             delay_sec = base_sec + random.uniform(0.0, jitter_sec)
 
             logfire.debug(
-                f"Next YouTube rescan scheduled in {delay_sec / 60:.1f} minutes "
+                f"Next YouTube delta rescan scheduled in {delay_sec / 60:.1f} minutes "
                 f"(base: {self.config.youtube.rescan_interval_minutes}m, "
                 f"jitter: +{(delay_sec - base_sec) / 60:.1f}m)."
             )
@@ -616,8 +661,8 @@ class IngestionManager:
                         loop = asyncio.get_running_loop()
                         self.pot_server_dir = await loop.run_in_executor(None, ensure_pot_provider, self.pot_dir, True)
 
-                logfire.debug("Running periodic YouTube rescan...")
-                await self.scan_youtube_sources_async()
+                logfire.debug("Running periodic YouTube delta scan...")
+                await self.scan_youtube_sources_async(deep_scan=False)
                 await self.coordinator.check_and_finalize_completed_pipelines()
                 await self.feed_idle_pipelines()
             except Exception as e:

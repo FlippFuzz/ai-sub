@@ -18,7 +18,7 @@ from ai_sub.protocol import (
 from ai_sub.server.config import ServerSettings
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.models import ActivityEvent, ServerTask, TaskStatus
-from ai_sub.server.pipeline import ComboPipeline
+from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
 
 
 class PipelineCoordinator:
@@ -103,6 +103,9 @@ class PipelineCoordinator:
                     logfire.info(f"Pipeline '{name}' resumed active video from disk.")
 
             start_span.set_attribute("resumed_pipelines", resumed_count)
+
+            # Immediately flush and push any videos found 100% complete on disk during boot
+            await self.check_and_finalize_completed_pipelines()
             self._sweep_task = asyncio.create_task(self._lease_sweeper_loop())
 
     async def stop(self) -> None:
@@ -118,6 +121,8 @@ class PipelineCoordinator:
     async def _lease_sweeper_loop(self) -> None:
         """Continuously checks for expired worker leases every 15 seconds."""
         timeout = self.settings.server.heartbeat_timeout_seconds
+        max_runs = self.settings.retry.max_runs
+
         while True:
             await asyncio.sleep(15)
             now = time()
@@ -133,24 +138,42 @@ class PipelineCoordinator:
                                 elapsed = now - task.last_heartbeat
                                 if elapsed > timeout:
                                     expired_count += 1
-                                    logfire.warning(
-                                        f"Task '{task.task_id}' lease expired (worker: {task.worker_id}, "
-                                        f"last heartbeat: {elapsed:.1f}s ago). Returning to PENDING."
-                                    )
-                                    self._log_activity(
-                                        event_type="timeout",
-                                        task=task,
-                                        worker_id=task.worker_id or "unknown",
-                                        detail=f"Lease timed out after {timeout}s without heartbeat",
-                                    )
-                                    task.status = TaskStatus.PENDING
+                                    worker_id = task.worker_id or "unknown"
                                     task.worker_id = None
                                     task.claimed_at = None
                                     task.last_heartbeat = None
                                     task.attempts += 1
 
+                                    if task.attempts >= max_runs:
+                                        task.status = TaskStatus.FAILED
+                                        logfire.error(
+                                            f"Task '{task.task_id}' lease expired ({elapsed:.1f}s ago). "
+                                            f"Max runs ({task.attempts}/{max_runs}) reached. Marked FAILED."
+                                        )
+                                        self._log_activity(
+                                            event_type="fail",
+                                            task=task,
+                                            worker_id=worker_id,
+                                            detail=f"Lease timed out after {timeout}s: max runs ({max_runs}) exhausted",
+                                        )
+                                    else:
+                                        task.status = TaskStatus.PENDING
+                                        logfire.warning(
+                                            f"Task '{task.task_id}' lease expired (worker: {worker_id}, "
+                                            f"last heartbeat: {elapsed:.1f}s ago). Returning to PENDING."
+                                        )
+                                        self._log_activity(
+                                            event_type="timeout",
+                                            task=task,
+                                            worker_id=worker_id,
+                                            detail=f"Lease timed out after {timeout}s without heartbeat",
+                                        )
+
                     sweep_span.set_attribute("active_leases", active_leases)
                     sweep_span.set_attribute("expired_leases", expired_count)
+
+            # Check if any pipeline reached completion due to expired/failed tasks
+            await self.check_and_finalize_completed_pipelines()
 
     async def claim_task(
         self,
@@ -403,15 +426,18 @@ class PipelineCoordinator:
         async with self._lock:
             if pipe.config.name in self._finalizing_pipes:
                 return False
-            if pipe.is_idle() or not pipe.is_video_complete() or not pipe.active_video:
+            if pipe.is_idle() or not pipe.active_video:
+                return False
+            if pipe.status != PipelineStatus.PUSH_FAILED and not pipe.is_video_complete():
                 return False
 
             self._finalizing_pipes.add(pipe.config.name)
+            pipe.status = PipelineStatus.FINALIZING
 
         try:
             vid = pipe.active_video
             assert vid is not None
-            logfire.info(f"Pipeline '{pipe.config.name}' finished all segments for '{vid.title}'. Finalizing...")
+            logfire.info(f"Pipeline '{pipe.config.name}' finalizing for '{vid.title}'...")
 
             srt_filename = f"{vid.filename_stem}.{pipe.full_shortcode}.srt"
             temp_srt = vid.job_dir / srt_filename
@@ -421,13 +447,21 @@ class PipelineCoordinator:
 
             yaml_files = list(vid.job_dir.glob("*.yaml"))
             if self.git_sync:
-                await self.git_sync.finalize_and_push(
-                    uploader=vid.uploader,
-                    video_id=vid.video_id,
-                    full_shortcode=pipe.full_shortcode,
-                    srt_files=generated_srts,
-                    yaml_files=yaml_files,
-                )
+                try:
+                    await self.git_sync.finalize_and_push(
+                        uploader=vid.uploader,
+                        video_id=vid.video_id,
+                        full_shortcode=pipe.full_shortcode,
+                        srt_files=generated_srts,
+                        yaml_files=yaml_files,
+                    )
+                except Exception as e:
+                    logfire.error(
+                        f"Git push failed for '{pipe.config.name}' ({vid.video_id}): {e}. Setting PUSH_FAILED."
+                    )
+                    async with self._lock:
+                        pipe.status = PipelineStatus.PUSH_FAILED
+                    return False
 
             async with self._lock:
                 pipe.clear_active_video()
@@ -476,18 +510,25 @@ class PipelineCoordinator:
                     "uploader": pipe.active_video.uploader,
                     "channel_name": pipe.active_video.channel_name,
                     "duration_ms": pipe.active_video.duration_ms,
+                    "source_type": pipe.active_video.source_type,
                 }
 
                 summary_task = next((t for t in pipe.tasks.values() if t.task_type == TaskType.SUMMARY), None)
                 sub_tasks = [t for t in pipe.tasks.values() if t.task_type == TaskType.SUBTITLES]
                 lyr_tasks = [t for t in pipe.tasks.values() if t.task_type == TaskType.LYRICS]
 
-                sub_completed = sum(1 for t in sub_tasks if t.status == TaskStatus.COMPLETED)
-                sub_claimed = sum(1 for t in sub_tasks if t.status == TaskStatus.CLAIMED)
-                sub_pct = int((sub_completed / len(sub_tasks) * 100)) if sub_tasks else 0
+                sum_done = (
+                    1
+                    if pipe.summary_response
+                    else (1 if summary_task and summary_task.status == TaskStatus.COMPLETED else 0)
+                )
+                sum_prog = 1 if summary_task and summary_task.status == TaskStatus.CLAIMED else 0
 
-                lyr_completed = sum(1 for t in lyr_tasks if t.status == TaskStatus.COMPLETED)
-                lyr_claimed = sum(1 for t in lyr_tasks if t.status == TaskStatus.CLAIMED)
+                sub_done = sum(1 for t in sub_tasks if t.status == TaskStatus.COMPLETED)
+                sub_prog = sum(1 for t in sub_tasks if t.status == TaskStatus.CLAIMED)
+
+                lyr_done = sum(1 for t in lyr_tasks if t.status == TaskStatus.COMPLETED)
+                lyr_prog = sum(1 for t in lyr_tasks if t.status == TaskStatus.CLAIMED)
 
                 active_lyr_tasks = [
                     {
@@ -499,42 +540,59 @@ class PipelineCoordinator:
                     if t.status == TaskStatus.CLAIMED
                 ]
 
-                lyr_status = "skipped"
-                if lyr_tasks:
-                    if lyr_completed == len(lyr_tasks):
-                        lyr_status = "completed"
-                    elif lyr_claimed > 0:
-                        lyr_status = "in_progress"
+                # Accurate state progression: lyrics cannot be marked "skipped" while subtitles are still running
+                if sub_done < total_chunks:
+                    if lyr_tasks:
+                        has_singing = True
+                        lyr_status = (
+                            "in_progress"
+                            if lyr_prog > 0
+                            else ("completed" if lyr_done == len(lyr_tasks) else "pending")
+                        )
                     else:
+                        has_singing = False
                         lyr_status = "pending"
+                else:
+                    if lyr_tasks:
+                        has_singing = True
+                        if lyr_done == len(lyr_tasks):
+                            lyr_status = "completed"
+                        elif lyr_prog > 0:
+                            lyr_status = "in_progress"
+                        else:
+                            lyr_status = "pending"
+                    else:
+                        has_singing = False
+                        lyr_status = "skipped"
 
                 stages_info = {
                     "summary": {
-                        "status": "completed"
-                        if pipe.summary_response
-                        else (summary_task.status.value if summary_task else "pending"),
+                        "total": 1,
+                        "done": sum_done,
+                        "in_progress": sum_prog,
+                        "status": "completed" if sum_done else ("claimed" if sum_prog else "pending"),
                         "worker_id": summary_task.worker_id if summary_task else None,
                         "elapsed_s": int(now - summary_task.claimed_at)
                         if summary_task and summary_task.claimed_at
                         else None,
                     },
                     "reencoding": {
-                        "total_chunks": total_chunks,
-                        "reencoded": reenc_count,
+                        "total": total_chunks,
+                        "done": reenc_count,
+                        "in_progress": 1 if pending_reenc > 0 else 0,
                         "pending": pending_reenc,
                     },
                     "subtitles": {
-                        "total": len(sub_tasks),
-                        "completed": sub_completed,
-                        "claimed": sub_claimed,
-                        "percentage": sub_pct,
+                        "total": total_chunks,
+                        "done": sub_done,
+                        "in_progress": sub_prog,
                     },
                     "lyrics": {
-                        "has_singing": len(lyr_tasks) > 0,
-                        "status": lyr_status,
                         "total": len(lyr_tasks),
-                        "completed": lyr_completed,
-                        "claimed": lyr_claimed,
+                        "done": lyr_done,
+                        "in_progress": lyr_prog,
+                        "has_singing": has_singing,
+                        "status": lyr_status,
                         "active_leases": active_lyr_tasks,
                     },
                 }
@@ -555,6 +613,7 @@ class PipelineCoordinator:
             pipeline_data.append(
                 {
                     "name": name,
+                    "status": pipe.status.value,
                     "models": {
                         "summary": pipe.config.summary_model,
                         "subtitles": pipe.config.subtitles_model,

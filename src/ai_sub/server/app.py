@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import mimetypes
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
@@ -84,17 +83,6 @@ def create_app(settings: ServerSettings) -> FastAPI:
         """
         pipeline_queues = ingestion.get_all_pipeline_queues()
         return coordinator.get_dashboard_data(pipeline_queues)
-
-    @app.post("/api/v1/sources/rescan")
-    async def trigger_sources_rescan() -> dict[str, str]:
-        """Triggers an asynchronous background rescan of watched directories and YouTube feeds.
-
-        Returns:
-            dict[str, str]: Operation status acknowledgement.
-        """
-        asyncio.create_task(ingestion.scan_all_sources())
-        asyncio.create_task(ingestion.feed_idle_pipelines())
-        return {"status": "rescan_triggered"}
 
     @app.post(
         "/api/v1/tasks/claim",
@@ -224,6 +212,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
         pipeline_status = {}
         for name, pipe in coordinator.pipelines.items():
             pipeline_status[name] = {
+                "status": pipe.status.value,
                 "idle": pipe.is_idle(),
                 "active_video": pipe.active_video.video_id if pipe.active_video else None,
                 "total_tasks": len(pipe.tasks),

@@ -56,12 +56,20 @@ class WorkerRunner:
         self._active_tasks = 0
         self._tasks_completed = 0
 
-    async def _heartbeat_loop(self, task_id: str, stop_event: asyncio.Event) -> None:
+    async def _heartbeat_loop(
+        self,
+        task_id: str,
+        stop_event: asyncio.Event,
+        execution_task: asyncio.Task[Any],
+    ) -> None:
         """Background task sending periodic heartbeats to maintain the task lease.
+
+        Aborts execution immediately if the lease was revoked or rejected by the server.
 
         Args:
             task_id: Unique task identifier.
-            stop_event: Event signaling when task execution finishes.
+            stop_event: Event signaling when task execution finishes normally.
+            execution_task: The active Gemini execution task to cancel if lease is revoked.
         """
         interval = self.settings.heartbeat_interval_seconds
         while not stop_event.is_set():
@@ -71,7 +79,60 @@ class WorkerRunner:
                 if not stop_event.is_set():
                     acked = await self.client.send_heartbeat(task_id, self.settings.worker_id)
                     if not acked:
-                        logfire.warning(f"Heartbeat for task '{task_id}' was rejected by the server.")
+                        logfire.warning(
+                            f"Heartbeat for task '{task_id}' was rejected (lease revoked or expired). "
+                            "Aborting in-flight execution immediately."
+                        )
+                        execution_task.cancel()
+                        break
+
+    async def _run_inference(
+        self,
+        task: TaskClaimResponse,
+        executor: GeminiExecutor,
+        chunk_path: Path,
+        search_providers: list[BaseSearchProvider],
+    ) -> dict[str, Any]:
+        """Runs the Gemini multimodal inference task and returns structured output.
+
+        Args:
+            task: Assigned task details from the server.
+            executor: Configured Gemini executor.
+            chunk_path: Local path to the media chunk file.
+            search_providers: Active search provider instances.
+
+        Returns:
+            dict[str, Any]: Validated output data dictionary.
+
+        Raises:
+            ValueError: If target response schema is unknown.
+        """
+        prompt = Prompt(system=task.prompt_system, user=task.prompt_user)
+
+        if task.response_schema_name == "SummaryAiResponse":
+            response_cls = SummaryAiResponse
+        elif task.response_schema_name == "SubtitlesAiResponse":
+            response_cls = SubtitlesAiResponse
+        elif task.response_schema_name == "LyricsAiResponse":
+            response_cls = LyricsAiResponse
+        else:
+            raise ValueError(f"Unknown response schema: '{task.response_schema_name}'")
+
+        active_tools = [p for p in search_providers if p.provider_name in task.search_tools]
+
+        res = await executor.run_structured(
+            prompt=prompt,
+            media_path=chunk_path,
+            video_duration_ms=task.video_duration_ms,
+            response_type=response_cls,
+            model_name=task.model,
+            service_tier=task.service_tier,  # type: ignore[arg-type]
+            tools=active_tools if active_tools else None,
+            agentic_video=task.agentic_video,
+            task_label=task.task_type.value,
+            retry_settings=task.retry,
+        )
+        return res.model_dump(mode="json")
 
     async def _execute_task(
         self,
@@ -79,7 +140,7 @@ class WorkerRunner:
         executor: GeminiExecutor,
         search_providers: list[BaseSearchProvider],
     ) -> dict[str, Any]:
-        """Downloads media, runs GeminiExecutor, and returns validated output dictionary.
+        """Downloads media, runs GeminiExecutor with lease-revocation monitoring, and returns validated output.
 
         Args:
             task: Assigned task details from the server including retry policy.
@@ -88,9 +149,6 @@ class WorkerRunner:
 
         Returns:
             dict[str, Any]: Validated output data dictionary.
-
-        Raises:
-            ValueError: If target response schema is unknown.
         """
         raw_name = Path(task.media_url).name
         if not Path(raw_name).suffix:
@@ -102,37 +160,12 @@ class WorkerRunner:
         await self.client.download_media(task.media_url, chunk_path)
 
         stop_heartbeat = asyncio.Event()
-        heartbeat_task = asyncio.create_task(self._heartbeat_loop(task.task_id, stop_heartbeat))
+        current_coro = self._run_inference(task, executor, chunk_path, search_providers)
+        inference_task = asyncio.create_task(current_coro)
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop(task.task_id, stop_heartbeat, inference_task))
 
         try:
-            prompt = Prompt(system=task.prompt_system, user=task.prompt_user)
-
-            if task.response_schema_name == "SummaryAiResponse":
-                response_cls = SummaryAiResponse
-            elif task.response_schema_name == "SubtitlesAiResponse":
-                response_cls = SubtitlesAiResponse
-            elif task.response_schema_name == "LyricsAiResponse":
-                response_cls = LyricsAiResponse
-            else:
-                raise ValueError(f"Unknown response schema: '{task.response_schema_name}'")
-
-            active_tools = [p for p in search_providers if p.provider_name in task.search_tools]
-
-            # Execute with dynamic server-directed retry and backoff policy
-            res = await executor.run_structured(
-                prompt=prompt,
-                media_path=chunk_path,
-                video_duration_ms=task.video_duration_ms,
-                response_type=response_cls,
-                model_name=task.model,
-                service_tier=task.service_tier,  # type: ignore[arg-type]
-                tools=active_tools if active_tools else None,
-                agentic_video=task.agentic_video,
-                task_label=task.task_type.value,
-                retry_settings=task.retry,
-            )
-
-            return res.model_dump(mode="json")
+            return await inference_task
         finally:
             stop_heartbeat.set()
             try:
@@ -202,7 +235,6 @@ class WorkerRunner:
                     active = self._active_tasks
 
                 if active > 0:
-                    # Wait for running tasks to finish or claim poll interval to elapse
                     poll_timeout = self.settings.claim_poll_interval_minutes * 60.0
                     try:
                         await asyncio.wait_for(self._task_completed_event.wait(), timeout=poll_timeout)
@@ -246,6 +278,12 @@ class WorkerRunner:
                             logfire.warning(
                                 f"[Slot {slot_id}] Task '{claim.task_id}' completion was not accepted by server."
                             )
+
+                    except asyncio.CancelledError:
+                        logfire.warning(
+                            f"[Slot {slot_id}] Task '{claim.task_id}' was cancelled "
+                            "(lease revoked by server or slot draining)."
+                        )
 
                     except QuotaExceededError as e:
                         logfire.warning(f"[Slot {slot_id}] Daily quota reached for model '{claim.model}': {e}")

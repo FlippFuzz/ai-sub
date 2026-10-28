@@ -21,7 +21,7 @@ from ai_sub.server.models import (
     TaskStatus,
     generate_w3c_traceparent,
 )
-from ai_sub.server.pipeline import ComboPipeline
+from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
 
 __all__ = [
     "ActiveVideo",
@@ -37,6 +37,7 @@ __all__ = [
     "IngestionManager",
     "PipelineConfig",
     "PipelineCoordinator",
+    "PipelineStatus",
     "ServerOptions",
     "ServerSettings",
     "ServerTask",
