@@ -10,7 +10,9 @@ worker_id: "test-worker-1" # Defaults to machine hostname if omitted
 # Concurrency & Work Limits
 concurrency: 2 # Number of video chunk tasks to process simultaneously (Default: 2)
 max_tasks: 0 # Exit after N tasks (0 runs until queue is empty or quotas exhausted)
+max_duration_minutes: 0 # Exit after N minutes, draining active tasks (0 runs without time limit)
 heartbeat_interval_seconds: 30.0
+claim_poll_interval_minutes: 3.0 # Standby poll interval in minutes when waiting on busy slots
 
 # Gemini API Configuration
 gemini_key: "AIzaSyYourGeminiApiKeyHere"

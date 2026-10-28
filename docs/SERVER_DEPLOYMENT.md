@@ -1,86 +1,83 @@
-# AI Sub Server & Remote Worker Deployment Guide
+# AI Sub Distributed Deployment Guide
 
-This guide covers setting up `ai-sub-server` for 24/7 orchestration on an Oracle Cloud Free Tier VM (2 OCPU, 12 GB RAM, 100 GB Disk) and connecting remote ephemeral `ai-sub-worker` instances.
-
----
-
-## 1. Server Configuration (`server.yaml`)
-
-Both the server and worker use strict YAML configuration files without hidden environment variables or CLI flags.
-
-Place `server.yaml` (or `<hostname>.server.yaml`) in your server workspace directory (e.g. `/home/ubuntu/ai-sub-server/server.yaml`):
-
-```yaml
-server:
-  host: "127.0.0.1"
-  port: 8000
-  work_dir: "./work"
-  heartbeat_timeout_seconds: 300
-
-git:
-  repo_url: "https://github.com/YourUsername/subtitles-archive.git"
-  branch: "main"
-  pat: "ghp_your_personal_access_token"
-
-sources:
-  files:
-    folders:
-      - "/home/ubuntu/videos/intake"
-    rescan_interval_minutes: 2
-
-  youtube:
-    urls:
-      - "https://www.youtube.com/playlist?list=PLxxxxxxxxxxxxxxxx"
-      - "https://www.youtube.com/@ChannelName/videos"
-    rescan_interval_minutes: 60
-    rescan_jitter_minutes: 15
-    channel_delay_seconds: 5.0
-    proxy: "http://127.0.0.1:40000"
-    cookie_file: "/home/ubuntu/ai-sub-server/cookie.txt"
-
-pipelines:
-  - name: "combo_38f"
-    summary_model: "google-gla:gemini-3.5-flash-lite"
-    subtitles_model: "google-gla:gemini-3.8-flash"
-    lyrics_model: "google-gla:gemini-3.5-flash-lite"
-
-  - name: "combo_36f"
-    summary_model: "google-gla:gemini-3.5-flash-lite"
-    subtitles_model: "google-gla:gemini-3.6-flash"
-    lyrics_model: "google-gla:gemini-3.5-flash-lite"
-
-  - name: "combo_35l"
-    summary_model: "google-gla:gemini-3.5-flash-lite"
-    subtitles_model: "google-gla:gemini-3.5-flash-lite"
-    lyrics_model: "google-gla:gemini-3.5-flash-lite"
-```
+This guide covers setting up `ai-sub-server` for 24/7 video ingestion and task coordination, along with connecting remote ephemeral `ai-sub-worker` instances.
 
 ---
 
-## 2. Nginx Reverse Proxy with Basic Auth & SSL
+## Architecture Overview
 
-### Create HTTP Basic Auth Credentials
+AI Sub separates subtitling into two main components:
+
+1. **Central Server (`ai-sub-server`)**: Runs on a persistent host (e.g., an Oracle Cloud Free Tier VM). It ingests videos from local watch folders or YouTube feeds, breaks them into segments, coordinates worker task leases, and pushes finalized subtitles and intermediate state to Git.
+2. **Workers (`ai-sub-worker`)**: Ephemeral, distributed nodes that claim tasks, stream media chunks from the server, run Gemini multimodal inference and web search, and return structured results to the server.
+
+### Security & Transport
+
+The server application binds locally to `127.0.0.1:8000` without built-in authentication or encryption. All security responsibilities are offloaded to standard production infrastructure:
+
+- **TLS / SSL Encryption**: Managed via Nginx and Let's Encrypt.
+- **Authentication**: Enforced via Nginx HTTP Basic Auth (`.htpasswd`).
+- **Brute-Force Protection**: Enforced via Fail2ban monitoring Nginx auth failures.
+
+---
+
+## 1. Server Deployment (`/home/ubuntu/ai-sub-server`)
+
+### Step 1: Install System Dependencies
+
+Install Python 3, virtual environment tools, Nginx, Certbot, Fail2ban, and Apache utilities:
 
 ```bash
-sudo apt-get install -y apache2-utils
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip git nginx certbot python3-certbot-nginx fail2ban apache2-utils
+```
+
+### Step 2: Set Up Directory and Python Environment
+
+Create the server directory and set up a Python virtual environment:
+
+```bash
+mkdir -p /home/ubuntu/ai-sub-server
+cd /home/ubuntu/ai-sub-server
+
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install ai-sub
+```
+
+### Step 3: Configure `server.yaml`
+
+Copy the example configuration file `docs/server.yaml.example` to `/home/ubuntu/ai-sub-server/server.yaml` and configure your Git archive, intake paths, and pipelines:
+
+```bash
+cp docs/server.yaml.example /home/ubuntu/ai-sub-server/server.yaml
+nano /home/ubuntu/ai-sub-server/server.yaml
+```
+
+### Step 4: Configure Auto-Updating Launcher (`server.sh`)
+
+Copy `docs/server.sh` to `/home/ubuntu/ai-sub-server/server.sh` and make it executable:
+
+```bash
+cp docs/server.sh /home/ubuntu/ai-sub-server/server.sh
+chmod +x /home/ubuntu/ai-sub-server/server.sh
+```
+
+### Step 5: Configure Nginx with Basic Auth
+
+Generate credentials for your worker nodes:
+
+```bash
 sudo htpasswd -c /etc/nginx/.htpasswd worker_user
 ```
 
-### Nginx Virtual Host (`/etc/nginx/sites-available/ai-sub`)
+Create `/etc/nginx/sites-available/ai-sub`:
 
 ```nginx
 server {
     listen 80;
     server_name sub.yourdomain.com;
-    return 301 https://$host$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name sub.yourdomain.com;
-
-    ssl_certificate /etc/letsencrypt/live/sub.yourdomain.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/sub.yourdomain.com/privkey.pem;
 
     client_max_body_size 100M;
     proxy_read_timeout 300s;
@@ -99,7 +96,7 @@ server {
 }
 ```
 
-Enable and reload Nginx:
+Enable the configuration:
 
 ```bash
 sudo ln -s /etc/nginx/sites-available/ai-sub /etc/nginx/sites-enabled/
@@ -107,33 +104,41 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
----
+### Step 6: Acquire Let's Encrypt SSL Certificate
 
-## 3. Running the Server (Systemd Service)
-
-Create `/etc/systemd/system/ai-sub-server.service`:
-
-```ini
-[Unit]
-Description=AI Sub Central Server Coordinator
-After=network.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/ai-sub-server
-Environment="PATH=/home/ubuntu/ai-sub-server/venv/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/home/ubuntu/ai-sub-server/venv/bin/ai-sub-server server.yaml
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start the service:
+Use Certbot to configure SSL on your domain:
 
 ```bash
+sudo certbot --nginx -d sub.yourdomain.com
+```
+
+### Step 7: Configure Fail2ban for HTTP Auth Protection
+
+Create `/etc/fail2ban/jail.d/nginx-http-auth.local`:
+
+```ini
+[nginx-http-auth]
+enabled  = true
+port     = http,https
+logpath  = /var/log/nginx/error.log
+maxretry = 5
+findtime = 600
+bantime  = 3600
+```
+
+Restart Fail2ban to activate brute-force protection:
+
+```bash
+sudo systemctl restart fail2ban
+sudo fail2ban-client status nginx-http-auth
+```
+
+### Step 8: Start Server as a Systemd Service
+
+Copy `docs/ai-sub-server.service` into `/etc/systemd/system/`:
+
+```bash
+sudo cp docs/ai-sub-server.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable ai-sub-server
 sudo systemctl start ai-sub-server
@@ -142,62 +147,61 @@ sudo journalctl -u ai-sub-server -f
 
 ---
 
-## 4. Remote Worker Setup (Ephemeral / Multi-Server / Cron)
+## 2. Worker Deployment (`/home/ubuntu/ai-sub-worker`)
 
-Workers only need Python 3.11+ and the `ai-sub` package.
+Workers are ephemeral and can run on any machine with Python 3.11+.
 
-### Configuration (`worker.yaml` or `<servername>.worker.yaml`)
-
-Copy `docs/worker.yaml.example` to `worker.yaml` (or `<servername>.worker.yaml`):
-
-```yaml
-server_url: "https://sub.yourdomain.com"
-server_auth: "worker_user:your_secure_password"
-worker_id: "oracle-e2-worker-1"
-concurrency: 2
-
-gemini_key: "AIzaSy..."
-
-models:
-  - "google-gla:gemini-3.8-flash"
-  - "google-gla:gemini-3.6-flash"
-  - "google-gla:gemini-3.5-flash-lite"
-
-search:
-  tools:
-    - "tinyfish"
-    - "lrclib"
-    - "duckduckgo"
-  tinyfish_key: "tf-..."
-```
-
-### File Resolution Order
-
-When running `ai-sub-worker`, the configuration is discovered in this exact sequence:
-
-1. Positional argument: `ai-sub-worker sub.yourdomain.com.worker.yaml`
-2. `<hostname>.worker.yaml`
-3. `worker.yaml`
-
-### Running the Worker
-
-#### Manual Invocation:
+### Step 1: Set Up Directory and Python Environment
 
 ```bash
-# Auto-discovers <hostname>.worker.yaml or worker.yaml
-ai-sub-worker
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip
 
-# Or explicitly specify a server config file
-ai-sub-worker sub.yourdomain.com.worker.yaml
+mkdir -p /home/ubuntu/ai-sub-worker
+cd /home/ubuntu/ai-sub-worker
+
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install ai-sub
 ```
 
-#### Automated Crontab (e.g. Run Every 15 Minutes):
+### Step 2: Configure `worker.yaml`
+
+Copy the example configuration file `docs/worker.yaml.example` to `/home/ubuntu/ai-sub-worker/worker.yaml` and set your server URL, HTTP Basic Auth credentials, and API keys:
+
+```bash
+cp docs/worker.yaml.example /home/ubuntu/ai-sub-worker/worker.yaml
+nano /home/ubuntu/ai-sub-worker/worker.yaml
+```
+
+### Step 3: Configure Auto-Updating Launcher (`worker.sh`)
+
+Copy `docs/worker.sh` to `/home/ubuntu/ai-sub-worker/worker.sh` and make it executable:
+
+```bash
+cp docs/worker.sh /home/ubuntu/ai-sub-worker/worker.sh
+chmod +x /home/ubuntu/ai-sub-worker/worker.sh
+```
+
+### Step 4: Scheduled Execution via Crontab
+
+Configure recurring cron tasks with environment variable overrides to schedule model execution windows:
+
+```bash
+crontab -e
+```
+
+Add scheduled runs:
 
 ```cron
-*/15 * * * * cd /home/ubuntu/worker && ./venv/bin/ai-sub-worker sub.yourdomain.com.worker.yaml >> /tmp/ai-sub-worker.log 2>&1
+# Every 4 hours: Run up to 50 tasks of 3.5-flash-lite, stopping new claims after 3 hours (180 mins)
+7 */4 * * * cd /home/ubuntu/ai-sub-worker && AISUB_WORKER_MODELS='google-gla:gemini-3.5-flash-lite' AISUB_WORKER_MAX_TASKS=50 AISUB_WORKER_MAX_DURATION_MINUTES=180 ./worker.sh > /tmp/ai-sub-worker.log 2>&1
+
+# Daily at 21:00 UTC: Offer gemini-3.8-flash during peak availability window
+0 21 * * * cd /home/ubuntu/ai-sub-worker && AISUB_WORKER_MODELS='google-gla:gemini-3.8-flash' AISUB_WORKER_MAX_DURATION_MINUTES=180 ./worker.sh > /tmp/ai-sub-worker-38f.log 2>&1
 ```
 
-- When the server queue is empty, all slots exit cleanly in ~1 second.
-- Processes multiple video chunks in parallel based on `concurrency: 2`.
-- When daily quotas are exhausted (HTTP 429), the worker records the event in `.ai-sub-quota.json` (resetting at 00:00 Pacific Time), drops that model from claiming, and continues running tasks for unexhausted models.
-- While processing, each active task runs its own independent background heartbeat every 30 seconds to maintain its lease.
+- When the server queue is empty, the worker exits cleanly in ~1 second.
+- In-flight tasks drain gracefully before exiting when the duration limit is reached.
+- Quota exhaustion (HTTP 429) automatically disables the affected model until 00:00 Pacific Time in `.ai-sub-quota.json` without failing the entire run.

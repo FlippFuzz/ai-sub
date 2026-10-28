@@ -6,6 +6,7 @@ import asyncio
 import re
 from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
+from time import time
 from typing import Any
 
 import logfire
@@ -30,6 +31,7 @@ class WorkerRunner:
     client: WorkerClient
     tracker: WorkerQuotaTracker
     usable_models: list[str]
+    _deadline: float | None
     _lock: asyncio.Lock
     _task_completed_event: asyncio.Event
     _active_tasks: int
@@ -48,6 +50,7 @@ class WorkerRunner:
         )
         self.tracker = WorkerQuotaTracker(settings.quota_file)
         self.usable_models = self.tracker.filter_available_models(settings.models)
+        self._deadline = None
         self._lock = asyncio.Lock()
         self._task_completed_event = asyncio.Event()
         self._active_tasks = 0
@@ -161,7 +164,15 @@ class WorkerRunner:
                 logfire.debug(f"[Slot {slot_id}] Reached max tasks limit ({self.settings.max_tasks}). Exiting.")
                 break
 
-            # 2. Re-filter usable models against quota state
+            # 2. Exit if maximum session duration reached
+            if self._deadline is not None and time() >= self._deadline:
+                logfire.info(
+                    f"[Slot {slot_id}] Maximum run duration ({self.settings.max_duration_minutes:.1f}m) "
+                    f"reached. Draining slot and exiting."
+                )
+                break
+
+            # 3. Re-filter usable models against quota state
             async with self._lock:
                 self.usable_models = self.tracker.filter_available_models(self.usable_models)
                 current_models = list(self.usable_models)
@@ -170,9 +181,11 @@ class WorkerRunner:
                 logfire.info(f"[Slot {slot_id}] No usable models remaining (all quota exhausted). Exiting.")
                 break
 
-            # 3. Synchronously claim next task under lock to avoid racing
+            # 4. Synchronously claim next task under lock to avoid racing
             async with self._lock:
                 if 0 < self.settings.max_tasks <= self._tasks_completed:
+                    break
+                if self._deadline is not None and time() >= self._deadline:
                     break
                 claim = await self.client.claim_task(
                     worker_id=self.settings.worker_id,
@@ -183,15 +196,16 @@ class WorkerRunner:
                     self._active_tasks += 1
                     self._task_completed_event.clear()
 
-            # 4. Handle no matching tasks available
+            # 5. Handle no matching tasks available
             if claim is None:
                 async with self._lock:
                     active = self._active_tasks
 
                 if active > 0:
-                    # Wait for running tasks to finish and potentially unlock subsequent stages
+                    # Wait for running tasks to finish or claim poll interval to elapse
+                    poll_timeout = self.settings.claim_poll_interval_minutes * 60.0
                     try:
-                        await asyncio.wait_for(self._task_completed_event.wait(), timeout=5.0)
+                        await asyncio.wait_for(self._task_completed_event.wait(), timeout=poll_timeout)
                     except asyncio.TimeoutError:
                         pass
                     continue
@@ -199,7 +213,7 @@ class WorkerRunner:
                     logfire.info(f"[Slot {slot_id}] No matching tasks on server and no active slots. Exiting.")
                     break
 
-            # 5. Process claimed task
+            # 6. Process claimed task
             carrier = {"traceparent": claim.traceparent} if claim.traceparent else None
             trace_ctx = (
                 logfire.attach_context(carrier) if carrier and hasattr(logfire, "attach_context") else nullcontext()
@@ -287,6 +301,13 @@ class WorkerRunner:
 
         concurrency = self.settings.concurrency
         logfire.info(f"Starting worker '{self.settings.worker_id}' with {concurrency} concurrent execution slot(s).")
+
+        if self.settings.max_duration_minutes > 0:
+            self._deadline = time() + (self.settings.max_duration_minutes * 60.0)
+            logfire.info(
+                f"Worker session time limit set to {self.settings.max_duration_minutes:.1f} minute(s). "
+                f"New task claims will stop after deadline."
+            )
 
         async with AsyncExitStack() as stack:
             search_providers = create_search_providers(self.settings.search)
