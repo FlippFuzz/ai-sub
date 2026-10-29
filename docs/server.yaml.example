@@ -1,0 +1,101 @@
+# ==============================================================================
+# AI Sub Server Configuration (server.yaml or <hostname>.server.yaml)
+# ==============================================================================
+
+# Core HTTP Server and Task Orchestration Options
+server:
+  host: "127.0.0.1"
+  port: 8000
+  work_dir: "./work"
+  heartbeat_timeout_seconds: 300
+  validation_buffer_ms: 2000
+
+# Task Execution and Distributed Retry Controls
+retry:
+  per_run: 5          # Internal retries on worker before surrendering task lease
+  max_runs: 3         # Maximum total worker attempts before marking task permanently FAILED
+  multiplier: 2.0
+  min_wait_seconds: 30.0
+  max_wait_seconds: 300
+
+# Git Repository Synchronization Settings
+git:
+  repo_url: "https://github.com/YourUsername/subtitles-archive.git"
+  branch: "main"
+  pat: "ghp_your_github_token_here"
+
+# Media Intake Sources
+sources:
+  # Local Filesystem Intake
+  files:
+    folders:
+      - "/home/ubuntu/videos/intake"
+    rescan_interval_minutes: 2
+
+  # YouTube Feed Intake
+  youtube:
+    urls:
+      - "https://www.youtube.com/playlist?list=PLxxxxxxxxxxxxxxxx"
+      - "https://www.youtube.com/@ChannelName/videos"
+    rescan_interval_minutes: 60  # Base interval between YouTube scans
+    rescan_jitter_minutes: 15    # Additive random delay (e.g., 60-75 mins total)
+    channel_delay_seconds: 5.0   # Jittered pause between scraping individual channels
+
+    channels_file: "channels.json"
+    max_title_bytes: 100
+    # proxy: "http://127.0.0.1:40000"
+    cookie_file: "/home/ubuntu/ai-sub-server/cookie.txt"
+
+    enable_pot_provider: true
+    pot_dir: "bgutil-ytdlp-pot-provider"
+    pot_update_interval_hours: 24
+
+    download_test_duration_s: 10
+    max_consecutive_failures: 3
+
+# Video Re-encoding and Compression Controls
+reencode:
+  encoder: null
+
+  summary:
+    enabled: true
+    threshold_mb: 500
+    keyframe_only: true
+    fps: 1.0
+    height: 360
+    bitrate_kb: 35
+
+  segment:
+    enabled: true
+    threshold_mb: 50
+    fps: 1.0
+    height: 360
+    bitrate_kb: 35
+
+# Auxiliary Web Search and Lyric Provider Settings
+search:
+  tools:
+    - "tinyfish"
+    - "lrclib"
+
+# Segmentation / Splitting Settings
+split:
+  max_seconds: 300
+  duration_tolerance_ms: 100
+
+# Active Pipeline Combinations
+pipelines:
+  - name: "combo_38f"
+    summary_model: "google-gla:gemini-3.5-flash-lite"
+    subtitles_model: "google-gla:gemini-3.8-flash"
+    lyrics_model: "google-gla:gemini-3.5-flash-lite"
+
+  - name: "combo_36f"
+    summary_model: "google-gla:gemini-3.5-flash-lite"
+    subtitles_model: "google-gla:gemini-3.6-flash"
+    lyrics_model: "google-gla:gemini-3.5-flash-lite"
+
+  - name: "combo_35l"
+    summary_model: "google-gla:gemini-3.5-flash-lite"
+    subtitles_model: "google-gla:gemini-3.5-flash-lite"
+    lyrics_model: "google-gla:gemini-3.5-flash-lite"

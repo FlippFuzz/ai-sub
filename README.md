@@ -3,199 +3,232 @@
 [![PyPI version](https://img.shields.io/pypi/v/ai-sub)](https://pypi.org/project/ai-sub)
 [![Downloads](https://img.shields.io/pypi/dw/ai-sub)](https://pypistats.org/packages/ai-sub)
 
+**AI Sub** uses Google's Gemini AI (via the Interactions API) to automatically transcribe and translate videos into audio-synchronized, bilingual English subtitles.
+
+It handles fast Japanese speech, livestream banter, video game terms, and live singing performances with high timing accuracy.
+
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
-- [Showcase](#showcase)
-- [How It Works](#how-it-works)
+- [How It Works (In Simple Terms)](#how-it-works-in-simple-terms)
+- [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Usage](#usage)
+  - [Option 1: Recommended Setup (Gemini + Tinyfish)](#option-1-recommended-setup-gemini--tinyfish)
+  - [Option 2: Free Search Setup (DuckDuckGo)](#option-2-free-search-setup-duckduckgo)
+  - [Option 3: Multi-Tool Search Setup](#option-3-multi-tool-search-setup)
+  - [Option 4: Providing Custom Notes & Lore](#option-4-providing-custom-notes--lore)
+  - [Option 5: Speed Mode (Skipping Steps)](#option-5-speed-mode-skipping-steps)
+- [Intermediate Files & Resuming](#intermediate-files--resuming)
 - [Configuration](#configuration)
-- [Release Notes](#release-notes)
-- [Known Limitations](#known-limitations)
-- [Advanced: Re-processing Segments](#advanced-re-processing-segments)
-
-## Overview
-
-**AI Sub** is a command-line tool that leverages Google's **Gemini** models to generate high-quality, audio-synchronized subtitles. It is designed to produce dual-language subtitles (Original + English translation) by analyzing both audio and visual cues.
 
 ---
 
-## Showcase
+## How It Works (In Simple Terms)
 
-Please visit [ai-sub-showcase](https://github.com/FlippFuzz/ai-sub-showcase).
+AI Sub breaks down video subtitling into a clean, human-like workflow:
 
-[![Video Screenshot](https://github.com/FlippFuzz/ai-sub/raw/main/showcase/old/42h4ydJS3zk.png)](https://raw.githubusercontent.com/FlippFuzz/ai-sub/refs/heads/main/showcase/old/42h4ydJS3zk.v007.srt)
+```text
+[Your Video File]
+       │
+       ▼
+ 1. The Big Picture (Summary)
+    The AI takes a quick bird's-eye view of the entire video to learn who is in it,
+    what they are doing (chatting, gaming, singing), and any inside jokes or names.
+    (If this stage fails, the pipeline halts immediately to save quota).
+       │
+       ▼
+ 2. Divide into 5-Minute Chunks
+    Long videos are split into 5-minute pieces so processing is fast and manageable.
+       │
+       ▼
+ 3. Listen & Transcribe (Subtitles)
+    The AI listens directly to the audio track down to the millisecond to catch
+    exactly when voices speak or sing. It also watches for on-screen signs or text,
+    writing dialogue and natural English translations.
+       │
+       ▼
+ 4. Music & Lyrics Polish (Lyrics — Only when someone sings!)
+    - If the segment was just talking or gaming: This step is skipped completely!
+    - If someone sang a song: The AI looks up official lyrics in LRCLIB and web search
+      to ensure tricky lyrics, puns, and Kanji are spelled and translated perfectly.
+    - If lyrics lookup fails: An error is explicitly logged for that part in the final
+      subtitles so you know it requires attention.
+       │
+       ▼
+ 5. Stitched Subtitle File (.srt)
+    All pieces are assembled into a single subtitle file ready to drag-and-drop into
+    VLC, MPV, or YouTube.
+```
 
 ---
 
-## How It Works
+## Prerequisites
 
-1.  **Segmentation:** Splits the input video into manageable 5-minute segments.
-2.  **Re-encoding (Optional):** Compresses segments (e.g., 1fps, 360p) to significantly reduce bandwidth usage and upload times without sacrificing AI analysis accuracy.
-3.  **Upload (Optional):** Uploads segments to the Gemini Files API for cloud-based processing. This bypasses local processing constraints and leverages the API's multimodal capabilities.
-4.  **Lyrics Search and Scene Detection (Optional):** Detects scenes and performs a web search for official lyrics to improve transcription accuracy for songs.
-5.  **Generation:** Generates synchronized subtitles and translations by using the audio as the ground truth for timing and visuals for context.
-6.  **Assembly:** Stitches the generated subtitles back together into a final SRT file (e.g., `<video_name>.<shortcode>.srt` where the shortcode combines model code and prompt versions such as `video.g36f-0918.srt`).
+- **Python 3.11** or higher installed on your computer.
+- A **Google Gemini API Key** ([Get one here from Google AI Studio](https://aistudio.google.com/)).
+- (Recommended) A **Tinyfish API Key** for fast, accurate web search and lyric lookups ([Get one here](https://tinyfish.ai/)).
 
 ---
 
 ## Installation
 
-**Prerequisites:** Python 3.10 or higher.
+### Linux & macOS
 
-1.  **Set up a Python virtual environment:**
+1. Open your terminal and create a virtual environment:
 
-    ```bash
-    python -m venv venv
-    source venv/bin/activate  # On Windows, use `venv\Scripts\activate.bat`
-    ```
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
 
-2.  **Install AI Sub:**
+2. Install AI Sub:
+   ```bash
+   pip install --upgrade ai-sub
+   ```
 
-    ```bash
-    pip install --upgrade ai-sub
-    ```
+### Windows
+
+1. Open **Command Prompt** or **PowerShell** and create a virtual environment:
+
+   ```powershell
+   python -m venv venv
+   .\venv\Scripts\activate
+   ```
+
+2. Install AI Sub:
+   ```powershell
+   pip install --upgrade ai-sub
+   ```
 
 ---
 
 ## Usage
 
-You can use AI Sub a Google AI Studio API Key and an optional langsearch API key for song lyrics web search.
+### Option 1: Recommended Setup (Gemini + Tinyfish)
 
-### Option 1 (Recommended): Google API Key + Langsearch API Key
+This configuration gives the best results for song lyrics, VTuber lore, video game jargon, and character names.
 
-This option provides the best quality for the free tier.
+#### On Linux / macOS:
 
-- As of 22 July 2026:
-- Gemini API provides 20 free requests/day for gemini-3.7-flash
-- Gemini API provides 500 free requests/day for gemini-3.5-flash-lite
-- Langsearch provides 1000 free request/day for web searches
+```bash
+export GEMINI_API_KEY="your_gemini_api_key_here"
+export TINYFISH_API_KEY="your_tinyfish_api_key_here"
 
-The limiting factor is the daily free quota for gemini-3.7-flash.
-You should be able to create subtitles for between 1 hour to 1 hour 40 mins of videos per day.
+ai-sub --ai.search.tools=tinyfish,lrclib "path/to/video.mp4"
+```
 
-1.  **Obtain your API Keys:**
-    - Sign in to [Google AI Studio](https://aistudio.google.com/app/apikey).
-    - Click "Create API Key".
+#### On Windows (PowerShell):
 
-    - Sign in to [Langsearch](https://langsearch.com/api-keys).
-    - API Keys -> Create API Key
+```powershell
+$env:GEMINI_API_KEY="your_gemini_api_key_here"
+$env:TINYFISH_API_KEY="your_tinyfish_api_key_here"
 
-    - Copy and securely store your keys. **Never disclose your API key publicly.**
+ai-sub --ai.search.tools=tinyfish,lrclib "path\to\video.mp4"
+```
 
-2.  **Run the application:**
+#### On Windows (Command Prompt):
 
-    Linux:
+```cmd
+set GEMINI_API_KEY=your_gemini_api_key_here
+set TINYFISH_API_KEY=your_tinyfish_api_key_here
 
-    ```bash
-    GOOGLE_KEY="YOUR_GOOGLE_API_KEY"
-    LANGSEARCH_KEY="YOUR_LANGSEARCH_API_KEY"
-    FILE_NAME="path/to/your/video.mp4"
+ai-sub --ai.search.tools=tinyfish,lrclib "path\to\video.mp4"
+```
 
-    ai-sub \
-    --ai.model-lyrics=google-gla:gemini-3.5-flash-lite \
-    --ai.model-subtitles=google-gla:gemini-3.7-flash \
-    --ai.search.web-search-tool=langsearch \
-    --ai.google.key="${GOOGLE_KEY}" \
-    --ai.search.key="${LANGSEARCH_KEY}" \
-    "${FILE_NAME}"
-    ```
+---
 
-    Windows:
+### Option 2: Free Search Setup (DuckDuckGo)
 
-    ```cmd
-    SET "GOOGLE_KEY=YOUR_GOOGLE_API_KEY"
-    SET "LANGSEARCH_KEY=YOUR_LANGSEARCH_API_KEY"
-    SET "FILE_NAME=path/to/your/video.mp4"
+If you do not have a Tinyfish key, you can use DuckDuckGo search for free with no extra API key:
 
-    ai-sub ^
-    --ai.model-lyrics=google-gla:gemini-3.5-flash-lite ^
-    --ai.model-subtitles=google-gla:gemini-3.7-flash ^
-    --ai.search.web-search-tool=langsearch ^
-    --ai.google.key="%GOOGLE_KEY%" ^
-    --ai.search.key="%LANGSEARCH_KEY%" ^
-    "%FILE_NAME%"
-    ```
+#### On Linux / macOS:
 
-### Option 2: Using Google API Key Only
+```bash
+export GEMINI_API_KEY="your_gemini_api_key_here"
 
-This is the easiest option if you don't want to bother with creating a Langsearch API key.
-We can use duckduckgo to try to lookup lyrics, but it is not as reliable.
+ai-sub --ai.search.tools=duckduckgo,lrclib "path/to/video.mp4"
+```
 
-1.  **Obtain your API Key:**
-    - Sign in to [Google AI Studio](https://aistudio.google.com/app/apikey).
-    - Click "Create API Key".
-    - Copy and securely store your key. **Never disclose your API key publicly.**
+#### On Windows (PowerShell):
 
-2.  **Run the application:**
+```powershell
+$env:GEMINI_API_KEY="your_gemini_api_key_here"
 
-    ```bash
-    GOOGLE_KEY="YOUR_GOOGLE_API_KEY"
-    FILE_NAME="path/to/your/video.mp4"
+ai-sub --ai.search.tools=duckduckgo,lrclib "path\to\video.mp4"
+```
 
-    ai-sub \
-    --ai.model-lyrics=google-gla:gemini-3.5-flash-lite \
-    --ai.model-subtitles=google-gla:gemini-3.7-flash \
-    --ai.search.web-search-tool=duckduckgo \
-    --ai.google.key="${GOOGLE_KEY}" \
-    "${FILE_NAME}"
-    ```
+---
 
-    Windows:
+### Option 3: Multi-Tool Search Setup
 
-    ```cmd
-    SET "GOOGLE_KEY=YOUR_GOOGLE_API_KEY"
-    SET "FILE_NAME=path/to/your/video.mp4"
+You can provide multiple search providers simultaneously. The AI agent will select between them:
 
-    ai-sub ^
-    --ai.model-lyrics=google-gla:gemini-3.5-flash-lite ^
-    --ai.model-subtitles=google-gla:gemini-3.7-flash ^
-    --ai.search.web-search-tool=duckduckgo ^
-    --ai.google.key="%GOOGLE_KEY%" ^
-    "%FILE_NAME%"
-    ```
+```bash
+ai-sub --ai.search.tools=tinyfish,ollama,lrclib "path/to/video.mp4"
+```
+
+---
+
+### Option 4: Providing Custom Notes & Lore
+
+You can feed custom notes to the AI (such as character names, spelling preferences, or specific terms) using `--context` or a text file:
+
+```bash
+# Inline notes
+ai-sub --context "The streamers are Fuwawa and Mococo. Keep 'Bau bau' untranslated." "video.mp4"
+
+# Notes from a text file
+ai-sub --context-file "notes.txt" "video.mp4"
+```
+
+---
+
+### Option 5: Speed Mode (Skipping Steps)
+
+If you are subtitling a pure talking/gaming stream with no singing, or if you want to skip the whole-video preview to save time:
+
+```bash
+# Skip the whole-video summary preview
+ai-sub --concurrency.summary=0 "video.mp4"
+
+# Skip lyric searches and music refinement
+ai-sub --concurrency.lyrics=0 "video.mp4"
+
+# Fast dialogue-only mode (skip both preview and lyrics refinement)
+ai-sub --concurrency.summary=0 --concurrency.lyrics=0 "video.mp4"
+```
+
+---
+
+## Intermediate Files & Resuming
+
+AI Sub automatically saves its work in a temporary folder (`tmp_<video_name>`).
+
+If your internet drops, your computer shuts down, or an API error occurs, **you do not lose your progress**. Simply run the exact same command again:
+
+- AI Sub will automatically pick up where it left off.
+- It will reuse all completed chunks and only finish the missing pieces.
+
+### Comparing Intermediate Subtitles in VLC
+
+Inside the temporary directory (`tmp_<video_name>`), AI Sub generates standalone subtitle files for each video part with complete upstream lineage:
+
+- `part_000.subtitles-g35l-01_g38f-19.srt`: Initial dialogue transcription and timing (linked to the summary model).
+- `part_000.lyrics-g35l-01_g38f-19_g35l-10.srt`: Song lyrics and translation refinement (linked to both summary and subtitle models).
+
+When opened in VLC or MPV alongside the video chunk, the subtitle tracks are labeled with their full lineage for easy comparison.
+
+Once the entire process finishes, the final stitched subtitle file is saved alongside your video with a clean, concise filename:
+
+```text
+my_video.mp4
+my_video.g38f-011019.srt  <-- Drag this into your video player!
+```
 
 ---
 
 ## Configuration
 
-For a detailed list of all configuration options, including AI models, re-encoding settings, and concurrency controls, please refer to [CONFIGURATION.md](https://github.com/FlippFuzz/ai-sub/blob/main/docs/CONFIGURATION.md).
-
-All settings can be configured via command-line arguments (e.g., `--ai.model=google-gla:gemini-3.7-flash`) or environment variables with the `AISUB_` prefix (e.g., `AISUB_AI_MODEL=google-gla:gemini-3.7-flash`).
-
----
-
-## Release Notes
-
-For the latest updates and bug fixes, please refer to [RELEASE_NOTES.md](https://github.com/FlippFuzz/ai-sub/blob/main/RELEASE_NOTES.md).
-
----
-
-## Known Limitations
-
-1.  **Timestamp Accuracy:** Subtitle timestamps may occasionally be inaccurate due to limitations of the Gemini AI model. Shorter video segments generally yield better accuracy. Experiment with the `--split.max-seconds` setting.
-2.  **AI Hallucinations:** Like all LLMs, Gemini may occasionally produce "hallucinations" or inaccurate information.
-
-If you encounter issues, consider re-processing specific video segments as detailed below.
-
----
-
-## Advanced: Re-processing Segments
-
-Intermediate files and job states are stored in a temporary directory (default: `tmp_<input_file_name>`). You can customize this location using the `--dir.tmp` flag.
-
-The application creates separate state files for each processing stage (e.g., lyrics detection, subtitle generation). To re-process a specific segment, you must delete the state file for the stage you want to re-run.
-
-File naming format: `part_XXX.<stage>.<model_shortcode>.yaml`
-
-**Example: To re-run subtitle generation for the third segment:**
-
-1.  Navigate to the temporary directory.
-2.  Identify the model shortcode used for subtitles (e.g., `g36f` for `gemini-3.7-flash`).
-3.  Delete the corresponding state file (e.g., `part_002.subtitles.g36f.yaml`).
-4.  Re-run the script. It will detect the missing subtitle job state and re-process only that segment, using any existing lyrics data.
-
-To re-run the entire pipeline for that segment (including lyrics search), delete both the `lyrics` and `subtitles` YAML files for that part.
+For advanced settings (such as custom frame rates, custom models, rate limits, per-stage agentic video toggles, and storage cleanup rules), refer to [CONFIGURATION.md](docs/CONFIGURATION.md).

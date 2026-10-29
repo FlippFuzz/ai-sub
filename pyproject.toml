@@ -1,25 +1,29 @@
 [project]
 name = "ai-sub"
-version = "3.6.0"
+version = "4.0.0"
 authors = [
-  { name="FlippFuzz" },
+  { name = "FlippFuzz" },
 ]
 description = "AI-Powered Subtitle Generation with Translation"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "pysubs2",
     "static-ffmpeg",
     "pydantic",
     "pydantic-settings",
-    "google-genai",
-    "logfire",
+    "google-genai >= 2.3.0",
+    "logfire[google-genai, httpx]",
     "ddgs",
     "httpx",
     "json_repair",
     "pyrate-limiter",
-    "tqdm",
-    "pyyaml"
+    "rich",
+    "pyyaml",
+    "fastapi",
+    "uvicorn",
+    "yt-dlp[default]",
+    "gitpython",
 ]
 
 [project.urls]
@@ -27,14 +31,16 @@ dependencies = [
 "Bug Tracker" = "https://github.com/FlippFuzz/ai-sub/issues"
 
 [project.scripts]
-ai-sub = "ai_sub.main:main"
+ai-sub = "ai_sub.standalone:main"
+ai-sub-server = "ai_sub.server.main:main"
+ai-sub-worker = "ai_sub.worker.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 preview = true

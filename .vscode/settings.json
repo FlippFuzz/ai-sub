@@ -12,5 +12,8 @@
   "editor.codeActionsOnSave": {
     "source.organizeImports.ruff": "explicit",
     "source.fixAll": "explicit"
-  }
+  },
+
+  // Ignore bgutil-ytdlp-pot-provider in work directory
+  "python.analysis.ignore": ["work/"]
 }
