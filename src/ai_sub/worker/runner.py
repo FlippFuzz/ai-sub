@@ -21,15 +21,13 @@ from ai_sub.protocol import TaskClaimResponse
 from ai_sub.search import BaseSearchProvider, create_search_providers
 from ai_sub.worker.client import WorkerClient
 from ai_sub.worker.config import WorkerSettings
-from ai_sub.worker.quota import WorkerQuotaTracker
 
 
 class WorkerRunner:
-    """Manages the lifecycle, concurrent execution slots, and quota states of a worker node."""
+    """Manages the lifecycle, concurrent execution slots, and in-memory quota states of a worker node."""
 
     settings: WorkerSettings
     client: WorkerClient
-    tracker: WorkerQuotaTracker
     usable_models: list[str]
     _deadline: float | None
     _lock: asyncio.Lock
@@ -48,8 +46,7 @@ class WorkerRunner:
             base_url=str(settings.server_url),
             auth=settings.get_basic_auth_tuple(),
         )
-        self.tracker = WorkerQuotaTracker(settings.quota_file)
-        self.usable_models = self.tracker.filter_available_models(settings.models)
+        self.usable_models = list(settings.models)
         self._deadline = None
         self._lock = asyncio.Lock()
         self._task_completed_event = asyncio.Event()
@@ -156,7 +153,7 @@ class WorkerRunner:
         if not Path(raw_name).suffix:
             raw_name = f"{raw_name}.mp4"
 
-        # Unique task filename to prevent collisions between concurrent worker slots
+        # Unique task filename prevents collisions across concurrent worker tasks
         safe_task_id = re.sub(r"[^a-zA-Z0-9_\-]+", "_", task.task_id)
         chunk_path = self.settings.temp_dir / f"{safe_task_id}_{raw_name}"
         await self.client.download_media(task.media_url, chunk_path)
@@ -207,16 +204,15 @@ class WorkerRunner:
                 )
                 break
 
-            # 3. Re-filter usable models against quota state
+            # 3. Snapshot currently usable models in memory
             async with self._lock:
-                self.usable_models = self.tracker.filter_available_models(self.usable_models)
                 current_models = list(self.usable_models)
 
             if not current_models:
                 logfire.info(f"[Slot {slot_id}] No usable models remaining (all quota exhausted). Exiting.")
                 break
 
-            # 4. Synchronously claim next task under lock to avoid racing
+            # 4. Synchronously claim next task under lock to avoid racing between slots
             async with self._lock:
                 if 0 < self.settings.max_tasks <= self._tasks_completed:
                     break
@@ -289,7 +285,6 @@ class WorkerRunner:
 
                     except QuotaExceededError as e:
                         logfire.warning(f"[Slot {slot_id}] Daily quota reached for model '{claim.model}': {e}")
-                        self.tracker.mark_exhausted(claim.model)
                         await self.client.fail_task(
                             task_id=claim.task_id,
                             worker_id=self.settings.worker_id,
@@ -300,6 +295,10 @@ class WorkerRunner:
                         async with self._lock:
                             if claim.model in self.usable_models:
                                 self.usable_models.remove(claim.model)
+                                logfire.info(
+                                    f"[Slot {slot_id}] Disabled model '{claim.model}' in memory. "
+                                    f"Remaining available models: {self.usable_models}"
+                                )
 
                     except Exception as e:
                         logfire.exception(f"[Slot {slot_id}] Execution error on task '{claim.task_id}': {e}")
@@ -331,7 +330,7 @@ class WorkerRunner:
             return 1
 
         if not self.usable_models:
-            logfire.info("All configured models are quota-exhausted until 00:00 PT. Exiting cleanly.")
+            logfire.info("No configured models available. Exiting cleanly.")
             return 0
 
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)

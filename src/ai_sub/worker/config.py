@@ -74,10 +74,6 @@ class WorkerSettings(YamlFileSettings):
         default_factory=WorkerSearchSettings,
         description="Web search configuration and provider API keys.",
     )
-    quota_file: Path = Field(
-        default=Path(".ai-sub-quota.json"),
-        description="Path to local quota state JSON tracking Pacific Time resets.",
-    )
     heartbeat_interval_seconds: float = Field(
         default=30.0,
         description="Interval in seconds between task heartbeat pings.",

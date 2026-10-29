@@ -8,7 +8,7 @@ User=ubuntu
 Group=ubuntu
 WorkingDirectory=/home/ubuntu/ai-sub-server
 Environment="PATH=/home/ubuntu/ai-sub-server/venv/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/home/ubuntu/ai-sub-server/server.sh server.yaml
+ExecStart=/home/ubuntu/ai-sub-server/server.sh
 Restart=always
 RestartSec=10
 

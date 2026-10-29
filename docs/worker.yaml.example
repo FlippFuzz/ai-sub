@@ -33,6 +33,5 @@ search:
   # langsearch_key: "your-langsearch-key"
   # ollama_key: "your-ollama-key"
 
-# Local Storage & Tracking Files
-quota_file: ".ai-sub-quota.json"
+# Local Storage
 temp_dir: "./ai_sub_worker"

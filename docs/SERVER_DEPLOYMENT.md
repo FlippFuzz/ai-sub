@@ -204,4 +204,4 @@ Add scheduled runs:
 
 - When the server queue is empty, the worker exits cleanly in ~1 second.
 - In-flight tasks drain gracefully before exiting when the duration limit is reached.
-- Quota exhaustion (HTTP 429) automatically disables the affected model until 00:00 Pacific Time in `.ai-sub-quota.json` without failing the entire run.
+- Quota exhaustion (HTTP 429) automatically disables the affected model in memory for the remainder of the worker run without failing other models or tasks.
