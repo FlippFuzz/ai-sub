@@ -25,11 +25,11 @@ The server application binds locally to `127.0.0.1:8000` without built-in authen
 
 ### Step 1: Install System Dependencies
 
-Install Python 3, virtual environment tools, Nginx, Certbot, Fail2ban, and Apache HTTP utilities:
+Install Python 3, virtual environment tools, Nginx, Certbot, Fail2ban, Apache HTTP utilities, and download tools:
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip git nginx fail2ban apache2-utils wget
+sudo apt install -y python3 python3-venv python3-pip git nginx fail2ban apache2-utils wget curl
 ```
 
 ### Step 2: Open Network Ports
@@ -132,9 +132,31 @@ sudo systemctl restart fail2ban
 sudo fail2ban-client status nginx-http-auth
 ```
 
-### Step 6: Set Up Directory, Python Environment, and Sample Files
+### Step 6: Install Node.js LTS via NVM (For YouTube PO Token Provider)
 
-Create the server directory and initialize a Python virtual environment:
+The default YouTube intake configuration enables `bgutil-ytdlp-pot-provider`, which compiles a local Node.js server using TypeScript (`npm ci && npx tsc`). Install NVM and the Node.js LTS runtime under your `ubuntu` user:
+
+```bash
+# 1. Install NVM
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash
+
+# 2. Source NVM into the current shell session
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+# 3. Install and set Node.js LTS as the default alias
+nvm install --lts
+nvm alias default 'lts/*'
+
+# 4. Verify node, npm, and npx are accessible
+node -v
+npm -v
+npx -v
+```
+
+### Step 7: Set Up Directory, Python Environment, and Package Installation
+
+Create the server directory, initialize a Python virtual environment, and install `ai-sub` with the `server` extra:
 
 ```bash
 mkdir -p /home/ubuntu/ai-sub-server
@@ -143,16 +165,16 @@ cd /home/ubuntu/ai-sub-server
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install ai-sub
+pip install "ai-sub[server]"
 ```
 
-### Step 7: Configure Server and Systemd Service
+### Step 8: Configure Server and Systemd Service
 
 #### a. Download and Edit Configuration
 
 ```bash
 wget -O server.yaml https://raw.githubusercontent.com/FlippFuzz/ai-sub/main/docs/server.yaml.example
-vim server.yaml
+nano server.yaml
 ```
 
 #### b. Set Up Systemd Service for Auto-Restart
@@ -200,7 +222,7 @@ nano worker.yaml
 
 ### Step 3: Configure Auto-Updating Launcher (`worker.sh`)
 
-Download [`docs/worker.sh`](docs/worker.sh:1) and make it executable:
+Download `docs/worker.sh` and make it executable:
 
 ```bash
 wget -O worker.sh https://raw.githubusercontent.com/FlippFuzz/ai-sub/main/docs/worker.sh

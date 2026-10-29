@@ -19,7 +19,7 @@ fi
 source venv/bin/activate
 
 # Auto-update ai-sub package
-pip install --upgrade ai-sub --quiet
+pip install --upgrade "ai-sub[server]" --quiet
 
 # Execute server coordinator passing through any arguments
 exec ai-sub-server "$@"

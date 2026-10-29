@@ -1,16 +1,1 @@
-pysubs2
-static-ffmpeg
-pydantic
-pydantic-settings
-google-genai >= 2.3.0
-logfire[google-genai, httpx]
-ddgs
-httpx
-json_repair
-pyrate-limiter
-rich
-pyyaml
-fastapi
-uvicorn
-yt-dlp[default]
-gitpython
+-e .[all]

@@ -1,6 +1,6 @@
 [project]
 name = "ai-sub"
-version = "4.0.0"
+version = "4.0.0b1"
 authors = [
   { name = "FlippFuzz" },
 ]
@@ -20,10 +20,18 @@ dependencies = [
     "pyrate-limiter",
     "rich",
     "pyyaml",
+]
+
+[project.optional-dependencies]
+server = [
     "fastapi",
     "uvicorn",
     "yt-dlp[default]",
     "gitpython",
+    "bgutil-ytdlp-pot-provider",
+]
+all = [
+    "ai-sub[server]",
 ]
 
 [project.urls]
