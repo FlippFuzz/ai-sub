@@ -67,9 +67,7 @@ sudo htpasswd -c /etc/nginx/.htpasswd worker_user
 
 ```nginx
 server {
-    listen 80;
     server_name sub.yourdomain.com;
-
     listen [::]:443 ssl ipv6only=on;
     listen 443 ssl;
     ssl_certificate /etc/letsencrypt/live/sub.yourdomain.com/fullchain.pem;
