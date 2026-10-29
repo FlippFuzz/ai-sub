@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import inspect
 import json
 import mimetypes
@@ -171,6 +173,63 @@ def _extract_thought_text(step: Any) -> str | None:
     return None
 
 
+def calculate_sha256_hex(file_path: Path) -> str:
+    """Calculates the SHA256 hex digest of a file using Python 3.11+ C file_digest.
+
+    Args:
+        file_path: Path to the target file.
+
+    Returns:
+        str: Lowercase 64-character SHA256 hex digest string.
+    """
+    with open(file_path, "rb") as file:
+        return hashlib.file_digest(file, "sha256").hexdigest()
+
+
+def _hashes_match(remote_hash: str | None, local_hex: str) -> bool:
+    """Checks if a remote file's SHA256 hash matches a local file's hex digest.
+
+    Handles Base64-encoded hex strings (Gemini API standard), raw hex strings,
+    and Base64-encoded binary digests.
+
+    Args:
+        remote_hash: The SHA256 hash string from Gemini Files API.
+        local_hex: The calculated local file SHA256 hex digest.
+
+    Returns:
+        bool: True if the hashes match, False otherwise.
+    """
+    if not remote_hash:
+        return False
+
+    # Direct hex match
+    if remote_hash.lower() == local_hex.lower():
+        return True
+
+    # Gemini API format: Base64-encoded ASCII hex string
+    b64_hex = base64.b64encode(local_hex.encode()).decode()
+    if remote_hash == b64_hex:
+        return True
+
+    # Base64-encoded binary digest format fallback
+    try:
+        b64_digest = base64.b64encode(bytes.fromhex(local_hex)).decode()
+        if remote_hash == b64_digest:
+            return True
+    except ValueError:
+        pass
+
+    # Decoded remote base64 match against local hex
+    try:
+        decoded_remote = base64.b64decode(remote_hash).decode("utf-8", errors="ignore")
+        if decoded_remote.lower() == local_hex.lower():
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 class GeminiExecutor:
     """Unified client orchestrating Gemini Files API uploads, quota tracking, and Interactions generation."""
 
@@ -317,6 +376,14 @@ class GeminiExecutor:
             await self._cleanup_storage_if_needed()
 
             display_name = _get_unique_display_name(file_path)
+            local_size = file_path.stat().st_size
+            local_hex_cache: str | None = None
+
+            async def _get_local_hex() -> str:
+                nonlocal local_hex_cache
+                if local_hex_cache is None:
+                    local_hex_cache = await asyncio.to_thread(calculate_sha256_hex, file_path)
+                return local_hex_cache
 
             existing_active: types.File | None = None
             existing_processing: types.File | None = None
@@ -328,6 +395,20 @@ class GeminiExecutor:
                     ):
                         if remote_file.display_name == display_name:
                             if remote_file.state == types.FileState.ACTIVE:
+                                if remote_file.size_bytes != local_size:
+                                    logfire.debug(
+                                        f"Existing remote file {remote_file.name} size ({remote_file.size_bytes}) "
+                                        f"differs from local ({local_size}). Skipping reuse."
+                                    )
+                                    continue
+
+                                local_hex = await _get_local_hex()
+                                if not _hashes_match(remote_file.sha256_hash, local_hex):
+                                    logfire.debug(
+                                        f"Existing remote file {remote_file.name} hash mismatch. Skipping reuse."
+                                    )
+                                    continue
+
                                 existing_active = remote_file
                                 break
                             if remote_file.state == types.FileState.PROCESSING and existing_processing is None:

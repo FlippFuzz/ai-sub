@@ -66,7 +66,7 @@ class OllamaSearchProvider(BaseHttpSearchProvider):
                 title = item.get("title")
                 url = item.get("url")
                 content = item.get("content")
-                if title and url and content and len(content) <= self.settings.max_length:
+                if title and url and content:
                     try:
                         results.append(
                             WebSearchResult(title=title, url=url, content=content[: self.settings.max_length])

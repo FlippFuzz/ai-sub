@@ -135,10 +135,11 @@ def stitch_subtitles(
                 )
             )
             any_failed = True
-            attempts = max(
-                lyrics_job.total_attempts if lyrics_job else 0,
-                sub_job.total_attempts if sub_job else 0,
-            )
+            if lyrics_required:
+                attempts = lyrics_job.total_attempts if lyrics_job else 0
+            else:
+                attempts = sub_job.total_attempts if sub_job else 0
+
             if attempts >= max_runs:
                 max_retries_exceeded = True
             else:

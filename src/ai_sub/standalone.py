@@ -482,56 +482,69 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                     while True:
                         task = await subtitles_queue.get()
                         try:
-                            with logfire.span("Subtitles: {segment}", segment=task.stem):
-                                sub_file = settings.dir.tmp / f"{task.stem}.subtitles.{subtitles_shortcode}.yaml"
-                                job = SubtitlesJob.load(sub_file, settings.ai.validation_buffer_ms)
-                                if not job:
-                                    job = SubtitlesJob(
-                                        name=task.stem,
-                                        video_duration_ms=task.duration_ms,
-                                        segment_offset_ms=task.offset_ms,
-                                        global_summary=summary_response,
-                                        user_context=user_context,
-                                    )
-                                else:
-                                    job.user_context = user_context
-                                    job.segment_offset_ms = task.offset_ms
-                                    job.global_summary = summary_response
-
-                                if not job.response and job.total_attempts < settings.retry.max_runs:
-                                    try:
-                                        ctx = WorkerContext(
-                                            executor=executor,
-                                            media_path=task.media_path,
-                                            search_providers=[],
+                            try:
+                                with logfire.span("Subtitles: {segment}", segment=task.stem):
+                                    sub_file = settings.dir.tmp / f"{task.stem}.subtitles.{subtitles_shortcode}.yaml"
+                                    job = SubtitlesJob.load(sub_file, settings.ai.validation_buffer_ms)
+                                    if not job:
+                                        job = SubtitlesJob(
+                                            name=task.stem,
+                                            video_duration_ms=task.duration_ms,
+                                            segment_offset_ms=task.offset_ms,
+                                            global_summary=summary_response,
+                                            user_context=user_context,
                                         )
-                                        res = await job.execute(ctx)
-                                        task.draft_subtitles = res.subtitles
-                                        task.detected_performances = res.detected_musical_performances
+                                    else:
+                                        job.user_context = user_context
+                                        job.segment_offset_ms = task.offset_ms
+                                        job.global_summary = summary_response
+
+                                    if not job.response and job.total_attempts < settings.retry.max_runs:
+                                        try:
+                                            ctx = WorkerContext(
+                                                executor=executor,
+                                                media_path=task.media_path,
+                                                search_providers=[],
+                                            )
+                                            res = await job.execute(ctx)
+                                            task.draft_subtitles = res.subtitles
+                                            task.detected_performances = res.detected_musical_performances
+                                            task.subtitles_complete = True
+
+                                            srt_path = (
+                                                settings.dir.tmp / f"{task.stem}.subtitles-{subtitles_shortcode}.srt"
+                                            )
+                                            await asyncio.to_thread(job.save_srt, srt_path)
+                                        except QuotaExceededError:
+                                            logfire.warning(f"Quota exceeded during subtitles pass for {task.stem}.")
+                                        except Exception as e:
+                                            job.total_attempts += 1
+                                            logfire.exception(f"Subtitles job error for {task.stem}: {e}")
+                                        finally:
+                                            try:
+                                                await asyncio.to_thread(job.save, sub_file)
+                                            except Exception as save_err:
+                                                logfire.error(
+                                                    f"Failed to save subtitles YAML for {task.stem}: {save_err}"
+                                                )
+                                    elif job.response:
+                                        task.draft_subtitles = job.response.subtitles
+                                        task.detected_performances = job.response.detected_musical_performances
                                         task.subtitles_complete = True
+                                    elif job.total_attempts >= settings.retry.max_runs:
+                                        logfire.warning(f"Skipping subtitles for {task.stem}: max attempts reached.")
 
-                                        srt_path = settings.dir.tmp / f"{task.stem}.subtitles-{subtitles_shortcode}.srt"
-                                        await asyncio.to_thread(job.save_srt, srt_path)
-                                    except QuotaExceededError:
-                                        logfire.warning(f"Quota exceeded during subtitles pass for {task.stem}.")
-                                    except Exception as e:
-                                        job.total_attempts += 1
-                                        logfire.exception(f"Subtitles job error for {task.stem}: {e}")
-                                    finally:
-                                        await asyncio.to_thread(job.save, sub_file)
-                                elif job.response:
-                                    task.draft_subtitles = job.response.subtitles
-                                    task.detected_performances = job.response.detected_musical_performances
-                                    task.subtitles_complete = True
-                                elif job.total_attempts >= settings.retry.max_runs:
-                                    logfire.warning(f"Skipping subtitles for {task.stem}: max attempts reached.")
+                                progress.update(subtitles_tid, advance=1)
 
-                            progress.update(subtitles_tid, advance=1)
-
-                            if task.subtitles_complete and use_lyrics and task.detected_performances:
-                                await lyrics_queue.put(task)
-                            elif lyrics_tid is not None:
-                                progress.update(lyrics_tid, advance=1)
+                                if task.subtitles_complete and use_lyrics and task.detected_performances:
+                                    await lyrics_queue.put(task)
+                                elif lyrics_tid is not None:
+                                    progress.update(lyrics_tid, advance=1)
+                            except Exception as worker_err:
+                                logfire.exception(f"Unhandled error in subtitles worker for {task.stem}: {worker_err}")
+                                progress.update(subtitles_tid, advance=1)
+                                if lyrics_tid is not None:
+                                    progress.update(lyrics_tid, advance=1)
                         finally:
                             subtitles_queue.task_done()
 
@@ -539,56 +552,64 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                     while True:
                         task = await lyrics_queue.get()
                         try:
-                            with logfire.span("Lyrics: {segment}", segment=task.stem):
-                                lyrics_file = settings.dir.tmp / f"{task.stem}.lyrics.{lyrics_shortcode}.yaml"
-                                job = LyricsJob.load(lyrics_file, settings.ai.validation_buffer_ms)
-                                if not job:
-                                    job = LyricsJob(
-                                        name=task.stem,
-                                        video_duration_ms=task.duration_ms,
-                                        segment_offset_ms=task.offset_ms,
-                                        draft_subtitles=task.draft_subtitles or [],
-                                        detected_performances=task.detected_performances or [],
-                                        global_summary=summary_response,
-                                        user_context=user_context,
-                                    )
-                                else:
-                                    job.user_context = user_context
-                                    job.segment_offset_ms = task.offset_ms
-                                    job.global_summary = summary_response
-                                    if task.draft_subtitles:
-                                        job.draft_subtitles = task.draft_subtitles
-                                    if task.detected_performances:
-                                        job.detected_performances = task.detected_performances
-
-                                if (
-                                    not job.response
-                                    and job.total_attempts < settings.retry.max_runs
-                                    and job.draft_subtitles
-                                    and job.detected_performances
-                                ):
-                                    try:
-                                        ctx = WorkerContext(
-                                            executor=executor,
-                                            media_path=task.media_path,
-                                            search_providers=lyrics_search_providers,
+                            try:
+                                with logfire.span("Lyrics: {segment}", segment=task.stem):
+                                    lyrics_file = settings.dir.tmp / f"{task.stem}.lyrics.{lyrics_shortcode}.yaml"
+                                    job = LyricsJob.load(lyrics_file, settings.ai.validation_buffer_ms)
+                                    if not job:
+                                        job = LyricsJob(
+                                            name=task.stem,
+                                            video_duration_ms=task.duration_ms,
+                                            segment_offset_ms=task.offset_ms,
+                                            draft_subtitles=task.draft_subtitles or [],
+                                            detected_performances=task.detected_performances or [],
+                                            global_summary=summary_response,
+                                            user_context=user_context,
                                         )
-                                        await job.execute(ctx)
+                                    else:
+                                        job.user_context = user_context
+                                        job.segment_offset_ms = task.offset_ms
+                                        job.global_summary = summary_response
+                                        if task.draft_subtitles:
+                                            job.draft_subtitles = task.draft_subtitles
+                                        if task.detected_performances:
+                                            job.detected_performances = task.detected_performances
 
-                                        srt_path = settings.dir.tmp / f"{task.stem}.lyrics-{lyrics_shortcode}.srt"
-                                        await asyncio.to_thread(job.save_srt, srt_path)
-                                    except QuotaExceededError:
-                                        logfire.warning(f"Quota exceeded during lyrics pass for {task.stem}.")
-                                    except Exception as e:
-                                        job.total_attempts += 1
-                                        logfire.exception(f"Lyrics job error for {task.stem}: {e}")
-                                    finally:
-                                        await asyncio.to_thread(job.save, lyrics_file)
-                                elif job.total_attempts >= settings.retry.max_runs:
-                                    logfire.warning(f"Skipping lyrics for {task.stem}: max attempts reached.")
+                                    if (
+                                        not job.response
+                                        and job.total_attempts < settings.retry.max_runs
+                                        and job.draft_subtitles
+                                        and job.detected_performances
+                                    ):
+                                        try:
+                                            ctx = WorkerContext(
+                                                executor=executor,
+                                                media_path=task.media_path,
+                                                search_providers=lyrics_search_providers,
+                                            )
+                                            await job.execute(ctx)
 
-                            if lyrics_tid is not None:
-                                progress.update(lyrics_tid, advance=1)
+                                            srt_path = settings.dir.tmp / f"{task.stem}.lyrics-{lyrics_shortcode}.srt"
+                                            await asyncio.to_thread(job.save_srt, srt_path)
+                                        except QuotaExceededError:
+                                            logfire.warning(f"Quota exceeded during lyrics pass for {task.stem}.")
+                                        except Exception as e:
+                                            job.total_attempts += 1
+                                            logfire.exception(f"Lyrics job error for {task.stem}: {e}")
+                                        finally:
+                                            try:
+                                                await asyncio.to_thread(job.save, lyrics_file)
+                                            except Exception as save_err:
+                                                logfire.error(f"Failed to save lyrics YAML for {task.stem}: {save_err}")
+                                    elif job.total_attempts >= settings.retry.max_runs:
+                                        logfire.warning(f"Skipping lyrics for {task.stem}: max attempts reached.")
+
+                                if lyrics_tid is not None:
+                                    progress.update(lyrics_tid, advance=1)
+                            except Exception as worker_err:
+                                logfire.exception(f"Unhandled error in lyrics worker for {task.stem}: {worker_err}")
+                                if lyrics_tid is not None:
+                                    progress.update(lyrics_tid, advance=1)
                         finally:
                             lyrics_queue.task_done()
 

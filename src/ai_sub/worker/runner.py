@@ -213,19 +213,29 @@ class WorkerRunner:
                 break
 
             # 4. Synchronously claim next task under lock to avoid racing between slots
+            claim = None
+            claim_failed = False
             async with self._lock:
                 if 0 < self.settings.max_tasks <= self._tasks_completed:
                     break
                 if self._deadline is not None and time() >= self._deadline:
                     break
-                claim = await self.client.claim_task(
-                    worker_id=self.settings.worker_id,
-                    models=current_models,
-                    search_tools=self.settings.search.tools,
-                )
-                if claim is not None:
-                    self._active_tasks += 1
-                    self._task_completed_event.clear()
+                try:
+                    claim = await self.client.claim_task(
+                        worker_id=self.settings.worker_id,
+                        models=current_models,
+                        search_tools=self.settings.search.tools,
+                    )
+                    if claim is not None:
+                        self._active_tasks += 1
+                        self._task_completed_event.clear()
+                except Exception as e:
+                    claim_failed = True
+                    logfire.warning(f"[Slot {slot_id}] Failed to claim task from server: {e}. Retrying in 5s...")
+
+            if claim_failed:
+                await asyncio.sleep(5.0)
+                continue
 
             # 5. Handle no matching tasks available
             if claim is None:

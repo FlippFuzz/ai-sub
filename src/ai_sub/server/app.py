@@ -38,6 +38,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
     git_sync = GitSyncManager(settings.git, settings.server.work_dir)
     coordinator = PipelineCoordinator(settings, git_sync=git_sync)
     ingestion = IngestionManager(settings.sources, coordinator, git_sync, settings.server.work_dir)
+    background_tasks: set[asyncio.Task[Any]] = set()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -51,9 +52,15 @@ def create_app(settings: ServerSettings) -> FastAPI:
         """
         await git_sync.ensure_repo()
         await coordinator.start()
-        await ingestion.start()
+        ingestion_task = asyncio.create_task(ingestion.start())
         logfire.info(f"ai-sub-server started on {settings.server.host}:{settings.server.port}")
         yield
+        if not ingestion_task.done():
+            ingestion_task.cancel()
+            try:
+                await ingestion_task
+            except asyncio.CancelledError:
+                pass
         await ingestion.stop()
         await coordinator.stop()
         logfire.info("ai-sub-server shut down gracefully.")
@@ -179,7 +186,9 @@ def create_app(settings: ServerSettings) -> FastAPI:
             except Exception as e:
                 logfire.exception(f"Background finalization and pipeline feed error: {e}")
 
-        asyncio.create_task(_finalize_and_feed())
+        bg_task = asyncio.create_task(_finalize_and_feed())
+        background_tasks.add(bg_task)
+        bg_task.add_done_callback(background_tasks.discard)
 
         return {"status": "ok"}
 

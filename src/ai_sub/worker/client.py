@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import logfire
-from httpx import AsyncClient, HTTPStatusError, Response
+from httpx import AsyncClient, HTTPError, Response
 
 from ai_sub.protocol import (
     TaskClaimRequest,
@@ -80,7 +80,7 @@ class WorkerClient:
         resp.raise_for_status()
         return TaskClaimResponse.model_validate(resp.json())
 
-    async def send_heartbeat(self, task_id: str, worker_id: str) -> bool:
+    async def send_heartbeat(self, task_id: str, worker_id: str) -> bool | None:
         """Sends a heartbeat ping to renew an active task lease.
 
         Args:
@@ -88,7 +88,8 @@ class WorkerClient:
             worker_id: Unique identifier of this worker.
 
         Returns:
-            bool: True if heartbeat was acknowledged; False if lease expired or was revoked.
+            bool | None: True if acknowledged; False if lease expired or was revoked;
+                None if a transient transport error or 5xx server error occurred.
         """
         req = TaskHeartbeatRequest(worker_id=worker_id)
         try:
@@ -99,10 +100,13 @@ class WorkerClient:
             if resp.status_code == 200:
                 data = TaskHeartbeatResponse.model_validate(resp.json())
                 return data.acknowledged
+            if resp.status_code >= 500:
+                logfire.warning(f"Heartbeat received server error {resp.status_code} for task '{task_id}'")
+                return None
             return False
         except Exception as e:
             logfire.warning(f"Heartbeat failed for task '{task_id}': {e}")
-            return False
+            return None
 
     async def download_media(self, media_url: str, destination: Path) -> Path:
         """Downloads a media chunk file from the server.
@@ -156,7 +160,7 @@ class WorkerClient:
                 json=req.model_dump(mode="json"),
             )
             return resp.status_code == 200
-        except HTTPStatusError as e:
+        except HTTPError as e:
             logfire.error(f"Failed to submit completed task '{task_id}': {e}")
             return False
 

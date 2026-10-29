@@ -38,14 +38,14 @@ _BASE_CONFIG: SettingsConfigDict = {
 ServiceTier = Literal["auto", "default", "flex", "priority"]
 
 
-def parse_string_list(val: Any) -> list[str]:
+def parse_string_list(val: Any) -> list[str] | Any:
     """Parses a list of strings from a Python list, JSON array, or comma-separated string.
 
     Args:
         val: Raw input value from environment variable or YAML.
 
     Returns:
-        list[str]: Normalized list of strings.
+        list[str] | Any: Normalized list of strings or unparsed raw input.
     """
     if isinstance(val, str):
         v = val.strip()
@@ -62,22 +62,26 @@ def parse_string_list(val: Any) -> list[str]:
         for m in val:
             if isinstance(m, str) and "," in m:
                 out.extend(sub.strip() for sub in m.split(",") if sub.strip())
-            elif isinstance(m, str) and m.strip():
-                out.append(m.strip())
+            else:
+                s = str(m).strip()
+                if s:
+                    out.append(s)
         return out
     return val
 
 
-def parse_path_list(val: Any) -> list[Path]:
+def parse_path_list(val: Any) -> list[Path] | Any:
     """Parses a list of Paths from a Python list, JSON array, or comma-separated string.
 
     Args:
         val: Raw input value from environment variable or YAML.
 
     Returns:
-        list[Path]: Normalized list of Path objects.
+        list[Path] | Any: Normalized list of Path objects or unparsed raw input.
     """
     raw_list = parse_string_list(val)
+    if not isinstance(raw_list, list):
+        return raw_list
     return [Path(p) for p in raw_list]
 
 
