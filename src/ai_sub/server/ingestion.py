@@ -322,105 +322,147 @@ class IngestionManager:
         cutoff_ts = int(time()) - lookback_seconds if not deep_scan else 0
 
         # Expand bare channel URLs into both /videos (Uploads) and /streams (Live VODs), excluding /shorts
-        target_urls: list[str] = []
+        # Preserving original channel handle/ID context
+        target_items: list[tuple[str, str | None]] = []
         for raw_url in self.config.youtube.urls:
             clean_url = raw_url.rstrip("/")
             if clean_url.endswith("/shorts"):
                 continue
+
+            url_handle: str | None = None
+            if match := re.search(r"/(@[\w.-]+)", clean_url):
+                url_handle = match.group(1)
+            elif match := re.search(r"/(channel/UC[\w-]+)", clean_url):
+                url_handle = match.group(1).split("/")[-1]
+
             if re.match(r"^https?://(www\.)?youtube\.com/(@[\w.-]+|channel/UC[\w-]+)$", clean_url):
-                target_urls.extend([f"{clean_url}/videos", f"{clean_url}/streams"])
+                target_items.extend(
+                    [
+                        (f"{clean_url}/videos", url_handle),
+                        (f"{clean_url}/streams", url_handle),
+                    ]
+                )
             else:
-                target_urls.append(clean_url)
+                target_items.append((clean_url, url_handle))
 
         discovered: list[DiscoveredVideo] = []
 
-        with YoutubeDL(cast(Any, ydl_opts)) as ydl:
-            for idx, url in enumerate(target_urls):
-                if idx > 0 and self.config.youtube.channel_delay_seconds > 0:
-                    delay = random.uniform(
-                        0.5 * self.config.youtube.channel_delay_seconds,
-                        1.5 * self.config.youtube.channel_delay_seconds,
-                    )
-                    time_sleep(delay)
-
-                try:
-                    result = ydl.extract_info(url, download=False)
-                    if not result:
-                        continue
-
-                    entries_raw = result.get("entries")
-                    entries_iterator = [result] if entries_raw is None else entries_raw
-                    entries_processed: list[Any] = []
-
-                    for entry in entries_iterator:
-                        if not entry:
-                            continue
-
-                        vid = entry.get("id")
-                        if not vid or len(vid) != 11:
-                            continue
-
-                        title = str(entry.get("title") or "Unknown")
-                        if title in ["[Deleted video]", "[Private video]", "[Unavailable video]"]:
-                            continue
-
-                        # Skip upcoming premieres, active live streams, and shorts
-                        if entry.get("live_status") in ("is_upcoming", "is_live", "post_live"):
-                            continue
-                        url_val = entry.get("url") or entry.get("webpage_url") or ""
-                        if "/shorts/" in url_val:
-                            continue
-
-                        raw_ts = entry.get("timestamp") or entry.get("release_timestamp") or 0
-                        try:
-                            ts = int(raw_ts)
-                        except (ValueError, TypeError):
-                            ts = 0
-
-                        if not ts and (ud := entry.get("upload_date")):
-                            try:
-                                dt = datetime.strptime(str(ud), "%Y%m%d").replace(tzinfo=timezone.utc)
-                                ts = int(dt.timestamp())
-                            except ValueError:
-                                ts = 0
-
-                        # Delta early-exit condition: if past the lookback window, stop paginating
-                        if not deep_scan and ts > 0 and ts < cutoff_ts:
-                            break
-
-                        entries_processed.append(entry)
-
-                        uploader = self.channel_mapper.get_uploader_id(entry)
-                        if not uploader:
-                            uploader = str(entry.get("uploader") or "youtube")
-                        uploader = uploader.strip("@")[:20]
-
-                        ch_name = self.channel_mapper.get_channel_name(entry)
-                        web_url = f"https://www.youtube.com/watch?v={vid}"
-
-                        discovered.append(
-                            DiscoveredVideo(
-                                video_id=vid,
-                                uploader=uploader,
-                                channel_name=ch_name,
-                                title=title,
-                                source_type="youtube",
-                                source_ref=web_url,
-                                timestamp=ts,
-                            )
+        with logfire.span(
+            "Scanning YouTube Sources",
+            deep_scan=deep_scan,
+            total_sources=len(target_items),
+        ) as scan_span:
+            with YoutubeDL(cast(Any, ydl_opts)) as ydl:
+                for idx, (url, url_context_handle) in enumerate(target_items):
+                    if idx > 0 and self.config.youtube.channel_delay_seconds > 0:
+                        delay = random.uniform(
+                            0.5 * self.config.youtube.channel_delay_seconds,
+                            1.5 * self.config.youtube.channel_delay_seconds,
                         )
+                        time_sleep(delay)
 
-                    self.channel_mapper.update_from_entries(entries_processed)
+                    with logfire.span("Scanning {url}", url=url, _level="debug") as url_span:
+                        try:
+                            result = ydl.extract_info(url, download=False)
+                            if not result:
+                                url_span.set_attribute("result", "empty")
+                                continue
 
-                except Exception as e:
-                    err_msg = str(e)
-                    logfire.warning(f"Error scanning YouTube source {url}: {err_msg}")
-                    if "Sign in to confirm you’re not a bot" in err_msg or "HTTP Error 429" in err_msg:
-                        logfire.warning("Bot block encountered. Halting current YouTube scan cycle.")
-                        break
+                            # Pre-seed ChannelMapper with parent tab/channel metadata
+                            self.channel_mapper.update_from_entries([result])
 
-        logfire.info(f"Discovered {len(discovered)} video(s) across YouTube sources.")
-        return discovered
+                            entries_raw = result.get("entries")
+                            entries_iterator = [result] if entries_raw is None else entries_raw
+                            entries_processed: list[Any] = []
+                            sample_entries: list[Any] = []
+
+                            for entry in entries_iterator:
+                                if not entry:
+                                    continue
+
+                                if len(sample_entries) < 10:
+                                    sample_entries.append(entry)
+
+                                vid = entry.get("id")
+                                if not vid or len(vid) != 11:
+                                    continue
+
+                                title = str(entry.get("title") or "Unknown")
+                                if title in ["[Deleted video]", "[Private video]", "[Unavailable video]"]:
+                                    continue
+
+                                # Skip upcoming premieres, active live streams, and shorts
+                                if entry.get("live_status") in ("is_upcoming", "is_live", "post_live"):
+                                    continue
+                                url_val = entry.get("url") or entry.get("webpage_url") or ""
+                                if "/shorts/" in url_val:
+                                    continue
+
+                                raw_ts = entry.get("timestamp") or entry.get("release_timestamp") or 0
+                                try:
+                                    ts = int(raw_ts)
+                                except (ValueError, TypeError):
+                                    ts = 0
+
+                                if not ts and (ud := entry.get("upload_date")):
+                                    try:
+                                        dt = datetime.strptime(str(ud), "%Y%m%d").replace(tzinfo=timezone.utc)
+                                        ts = int(dt.timestamp())
+                                    except ValueError:
+                                        ts = 0
+
+                                # Delta early-exit condition: if past the lookback window, stop paginating
+                                if not deep_scan and ts > 0 and ts < cutoff_ts:
+                                    break
+
+                                entries_processed.append(entry)
+
+                                uploader, ch_name = self.channel_mapper.resolve(
+                                    entry=entry,
+                                    parent=result,
+                                    url_context=url_context_handle,
+                                )
+                                web_url = f"https://www.youtube.com/watch?v={vid}"
+
+                                discovered.append(
+                                    DiscoveredVideo(
+                                        video_id=vid,
+                                        uploader=uploader,
+                                        channel_name=ch_name,
+                                        title=title,
+                                        source_type="youtube",
+                                        source_ref=web_url,
+                                        timestamp=ts,
+                                    )
+                                )
+
+                            self.channel_mapper.update_from_entries(entries_processed)
+
+                            url_span.set_attribute("sample_entries", sample_entries)
+                            url_span.set_attribute(
+                                "root_metadata",
+                                {
+                                    "id": result.get("id"),
+                                    "title": result.get("title"),
+                                    "uploader_id": result.get("uploader_id"),
+                                    "uploader": result.get("uploader"),
+                                    "channel_id": result.get("channel_id"),
+                                    "channel": result.get("channel"),
+                                },
+                            )
+                            url_span.set_attribute("discovered_count", len(entries_processed))
+
+                        except Exception as e:
+                            err_msg = str(e)
+                            logfire.warning(f"Error scanning YouTube source {url}: {err_msg}")
+                            url_span.set_attribute("error", err_msg)
+                            if "Sign in to confirm you’re not a bot" in err_msg or "HTTP Error 429" in err_msg:
+                                logfire.warning("Bot block encountered. Halting current YouTube scan cycle.")
+                                break
+
+            scan_span.set_attribute("total_discovered", len(discovered))
+            logfire.info(f"Discovered {len(discovered)} video(s) across YouTube sources.")
+            return discovered
 
     async def scan_watch_folders_async(self) -> list[DiscoveredVideo]:
         """Scans local watch directories off-thread and updates the in-memory cache.
@@ -501,6 +543,11 @@ class IngestionManager:
                     except OSError:
                         pass
 
+                if info:
+                    self.channel_mapper.update_from_entries([info])
+                    if video.uploader == "youtube":
+                        video.uploader, video.channel_name = self.channel_mapper.resolve(info)
+
                 return (bool(info and has_file), False)
         except Exception as e:
             for p in self.test_download_dir.glob(f"test_{video.video_id}.*"):
@@ -540,6 +587,11 @@ class IngestionManager:
                 info = ydl.extract_info(video.source_ref, download=True)
                 if not info:
                     raise RuntimeError(f"Could not extract download info for {video.source_ref}")
+
+                self.channel_mapper.update_from_entries([info])
+                if video.uploader == "youtube":
+                    video.uploader, video.channel_name = self.channel_mapper.resolve(info)
+
                 fn = ydl.prepare_filename(info)
                 return Path(fn)
 

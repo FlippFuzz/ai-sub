@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -91,6 +92,14 @@ class ChannelMapper:
             except (ValueError, TypeError):
                 ts_int = 0
 
+            # Fall back to uploader_url or channel_url if uploader_id is missing from entry
+            if not uploader_id:
+                for url_key in ("uploader_url", "channel_url"):
+                    if u_url := entry.get(url_key):
+                        if m := re.search(r"/(@[\w.-]+)", str(u_url)):
+                            uploader_id = m.group(1)
+                            break
+
             if channel_id and uploader_id:
                 c_str = str(channel_id)
                 u_str = str(uploader_id)
@@ -128,6 +137,14 @@ class ChannelMapper:
             ts_int = int(ts)
         except (ValueError, TypeError):
             ts_int = 0
+
+        # Extract handle from URLs if uploader_id is absent
+        if not uploader_id:
+            for url_key in ("uploader_url", "channel_url"):
+                if u_url := entry.get(url_key):
+                    if m := re.search(r"/(@[\w.-]+)", str(u_url)):
+                        uploader_id = m.group(1)
+                        break
 
         if uploader_id:
             u_str = str(uploader_id)
@@ -169,3 +186,50 @@ class ChannelMapper:
             if info and info.channel_name:
                 return info.channel_name
         return None
+
+    def resolve(
+        self,
+        entry: Mapping[str, Any] | None = None,
+        parent: Mapping[str, Any] | None = None,
+        url_context: str | None = None,
+    ) -> tuple[str, str]:
+        """Resolves sanitized uploader ID and channel display name using fallback hierarchy.
+
+        Uploader ID strictly resolves to an ID/handle (never a display name):
+        1. entry uploader_id (or cached ID via entry channel_id)
+        2. parent tab uploader_id (or cached ID via parent channel_id)
+        3. url_context (e.g. '@ChannelHandle')
+        4. Fallback 'youtube'
+
+        Args:
+            entry: Optional video entry metadata from yt-dlp.
+            parent: Optional parent playlist/channel tab metadata from yt-dlp.
+            url_context: Optional channel handle or ID extracted from configured URL.
+
+        Returns:
+            tuple[str, str]: Resolved (uploader_id, channel_name) pair.
+        """
+        uploader: str | None = None
+
+        if entry:
+            uploader = self.get_uploader_id(entry) or entry.get("uploader_id")
+        if not uploader and parent:
+            uploader = self.get_uploader_id(parent) or parent.get("uploader_id")
+        if not uploader and url_context:
+            uploader = url_context
+        if not uploader:
+            uploader = "youtube"
+
+        uploader_clean = str(uploader).strip("@")[:20]
+
+        ch_name: str | None = None
+        if entry:
+            ch_name = self.get_channel_name(entry)
+        if not ch_name and parent:
+            ch_name = self.get_channel_name(parent) or parent.get("channel") or parent.get("uploader")
+        if not ch_name and url_context:
+            ch_name = url_context.lstrip("@")
+        if not ch_name:
+            ch_name = uploader_clean
+
+        return uploader_clean, str(ch_name)
