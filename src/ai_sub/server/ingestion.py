@@ -357,7 +357,7 @@ class IngestionManager:
                             continue
 
                         vid = entry.get("id")
-                        if not vid or len(vid) != 11 or vid.startswith("UC"):
+                        if not vid or len(vid) != 11:
                             continue
 
                         title = str(entry.get("title") or "Unknown")

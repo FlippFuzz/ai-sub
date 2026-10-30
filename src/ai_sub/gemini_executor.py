@@ -517,21 +517,19 @@ class GeminiExecutor:
                 interaction_tools.append(item)
             elif callable(item):
                 fn_name = getattr(item, "__name__", str(item))
-                decl = types.FunctionDeclaration.from_callable(client=api_client, callable=item)
-                params: dict[str, Any] | None = None
-                if decl.parameters is not None:
-                    if hasattr(decl.parameters, "model_dump"):
-                        params = decl.parameters.model_dump(mode="json", exclude_none=True)
-                    elif isinstance(decl.parameters, dict):
-                        params = decl.parameters
+                decl = types.FunctionDeclaration.from_callable(
+                    client=api_client,
+                    callable=item,
+                    use_json_schema=True,
+                )
 
                 tool_def: dict[str, Any] = {
                     "type": "function",
                     "name": decl.name or fn_name,
                     "description": decl.description or "",
                 }
-                if params is not None:
-                    tool_def["parameters"] = params
+                if decl.parameters_json_schema:
+                    tool_def["parameters"] = decl.parameters_json_schema
 
                 interaction_tools.append(tool_def)
                 dispatch_map[decl.name or fn_name] = item
