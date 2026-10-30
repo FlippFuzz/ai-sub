@@ -200,3 +200,4 @@ repomix*.xml
 *.yaml
 work/
 ai_sub_worker/
+.deploy/

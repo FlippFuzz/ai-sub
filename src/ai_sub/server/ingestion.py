@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import os
 import random
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -26,12 +28,67 @@ from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
 from ai_sub.video import ensure_ffmpeg
 
 
+class YtDlpBotCheckLogger:
+    """Minimal yt-dlp logger hook that detects bot check errors in real time."""
+
+    context: str
+    bot_blocked: bool
+    last_error: str | None
+
+    def __init__(self, context: str = "yt-dlp") -> None:
+        """Initializes the logger hook with a context label.
+
+        Args:
+            context: Identifier string for logging context.
+        """
+        self.context = context
+        self.bot_blocked = False
+        self.last_error = None
+
+    def debug(self, msg: str) -> None:
+        """Suppresses verbose extractor debug messages.
+
+        Args:
+            msg: Log message string.
+        """
+        pass
+
+    def info(self, msg: str) -> None:
+        """Suppresses routine information messages.
+
+        Args:
+            msg: Log message string.
+        """
+        pass
+
+    def warning(self, msg: str) -> None:
+        """Logs extractor warnings to Logfire.
+
+        Args:
+            msg: Warning message string.
+        """
+        logfire.warning(f"[{self.context}] {msg}")
+
+    def error(self, msg: str) -> None:
+        """Captures error messages and flags bot-detection blocks.
+
+        Args:
+            msg: Error message string.
+        """
+        self.last_error = msg
+        if "Sign in to confirm you’re not a bot" in msg or "HTTP Error 429" in msg:
+            self.bot_blocked = True
+            logfire.error(f"[{self.context}] YouTube Bot Check / 429 encountered: {msg}")
+        else:
+            logfire.error(f"[{self.context}] {msg}")
+
+
 def ensure_pot_provider(pot_dir: Path, check_updates: bool = False) -> Path | None:
-    """Clones or updates bgutil-ytdlp-pot-provider and runs npm build if needed.
+    """Clones or updates bgutil-ytdlp-pot-provider to match the installed plugin version.
 
     Args:
         pot_dir: Directory where the PO token provider repository is located.
-        check_updates: Whether to check GitHub for git updates. Defaults to False.
+        check_updates: Whether to check GitHub for updates if no plugin version is pinned.
 
     Returns:
         Path | None: Server home directory if built and valid; None otherwise.
@@ -44,35 +101,49 @@ def ensure_pot_provider(pot_dir: Path, check_updates: bool = False) -> Path | No
         logfire.warning("Node.js or npm not found in PATH. Skipping bgutil-ytdlp-pot-provider setup.")
         return None
 
+    try:
+        target_version = importlib.metadata.version("bgutil-ytdlp-pot-provider")
+    except Exception:
+        target_version = None
+
     repo_url = "https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git"
     server_dir = pot_dir / "server"
     needs_build = False
 
     try:
         if not pot_dir.exists():
-            logfire.info(f"Cloning bgutil-ytdlp-pot-provider into {pot_dir}")
+            logfire.info(f"Cloning bgutil-ytdlp-pot-provider ({target_version or 'default branch'}) into {pot_dir}")
             pot_dir.parent.mkdir(parents=True, exist_ok=True)
-            Repo.clone_from(repo_url, pot_dir)
+            if target_version:
+                Repo.clone_from(repo_url, pot_dir, branch=target_version)
+            else:
+                Repo.clone_from(repo_url, pot_dir)
             needs_build = True
-        elif check_updates:
+        else:
             repo = Repo(pot_dir)
-            old_hash = repo.head.commit.hexsha
-            repo.remotes.origin.fetch()
-
             try:
-                repo.git.reset("--hard", "@{u}")
+                current_tag = repo.git.describe("--tags", "--exact-match").strip()
             except Exception:
-                try:
-                    repo.git.reset("--hard", "origin/master")
-                except Exception:
-                    repo.git.reset("--hard", "origin/main")
+                current_tag = None
 
-            new_hash = repo.head.commit.hexsha
-            if old_hash != new_hash:
+            # Enforce exact tag matching: sync whenever the repository tag does not match plugin version
+            if target_version and current_tag != target_version:
                 logfire.info(
-                    f"Updates found for bgutil-ytdlp-pot-provider ({old_hash[:7]} -> {new_hash[:7]}). Rebuilding..."
+                    f"Syncing bgutil-ytdlp-pot-provider tag (script: {current_tag or 'unknown'}, "
+                    f"plugin: {target_version})..."
                 )
+                repo.remotes.origin.fetch(tags=True)
+                repo.git.checkout(target_version, force=True)
                 needs_build = True
+            elif check_updates and not target_version:
+                old_hash = repo.head.commit.hexsha
+                repo.remotes.origin.fetch()
+                try:
+                    repo.git.reset("--hard", "@{u}")
+                except Exception:
+                    repo.git.reset("--hard", "origin/master")
+                if old_hash != repo.head.commit.hexsha:
+                    needs_build = True
 
         build_output = server_dir / "build"
         dist_output = server_dir / "dist"
@@ -80,7 +151,13 @@ def ensure_pot_provider(pot_dir: Path, check_updates: bool = False) -> Path | No
             needs_build = True
 
         if needs_build:
-            logfire.info("Building bgutil-ytdlp-pot-provider server (npm ci && npx tsc)...")
+            logfire.info(
+                f"Building bgutil-ytdlp-pot-provider server (v{target_version or 'latest'}) via npm ci && npx tsc..."
+            )
+            # Purge previous build artifacts to prevent stale cached versions
+            shutil.rmtree(build_output, ignore_errors=True)
+            shutil.rmtree(dist_output, ignore_errors=True)
+
             is_win = os.name == "nt"
             subprocess.run([npm_bin, "ci"], cwd=server_dir, check=True, capture_output=True, shell=is_win)
             subprocess.run([npx_bin, "tsc"], cwd=server_dir, check=True, capture_output=True, shell=is_win)
@@ -136,7 +213,7 @@ class IngestionManager:
         git_sync: GitSyncManager,
         base_work_dir: Path,
     ) -> None:
-        """Initializes the ingestion manager.
+        """Initializes the ingestion manager and performs one-time environment diagnostics.
 
         Args:
             config: Intake sources configuration containing files and youtube options.
@@ -152,14 +229,13 @@ class IngestionManager:
         channels_path = config.youtube.channels_file
         if not channels_path.is_absolute():
             channels_path = base_work_dir / channels_path
-
         self.channel_mapper = ChannelMapper(channels_path)
 
         pot_dir = config.youtube.pot_dir
         if not pot_dir.is_absolute():
             pot_dir = base_work_dir / pot_dir
-
         self.pot_dir = pot_dir
+
         self.pot_server_dir = (
             ensure_pot_provider(pot_dir, check_updates=False) if config.youtube.enable_pot_provider else None
         )
@@ -178,8 +254,62 @@ class IngestionManager:
         self._scan_lock = asyncio.Lock()
         self._feed_lock = asyncio.Lock()
 
-    def _get_base_ytdlp_opts(self) -> dict[str, Any]:
+        # Emit environment diagnostic metrics once on startup
+        self._log_startup_diagnostics()
+
+    def _log_startup_diagnostics(self) -> None:
+        """Logs binaries, cookies, proxy, and PO token setup once upon startup."""
+        node_bin = shutil.which("node")
+        npm_bin = shutil.which("npm")
+        npx_bin = shutil.which("npx")
+        ffmpeg_bin, _ = ensure_ffmpeg()
+
+        cookie_p = self.config.youtube.cookie_file
+        cookie_resolved = cookie_p.resolve() if cookie_p else None
+        cookie_exists = bool(cookie_resolved and cookie_resolved.is_file())
+        cookie_size = cookie_resolved.stat().st_size if (cookie_resolved and cookie_exists) else 0
+
+        proxy_str = str(self.config.youtube.proxy) if self.config.youtube.proxy else "None"
+        masked_proxy = re.sub(r"://([^:]+):([^@]+)@", "://***:***@", proxy_str)
+
+        try:
+            pot_plugin_ver = importlib.metadata.version("bgutil-ytdlp-pot-provider")
+        except Exception:
+            pot_plugin_ver = "NOT_INSTALLED"
+
+        with logfire.span(
+            "YouTube Ingestion Startup Diagnostics",
+            node_path=node_bin or "NOT_FOUND",
+            npm_path=npm_bin or "NOT_FOUND",
+            npx_path=npx_bin or "NOT_FOUND",
+            ffmpeg_path=ffmpeg_bin,
+            cookie_file=str(cookie_p) if cookie_p else "None",
+            cookie_exists=cookie_exists,
+            cookie_bytes=cookie_size,
+            proxy=masked_proxy,
+            pot_enabled=self.config.youtube.enable_pot_provider,
+            pot_plugin_version=pot_plugin_ver,
+            pot_server_dir=str(self.pot_server_dir) if self.pot_server_dir else "None",
+        ):
+            if not cookie_exists and cookie_p:
+                logfire.error(
+                    f"Cookie file '{cookie_p}' was specified in config but DOES NOT exist. "
+                    "yt-dlp will make requests unauthenticated!"
+                )
+            elif cookie_exists:
+                logfire.info(f"Loaded YouTube cookie file from {cookie_resolved} ({cookie_size} bytes).")
+
+            if self.config.youtube.enable_pot_provider and not self.pot_server_dir:
+                logfire.warning(
+                    "bgutil-ytdlp-pot-provider is enabled, but node/npm/npx was not found on PATH "
+                    "or matching tag could not be found. PO Token generation is inactive."
+                )
+
+    def _get_base_ytdlp_opts(self, logger: YtDlpBotCheckLogger | None = None) -> dict[str, Any]:
         """Constructs base yt-dlp parameters including PO token server, node runtime, and FFmpeg path.
+
+        Args:
+            logger: Optional custom logger hook for capturing yt-dlp output.
 
         Returns:
             dict[str, Any]: Base yt-dlp configuration options dictionary.
@@ -201,10 +331,13 @@ class IngestionManager:
             "ffmpeg_location": ffmpeg_bin,
             "extractor_args": extractor_args,
         }
+        if logger is not None:
+            opts["logger"] = logger
+
         if self.config.youtube.proxy:
             opts["proxy"] = str(self.config.youtube.proxy)
         if self.config.youtube.cookie_file and self.config.youtube.cookie_file.is_file():
-            opts["cookiefile"] = str(self.config.youtube.cookie_file)
+            opts["cookiefile"] = str(self.config.youtube.cookie_file.resolve())
 
         return opts
 
@@ -259,7 +392,8 @@ class IngestionManager:
         if not self.config.youtube.urls:
             return []
 
-        ydl_opts = self._get_base_ytdlp_opts()
+        custom_logger = YtDlpBotCheckLogger(context="scan_youtube")
+        ydl_opts = self._get_base_ytdlp_opts(logger=custom_logger)
         ydl_opts["extract_flat"] = True
 
         # Search lookback window: twice the rescan interval + jitter (in seconds)
@@ -272,6 +406,10 @@ class IngestionManager:
 
         with YoutubeDL(cast(Any, ydl_opts)) as ydl:
             for idx, url in enumerate(self.config.youtube.urls):
+                if custom_logger.bot_blocked:
+                    logfire.warning("Bot block detected. Aborting remainder of current YouTube scan cycle.")
+                    break
+
                 if idx > 0 and self.config.youtube.channel_delay_seconds > 0:
                     base_delay = self.config.youtube.channel_delay_seconds
                     jittered_delay = random.uniform(0.5 * base_delay, 1.5 * base_delay)
@@ -282,6 +420,10 @@ class IngestionManager:
 
                 try:
                     result = ydl.extract_info(url, download=False)
+                    if custom_logger.bot_blocked:
+                        logfire.warning(f"Bot block encountered while scraping {url}. Aborting current scan cycle.")
+                        break
+
                     if not result:
                         continue
 
@@ -355,6 +497,9 @@ class IngestionManager:
 
                 except Exception as e:
                     logfire.warning(f"Error scanning YouTube source {url}: {e}")
+                    if custom_logger.bot_blocked or "Sign in to confirm you’re not a bot" in str(e):
+                        logfire.warning(f"Bot block encountered on {url}. Stopping current YouTube scan cycle.")
+                        break
 
         return discovered
 
@@ -401,19 +546,20 @@ class IngestionManager:
         await self.scan_youtube_sources_async(deep_scan=deep_scan)
         return self.cached_videos
 
-    def check_video_availability(self, video: DiscoveredVideo) -> bool:
+    def check_video_availability(self, video: DiscoveredVideo) -> tuple[bool, bool]:
         """Executes a pre-flight simulation and snippet download test to verify video availability.
 
         Args:
             video: Discovered video metadata.
 
         Returns:
-            bool: True if video is confirmed downloadable; False if private, blocked, or unavailable.
+            tuple[bool, bool]: (is_available, is_bot_blocked).
         """
         if video.source_type == "local":
-            return video.local_path is not None and video.local_path.is_file()
+            return (video.local_path is not None and video.local_path.is_file()), False
 
-        test_opts = self._get_base_ytdlp_opts()
+        custom_logger = YtDlpBotCheckLogger(context=f"probe_{video.video_id}")
+        test_opts = self._get_base_ytdlp_opts(logger=custom_logger)
         duration_s = self.config.youtube.download_test_duration_s
         outtmpl = str(self.test_download_dir / f"test_{video.video_id}.%(ext)s")
 
@@ -456,16 +602,17 @@ class IngestionManager:
                             pass
 
                     if found_file:
-                        return True
-            return False
+                        return True, False
+            return False, custom_logger.bot_blocked
         except Exception as e:
             for p in self.test_download_dir.glob(f"test_{video.video_id}.*"):
                 try:
                     p.unlink()
                 except OSError:
                     pass
+            is_bot = custom_logger.bot_blocked or "Sign in to confirm you’re not a bot" in str(e)
             logfire.warning(f"Availability check failed for {video.title} ({video.video_id}): {e}")
-            return False
+            return False, is_bot
 
     async def download_youtube_to_combo_dir(self, video: DiscoveredVideo, combo_work_dir: Path) -> Path:
         """Downloads a video stream directly into work/<combo>/<video_id>/<title> [<id>].ext.
@@ -483,7 +630,8 @@ class IngestionManager:
         job_dir = combo_work_dir / video.video_id
         job_dir.mkdir(parents=True, exist_ok=True)
 
-        ydl_opts = self._get_base_ytdlp_opts()
+        custom_logger = YtDlpBotCheckLogger(context=f"download_{video.video_id}")
+        ydl_opts = self._get_base_ytdlp_opts(logger=custom_logger)
         ydl_opts["format"] = "bestvideo[height<=360]+bestaudio/best[height<=360]/best"
         ydl_opts["outtmpl"] = str(job_dir / f"%(title).{self.config.youtube.max_title_bytes}B [%(id)s].%(ext)s")
 
@@ -493,6 +641,8 @@ class IngestionManager:
             with YoutubeDL(cast(Any, ydl_opts)) as ydl:
                 info = ydl.extract_info(video.source_ref, download=True)
                 if not info:
+                    if custom_logger.bot_blocked:
+                        raise RuntimeError(f"YouTube Bot Check triggered on {video.video_id}")
                     raise RuntimeError(f"Could not extract download info for {video.source_ref}")
                 fn = ydl.prepare_filename(info)
                 return Path(fn)
@@ -583,20 +733,37 @@ class IngestionManager:
                 pipe.status = PipelineStatus.PREPARING
 
                 loop = asyncio.get_running_loop()
-                is_available = await loop.run_in_executor(None, self.check_video_availability, candidate)
+                is_available, is_bot_blocked = await loop.run_in_executor(
+                    None, self.check_video_availability, candidate
+                )
+
                 if not is_available:
-                    logfire.warning(
-                        f"Video {candidate.video_id} ('{candidate.title}') failed pre-flight availability check."
-                    )
                     pipe.status = PipelineStatus.IDLE
+
+                    # Do NOT penalize the candidate video if the failure was an IP/session bot block
+                    if is_bot_blocked:
+                        logfire.warning(
+                            f"YouTube bot detection triggered on video '{candidate.title}' ({candidate.video_id}). "
+                            "Stopping intake feed for current cycle to prevent IP flagging (video not penalized)."
+                        )
+                        return
+
+                    # Increment failure counters only for legitimate non-bot video availability failures
                     self.consecutive_failures += 1
                     self.failed_video_counts[candidate.video_id] = (
                         self.failed_video_counts.get(candidate.video_id, 0) + 1
                     )
+                    logfire.warning(
+                        f"Video {candidate.video_id} ('{candidate.title}') failed pre-flight availability check "
+                        f"(attempt {self.failed_video_counts[candidate.video_id]}/3)."
+                    )
+
                     if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
-                        logfire.warning("Circuit breaker tripped: pausing ingestion until next rescan cycle.")
+                        logfire.warning("Consecutive failure threshold reached: stopping current intake cycle.")
                         return
-                    continue
+
+                    # Stop this feed cycle on failure to prevent rapid-fire retries across idle pipelines
+                    break
 
                 try:
                     if candidate.source_type == "local" and candidate.local_path:
@@ -621,14 +788,31 @@ class IngestionManager:
                     pipe.status = PipelineStatus.IDLE
                     pipe.active_video = None
                     shutil.rmtree(pipe.work_dir / candidate.video_id, ignore_errors=True)
+
+                    is_bot = (
+                        "Sign in to confirm you’re not a bot" in str(e)
+                        or "Bot Check" in str(e)
+                        or "HTTP Error 429" in str(e)
+                    )
+
+                    # Do NOT penalize the candidate video if the download failed due to an IP-level bot check
+                    if is_bot:
+                        logfire.warning(
+                            f"Bot detection triggered during download of '{candidate.title}' ({candidate.video_id}). "
+                            "Stopping current intake cycle immediately (video not penalized)."
+                        )
+                        return
+
                     self.consecutive_failures += 1
                     self.failed_video_counts[candidate.video_id] = (
                         self.failed_video_counts.get(candidate.video_id, 0) + 1
                     )
                     logfire.error(f"Failed to prepare video {candidate.video_id} for pipeline {pipe.config.name}: {e}")
+
                     if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
-                        logfire.warning("Circuit breaker tripped: pausing ingestion until next rescan cycle.")
+                        logfire.warning("Consecutive failure threshold reached: stopping current intake cycle.")
                         return
+                    break
 
     async def start(self) -> None:
         """Starts the ingestion manager with a deep scan on boot, followed by periodic delta intake loops."""
