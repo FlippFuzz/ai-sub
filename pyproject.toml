@@ -1,6 +1,10 @@
+[build-system]
+requires = ["setuptools>=80", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ai-sub"
-version = "4.0.0+v4.bugfixes"
+dynamic = ["version"]
 authors = [
   { name = "FlippFuzz" },
 ]
@@ -45,6 +49,9 @@ ai-sub-worker = "ai_sub.worker.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools_scm]
+version_file = "src/ai_sub/_version.py"
 
 [tool.ruff]
 line-length = 120

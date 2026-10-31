@@ -24,6 +24,7 @@ from ai_sub.server.coordinator import PipelineCoordinator
 from ai_sub.server.dashboard import DASHBOARD_HTML
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.ingestion import IngestionManager
+from ai_sub.telemetry import get_app_version
 
 
 def create_app(settings: ServerSettings) -> FastAPI:
@@ -68,7 +69,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
     app = FastAPI(
         title="ai-sub-server",
         description="Central task coordinator, media distributor, and live observability dashboard for AI Sub",
-        version="4.0.0",
+        version=get_app_version(),
         lifespan=lifespan,
     )
 
