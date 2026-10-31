@@ -191,7 +191,6 @@ class IngestionManager:
         self._scan_lock = asyncio.Lock()
         self._feed_lock = asyncio.Lock()
 
-        # Emit environment diagnostic metrics once on startup
         self._log_startup_diagnostics()
 
     def _log_startup_diagnostics(self) -> None:
@@ -237,7 +236,6 @@ class IngestionManager:
         Returns:
             dict[str, Any]: Base yt-dlp configuration options dictionary.
         """
-        # approximate_date enables relative date parsing in flat playlist extraction ("2 days ago" -> Unix timestamp)
         extractor_args: dict[str, Any] = {
             "youtubetab": {"approximate_date": [""]},
         }
@@ -321,8 +319,6 @@ class IngestionManager:
         )
         cutoff_ts = int(time()) - lookback_seconds if not deep_scan else 0
 
-        # Expand bare channel URLs into both /videos (Uploads) and /streams (Live VODs), excluding /shorts
-        # Preserving original channel handle/ID context
         target_items: list[tuple[str, str | None]] = []
         for raw_url in self.config.youtube.urls:
             clean_url = raw_url.rstrip("/")
@@ -368,7 +364,6 @@ class IngestionManager:
                                 url_span.set_attribute("result", "empty")
                                 continue
 
-                            # Pre-seed ChannelMapper with parent tab/channel metadata
                             self.channel_mapper.update_from_entries([result])
 
                             entries_raw = result.get("entries")
@@ -391,7 +386,6 @@ class IngestionManager:
                                 if title in ["[Deleted video]", "[Private video]", "[Unavailable video]"]:
                                     continue
 
-                                # Skip upcoming premieres, active live streams, and shorts
                                 if entry.get("live_status") in ("is_upcoming", "is_live", "post_live"):
                                     continue
                                 url_val = entry.get("url") or entry.get("webpage_url") or ""
@@ -411,7 +405,6 @@ class IngestionManager:
                                     except ValueError:
                                         ts = 0
 
-                                # Delta early-exit condition: if past the lookback window, stop paginating
                                 if not deep_scan and ts > 0 and ts < cutoff_ts:
                                     break
 
@@ -705,6 +698,7 @@ class IngestionManager:
                             raw_video_path=media_path,
                             channel_name=candidate.channel_name,
                             source_type=candidate.source_type,
+                            timestamp=candidate.timestamp,
                         )
                         break
                     except Exception as e:
@@ -729,7 +723,6 @@ class IngestionManager:
     async def start(self) -> None:
         """Starts the ingestion manager with a deep scan on boot, followed by periodic delta intake loops."""
         await self.scan_watch_folders_async()
-        # Full deep crawl on boot to populate the complete historical video catalog in RAM
         await self.scan_youtube_sources_async(deep_scan=True)
         await self.feed_idle_pipelines()
 

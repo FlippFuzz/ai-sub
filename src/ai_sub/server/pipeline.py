@@ -284,6 +284,7 @@ class ComboPipeline:
         raw_video_path: Path,
         channel_name: str | None = None,
         source_type: Literal["local", "youtube"] = "local",
+        timestamp: int = 0,
     ) -> None:
         """Prepares a video inside work/<combo>/<video_id>/, saving metadata and splitting chunks.
 
@@ -294,6 +295,7 @@ class ComboPipeline:
             raw_video_path: Path to the local raw video file in this combo directory.
             channel_name: Human-readable channel display name. Defaults to None.
             source_type: Ingestion source type ('local' or 'youtube'). Defaults to 'local'.
+            timestamp: Video publication or intake Unix timestamp. Defaults to 0.
         """
         self.status = PipelineStatus.PREPARING
         job_dir = self.work_dir / video_id
@@ -320,6 +322,7 @@ class ComboPipeline:
                 "raw_filename": raw_video_path.name,
                 "raw_path": str(raw_video_path.resolve()),
                 "source_type": source_type,
+                "timestamp": timestamp,
                 "duration_ms": total_duration_ms,
                 "raw_size_mb": round(raw_size_mb, 2),
             }
@@ -404,6 +407,7 @@ class ComboPipeline:
                 title=title,
                 filename_stem=filename_stem,
                 source_type=source_type,
+                timestamp=timestamp,
                 job_dir=job_dir,
                 raw_path=raw_video_path,
                 duration_ms=total_duration_ms,
@@ -575,7 +579,6 @@ class ComboPipeline:
             task_id=task_id,
             task_type=task.task_type.value,
         ) as cascade_span:
-            # Validate output schemas first before altering in-memory task status
             if task.task_type == TaskType.SUMMARY:
                 resp = SummaryAiResponse.model_validate(
                     result_data,
@@ -692,9 +695,6 @@ class ComboPipeline:
     def is_video_complete(self) -> bool:
         """Checks if all segments for the active video have finished processing.
 
-        Returns True when all queued tasks have reached a terminal state (COMPLETED or FAILED)
-        and no tasks remain pending or claimed, or when all chunk files on disk are verified.
-
         Returns:
             bool: True if video processing is finished; False otherwise.
         """
@@ -707,19 +707,16 @@ class ComboPipeline:
         if self.status in (PipelineStatus.FINALIZING, PipelineStatus.PUSH_FAILED):
             return True
 
-        # If summary failed permanently, pipeline halts
         summary_task = next((t for t in self.tasks.values() if t.task_type == TaskType.SUMMARY), None)
         if summary_task and summary_task.status == TaskStatus.FAILED:
             return True
 
-        # Must not have any active or waiting leases
         if any(t.status in (TaskStatus.PENDING, TaskStatus.CLAIMED) for t in self.tasks.values()):
             return False
 
         if self.summary_response is None:
             return False
 
-        # Ensure all chunk subtitle tasks were queued and resolved
         sub_tasks = [t for t in self.tasks.values() if t.task_type == TaskType.SUBTITLES]
         if len(sub_tasks) < len(self.active_video.segment_paths):
             return False
@@ -764,9 +761,6 @@ class ComboPipeline:
 
     def stitch_final_subtitles(self, output_path: Path) -> list[Path]:
         """Stitches completed segment subtitles into unified SRT files using the shared stitching engine.
-
-        Produces the primary subtitle file and, if musical performances were refined,
-        an additional raw subtitles file (<stem>.raw-<full_shortcode>.srt).
 
         Args:
             output_path: Destination path for the primary stitched SRT file.
@@ -825,8 +819,6 @@ class ComboPipeline:
     async def resume_from_disk(self) -> bool:
         """Inspects work/<combo>/ to restore in-progress video subdirectories upon server boot.
 
-        Accurately reconstructs all tasks in memory—preserving completed stages from disk.
-
         Returns:
             bool: True if an active video was successfully restored; False otherwise.
         """
@@ -860,6 +852,7 @@ class ComboPipeline:
                 raw_filename = meta.get("raw_filename")
                 raw_path_meta = meta.get("raw_path")
                 source_type = meta.get("source_type", "youtube")
+                timestamp = int(meta.get("timestamp", 0))
             except Exception as e:
                 logfire.warning(f"Could not load {meta_file.name}: {e}. Skipping resume.")
                 self.status = PipelineStatus.IDLE
@@ -914,6 +907,7 @@ class ComboPipeline:
                 title=title,
                 filename_stem=filename_stem,
                 source_type=source_type,
+                timestamp=timestamp,
                 job_dir=job_dir,
                 raw_path=raw_video_path,
                 duration_ms=total_duration_ms,
@@ -942,7 +936,6 @@ class ComboPipeline:
                 return True
 
             self.summary_response = loaded_summary_job.response
-            # Register completed summary task in memory so coordinator metrics stay consistent
             self.tasks[sum_task_id] = ServerTask(
                 task_id=sum_task_id,
                 task_type=TaskType.SUMMARY,
@@ -977,7 +970,6 @@ class ComboPipeline:
                 )
 
                 if loaded_sub_job and loaded_sub_job.response:
-                    # Register completed subtitle task in memory
                     self.tasks[sub_task_id] = ServerTask(
                         task_id=sub_task_id,
                         task_type=TaskType.SUBTITLES,
@@ -1009,7 +1001,6 @@ class ComboPipeline:
                         status=TaskStatus.PENDING,
                     )
 
-                # Check lyrics refinement for singing performances
                 if loaded_sub_job and loaded_sub_job.response and loaded_sub_job.response.detected_musical_performances:
                     lyr_task_id = f"{self.config.name}::{video_id}::lyrics::{idx:03d}"
                     lyr_prompt = get_lyrics_prompt(
@@ -1021,7 +1012,6 @@ class ComboPipeline:
                         segment_duration_ms=seg_dur_ms,
                     )
                     if loaded_lyrics_job and loaded_lyrics_job.response:
-                        # Register completed lyrics task in memory
                         self.tasks[lyr_task_id] = ServerTask(
                             task_id=lyr_task_id,
                             task_type=TaskType.LYRICS,
@@ -1044,7 +1034,6 @@ class ComboPipeline:
 
             has_pending = any(t.status in (TaskStatus.PENDING, TaskStatus.CLAIMED) for t in self.tasks.values())
             if not has_pending:
-                # All chunks are already complete on disk; mark as ready for finalization immediately
                 self.status = PipelineStatus.FINALIZING
                 resume_span.set_attribute("result", "resumed_all_chunks_complete")
                 logfire.info(

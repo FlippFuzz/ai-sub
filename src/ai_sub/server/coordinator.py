@@ -104,7 +104,6 @@ class PipelineCoordinator:
 
             start_span.set_attribute("resumed_pipelines", resumed_count)
 
-            # Immediately flush and push any videos found 100% complete on disk during boot
             try:
                 await self.check_and_finalize_completed_pipelines()
             except Exception as e:
@@ -176,7 +175,6 @@ class PipelineCoordinator:
                     sweep_span.set_attribute("active_leases", active_leases)
                     sweep_span.set_attribute("expired_leases", expired_count)
 
-            # Check if any pipeline reached completion due to expired/failed tasks
             try:
                 await self.check_and_finalize_completed_pipelines()
             except Exception as e:
@@ -214,7 +212,6 @@ class PipelineCoordinator:
                         if task.status != TaskStatus.PENDING:
                             continue
 
-                        # Check if chunk re-encoding is still pending for this task
                         if not pipe.is_task_ready_for_claim(task):
                             continue
 
@@ -487,7 +484,6 @@ class PipelineCoordinator:
             srt_filename = f"{vid.filename_stem}.{pipe.full_shortcode}.srt"
             temp_srt = vid.job_dir / srt_filename
 
-            # Run synchronous subtitle stitching off the event loop
             try:
                 generated_srts = await asyncio.to_thread(pipe.stitch_final_subtitles, temp_srt)
             except Exception as e:
@@ -497,6 +493,7 @@ class PipelineCoordinator:
                 return False
 
             yaml_files = list(vid.job_dir.glob("*.yaml"))
+            meta_file = vid.job_dir / "video_meta.json"
             if self.git_sync:
                 try:
                     await self.git_sync.finalize_and_push(
@@ -505,6 +502,7 @@ class PipelineCoordinator:
                         full_shortcode=pipe.full_shortcode,
                         srt_files=generated_srts,
                         yaml_files=yaml_files,
+                        meta_file=meta_file if meta_file.is_file() else None,
                     )
                 except Exception as e:
                     logfire.error(
@@ -596,7 +594,6 @@ class PipelineCoordinator:
                     if t.status == TaskStatus.CLAIMED
                 ]
 
-                # Accurate state progression: lyrics cannot be marked "skipped" while subtitles are still running
                 if sub_done < total_chunks:
                     if lyr_tasks:
                         has_singing = True

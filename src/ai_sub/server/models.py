@@ -80,6 +80,7 @@ class ActiveVideo(BaseModel):
     title: str = Field(description="Display title of the video.")
     filename_stem: str = Field(description="Filesystem-safe base name for output files.")
     source_type: Literal["local", "youtube"] = Field(default="local", description="Ingestion source type.")
+    timestamp: int = Field(default=0, description="Upload or file modification Unix timestamp.")
     user_context: str | None = Field(default=None, description="Generated context string passed to LLM prompts.")
     job_dir: Path = Field(description="Subdirectory containing all files for this video job.")
     raw_path: Path = Field(description="Filesystem path to the original raw video.")
