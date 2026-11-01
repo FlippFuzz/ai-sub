@@ -320,10 +320,10 @@ class GitSyncManager:
                     try:
                         repo.git.pull("origin", self.config.branch, "--rebase")
                     except GitCommandError:
-                        # Check which files have merge conflicts
+                        # Check which files have merge conflicts using -z to avoid Git C-style path quoting
                         try:
-                            unmerged_output = repo.git.diff("--diff-filter=U", "--name-only")
-                            unmerged_files = [f.strip() for f in unmerged_output.splitlines() if f.strip()]
+                            unmerged_output = repo.git.diff("-z", "--diff-filter=U", "--name-only")
+                            unmerged_files = [f for f in unmerged_output.split("\0") if f]
                             readme_rel = f"{uploader}/README.md"
 
                             # Only auto-resolve if the conflict is strictly on the channel README
