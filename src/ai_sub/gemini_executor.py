@@ -104,7 +104,11 @@ def _is_daily_quota_exceeded(e: Exception) -> bool:
         bool: True if daily project quota is exhausted, False otherwise.
     """
     err_str = str(e).lower()
-    return "429" in err_str and "generaterequestsperdayperprojectpermodel-freetier" in err_str
+    if "requests per day on free tier" in err_str:
+        return True
+    if e.__cause__ and "requests per day on free tier" in str(e.__cause__).lower():
+        return True
+    return False
 
 
 def _is_retryable_error(e: Exception) -> bool:
@@ -529,7 +533,7 @@ class GeminiExecutor:
         except Exception as e:
             if _is_daily_quota_exceeded(e):
                 self._quota_exhausted[model_id] = True
-                logfire.warning(f"Daily quota exhausted for {model_id}.")
+                logfire.warning(f"Daily quota exhausted for {model_id}: {e}")
                 raise QuotaExceededError(str(e)) from e
             raise
 

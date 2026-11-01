@@ -26,6 +26,24 @@ from ai_sub.server.pot_provider import ensure_pot_provider
 from ai_sub.video import ensure_ffmpeg
 
 
+def _is_bot_detection_error(err_msg: str) -> bool:
+    """Detects whether an error message from yt-dlp indicates anti-bot throttling or block.
+
+    Args:
+        err_msg: Raw error message string.
+
+    Returns:
+        bool: True if bot block or rate-limiting is detected, False otherwise.
+    """
+    lower = err_msg.lower()
+    return (
+        "not a bot" in lower
+        or "sign in to confirm" in lower
+        or "http error 429" in lower
+        or "too many requests" in lower
+    )
+
+
 class DiscoveredVideo(BaseModel):
     """Metadata container for a video discovered from local files or YouTube feeds."""
 
@@ -55,6 +73,7 @@ class IngestionManager:
     cached_local_videos: dict[str, DiscoveredVideo]
     cached_youtube_videos: dict[str, DiscoveredVideo]
     cached_videos: list[DiscoveredVideo]
+    _youtube_blocked_until: float
     _preparing_videos: set[str]
     _last_pot_update: float
     _files_rescan_task: asyncio.Task[None] | None
@@ -104,6 +123,7 @@ class IngestionManager:
         self.cached_local_videos = {}
         self.cached_youtube_videos = {}
         self.cached_videos = []
+        self._youtube_blocked_until = 0.0
         self._preparing_videos = set()
         self._last_pot_update = time()
         self._files_rescan_task = None
@@ -178,6 +198,30 @@ class IngestionManager:
 
         return opts
 
+    def is_youtube_blocked(self) -> bool:
+        """Checks if YouTube operations are temporarily suspended due to bot detection.
+
+        Returns:
+            bool: True if YouTube operations are within a bot block cooldown window, False otherwise.
+        """
+        return time() < self._youtube_blocked_until
+
+    def _trigger_youtube_bot_block(self, reason: str = "") -> None:
+        """Sets a cooldown timer on all YouTube operations following bot detection.
+
+        Args:
+            reason: Context description for the log warning. Defaults to "".
+        """
+        base_sec = self.config.youtube.rescan_interval_minutes * 60.0
+        jitter_sec = max(0.0, self.config.youtube.rescan_jitter_minutes * 60.0)
+        cooldown_sec = base_sec + random.uniform(0.0, jitter_sec)
+        self._youtube_blocked_until = time() + cooldown_sec
+        logfire.warning(
+            f"Bot detection triggered{f' ({reason})' if reason else ''}. "
+            f"Halting all YouTube requests for {cooldown_sec / 60:.1f} minutes "
+            f"(until next scheduled rescan window)."
+        )
+
     def _update_combined_cache(self) -> None:
         """Merges discovered local and YouTube videos into the master cache, sorted newest-first."""
         all_vids = list(self.cached_local_videos.values()) + list(self.cached_youtube_videos.values())
@@ -226,7 +270,7 @@ class IngestionManager:
         Returns:
             list[DiscoveredVideo]: Discovered YouTube video items.
         """
-        if not self.config.youtube.urls:
+        if not self.config.youtube.urls or self.is_youtube_blocked():
             return []
 
         ydl_opts = self._get_base_ytdlp_opts()
@@ -337,8 +381,8 @@ class IngestionManager:
                             err_msg = str(e)
                             logfire.warning(f"Error scanning YouTube source {url}: {err_msg}")
                             url_span.set_attribute("error", err_msg)
-                            if "Sign in to confirm you’re not a bot" in err_msg or "HTTP Error 429" in err_msg:
-                                logfire.warning("Bot block encountered. Halting current YouTube scan cycle.")
+                            if _is_bot_detection_error(err_msg):
+                                self._trigger_youtube_bot_block(reason=f"scanning source {url}")
                                 break
 
             scan_span.set_attribute("total_discovered", len(discovered))
@@ -367,6 +411,11 @@ class IngestionManager:
         Returns:
             list[DiscoveredVideo]: Discovered YouTube video items.
         """
+        if self.is_youtube_blocked():
+            remaining_m = (self._youtube_blocked_until - time()) / 60.0
+            logfire.info(f"Skipping YouTube scan: bot block cooldown active ({remaining_m:.1f}m remaining).")
+            return list(self.cached_youtube_videos.values())
+
         async with self._scan_lock:
             discovered = await asyncio.to_thread(self.scan_youtube_sources, deep_scan)
             self.cached_youtube_videos.update({v.video_id: v for v in discovered})
@@ -436,7 +485,7 @@ class IngestionManager:
                 except OSError:
                     pass
             err_msg = str(e)
-            is_bot = "Sign in to confirm you’re not a bot" in err_msg or "HTTP Error 429" in err_msg
+            is_bot = _is_bot_detection_error(err_msg)
             logfire.warning(f"Availability check failed for '{video.title}' ({video.video_id}): {err_msg}")
             return False, is_bot
 
@@ -537,6 +586,8 @@ class IngestionManager:
             assignments: list[tuple[ComboPipeline, DiscoveredVideo]] = []
             for pipe in idle_pipelines:
                 for candidate in self.cached_videos:
+                    if candidate.source_type == "youtube" and self.is_youtube_blocked():
+                        continue
                     if candidate.video_id in self._preparing_videos:
                         continue
                     if self.failed_video_counts.get(candidate.video_id, 0) >= 3:
@@ -550,6 +601,9 @@ class IngestionManager:
                     break
 
         pending_assignments = list(assignments)
+        if not pending_assignments:
+            return
+
         try:
             while pending_assignments:
                 pipe, candidate = pending_assignments.pop(0)
@@ -561,10 +615,7 @@ class IngestionManager:
                         self._preparing_videos.discard(candidate.video_id)
 
                     if is_bot:
-                        logfire.warning(
-                            f"Bot detection triggered on '{candidate.title}' ({candidate.video_id}). "
-                            "Halting intake feed for this cycle."
-                        )
+                        self._trigger_youtube_bot_block(reason=f"availability check for '{candidate.title}'")
                         return
 
                     self.consecutive_failures += 1
@@ -602,8 +653,8 @@ class IngestionManager:
                     shutil.rmtree(pipe.work_dir / candidate.video_id, ignore_errors=True)
 
                     err_str = str(e)
-                    if "Sign in to confirm you’re not a bot" in err_str or "HTTP Error 429" in err_str:
-                        logfire.warning(f"Bot detection on download of '{candidate.title}'. Halting feed.")
+                    if _is_bot_detection_error(err_str):
+                        self._trigger_youtube_bot_block(reason=f"downloading '{candidate.title}'")
                         return
 
                     self.consecutive_failures += 1
@@ -672,6 +723,15 @@ class IngestionManager:
                 f"jitter: +{(delay_sec - base_sec) / 60:.1f}m)."
             )
             await asyncio.sleep(delay_sec)
+
+            if self.is_youtube_blocked():
+                remaining_sec = self._youtube_blocked_until - time()
+                if remaining_sec > 0:
+                    logfire.info(
+                        "Bot block cooldown active. "
+                        f"Waiting {remaining_sec / 60:.1f}m before attempting YouTube rescan..."
+                    )
+                    await asyncio.sleep(remaining_sec)
 
             self.consecutive_failures = 0
             try:
