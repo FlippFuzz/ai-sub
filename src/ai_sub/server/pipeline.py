@@ -138,21 +138,18 @@ class ComboPipeline:
         """Checks if the pipeline is idle and ready to accept a new video.
 
         Returns:
-            bool: True if pipeline status is IDLE; False otherwise.
+            bool: True if pipeline status is IDLE, False otherwise.
         """
         return self.status == PipelineStatus.IDLE
 
     def is_task_ready_for_claim(self, task: ServerTask) -> bool:
         """Determines if a task is eligible to be claimed by a worker.
 
-        Prevents subtitle tasks from being dispatched while their corresponding
-        video chunk is actively queued or undergoing background FFmpeg compression.
-
         Args:
             task: Candidate server task.
 
         Returns:
-            bool: True if task is ready for pickup; False otherwise.
+            bool: True if task is ready for pickup, False otherwise.
         """
         if task.task_type == TaskType.SUBTITLES and self.reencode_settings.segment.enabled:
             if task.segment_index is not None and self.active_video is not None:
@@ -178,9 +175,7 @@ class ComboPipeline:
         Returns:
             list[str]: Active search tools list.
         """
-        if self.config.search_tools is not None:
-            return self.config.search_tools
-        return self.search_settings.tools
+        return self.config.search_tools if self.config.search_tools is not None else self.search_settings.tools
 
     async def _reencode_segments_background(self) -> None:
         """Background loop re-encoding segments sequentially using the serial FFmpeg lock."""
@@ -190,8 +185,8 @@ class ComboPipeline:
         active = self.active_video
         reencode_dir = active.job_dir / "reencoded"
         reencode_dir.mkdir(parents=True, exist_ok=True)
-
         seg_cfg = self.reencode_settings.segment
+
         with logfire.span(
             "Background Re-encoding Loop: {video_id}",
             combo=self.config.name,
@@ -206,23 +201,13 @@ class ComboPipeline:
 
             for idx, seg_path in enumerate(active.segment_paths):
                 file_size_mb = seg_path.stat().st_size / (1024 * 1024)
-                should_reencode = False
-                skip_reason = None
-
-                if not seg_cfg.enabled:
-                    skip_reason = "reencode.segment.enabled is False"
-                elif seg_cfg.threshold_mb > 0 and file_size_mb < seg_cfg.threshold_mb:
-                    skip_reason = f"size ({file_size_mb:.1f} MB) < threshold ({seg_cfg.threshold_mb} MB)"
-                else:
-                    should_reencode = True
+                should_reencode = seg_cfg.enabled and (
+                    seg_cfg.threshold_mb == 0 or file_size_mb >= seg_cfg.threshold_mb
+                )
 
                 if not should_reencode:
                     active.reencoded_segment_paths[idx] = seg_path
                     skipped_count += 1
-                    logfire.debug(
-                        f"[{self.config.name}] Chunk {seg_path.name} ({file_size_mb:.1f} MB) "
-                        f"re-encoding skipped ({skip_reason})."
-                    )
                     continue
 
                 out_file = reencode_dir / f"{seg_path.stem}.mp4"
@@ -255,10 +240,6 @@ class ComboPipeline:
                         out_size_mb = out_file.stat().st_size / (1024 * 1024)
                         chunk_span.set_attribute("result", "reencoded")
                         chunk_span.set_attribute("output_size_mb", round(out_size_mb, 2))
-                        logfire.info(
-                            f"[{self.config.name}] Chunk {seg_path.name} ({file_size_mb:.1f} MB) "
-                            f"re-encoded to {out_file.name} ({out_size_mb:.1f} MB)."
-                        )
 
                         task_id = f"{self.config.name}::{active.video_id}::subtitles::{idx:03d}"
                         if task_id in self.tasks:
@@ -271,10 +252,6 @@ class ComboPipeline:
 
             loop_span.set_attribute("reencoded_chunks", reencoded_count)
             loop_span.set_attribute("skipped_chunks", skipped_count)
-            logfire.info(
-                f"[{self.config.name}] Background re-encoding finished for {active.video_id}: "
-                f"{reencoded_count} re-encoded, {skipped_count} kept in native format."
-            )
 
     async def prepare_and_set_video(
         self,
@@ -330,15 +307,9 @@ class ComboPipeline:
                 json.dump(meta_data, f, indent=2, ensure_ascii=False)
 
             sum_cfg = self.reencode_settings.summary
-            should_reencode_summary = False
-            summary_skip_reason = None
-
-            if not sum_cfg.enabled:
-                summary_skip_reason = "reencode.summary.enabled is False"
-            elif sum_cfg.threshold_mb > 0 and raw_size_mb < sum_cfg.threshold_mb:
-                summary_skip_reason = f"size ({raw_size_mb:.1f} MB) < threshold ({sum_cfg.threshold_mb} MB)"
-            else:
-                should_reencode_summary = True
+            should_reencode_summary = sum_cfg.enabled and (
+                sum_cfg.threshold_mb == 0 or raw_size_mb >= sum_cfg.threshold_mb
+            )
 
             with logfire.span(
                 "Check Summary Proxy: {video_id}",
@@ -351,10 +322,6 @@ class ComboPipeline:
             ) as proxy_span:
                 if should_reencode_summary:
                     proxy_path = job_dir / "summary_proxy.mp4"
-                    logfire.info(
-                        f"[{self.config.name}] Compressing summary proxy ({raw_size_mb:.1f} MB >= "
-                        f"{sum_cfg.threshold_mb} MB threshold)..."
-                    )
                     await reencode_video(
                         input_path=raw_video_path,
                         output_path=proxy_path,
@@ -368,17 +335,9 @@ class ComboPipeline:
                     proxy_size_mb = proxy_path.stat().st_size / (1024 * 1024)
                     proxy_span.set_attribute("result", "reencoded")
                     proxy_span.set_attribute("proxy_size_mb", round(proxy_size_mb, 2))
-                    logfire.info(
-                        f"[{self.config.name}] Summary proxy generated: {proxy_path.name} ({proxy_size_mb:.1f} MB)."
-                    )
                 else:
                     proxy_path = raw_video_path
                     proxy_span.set_attribute("result", "skipped")
-                    proxy_span.set_attribute("skip_reason", summary_skip_reason)
-                    logfire.info(
-                        f"[{self.config.name}] Summary proxy re-encoding skipped: {summary_skip_reason}. "
-                        "Using raw video directly."
-                    )
 
             with logfire.span(
                 "Split Video into Segments: {video_id}",
@@ -395,10 +354,6 @@ class ComboPipeline:
                 )
                 durations = await asyncio.gather(*(get_video_duration_ms(p) for p in segment_paths))
                 split_span.set_attribute("chunks_created", len(segment_paths))
-                logfire.info(
-                    f"[{self.config.name}] Split '{video_id}' into {len(segment_paths)} chunks "
-                    f"(probed total {sum(durations)}ms)."
-                )
 
             self.active_video = ActiveVideo(
                 video_id=video_id,
@@ -437,10 +392,9 @@ class ComboPipeline:
 
         task_id = f"{self.config.name}::{active.video_id}::summary"
         prompt = get_summary_prompt(user_context=active.user_context)
-
         active_tools = [t for t in self._get_active_search_tools() if t != "lrclib"]
 
-        task = ServerTask(
+        self.tasks[task_id] = ServerTask(
             task_id=task_id,
             task_type=TaskType.SUMMARY,
             pipeline_name=self.config.name,
@@ -453,11 +407,6 @@ class ComboPipeline:
             response_schema_name="SummaryAiResponse",
             search_tools=active_tools,
             agentic_video=True,
-        )
-        self.tasks[task_id] = task
-        logfire.info(
-            f"[{self.config.name}] Queued summary task for {active.video_id} "
-            f"(model: {self.config.summary_model}, media: {proxy_path.name})."
         )
 
     def _queue_subtitles_tasks(self) -> None:
@@ -484,10 +433,9 @@ class ComboPipeline:
                     segment_offset_ms=current_offset_ms,
                     segment_duration_ms=seg_dur_ms,
                 )
-
                 media_file = active.reencoded_segment_paths.get(idx) or seg_path
 
-                task = ServerTask(
+                self.tasks[task_id] = ServerTask(
                     task_id=task_id,
                     task_type=TaskType.SUBTITLES,
                     pipeline_name=self.config.name,
@@ -502,13 +450,7 @@ class ComboPipeline:
                     search_tools=[],
                     agentic_video=False,
                 )
-                self.tasks[task_id] = task
                 current_offset_ms += seg_dur_ms
-
-            logfire.info(
-                f"[{self.config.name}] Queued {len(active.segment_paths)} subtitle tasks "
-                f"for {active.video_id} (model: {self.config.subtitles_model})."
-            )
 
     def _queue_lyrics_task(self, seg_idx: int, sub_resp: SubtitlesAiResponse) -> None:
         """Generates and enqueues a Phase 3 lyrics task for a segment with detected singing.
@@ -535,9 +477,7 @@ class ComboPipeline:
             segment_duration_ms=seg_dur_ms,
         )
 
-        active_tools = self._get_active_search_tools()
-
-        task = ServerTask(
+        self.tasks[task_id] = ServerTask(
             task_id=task_id,
             task_type=TaskType.LYRICS,
             pipeline_name=self.config.name,
@@ -549,15 +489,10 @@ class ComboPipeline:
             video_duration_ms=seg_dur_ms,
             prompt=prompt,
             response_schema_name="LyricsAiResponse",
-            search_tools=active_tools,
+            search_tools=self._get_active_search_tools(),
             agentic_video=True,
             detected_performances=[p.model_dump(mode="json") for p in sub_resp.detected_musical_performances],
             draft_subtitles=[s.model_dump(mode="json") for s in sub_resp.subtitles],
-        )
-        self.tasks[task_id] = task
-        logfire.info(
-            f"[{self.config.name}] Queued lyrics task for segment {seg_idx:03d} of {active.video_id} "
-            f"({len(sub_resp.detected_musical_performances)} musical performances detected)."
         )
 
     def on_task_completed(self, task_id: str, result_data: dict[str, Any]) -> None:
@@ -572,6 +507,7 @@ class ComboPipeline:
             return
 
         active = self.active_video
+        val_ctx = {"video_duration_ms": task.video_duration_ms, "validation_buffer_ms": self.validation_buffer_ms}
 
         with logfire.span(
             "Task Cascade Complete: {task_id}",
@@ -580,75 +516,42 @@ class ComboPipeline:
             task_type=task.task_type.value,
         ) as cascade_span:
             if task.task_type == TaskType.SUMMARY:
-                resp = SummaryAiResponse.model_validate(
-                    result_data,
-                    context={
-                        "video_duration_ms": active.duration_ms,
-                        "validation_buffer_ms": self.validation_buffer_ms,
-                    },
-                )
+                resp = SummaryAiResponse.model_validate(result_data, context=val_ctx)
                 self.summary_response = resp
-
                 summary_job = SummaryJob(
                     name="summary",
                     video_duration_ms=active.duration_ms,
                     user_context=active.user_context,
                     response=resp,
                 )
-                summary_file = active.job_dir / f"summary.{self.summary_shortcode}.yaml"
-                summary_job.save(summary_file)
-
+                summary_job.save(active.job_dir / f"summary.{self.summary_shortcode}.yaml")
                 task.status = TaskStatus.COMPLETED
                 task.result = result_data
 
                 cascade_span.set_attribute("chapters_count", len(resp.chapters))
                 cascade_span.set_attribute("entities_count", len(resp.entities))
                 cascade_span.set_attribute("glossary_count", len(resp.domain_glossary))
-                logfire.info(
-                    f"[{self.config.name}] Summary task complete: extracted {len(resp.chapters)} chapters, "
-                    f"{len(resp.entities)} entities, {len(resp.domain_glossary)} glossary terms. "
-                    f"Saved to {summary_file.name}."
-                )
-
                 self._queue_subtitles_tasks()
 
             elif task.task_type == TaskType.SUBTITLES:
                 assert task.segment_index is not None
                 idx = task.segment_index
-                seg_dur_ms = active.segment_durations_ms[idx]
-                offset_ms = sum(active.segment_durations_ms[:idx])
-
-                resp = SubtitlesAiResponse.model_validate(
-                    result_data,
-                    context={
-                        "video_duration_ms": seg_dur_ms,
-                        "validation_buffer_ms": self.validation_buffer_ms,
-                    },
-                )
-
+                resp = SubtitlesAiResponse.model_validate(result_data, context=val_ctx)
                 seg_path = active.segment_paths[idx]
                 sub_job = SubtitlesJob(
                     name=seg_path.stem,
-                    video_duration_ms=seg_dur_ms,
-                    segment_offset_ms=offset_ms,
+                    video_duration_ms=task.video_duration_ms,
+                    segment_offset_ms=sum(active.segment_durations_ms[:idx]),
                     global_summary=self.summary_response,
                     user_context=active.user_context,
                     response=resp,
                 )
-                sub_file = active.job_dir / f"{seg_path.stem}.subtitles.{self.subtitles_shortcode}.yaml"
-                sub_job.save(sub_file)
-
+                sub_job.save(active.job_dir / f"{seg_path.stem}.subtitles.{self.subtitles_shortcode}.yaml")
                 task.status = TaskStatus.COMPLETED
                 task.result = result_data
 
                 cascade_span.set_attribute("subtitles_count", len(resp.subtitles))
                 cascade_span.set_attribute("music_count", len(resp.detected_musical_performances))
-                logfire.info(
-                    f"[{self.config.name}] Subtitle chunk {idx:03d} complete: "
-                    f"{len(resp.subtitles)} lines transcribed, "
-                    f"{len(resp.detected_musical_performances)} singing performances detected. "
-                    f"Saved to {sub_file.name}."
-                )
 
                 if resp.detected_musical_performances:
                     self._queue_lyrics_task(idx, resp)
@@ -656,22 +559,12 @@ class ComboPipeline:
             elif task.task_type == TaskType.LYRICS:
                 assert task.segment_index is not None
                 idx = task.segment_index
-                seg_dur_ms = active.segment_durations_ms[idx]
-                offset_ms = sum(active.segment_durations_ms[:idx])
+                resp = LyricsAiResponse.model_validate(result_data, context=val_ctx)
                 seg_path = active.segment_paths[idx]
-
-                resp = LyricsAiResponse.model_validate(
-                    result_data,
-                    context={
-                        "video_duration_ms": seg_dur_ms,
-                        "validation_buffer_ms": self.validation_buffer_ms,
-                    },
-                )
-
                 lyrics_job = LyricsJob(
                     name=seg_path.stem,
-                    video_duration_ms=seg_dur_ms,
-                    segment_offset_ms=offset_ms,
+                    video_duration_ms=task.video_duration_ms,
+                    segment_offset_ms=sum(active.segment_durations_ms[:idx]),
                     draft_subtitles=[Subtitles.model_validate(s) for s in task.draft_subtitles],
                     detected_performances=[
                         DetectedMusicalPerformance.model_validate(p) for p in task.detected_performances
@@ -680,28 +573,19 @@ class ComboPipeline:
                     user_context=active.user_context,
                     response=resp,
                 )
-                lyrics_file = active.job_dir / f"{seg_path.stem}.lyrics.{self.lyrics_shortcode}.yaml"
-                lyrics_job.save(lyrics_file)
-
+                lyrics_job.save(active.job_dir / f"{seg_path.stem}.lyrics.{self.lyrics_shortcode}.yaml")
                 task.status = TaskStatus.COMPLETED
                 task.result = result_data
 
                 cascade_span.set_attribute("refined_subtitles_count", len(resp.subtitles))
-                logfire.info(
-                    f"[{self.config.name}] Lyrics refinement for chunk {idx:03d} complete: "
-                    f"{len(resp.subtitles)} lines polished and saved to {lyrics_file.name}."
-                )
 
     def is_video_complete(self) -> bool:
         """Checks if all segments for the active video have finished processing.
 
         Returns:
-            bool: True if video processing is finished; False otherwise.
+            bool: True if video processing is finished, False otherwise.
         """
-        if not self.active_video:
-            return False
-
-        if self.status == PipelineStatus.PREPARING:
+        if not self.active_video or self.status == PipelineStatus.PREPARING:
             return False
 
         if self.status in (PipelineStatus.FINALIZING, PipelineStatus.PUSH_FAILED):
@@ -718,10 +602,7 @@ class ComboPipeline:
             return False
 
         sub_tasks = [t for t in self.tasks.values() if t.task_type == TaskType.SUBTITLES]
-        if len(sub_tasks) < len(self.active_video.segment_paths):
-            return False
-
-        return True
+        return len(sub_tasks) >= len(self.active_video.segment_paths)
 
     def _build_settings_metadata(self) -> dict[str, Any]:
         """Constructs metadata dictionary capturing active pipeline settings for Event 0.
@@ -732,12 +613,7 @@ class ComboPipeline:
         assert self.active_video is not None
         search_dump = self.search_settings.model_dump(
             mode="json",
-            exclude={
-                "key": True,
-                "tinyfish_key": True,
-                "langsearch_key": True,
-                "ollama_key": True,
-            },
+            exclude={"key": True, "tinyfish_key": True, "langsearch_key": True, "ollama_key": True},
         )
         if self.config.search_tools is not None:
             search_dump["tools"] = self.config.search_tools
@@ -760,7 +636,7 @@ class ComboPipeline:
         }
 
     def stitch_final_subtitles(self, output_path: Path) -> list[Path]:
-        """Stitches completed segment subtitles into unified SRT files using the shared stitching engine.
+        """Stitches completed segment subtitles into unified SRT files.
 
         Args:
             output_path: Destination path for the primary stitched SRT file.
@@ -776,7 +652,6 @@ class ComboPipeline:
 
         active = self.active_video
         raw_output_path = output_path.parent / f"{active.filename_stem}.raw-{self.full_shortcode}.srt"
-
         has_failures = any(t.status == TaskStatus.FAILED for t in self.tasks.values())
         status_str = "RetriesExceeded" if has_failures else "Completed"
 
@@ -807,20 +682,13 @@ class ComboPipeline:
 
             stitch_span.set_attribute("total_events", result.total_events)
             stitch_span.set_attribute("duration_ms", result.duration_ms)
-            logfire.info(
-                f"[{self.config.name}] Stitched {result.total_events} subtitle events across "
-                f"{len(active.segment_paths)} chunks to {output_path.name}."
-            )
-            if result.lyrics_refined and raw_output_path.is_file():
-                logfire.info(f"[{self.config.name}] Stitched raw dialogue subtitles to {raw_output_path.name}.")
-
             return result.generated_files
 
     async def resume_from_disk(self) -> bool:
         """Inspects work/<combo>/ to restore in-progress video subdirectories upon server boot.
 
         Returns:
-            bool: True if an active video was successfully restored; False otherwise.
+            bool: True if an active video was successfully restored, False otherwise.
         """
         valid_extensions = {".mp4", ".mkv", ".webm", ".mov", ".flv", ".ts"}
 
@@ -829,13 +697,11 @@ class ComboPipeline:
             if not job_dirs:
                 self.status = PipelineStatus.IDLE
                 resume_span.set_attribute("result", "idle")
-                logfire.debug(f"[{self.config.name}] No active job subdirectories found. Pipeline is idle.")
                 return False
 
             job_dir = job_dirs[0]
             meta_file = job_dir / "video_meta.json"
             if not meta_file.is_file():
-                logfire.warning(f"[{self.config.name}] Job folder '{job_dir.name}' lacks video_meta.json. Cleaning.")
                 shutil.rmtree(job_dir, ignore_errors=True)
                 self.status = PipelineStatus.IDLE
                 resume_span.set_attribute("result", "purged_invalid_folder")
@@ -851,10 +717,11 @@ class ComboPipeline:
                 filename_stem = str(meta.get("filename_stem", ""))
                 raw_filename = meta.get("raw_filename")
                 raw_path_meta = meta.get("raw_path")
+                meta_size_mb = meta.get("raw_size_mb")
+                meta_duration_ms = int(meta.get("duration_ms", 0))
                 source_type = meta.get("source_type", "youtube")
                 timestamp = int(meta.get("timestamp", 0))
-            except Exception as e:
-                logfire.warning(f"Could not load {meta_file.name}: {e}. Skipping resume.")
+            except Exception:
                 self.status = PipelineStatus.IDLE
                 resume_span.set_attribute("result", "corrupt_metadata")
                 return False
@@ -862,43 +729,104 @@ class ComboPipeline:
             segment_files = sorted(
                 [p for p in job_dir.glob("part_*") if p.is_file() and p.suffix.lower() in valid_extensions]
             )
-            if not segment_files:
-                logfire.warning(f"[{self.config.name}] Job '{video_id}' has no split chunks. Cleaning.")
-                shutil.rmtree(job_dir, ignore_errors=True)
-                self.status = PipelineStatus.IDLE
-                resume_span.set_attribute("result", "no_chunks")
-                return False
 
             proxy_path = job_dir / "summary_proxy.mp4"
             raw_video_path: Path | None = None
-            if raw_path_meta and Path(raw_path_meta).is_file():
-                raw_video_path = Path(raw_path_meta)
-            elif raw_filename and (job_dir / str(raw_filename)).is_file():
-                raw_video_path = job_dir / str(raw_filename)
 
-            if not raw_video_path or not raw_video_path.is_file():
+            # Verify saved raw file exists and matches size (and mtime for local files) before reuse
+            if raw_path_meta:
+                candidate = Path(str(raw_path_meta))
+                if candidate.is_file():
+                    actual_mb = candidate.stat().st_size / (1024 * 1024)
+                    actual_mtime = int(candidate.stat().st_mtime)
+                    size_match = meta_size_mb is None or abs(actual_mb - float(meta_size_mb)) < 0.1
+                    mtime_match = source_type != "local" or timestamp <= 0 or actual_mtime == timestamp
+                    if size_match and mtime_match:
+                        raw_video_path = candidate
+
+            if not raw_video_path and raw_filename:
+                candidate = job_dir / str(raw_filename)
+                if candidate.is_file():
+                    actual_mb = candidate.stat().st_size / (1024 * 1024)
+                    if meta_size_mb is None or abs(actual_mb - float(meta_size_mb)) < 0.1:
+                        raw_video_path = candidate
+
+            if not raw_video_path:
                 raw_candidates = [
                     p
                     for p in job_dir.glob(f"*{video_id}*.*")
                     if p.is_file() and not p.name.startswith("part_") and p.suffix.lower() in valid_extensions
                 ]
-                raw_video_path = raw_candidates[0] if raw_candidates else segment_files[0]
+                raw_video_path = raw_candidates[0] if raw_candidates else None
 
-            if not proxy_path.is_file():
-                proxy_path = raw_video_path
-
-            if not filename_stem:
-                filename_stem = sanitize_filename(raw_video_path.stem)
+            if not segment_files:
+                if raw_video_path and raw_video_path.is_file():
+                    logfire.info(f"Re-splitting segments for {video_id} during resume...")
+                    shutil.rmtree(job_dir / "reencoded", ignore_errors=True)
+                    segment_files = await split_video(
+                        input_video=raw_video_path,
+                        output_dir=job_dir,
+                        split_duration_s=self.split_settings.max_seconds,
+                        output_pattern="part_%03d",
+                        duration_tolerance_ms=self.split_settings.duration_tolerance_ms,
+                    )
+                else:
+                    shutil.rmtree(job_dir, ignore_errors=True)
+                    self.status = PipelineStatus.IDLE
+                    resume_span.set_attribute("result", "no_chunks_or_raw")
+                    return False
 
             durations = await asyncio.gather(*(get_video_duration_ms(p) for p in segment_files))
-            total_duration_ms = sum(durations)
+            total_seg_duration = sum(durations)
+            tolerance = self.split_settings.duration_tolerance_ms * len(segment_files)
+
+            # Validate whether existing segment files cover the full original video duration
+            if meta_duration_ms > 0 and abs(total_seg_duration - meta_duration_ms) > tolerance:
+                if raw_video_path and raw_video_path.is_file():
+                    logfire.warning(
+                        f"Segment duration sum ({total_seg_duration}ms) differs from metadata duration "
+                        f"({meta_duration_ms}ms) for {video_id}. Re-splitting video from raw..."
+                    )
+                    for seg in segment_files:
+                        try:
+                            seg.unlink()
+                        except OSError:
+                            pass
+                    # Wipe stale re-encoded files and old intermediate state files whose stems will be reused
+                    shutil.rmtree(job_dir / "reencoded", ignore_errors=True)
+                    for stale_yaml in job_dir.glob("part_*.yaml"):
+                        try:
+                            stale_yaml.unlink()
+                        except OSError:
+                            pass
+
+                    segment_files = await split_video(
+                        input_video=raw_video_path,
+                        output_dir=job_dir,
+                        split_duration_s=self.split_settings.max_seconds,
+                        output_pattern="part_%03d",
+                        duration_tolerance_ms=self.split_settings.duration_tolerance_ms,
+                    )
+                    durations = await asyncio.gather(*(get_video_duration_ms(p) for p in segment_files))
+                else:
+                    logfire.warning(
+                        f"Duration mismatch for {video_id} on resume, but raw media is unavailable. "
+                        "Proceeding with existing chunks."
+                    )
+
+            if not proxy_path.is_file():
+                proxy_path = raw_video_path or segment_files[0]
+
+            if not filename_stem:
+                stem_source = raw_video_path if raw_video_path else segment_files[0]
+                filename_stem = sanitize_filename(stem_source.stem)
 
             reencode_dir = job_dir / "reencoded"
-            reencoded_paths = {}
-            for idx, seg_path in enumerate(segment_files):
-                reenc_file = reencode_dir / f"{seg_path.stem}.mp4"
-                if reenc_file.is_file():
-                    reencoded_paths[idx] = reenc_file
+            reencoded_paths = {
+                idx: reencode_dir / f"{p.stem}.mp4"
+                for idx, p in enumerate(segment_files)
+                if (reencode_dir / f"{p.stem}.mp4").is_file()
+            }
 
             self.active_video = ActiveVideo(
                 video_id=video_id,
@@ -909,8 +837,8 @@ class ComboPipeline:
                 source_type=source_type,
                 timestamp=timestamp,
                 job_dir=job_dir,
-                raw_path=raw_video_path,
-                duration_ms=total_duration_ms,
+                raw_path=raw_video_path or segment_files[0],
+                duration_ms=sum(durations),
                 summary_proxy_path=proxy_path,
                 segment_paths=segment_files,
                 reencoded_segment_paths=reencoded_paths,
@@ -919,23 +847,19 @@ class ComboPipeline:
             self.active_video.user_context = self._build_user_context()
             active = self.active_video
             self.tasks.clear()
-
             self._reencode_task = asyncio.create_task(self._reencode_segments_background())
 
             summary_file = job_dir / f"summary.{self.summary_shortcode}.yaml"
             loaded_summary_job = SummaryJob.load(summary_file, self.validation_buffer_ms)
 
-            sum_task_id = f"{self.config.name}::{video_id}::summary"
             if not loaded_summary_job or not loaded_summary_job.response:
-                logfire.info(
-                    f"[{self.config.name}] Resuming: summary incomplete for '{video_id}'. Queueing summary task."
-                )
                 self.status = PipelineStatus.PROCESSING
                 self._queue_summary_task()
                 resume_span.set_attribute("result", "resumed_summary_pending")
                 return True
 
             self.summary_response = loaded_summary_job.response
+            sum_task_id = f"{self.config.name}::{video_id}::summary"
             self.tasks[sum_task_id] = ServerTask(
                 task_id=sum_task_id,
                 task_type=TaskType.SUMMARY,
@@ -944,19 +868,17 @@ class ComboPipeline:
                 model=self.config.summary_model,
                 service_tier=self.config.service_tier_summary,
                 media_path=proxy_path,
-                video_duration_ms=total_duration_ms,
+                video_duration_ms=active.duration_ms,
                 prompt=get_summary_prompt(user_context=active.user_context),
                 response_schema_name="SummaryAiResponse",
                 status=TaskStatus.COMPLETED,
                 result=loaded_summary_job.response.model_dump(mode="json"),
             )
-            logfire.info(f"[{self.config.name}] Resuming: loaded valid summary for '{video_id}'.")
 
             current_offset_ms = 0
             for idx, (seg_path, seg_dur_ms) in enumerate(zip(segment_files, durations, strict=True)):
                 sub_file = job_dir / f"{seg_path.stem}.subtitles.{self.subtitles_shortcode}.yaml"
                 lyrics_file = job_dir / f"{seg_path.stem}.lyrics.{self.lyrics_shortcode}.yaml"
-
                 loaded_sub_job = SubtitlesJob.load(sub_file, self.validation_buffer_ms)
                 loaded_lyrics_job = LyricsJob.load(lyrics_file, self.validation_buffer_ms)
 
@@ -1033,20 +955,14 @@ class ComboPipeline:
                 current_offset_ms += seg_dur_ms
 
             has_pending = any(t.status in (TaskStatus.PENDING, TaskStatus.CLAIMED) for t in self.tasks.values())
-            if not has_pending:
+            if has_pending:
+                self.status = PipelineStatus.PROCESSING
+                pending_count = sum(1 for t in self.tasks.values() if t.status == TaskStatus.PENDING)
+                resume_span.set_attribute("result", "resumed_subtitles_pending")
+                resume_span.set_attribute("pending_tasks", pending_count)
+            else:
                 self.status = PipelineStatus.FINALIZING
                 resume_span.set_attribute("result", "resumed_all_chunks_complete")
-                logfire.info(
-                    f"[{self.config.name}] Resumed '{video_id}': all segments completed on disk. Ready to finalize."
-                )
-            else:
-                self.status = PipelineStatus.PROCESSING
-                resume_span.set_attribute("result", "resumed_subtitles_pending")
-                pending_count = sum(1 for t in self.tasks.values() if t.status == TaskStatus.PENDING)
-                resume_span.set_attribute("pending_tasks", pending_count)
-                logfire.info(
-                    f"[{self.config.name}] Resumed '{video_id}' from disk with {pending_count} pending task(s)."
-                )
 
             return True
 
@@ -1070,4 +986,3 @@ class ComboPipeline:
             self.tasks.clear()
             self.summary_response = None
             self.status = PipelineStatus.IDLE
-            logfire.info(f"[{self.config.name}] Job directory cleared. Pipeline is idle.")

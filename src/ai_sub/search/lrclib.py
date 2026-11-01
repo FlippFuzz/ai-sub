@@ -29,9 +29,7 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
         Returns:
             dict[str, str]: HTTP request headers.
         """
-        return {
-            "User-Agent": f"ai-sub {get_app_version()} (https://github.com/FlippFuzz/ai-sub)",
-        }
+        return {"User-Agent": f"ai-sub {get_app_version()} (https://github.com/FlippFuzz/ai-sub)"}
 
     def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
         """Returns tool callables for Gemini model registration.
@@ -72,32 +70,28 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
         if artist_name and artist_name.strip():
             params["artist_name"] = artist_name.strip()
 
-        def _extract_valid_results(data: Any) -> list[dict[str, Any]]:
+        def _extract(data: Any) -> list[dict[str, Any]]:
             extracted: list[dict[str, Any]] = []
             if isinstance(data, list):
                 for item in data:
                     if item.get("instrumental"):
                         continue
-                    plain_lyrics = item.get("plainLyrics")
-                    if not plain_lyrics or not str(plain_lyrics).strip():
-                        continue
-
-                    truncated_lyrics = str(plain_lyrics).strip()[: self.settings.max_length]
-                    extracted.append(
-                        {
-                            "track_name": item.get("trackName") or item.get("name"),
-                            "artist_name": item.get("artistName"),
-                            "plain_lyrics": truncated_lyrics,
-                        }
-                    )
-                    if len(extracted) >= 3:
-                        break
+                    plain = str(item.get("plainLyrics") or "").strip()
+                    if plain:
+                        extracted.append(
+                            {
+                                "track_name": item.get("trackName") or item.get("name"),
+                                "artist_name": item.get("artistName"),
+                                "plain_lyrics": plain[: self.settings.max_length],
+                            }
+                        )
+                        if len(extracted) >= 3:
+                            break
             return extracted
 
         with logfire.span("lrclib_search: {title=}, {artist=}", title=track_title, artist=artist_name or ""):
-            response = await self._request("GET", "https://lrclib.net/api/search", params=params)
-
-            results = _extract_valid_results(response.json())
+            res = await self._request("GET", "https://lrclib.net/api/search", params=params)
+            results = _extract(res.json())
 
             if not results:
                 fallback_res = await self._request(
@@ -105,7 +99,7 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
                     "https://lrclib.net/api/search",
                     params={"q": track_title.strip()},
                 )
-                results = _extract_valid_results(fallback_res.json())
+                results = _extract(fallback_res.json())
 
             self._cache[cache_key] = results
             return results
@@ -119,9 +113,9 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
         Returns:
             list[WebSearchResult]: Formatted search result items containing song lyrics.
         """
-        raw_results = await self.search_lrclib_lyrics_database(track_title=query)
+        raw = await self.search_lrclib_lyrics_database(track_title=query)
         results: list[WebSearchResult] = []
-        for item in raw_results:
+        for item in raw:
             track = item.get("track_name") or "Unknown Track"
             artist = item.get("artist_name") or "Unknown Artist"
             lyrics = item.get("plain_lyrics") or ""

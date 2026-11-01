@@ -42,7 +42,8 @@ class TaskClaimResponse(BaseModel):
     prompt_system: str = Field(description="System instruction prompt for the Gemini model.")
     prompt_user: str = Field(description="User prompt instructions and input context.")
     response_schema_name: str = Field(
-        description="Target response schema ('SummaryAiResponse', 'SubtitlesAiResponse', or 'LyricsAiResponse')."
+        default="",
+        description="Target response schema ('SummaryAiResponse', 'SubtitlesAiResponse', or 'LyricsAiResponse').",
     )
     traceparent: str | None = Field(default=None, description="W3C traceparent header for distributed Logfire tracing.")
     search_tools: list[str] = Field(default_factory=list, description="Search tools permitted for this task.")
@@ -52,7 +53,6 @@ class TaskClaimResponse(BaseModel):
         default_factory=list,
         description="Serialized list of detected singing performances for lyrics refinement.",
     )
-    # Server-directed retry and backoff policy applied during worker execution
     retry: RetrySettings = Field(
         default_factory=RetrySettings,
         description="Task execution retry and backoff policy configured by the server.",

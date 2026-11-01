@@ -1,14 +1,12 @@
-"""Source ingestion, PO token provider setup, ChannelMapper, and direct-to-combo video feeding."""
+"""Source ingestion, PO token setup, ChannelMapper, and direct-to-combo video feeding."""
 
 from __future__ import annotations
 
 import asyncio
 import importlib.metadata
-import os
 import random
 import re
 import shutil
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from time import sleep as time_sleep
@@ -16,7 +14,6 @@ from time import time
 from typing import Any, Literal, cast
 
 import logfire
-from git import Repo
 from pydantic import BaseModel, Field
 from yt_dlp import YoutubeDL
 
@@ -25,87 +22,8 @@ from ai_sub.server.config import SourcesConfig
 from ai_sub.server.coordinator import PipelineCoordinator
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
+from ai_sub.server.pot_provider import ensure_pot_provider
 from ai_sub.video import ensure_ffmpeg
-
-
-def ensure_pot_provider(pot_dir: Path, check_updates: bool = False) -> Path | None:
-    """Clones or updates bgutil-ytdlp-pot-provider to match the installed plugin version.
-
-    Args:
-        pot_dir: Directory where the PO token provider repository is located.
-        check_updates: Whether to check GitHub for updates if no plugin version is pinned.
-
-    Returns:
-        Path | None: Server home directory if built and valid; None otherwise.
-    """
-    node_bin = shutil.which("node")
-    npm_bin = shutil.which("npm")
-    npx_bin = shutil.which("npx")
-
-    if not (node_bin and npm_bin and npx_bin):
-        logfire.warning("Node.js, npm, or npx not found in PATH. Skipping PO token provider.")
-        return None
-
-    try:
-        target_version = importlib.metadata.version("bgutil-ytdlp-pot-provider")
-    except Exception:
-        target_version = None
-
-    repo_url = "https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git"
-    server_dir = pot_dir / "server"
-    needs_build = False
-
-    try:
-        if not pot_dir.exists():
-            logfire.info(f"Cloning bgutil-ytdlp-pot-provider ({target_version or 'default'}) into {pot_dir}")
-            pot_dir.parent.mkdir(parents=True, exist_ok=True)
-            if target_version:
-                Repo.clone_from(repo_url, pot_dir, branch=target_version)
-            else:
-                Repo.clone_from(repo_url, pot_dir)
-            needs_build = True
-        else:
-            repo = Repo(pot_dir)
-            try:
-                current_tag = repo.git.describe("--tags", "--exact-match").strip()
-            except Exception:
-                current_tag = None
-
-            if target_version and current_tag != target_version:
-                logfire.info(f"Syncing bgutil tag: {current_tag} -> {target_version}...")
-                repo.remotes.origin.fetch(tags=True)
-                repo.git.checkout(target_version, force=True)
-                needs_build = True
-            elif check_updates and not target_version:
-                old_hash = repo.head.commit.hexsha
-                repo.remotes.origin.fetch()
-                try:
-                    repo.git.reset("--hard", "@{u}")
-                except Exception:
-                    repo.git.reset("--hard", "origin/master")
-                if old_hash != repo.head.commit.hexsha:
-                    needs_build = True
-
-        build_dir = server_dir / "build"
-        dist_dir = server_dir / "dist"
-        if not (build_dir.exists() or dist_dir.exists()):
-            needs_build = True
-
-        if needs_build:
-            logfire.info(f"Building bgutil-ytdlp-pot-provider server ({target_version or 'latest'})...")
-            shutil.rmtree(build_dir, ignore_errors=True)
-            shutil.rmtree(dist_dir, ignore_errors=True)
-            is_win = os.name == "nt"
-            subprocess.run([npm_bin, "ci"], cwd=server_dir, check=True, capture_output=True, shell=is_win)
-            subprocess.run([npx_bin, "tsc"], cwd=server_dir, check=True, capture_output=True, shell=is_win)
-            logfire.info("bgutil-ytdlp-pot-provider built successfully.")
-
-        if server_dir.exists():
-            return server_dir
-    except Exception as e:
-        logfire.warning(f"Failed to setup bgutil-ytdlp-pot-provider: {e}")
-
-    return None
 
 
 class DiscoveredVideo(BaseModel):
@@ -137,6 +55,7 @@ class IngestionManager:
     cached_local_videos: dict[str, DiscoveredVideo]
     cached_youtube_videos: dict[str, DiscoveredVideo]
     cached_videos: list[DiscoveredVideo]
+    _preparing_videos: set[str]
     _last_pot_update: float
     _files_rescan_task: asyncio.Task[None] | None
     _youtube_rescan_task: asyncio.Task[None] | None
@@ -185,6 +104,7 @@ class IngestionManager:
         self.cached_local_videos = {}
         self.cached_youtube_videos = {}
         self.cached_videos = []
+        self._preparing_videos = set()
         self._last_pot_update = time()
         self._files_rescan_task = None
         self._youtube_rescan_task = None
@@ -231,19 +151,16 @@ class IngestionManager:
                 logfire.info(f"Loaded YouTube cookie file from {cookie_resolved}.")
 
     def _get_base_ytdlp_opts(self) -> dict[str, Any]:
-        """Constructs base yt-dlp parameters including PO token server, node runtime, and FFmpeg path.
+        """Constructs base yt-dlp parameters including PO token server and FFmpeg path.
 
         Returns:
             dict[str, Any]: Base yt-dlp configuration options dictionary.
         """
-        extractor_args: dict[str, Any] = {
-            "youtubetab": {"approximate_date": [""]},
-        }
+        extractor_args: dict[str, Any] = {"youtubetab": {"approximate_date": [""]}}
         if self.pot_server_dir and self.pot_server_dir.exists():
             extractor_args["youtubepot-bgutilscript"] = {"server_home": str(self.pot_server_dir)}
 
         ffmpeg_bin, _ = ensure_ffmpeg()
-
         opts: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
@@ -304,6 +221,7 @@ class IngestionManager:
 
         Args:
             deep_scan: If True, crawls full channel history; if False, applies lookback window cutoff.
+            Defaults to False.
 
         Returns:
             list[DiscoveredVideo]: Discovered YouTube video items.
@@ -332,12 +250,7 @@ class IngestionManager:
                 url_handle = match.group(1).split("/")[-1]
 
             if re.match(r"^https?://(www\.)?youtube\.com/(@[\w.-]+|channel/UC[\w-]+)$", clean_url):
-                target_items.extend(
-                    [
-                        (f"{clean_url}/videos", url_handle),
-                        (f"{clean_url}/streams", url_handle),
-                    ]
-                )
+                target_items.extend([(f"{clean_url}/videos", url_handle), (f"{clean_url}/streams", url_handle)])
             else:
                 target_items.append((clean_url, url_handle))
 
@@ -365,31 +278,22 @@ class IngestionManager:
                                 continue
 
                             self.channel_mapper.update_from_entries([result])
-
                             entries_raw = result.get("entries")
                             entries_iterator = [result] if entries_raw is None else entries_raw
                             entries_processed: list[Any] = []
-                            sample_entries: list[Any] = []
 
                             for entry in entries_iterator:
                                 if not entry:
                                     continue
-
-                                if len(sample_entries) < 10:
-                                    sample_entries.append(entry)
-
                                 vid = entry.get("id")
                                 if not vid or len(vid) != 11:
                                     continue
-
                                 title = str(entry.get("title") or "Unknown")
                                 if title in ["[Deleted video]", "[Private video]", "[Unavailable video]"]:
                                     continue
-
                                 if entry.get("live_status") in ("is_upcoming", "is_live", "post_live"):
                                     continue
-                                url_val = entry.get("url") or entry.get("webpage_url") or ""
-                                if "/shorts/" in url_val:
+                                if "/shorts/" in (entry.get("url") or entry.get("webpage_url") or ""):
                                     continue
 
                                 raw_ts = entry.get("timestamp") or entry.get("release_timestamp") or 0
@@ -405,18 +309,16 @@ class IngestionManager:
                                     except ValueError:
                                         ts = 0
 
+                                # Continue across pinned or out-of-order videos instead of breaking
                                 if not deep_scan and ts > 0 and ts < cutoff_ts:
-                                    break
+                                    continue
 
                                 entries_processed.append(entry)
-
                                 uploader, ch_name = self.channel_mapper.resolve(
                                     entry=entry,
                                     parent=result,
                                     url_context=url_context_handle,
                                 )
-                                web_url = f"https://www.youtube.com/watch?v={vid}"
-
                                 discovered.append(
                                     DiscoveredVideo(
                                         video_id=vid,
@@ -424,27 +326,13 @@ class IngestionManager:
                                         channel_name=ch_name,
                                         title=title,
                                         source_type="youtube",
-                                        source_ref=web_url,
+                                        source_ref=f"https://www.youtube.com/watch?v={vid}",
                                         timestamp=ts,
                                     )
                                 )
 
                             self.channel_mapper.update_from_entries(entries_processed)
-
-                            url_span.set_attribute("sample_entries", sample_entries)
-                            url_span.set_attribute(
-                                "root_metadata",
-                                {
-                                    "id": result.get("id"),
-                                    "title": result.get("title"),
-                                    "uploader_id": result.get("uploader_id"),
-                                    "uploader": result.get("uploader"),
-                                    "channel_id": result.get("channel_id"),
-                                    "channel": result.get("channel"),
-                                },
-                            )
                             url_span.set_attribute("discovered_count", len(entries_processed))
-
                         except Exception as e:
                             err_msg = str(e)
                             logfire.warning(f"Error scanning YouTube source {url}: {err_msg}")
@@ -458,30 +346,29 @@ class IngestionManager:
             return discovered
 
     async def scan_watch_folders_async(self) -> list[DiscoveredVideo]:
-        """Scans local watch directories off-thread and updates the in-memory cache.
+        """Scans local watch directories off-thread and updates in-memory cache.
 
         Returns:
             list[DiscoveredVideo]: Discovered local video items.
         """
         async with self._scan_lock:
-            loop = asyncio.get_running_loop()
-            discovered = await loop.run_in_executor(None, self.scan_watch_folders)
+            discovered = await asyncio.to_thread(self.scan_watch_folders)
             self.cached_local_videos = {v.video_id: v for v in discovered}
             self._update_combined_cache()
             return discovered
 
     async def scan_youtube_sources_async(self, deep_scan: bool = False) -> list[DiscoveredVideo]:
-        """Scans YouTube sources off-thread and updates the in-memory cache.
+        """Scans YouTube sources off-thread and updates in-memory cache.
 
         Args:
             deep_scan: If True, crawls full channel history; if False, applies lookback window cutoff.
+            Defaults to False.
 
         Returns:
             list[DiscoveredVideo]: Discovered YouTube video items.
         """
         async with self._scan_lock:
-            loop = asyncio.get_running_loop()
-            discovered = await loop.run_in_executor(None, self.scan_youtube_sources, deep_scan)
+            discovered = await asyncio.to_thread(self.scan_youtube_sources, deep_scan)
             self.cached_youtube_videos.update({v.video_id: v for v in discovered})
             self._update_combined_cache()
             return discovered
@@ -573,8 +460,6 @@ class IngestionManager:
         ydl_opts["format"] = "bestvideo[height<=360]+bestaudio/best[height<=360]/best"
         ydl_opts["outtmpl"] = str(job_dir / f"%(title).{self.config.youtube.max_title_bytes}B [%(id)s].%(ext)s")
 
-        loop = asyncio.get_running_loop()
-
         def _do_download() -> Path:
             with YoutubeDL(cast(Any, ydl_opts)) as ydl:
                 info = ydl.extract_info(video.source_ref, download=True)
@@ -585,11 +470,10 @@ class IngestionManager:
                 if video.uploader == "youtube":
                     video.uploader, video.channel_name = self.channel_mapper.resolve(info)
 
-                fn = ydl.prepare_filename(info)
-                return Path(fn)
+                return Path(ydl.prepare_filename(info))
 
         with logfire.span("Downloading YouTube Video to {job_dir}: {title}", job_dir=job_dir.name, title=video.title):
-            downloaded = await loop.run_in_executor(None, _do_download)
+            downloaded = await asyncio.to_thread(_do_download)
             if not downloaded.is_file():
                 matches = [
                     p
@@ -650,75 +534,96 @@ class IngestionManager:
             if not self.cached_videos:
                 await self.scan_all_sources(deep_scan=False)
 
-            loop = asyncio.get_running_loop()
-
+            assignments: list[tuple[ComboPipeline, DiscoveredVideo]] = []
             for pipe in idle_pipelines:
                 for candidate in self.cached_videos:
+                    if candidate.video_id in self._preparing_videos:
+                        continue
                     if self.failed_video_counts.get(candidate.video_id, 0) >= 3:
                         continue
                     if self.git_sync.is_video_completed(candidate.uploader, candidate.video_id, pipe.full_shortcode):
                         continue
 
                     pipe.status = PipelineStatus.PREPARING
+                    self._preparing_videos.add(candidate.video_id)
+                    assignments.append((pipe, candidate))
+                    break
 
-                    is_available, is_bot = await loop.run_in_executor(None, self.check_video_availability, candidate)
-                    if not is_available:
-                        pipe.status = PipelineStatus.IDLE
-                        if is_bot:
-                            logfire.warning(
-                                f"Bot detection triggered on '{candidate.title}' ({candidate.video_id}). "
-                                "Halting intake feed for this cycle."
-                            )
-                            return
+        pending_assignments = list(assignments)
+        try:
+            while pending_assignments:
+                pipe, candidate = pending_assignments.pop(0)
+                is_available, is_bot = await asyncio.to_thread(self.check_video_availability, candidate)
 
-                        self.consecutive_failures += 1
-                        self.failed_video_counts[candidate.video_id] = (
-                            self.failed_video_counts.get(candidate.video_id, 0) + 1
-                        )
+                if not is_available:
+                    pipe.status = PipelineStatus.IDLE
+                    async with self._feed_lock:
+                        self._preparing_videos.discard(candidate.video_id)
+
+                    if is_bot:
                         logfire.warning(
-                            f"Video '{candidate.title}' ({candidate.video_id}) unavailable "
-                            f"(attempt {self.failed_video_counts[candidate.video_id]}/3)."
+                            f"Bot detection triggered on '{candidate.title}' ({candidate.video_id}). "
+                            "Halting intake feed for this cycle."
                         )
-                        if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
-                            return
-                        continue
+                        return
 
-                    try:
-                        if candidate.source_type == "local" and candidate.local_path:
-                            media_path = candidate.local_path
-                        else:
-                            media_path = await self.download_youtube_to_combo_dir(candidate, pipe.work_dir)
+                    self.consecutive_failures += 1
+                    self.failed_video_counts[candidate.video_id] = (
+                        self.failed_video_counts.get(candidate.video_id, 0) + 1
+                    )
+                    logfire.warning(
+                        f"Video '{candidate.title}' ({candidate.video_id}) unavailable "
+                        f"(attempt {self.failed_video_counts[candidate.video_id]}/3)."
+                    )
+                    if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
+                        return
+                    continue
 
-                        self.consecutive_failures = 0
-                        logfire.info(f"Feeding '{pipe.config.name}' with '{candidate.title}' ({candidate.video_id}).")
-                        await pipe.prepare_and_set_video(
-                            video_id=candidate.video_id,
-                            uploader=candidate.uploader,
-                            title=candidate.title,
-                            raw_video_path=media_path,
-                            channel_name=candidate.channel_name,
-                            source_type=candidate.source_type,
-                            timestamp=candidate.timestamp,
-                        )
-                        break
-                    except Exception as e:
-                        pipe.status = PipelineStatus.IDLE
-                        pipe.active_video = None
-                        shutil.rmtree(pipe.work_dir / candidate.video_id, ignore_errors=True)
+                try:
+                    if candidate.source_type == "local" and candidate.local_path:
+                        media_path = candidate.local_path
+                    else:
+                        media_path = await self.download_youtube_to_combo_dir(candidate, pipe.work_dir)
 
-                        err_str = str(e)
-                        if "Sign in to confirm you’re not a bot" in err_str or "HTTP Error 429" in err_str:
-                            logfire.warning(f"Bot detection on download of '{candidate.title}'. Halting feed.")
-                            return
+                    self.consecutive_failures = 0
+                    logfire.info(f"Feeding '{pipe.config.name}' with '{candidate.title}' ({candidate.video_id}).")
+                    await pipe.prepare_and_set_video(
+                        video_id=candidate.video_id,
+                        uploader=candidate.uploader,
+                        title=candidate.title,
+                        raw_video_path=media_path,
+                        channel_name=candidate.channel_name,
+                        source_type=candidate.source_type,
+                        timestamp=candidate.timestamp,
+                    )
+                except Exception as e:
+                    pipe.status = PipelineStatus.IDLE
+                    pipe.active_video = None
+                    shutil.rmtree(pipe.work_dir / candidate.video_id, ignore_errors=True)
 
-                        self.consecutive_failures += 1
-                        self.failed_video_counts[candidate.video_id] = (
-                            self.failed_video_counts.get(candidate.video_id, 0) + 1
-                        )
-                        logfire.error(f"Failed to prepare '{candidate.title}' for {pipe.config.name}: {e}")
-                        if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
-                            return
-                        continue
+                    err_str = str(e)
+                    if "Sign in to confirm you’re not a bot" in err_str or "HTTP Error 429" in err_str:
+                        logfire.warning(f"Bot detection on download of '{candidate.title}'. Halting feed.")
+                        return
+
+                    self.consecutive_failures += 1
+                    self.failed_video_counts[candidate.video_id] = (
+                        self.failed_video_counts.get(candidate.video_id, 0) + 1
+                    )
+                    logfire.error(f"Failed to prepare '{candidate.title}' for {pipe.config.name}: {e}")
+                    if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
+                        return
+                finally:
+                    async with self._feed_lock:
+                        self._preparing_videos.discard(candidate.video_id)
+        finally:
+            # Clean up any unreached assignments on early exit (bot block, failure threshold, or cancellation)
+            if pending_assignments:
+                async with self._feed_lock:
+                    for pipe, candidate in pending_assignments:
+                        if pipe.status == PipelineStatus.PREPARING:
+                            pipe.status = PipelineStatus.IDLE
+                        self._preparing_videos.discard(candidate.video_id)
 
     async def start(self) -> None:
         """Starts the ingestion manager with a deep scan on boot, followed by periodic delta intake loops."""
@@ -776,8 +681,7 @@ class IngestionManager:
                     if (now - self._last_pot_update) >= interval_sec:
                         self._last_pot_update = now
                         logfire.info("Checking for bgutil-ytdlp-pot-provider upstream updates...")
-                        loop = asyncio.get_running_loop()
-                        self.pot_server_dir = await loop.run_in_executor(None, ensure_pot_provider, self.pot_dir, True)
+                        self.pot_server_dir = await asyncio.to_thread(ensure_pot_provider, self.pot_dir, True)
 
                 logfire.debug("Running periodic YouTube delta scan...")
                 await self.scan_youtube_sources_async(deep_scan=False)

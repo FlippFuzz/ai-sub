@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import mimetypes
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, AsyncGenerator
 
 import logfire
 from fastapi import FastAPI, HTTPException, Response, status
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse
 
 from ai_sub.protocol import (
     TaskClaimRequest,
@@ -21,10 +22,11 @@ from ai_sub.protocol import (
 )
 from ai_sub.server.config import ServerSettings
 from ai_sub.server.coordinator import PipelineCoordinator
-from ai_sub.server.dashboard import DASHBOARD_HTML
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.ingestion import IngestionManager
 from ai_sub.telemetry import get_app_version
+
+DASHBOARD_HTML_PATH = Path(__file__).parent / "static" / "dashboard.html"
 
 
 def create_app(settings: ServerSettings) -> FastAPI:
@@ -73,15 +75,15 @@ def create_app(settings: ServerSettings) -> FastAPI:
         lifespan=lifespan,
     )
 
-    @app.get("/", response_class=HTMLResponse)
-    @app.get("/dashboard", response_class=HTMLResponse)
-    async def get_dashboard() -> HTMLResponse:
-        """Serves the live WebUI dashboard.
+    @app.get("/", response_class=FileResponse)
+    @app.get("/dashboard", response_class=FileResponse)
+    async def get_dashboard() -> FileResponse:
+        """Serves the live WebUI dashboard HTML template.
 
         Returns:
-            HTMLResponse: Live WebUI HTML page.
+            FileResponse: Static WebUI HTML dashboard file response.
         """
-        return HTMLResponse(content=DASHBOARD_HTML)
+        return FileResponse(DASHBOARD_HTML_PATH, media_type="text/html")
 
     @app.get("/api/v1/dashboard/data")
     async def get_dashboard_data() -> dict[str, Any]:
@@ -178,7 +180,6 @@ def create_app(settings: ServerSettings) -> FastAPI:
                 detail="Task was not assigned to this worker or has already completed.",
             )
 
-        # Run finalization and feeding in background so worker response returns immediately
         async def _finalize_and_feed() -> None:
             try:
                 finalized = await coordinator.check_and_finalize_completed_pipelines()

@@ -37,7 +37,7 @@ class PipelineCoordinator:
 
         Args:
             settings: Server settings model.
-            git_sync: Optional Git synchronization manager for pushing completed subtitles. Defaults to None.
+            git_sync: Optional Git synchronization manager. Defaults to None.
         """
         self.settings = settings
         self.git_sync = git_sync
@@ -150,20 +150,19 @@ class PipelineCoordinator:
                                     if task.attempts >= max_runs:
                                         task.status = TaskStatus.FAILED
                                         logfire.error(
-                                            f"Task '{task.task_id}' lease expired ({elapsed:.1f}s ago). "
-                                            f"Max runs ({task.attempts}/{max_runs}) reached. Marked FAILED."
+                                            f"Task '{task.task_id}' lease expired ({elapsed:.1f}s). Marked FAILED."
                                         )
                                         self._log_activity(
                                             event_type="fail",
                                             task=task,
                                             worker_id=worker_id,
-                                            detail=f"Lease timed out after {timeout}s: max runs ({max_runs}) exhausted",
+                                            detail=f"Lease timed out after {timeout}s: max runs exhausted",
                                         )
                                     else:
                                         task.status = TaskStatus.PENDING
                                         logfire.warning(
-                                            f"Task '{task.task_id}' lease expired (worker: {worker_id}, "
-                                            f"last heartbeat: {elapsed:.1f}s ago). Returning to PENDING."
+                                            f"Task '{task.task_id}' lease expired (worker: {worker_id}). "
+                                            "Set to PENDING."
                                         )
                                         self._log_activity(
                                             event_type="timeout",
@@ -209,10 +208,7 @@ class PipelineCoordinator:
 
                 for pipe in self.pipelines.values():
                     for task in pipe.tasks.values():
-                        if task.status != TaskStatus.PENDING:
-                            continue
-
-                        if not pipe.is_task_ready_for_claim(task):
+                        if task.status != TaskStatus.PENDING or not pipe.is_task_ready_for_claim(task):
                             continue
 
                         if task.model.lower() not in available_models:
@@ -239,25 +235,8 @@ class PipelineCoordinator:
                             f"(model: {task.model}, type: {task.task_type.value})."
                         )
 
-                        media_filename = task.media_path.name
-                        return TaskClaimResponse(
-                            task_id=task.task_id,
-                            task_type=task.task_type,
-                            pipeline_name=task.pipeline_name,
-                            video_id=task.video_id,
-                            model=task.model,
-                            media_url=f"/api/v1/tasks/{task.task_id}/media/{media_filename}",
-                            video_duration_ms=task.video_duration_ms,
-                            prompt_system=task.prompt.system,
-                            prompt_user=task.prompt.user,
-                            response_schema_name=task.response_schema_name,
-                            traceparent=task.traceparent,
-                            search_tools=task.search_tools,
-                            agentic_video=task.agentic_video,
-                            service_tier=task.service_tier,
-                            detected_performances=task.detected_performances,
-                            retry=self.settings.retry,
-                        )
+                        media_url = f"/api/v1/tasks/{task.task_id}/media/{task.media_path.name}"
+                        return task.to_claim_response(media_url=media_url, retry=self.settings.retry)
 
                 claim_span.set_attribute("result", "none_available")
                 return None
@@ -270,7 +249,7 @@ class PipelineCoordinator:
             worker_id: Worker claiming the lease.
 
         Returns:
-            bool: True if lease was successfully renewed; False if task was revoked or completed.
+            bool: True if lease was successfully renewed, False otherwise.
         """
         async with self._lock:
             for pipe in self.pipelines.values():
@@ -293,19 +272,14 @@ class PipelineCoordinator:
         Args:
             task: Affected server task.
             worker_id: Worker reporting the failure.
-            reason: Error code (e.g. 'QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').
+            reason: Error code ('QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').
             error_message: Optional error details. Defaults to None.
 
         Returns:
             bool: True indicating the task failure was processed.
         """
         detail = f"[{reason}] {error_message or 'No message provided'}"
-        self._log_activity(
-            event_type="fail",
-            task=task,
-            worker_id=worker_id,
-            detail=detail,
-        )
+        self._log_activity(event_type="fail", task=task, worker_id=worker_id, detail=detail)
         task.worker_id = None
         task.claimed_at = None
         task.last_heartbeat = None
@@ -315,17 +289,11 @@ class PipelineCoordinator:
             max_runs = self.settings.retry.max_runs
             if task.attempts >= max_runs:
                 task.status = TaskStatus.FAILED
-                logfire.error(
-                    f"Task '{task.task_id}' marked FAILED after exhausting "
-                    f"{task.attempts}/{max_runs} runs. Reason: {reason}."
-                )
+                logfire.error(f"Task '{task.task_id}' marked FAILED after {task.attempts}/{max_runs} runs.")
                 return True
 
         task.status = TaskStatus.PENDING
-        logfire.warning(
-            f"Task '{task.task_id}' failed by worker '{worker_id}' (reason: {reason}). "
-            f"Details: {error_message or 'none'}. Returning to PENDING."
-        )
+        logfire.warning(f"Task '{task.task_id}' failed by worker '{worker_id}' ({reason}). Reset to PENDING.")
         return True
 
     async def complete_task(
@@ -342,7 +310,7 @@ class PipelineCoordinator:
             result: Validated AI result dictionary.
 
         Returns:
-            bool: True if completion was accepted; False otherwise.
+            bool: True if completion was accepted, False otherwise.
         """
         async with self._lock:
             with logfire.span("Process Complete Task: {task_id}", task_id=task_id, worker_id=worker_id) as comp_span:
@@ -354,9 +322,7 @@ class PipelineCoordinator:
                             try:
                                 pipe.on_task_completed(task_id, result)
                             except Exception as val_err:
-                                logfire.warning(
-                                    f"Task '{task_id}' completion validation failed: {val_err}. Routing to fail."
-                                )
+                                logfire.warning(f"Task '{task_id}' validation failed: {val_err}. Routing to fail.")
                                 comp_span.set_attribute("result", "validation_failed")
                                 comp_span.set_attribute("error", str(val_err))
                                 self._fail_task_locked(
@@ -378,7 +344,7 @@ class PipelineCoordinator:
                                 detail = f"Subtitles: {sub_len} lines transcribed ({music_len} songs detected)"
                             elif task.task_type == TaskType.LYRICS:
                                 lyr_len = len(result.get("subs", result.get("subtitles", [])))
-                                detail = f"Lyrics: {lyr_len} lines refined with song lyrics"
+                                detail = f"Lyrics: {lyr_len} lines refined"
 
                             self._log_activity(
                                 event_type="complete",
@@ -389,9 +355,7 @@ class PipelineCoordinator:
                             )
                             comp_span.set_attribute("result", "accepted")
                             comp_span.set_attribute("duration_s", round(duration, 1))
-                            logfire.info(
-                                f"Task '{task_id}' marked COMPLETED by worker '{worker_id}' (elapsed: {duration:.1f}s)."
-                            )
+                            logfire.info(f"Task '{task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
                             return True
 
                 comp_span.set_attribute("result", "rejected_not_claimed")
@@ -405,16 +369,16 @@ class PipelineCoordinator:
         reason: str,
         error_message: str | None = None,
     ) -> bool:
-        """Handles task failure, releasing the lease or marking permanently failed if max_runs reached.
+        """Handles task failure, releasing the lease or marking permanently failed.
 
         Args:
             task_id: Unique task identifier.
             worker_id: Worker reporting the failure.
-            reason: Error code (e.g. 'QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').
-            error_message: Optional error details.
+            reason: Error code ('QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').
+            error_message: Optional error details. Defaults to None.
 
         Returns:
-            bool: True if failure was recorded; False otherwise.
+            bool: True if failure was recorded, False otherwise.
         """
         async with self._lock:
             with logfire.span(
@@ -447,7 +411,7 @@ class PipelineCoordinator:
             task_id: Unique task identifier.
 
         Returns:
-            Path | None: File path if task exists and file is present; None otherwise.
+            Path | None: File path if task exists and file is present, None otherwise.
         """
         for pipe in self.pipelines.values():
             if task_id in pipe.tasks:
@@ -457,13 +421,13 @@ class PipelineCoordinator:
         return None
 
     async def finalize_pipeline_if_complete(self, pipe: ComboPipeline) -> bool:
-        """Checks if a pipeline has finished all segments, stitches subtitles, pushes to Git, and clears it.
+        """Checks if a pipeline has finished all segments, stitches subtitles, and pushes to Git.
 
         Args:
             pipe: Pipeline instance to check and finalize.
 
         Returns:
-            bool: True if pipeline was completed and finalized; False otherwise.
+            bool: True if pipeline was completed and finalized, False otherwise.
         """
         async with self._lock:
             if pipe.config.name in self._finalizing_pipes:
@@ -487,7 +451,7 @@ class PipelineCoordinator:
             try:
                 generated_srts = await asyncio.to_thread(pipe.stitch_final_subtitles, temp_srt)
             except Exception as e:
-                logfire.error(f"Subtitle stitching failed for '{pipe.config.name}' ({vid.video_id}): {e}")
+                logfire.error(f"Subtitle stitching failed for '{pipe.config.name}': {e}")
                 async with self._lock:
                     pipe.status = PipelineStatus.PUSH_FAILED
                 return False
@@ -505,9 +469,7 @@ class PipelineCoordinator:
                         meta_file=meta_file if meta_file.is_file() else None,
                     )
                 except Exception as e:
-                    logfire.error(
-                        f"Git push failed for '{pipe.config.name}' ({vid.video_id}): {e}. Setting PUSH_FAILED."
-                    )
+                    logfire.error(f"Git push failed for '{pipe.config.name}': {e}. Setting PUSH_FAILED.")
                     async with self._lock:
                         pipe.status = PipelineStatus.PUSH_FAILED
                     return False
@@ -572,9 +534,7 @@ class PipelineCoordinator:
                 lyr_tasks = [t for t in pipe.tasks.values() if t.task_type == TaskType.LYRICS]
 
                 sum_done = (
-                    1
-                    if pipe.summary_response
-                    else (1 if summary_task and summary_task.status == TaskStatus.COMPLETED else 0)
+                    1 if pipe.summary_response or (summary_task and summary_task.status == TaskStatus.COMPLETED) else 0
                 )
                 sum_prog = 1 if summary_task and summary_task.status == TaskStatus.CLAIMED else 0
 
@@ -594,28 +554,17 @@ class PipelineCoordinator:
                     if t.status == TaskStatus.CLAIMED
                 ]
 
+                has_singing = bool(lyr_tasks)
                 if sub_done < total_chunks:
-                    if lyr_tasks:
-                        has_singing = True
-                        lyr_status = (
-                            "in_progress"
-                            if lyr_prog > 0
-                            else ("completed" if lyr_done == len(lyr_tasks) else "pending")
-                        )
-                    else:
-                        has_singing = False
-                        lyr_status = "pending"
+                    lyr_status = "in_progress" if lyr_prog > 0 else "pending"
                 else:
                     if lyr_tasks:
-                        has_singing = True
-                        if lyr_done == len(lyr_tasks):
-                            lyr_status = "completed"
-                        elif lyr_prog > 0:
-                            lyr_status = "in_progress"
-                        else:
-                            lyr_status = "pending"
+                        lyr_status = (
+                            "completed"
+                            if lyr_done == len(lyr_tasks)
+                            else ("in_progress" if lyr_prog > 0 else "pending")
+                        )
                     else:
-                        has_singing = False
                         lyr_status = "skipped"
 
                 stages_info = {
@@ -650,18 +599,17 @@ class PipelineCoordinator:
                     },
                 }
 
-            tasks_list = []
-            for t in pipe.tasks.values():
-                tasks_list.append(
-                    {
-                        "task_id": t.task_id,
-                        "type": t.task_type.value,
-                        "status": t.status.value,
-                        "worker_id": t.worker_id,
-                        "attempts": t.attempts,
-                        "elapsed_s": int(now - t.claimed_at) if t.claimed_at else None,
-                    }
-                )
+            tasks_list = [
+                {
+                    "task_id": t.task_id,
+                    "type": t.task_type.value,
+                    "status": t.status.value,
+                    "worker_id": t.worker_id,
+                    "attempts": t.attempts,
+                    "elapsed_s": int(now - t.claimed_at) if t.claimed_at else None,
+                }
+                for t in pipe.tasks.values()
+            ]
 
             pipeline_data.append(
                 {

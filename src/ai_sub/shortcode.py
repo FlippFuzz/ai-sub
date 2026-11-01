@@ -21,47 +21,25 @@ def generate_model_shortcode(model_name: str) -> str:
     Returns:
         str: Sanitized shortcode string.
     """
-    clean_name = model_name.split(":", 1)[-1].lower()
+    clean = model_name.split(":", 1)[-1].lower()
+    if not clean.startswith("gemini"):
+        return re.sub(r"[^a-zA-Z0-9]+", "-", clean.replace(".", "")).strip("-") or "model"
 
-    if clean_name.startswith("gemini"):
-        rem = clean_name[len("gemini") :].lstrip("-_")
+    rem = clean[6:].lstrip("-_")
+    v_match = re.search(r"(\d+(?:\.\d+)*)", rem)
+    v_code = v_match.group(1).replace(".", "") if v_match else ""
+    rem = rem[v_match.end() :].lstrip("-_") if v_match else rem
 
-        version_match = re.search(r"(\d+(?:\.\d+)*)", rem)
-        if version_match:
-            version_str = version_match.group(1)
-            version_code = version_str.replace(".", "")
-            rem = rem.replace(version_str, "", 1).lstrip("-_")
-        else:
-            version_code = ""
+    tier = "g"
+    for name, code in (("flash-lite", "l"), ("lite", "l"), ("flash", "f"), ("pro", "p")):
+        if rem.startswith(name):
+            tier = code
+            rem = rem[len(name) :].lstrip("-_")
+            break
 
-        tier_code = "g"
-        for tier_name, code in [
-            ("flash-lite", "l"),
-            ("lite", "l"),
-            ("flash", "f"),
-            ("pro", "p"),
-        ]:
-            if rem == tier_name or rem.startswith(tier_name + "-") or rem.startswith(tier_name + "_"):
-                tier_code = code
-                rem = rem[len(tier_name) :].lstrip("-_")
-                break
-
-        base_code = f"g{version_code}{tier_code}"
-        if rem:
-            variant_map = {"preview": "p"}
-            if rem in variant_map:
-                return f"{base_code}{variant_map[rem]}"
-
-            variant = rem.replace(".", "")
-            variant = re.sub(r"[^a-zA-Z0-9]+", "-", variant).strip("-")
-            if variant:
-                return f"{base_code}-{variant}"
-
-        return base_code
-
-    sanitized = clean_name.replace(".", "")
-    sanitized = re.sub(r"[^a-zA-Z0-9]+", "-", sanitized).strip("-")
-    return sanitized or "model"
+    variant = {"preview": "p"}.get(rem, re.sub(r"[^a-zA-Z0-9]+", "-", rem.replace(".", "")).strip("-"))
+    base = f"g{v_code}{tier}"
+    return f"{base}{variant}" if variant == "p" else (f"{base}-{variant}" if variant else base)
 
 
 def generate_summary_shortcode(
@@ -77,8 +55,7 @@ def generate_summary_shortcode(
     Returns:
         str: Tag formatted as '<model_code>-<summary_v>' (e.g., 'g35l-01').
     """
-    model_code = generate_model_shortcode(model_name)
-    return f"{model_code}-{summary_prompt_version:02d}"
+    return f"{generate_model_shortcode(model_name)}-{summary_prompt_version:02d}"
 
 
 def generate_subtitles_shortcode(
@@ -88,23 +65,16 @@ def generate_subtitles_shortcode(
 ) -> str:
     """Combines model shortcode and 2-digit subtitles prompt version tag with optional summary lineage.
 
-    If summary_shortcode is provided, prepends it so changes to the upstream summary model
-    automatically invalidate downstream subtitle caches.
-
     Args:
         model_name: Model identifier string.
-        summary_shortcode: Optional upstream summary tag (e.g. 'g35l-01').
+        summary_shortcode: Optional upstream summary tag. Defaults to None.
         subtitles_prompt_version: Prompt version number. Defaults to SUBTITLES_PROMPT_VERSION.
 
     Returns:
-        str: Tag formatted as '[<summary_code>_]<model_code>-<subtitles_v>'
-            (e.g., 'g35l-01_g38f-19' or 'g38f-19').
+        str: Tag formatted as '[<summary_code>_]<model_code>-<subtitles_v>'.
     """
-    model_code = generate_model_shortcode(model_name)
-    sub_tag = f"{model_code}-{subtitles_prompt_version:02d}"
-    if summary_shortcode:
-        return f"{summary_shortcode}_{sub_tag}"
-    return sub_tag
+    sub_tag = f"{generate_model_shortcode(model_name)}-{subtitles_prompt_version:02d}"
+    return f"{summary_shortcode}_{sub_tag}" if summary_shortcode else sub_tag
 
 
 def generate_lyrics_shortcode(
@@ -116,15 +86,13 @@ def generate_lyrics_shortcode(
 
     Args:
         lyrics_model_name: Lyrics model identifier string.
-        subtitles_shortcode: Full upstream subtitles shortcode representing the transcription lineage.
+        subtitles_shortcode: Full upstream subtitles shortcode representing transcription lineage.
         lyrics_prompt_version: Lyrics prompt version number. Defaults to LYRICS_PROMPT_VERSION.
 
     Returns:
-        str: Tag formatted as '<subtitles_shortcode>_<lyrics_code>-<lyrics_v>'
-            (e.g., 'g35l-01_g38f-19_g35l-10' or 'g38f-19_g35l-10').
+        str: Tag formatted as '<subtitles_shortcode>_<lyrics_code>-<lyrics_v>'.
     """
-    lyrics_code = generate_model_shortcode(lyrics_model_name)
-    return f"{subtitles_shortcode}_{lyrics_code}-{lyrics_prompt_version:02d}"
+    return f"{subtitles_shortcode}_{generate_model_shortcode(lyrics_model_name)}-{lyrics_prompt_version:02d}"
 
 
 def generate_full_shortcode(
@@ -133,7 +101,7 @@ def generate_full_shortcode(
     lyrics_prompt_version: int = LYRICS_PROMPT_VERSION,
     subtitles_prompt_version: int = SUBTITLES_PROMPT_VERSION,
 ) -> str:
-    """Combines model shortcode with a composite 6-digit prompt version suffix for final output.
+    """Combines model shortcode with composite 6-digit prompt version suffix for final output.
 
     Args:
         model_name: Model identifier string.
@@ -144,6 +112,5 @@ def generate_full_shortcode(
     Returns:
         str: Tag formatted as '<model_code>-<summary_v><lyrics_v><sub_v>' (e.g., 'g38f-011019').
     """
-    model_code = generate_model_shortcode(model_name)
-    suffix = f"-{summary_prompt_version:02d}{lyrics_prompt_version:02d}{subtitles_prompt_version:02d}"
-    return f"{model_code}{suffix}"
+    code = generate_model_shortcode(model_name)
+    return f"{code}-{summary_prompt_version:02d}{lyrics_prompt_version:02d}{subtitles_prompt_version:02d}"

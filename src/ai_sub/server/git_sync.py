@@ -319,11 +319,28 @@ class GitSyncManager:
                     time.sleep(backoff)
                     try:
                         repo.git.pull("origin", self.config.branch, "--rebase")
-                    except Exception:
+                    except GitCommandError:
+                        # Check which files have merge conflicts
                         try:
-                            repo.git.rebase("--abort")
-                        except Exception:
-                            pass
+                            unmerged_output = repo.git.diff("--diff-filter=U", "--name-only")
+                            unmerged_files = [f.strip() for f in unmerged_output.splitlines() if f.strip()]
+                            readme_rel = f"{uploader}/README.md"
+
+                            # Only auto-resolve if the conflict is strictly on the channel README
+                            if unmerged_files == [readme_rel]:
+                                self._update_channel_readme_sync(uploader)
+                                repo.git.add(readme_rel)
+                                repo.git.rebase("--continue", env={**os.environ, "GIT_EDITOR": "true"})
+                                logfire.info("Resolved channel README conflict and continued rebase.")
+                            else:
+                                logfire.warning(f"Non-README conflict encountered ({unmerged_files}). Aborting rebase.")
+                                repo.git.rebase("--abort")
+                        except Exception as rebase_err:
+                            logfire.warning(f"Could not automatically resolve rebase: {rebase_err}. Aborting.")
+                            try:
+                                repo.git.rebase("--abort")
+                            except Exception:
+                                pass
                 else:
                     logfire.error(f"Git push exhausted retries: {e}")
                     raise

@@ -66,6 +66,7 @@ class WorkerClient:
 
         Returns:
             TaskClaimResponse | None: Claimed task details if available, or None if queue is empty.
+
         """
         req = TaskClaimRequest(
             worker_id=worker_id,
@@ -88,8 +89,7 @@ class WorkerClient:
             worker_id: Unique identifier of this worker.
 
         Returns:
-            bool | None: True if acknowledged; False if lease expired or was revoked;
-                None if a transient transport error or 5xx server error occurred.
+            bool | None: True if acknowledged; False if lease expired; None if a transient transport error occurred.
         """
         req = TaskHeartbeatRequest(worker_id=worker_id)
         try:
@@ -178,8 +178,8 @@ class WorkerClient:
             task_id: Unique task identifier.
             worker_id: Unique identifier of this worker.
             reason: Failure code ('QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').
-            model: Gemini model identifier that failed, if applicable.
-            error_message: Optional error message or traceback.
+            model: Gemini model identifier that failed, if applicable. Defaults to None.
+            error_message: Optional error message or traceback. Defaults to None.
 
         Returns:
             bool: True if failure was acknowledged; False otherwise.

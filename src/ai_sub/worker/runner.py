@@ -10,17 +10,24 @@ from time import time
 from typing import Any
 
 import logfire
+from pydantic import BaseModel
 
 from ai_sub.config import AiSettings
 from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError
 from ai_sub.jobs.base import Prompt
-from ai_sub.jobs.lyrics import LyricsAiResponse
-from ai_sub.jobs.subtitles import SubtitlesAiResponse
+from ai_sub.jobs.lyrics import LyricsAiResponse, prefetch_lyrics
+from ai_sub.jobs.subtitles import DetectedMusicalPerformance, SubtitlesAiResponse
 from ai_sub.jobs.summary import SummaryAiResponse
-from ai_sub.protocol import TaskClaimResponse
+from ai_sub.protocol import TaskClaimResponse, TaskType
 from ai_sub.search import BaseSearchProvider, create_search_providers
 from ai_sub.worker.client import WorkerClient
 from ai_sub.worker.config import WorkerSettings
+
+TASK_RESPONSE_SCHEMAS: dict[TaskType, type[BaseModel]] = {
+    TaskType.SUMMARY: SummaryAiResponse,
+    TaskType.SUBTITLES: SubtitlesAiResponse,
+    TaskType.LYRICS: LyricsAiResponse,
+}
 
 
 class WorkerRunner:
@@ -34,6 +41,7 @@ class WorkerRunner:
     _task_completed_event: asyncio.Event
     _active_tasks: int
     _tasks_completed: int
+    _last_claim_timestamp: float
 
     def __init__(self, settings: WorkerSettings) -> None:
         """Initializes the worker runner.
@@ -52,6 +60,7 @@ class WorkerRunner:
         self._task_completed_event = asyncio.Event()
         self._active_tasks = 0
         self._tasks_completed = 0
+        self._last_claim_timestamp = 0.0
 
     async def _heartbeat_loop(
         self,
@@ -61,12 +70,10 @@ class WorkerRunner:
     ) -> None:
         """Background task sending periodic heartbeats to maintain the task lease.
 
-        Aborts execution immediately if the lease was revoked or rejected by the server.
-
         Args:
             task_id: Unique task identifier.
             stop_event: Event signaling when task execution finishes normally.
-            execution_task: The active Gemini execution task to cancel if lease is revoked.
+            execution_task: Active Gemini execution task to cancel if lease is revoked.
         """
         interval = self.settings.heartbeat_interval_seconds
         while not stop_event.is_set():
@@ -76,12 +83,9 @@ class WorkerRunner:
                 if not stop_event.is_set():
                     acked = await self.client.send_heartbeat(task_id, self.settings.worker_id)
                     if acked is None:
-                        continue  # transient error; lease still valid server-side
+                        continue
                     if not acked:
-                        logfire.warning(
-                            f"Heartbeat for task '{task_id}' was rejected (lease revoked or expired). "
-                            "Aborting in-flight execution immediately."
-                        )
+                        logfire.warning(f"Heartbeat for task '{task_id}' was rejected. Aborting execution immediately.")
                         execution_task.cancel()
                         break
 
@@ -104,23 +108,34 @@ class WorkerRunner:
             dict[str, Any]: Validated output data dictionary.
 
         Raises:
-            ValueError: If target response schema is unknown.
+            ValueError: If target task type response schema is unknown.
         """
-        prompt = Prompt(system=task.prompt_system, user=task.prompt_user)
-
-        if task.response_schema_name == "SummaryAiResponse":
-            response_cls = SummaryAiResponse
-        elif task.response_schema_name == "SubtitlesAiResponse":
-            response_cls = SubtitlesAiResponse
-        elif task.response_schema_name == "LyricsAiResponse":
-            response_cls = LyricsAiResponse
-        else:
-            raise ValueError(f"Unknown response schema: '{task.response_schema_name}'")
+        response_cls = TASK_RESPONSE_SCHEMAS.get(task.task_type)
+        if response_cls is None:
+            raise ValueError(f"Unknown task type: '{task.task_type}'")
 
         active_tools = [p for p in search_providers if p.provider_name in task.search_tools]
 
+        prompt_user = task.prompt_user
+        if task.task_type == TaskType.LYRICS and task.detected_performances:
+            try:
+                performances = [DetectedMusicalPerformance.model_validate(p) for p in task.detected_performances]
+                prefetched = await prefetch_lyrics(performances, active_tools)
+                if prefetched and prefetched.strip():
+                    search_block = f"<initial_search_results>\n  {prefetched.strip()}\n</initial_search_results>\n"
+                    if "<draft_subtitles_to_refine>" in prompt_user:
+                        prompt_user = prompt_user.replace(
+                            "<draft_subtitles_to_refine>",
+                            f"{search_block}<draft_subtitles_to_refine>",
+                            1,
+                        )
+                    else:
+                        prompt_user += f"\n{search_block}"
+            except Exception as e:
+                logfire.warning(f"Worker lyrics pre-fetch error: {e}")
+
         res = await executor.run_structured(
-            prompt=prompt,
+            prompt=Prompt(system=task.prompt_system, user=prompt_user),
             media_path=chunk_path,
             video_duration_ms=task.video_duration_ms,
             response_type=response_cls,
@@ -153,7 +168,6 @@ class WorkerRunner:
         if not Path(raw_name).suffix:
             raw_name = f"{raw_name}.mp4"
 
-        # Unique task filename prevents collisions across concurrent worker tasks
         safe_task_id = re.sub(r"[^a-zA-Z0-9_\-]+", "_", task.task_id)
         chunk_path = self.settings.temp_dir / f"{safe_task_id}_{raw_name}"
         await self.client.download_media(task.media_url, chunk_path)
@@ -190,29 +204,21 @@ class WorkerRunner:
             executor: Configured Gemini executor.
             search_providers: List of initialized search providers.
         """
+        slot_consecutive_idle = 0
+        last_observed_claim = self._last_claim_timestamp
+
         while True:
-            # 1. Exit if worker task completion cap reached
             if 0 < self.settings.max_tasks <= self._tasks_completed:
                 logfire.debug(f"[Slot {slot_id}] Reached max tasks limit ({self.settings.max_tasks}). Exiting.")
                 break
 
-            # 2. Exit if maximum session duration reached
             if self._deadline is not None and time() >= self._deadline:
                 logfire.info(
                     f"[Slot {slot_id}] Maximum run duration ({self.settings.max_duration_minutes:.1f}m) "
-                    f"reached. Draining slot and exiting."
+                    "reached. Draining slot and exiting."
                 )
                 break
 
-            # 3. Snapshot currently usable models in memory
-            async with self._lock:
-                current_models = list(self.usable_models)
-
-            if not current_models:
-                logfire.info(f"[Slot {slot_id}] No usable models remaining (all quota exhausted). Exiting.")
-                break
-
-            # 4. Synchronously claim next task under lock to avoid racing between slots
             claim = None
             claim_failed = False
             async with self._lock:
@@ -220,14 +226,20 @@ class WorkerRunner:
                     break
                 if self._deadline is not None and time() >= self._deadline:
                     break
+                if not self.usable_models:
+                    logfire.info(f"[Slot {slot_id}] No usable models remaining. Exiting.")
+                    break
+
                 try:
                     claim = await self.client.claim_task(
                         worker_id=self.settings.worker_id,
-                        models=current_models,
+                        models=list(self.usable_models),
                         search_tools=self.settings.search.tools,
                     )
                     if claim is not None:
                         self._active_tasks += 1
+                        self._last_claim_timestamp = time()
+                        slot_consecutive_idle = 0
                         self._task_completed_event.clear()
                 except Exception as e:
                     claim_failed = True
@@ -237,8 +249,12 @@ class WorkerRunner:
                 await asyncio.sleep(5.0)
                 continue
 
-            # 5. Handle no matching tasks available
             if claim is None:
+                # Reset idle counter if another slot claimed work in the interim
+                if self._last_claim_timestamp > last_observed_claim:
+                    slot_consecutive_idle = 0
+                    last_observed_claim = self._last_claim_timestamp
+
                 async with self._lock:
                     active = self._active_tasks
 
@@ -250,10 +266,26 @@ class WorkerRunner:
                         pass
                     continue
                 else:
-                    logfire.info(f"[Slot {slot_id}] No matching tasks on server and no active slots. Exiting.")
-                    break
+                    slot_consecutive_idle += 1
+                    max_idle = self.settings.max_consecutive_idle
 
-            # 6. Process claimed task
+                    if slot_consecutive_idle >= max_idle:
+                        logfire.info(
+                            f"[Slot {slot_id}] Reached maximum consecutive idle poll cycles "
+                            f"({slot_consecutive_idle}/{max_idle}) with no active slots. Exiting."
+                        )
+                        break
+                    else:
+                        poll_seconds = self.settings.claim_poll_interval_minutes * 60.0
+                        logfire.info(
+                            f"[Slot {slot_id}] No matching tasks on server "
+                            f"(idle cycle {slot_consecutive_idle}/{max_idle}). "
+                            f"Waiting {self.settings.claim_poll_interval_minutes:.1f}m before polling again..."
+                        )
+                        await asyncio.sleep(poll_seconds)
+                        continue
+
+            last_observed_claim = self._last_claim_timestamp
             carrier = {"traceparent": claim.traceparent} if claim.traceparent else None
             trace_ctx = (
                 logfire.attach_context(carrier) if carrier and hasattr(logfire, "attach_context") else nullcontext()
@@ -325,7 +357,6 @@ class WorkerRunner:
                             self._active_tasks -= 1
                             self._task_completed_event.set()
 
-        # Wake up any other slots waiting so they can re-evaluate termination
         self._task_completed_event.set()
 
     async def run(self) -> int:
@@ -344,7 +375,6 @@ class WorkerRunner:
             return 0
 
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
-
         ai_settings = AiSettings(key=gemini_key, search=self.settings.search)
         executor = GeminiExecutor(ai_settings)
 
@@ -355,7 +385,7 @@ class WorkerRunner:
             self._deadline = time() + (self.settings.max_duration_minutes * 60.0)
             logfire.info(
                 f"Worker session time limit set to {self.settings.max_duration_minutes:.1f} minute(s). "
-                f"New task claims will stop after deadline."
+                "New task claims will stop after deadline."
             )
 
         async with AsyncExitStack() as stack:

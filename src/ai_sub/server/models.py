@@ -9,8 +9,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai_sub.config import RetrySettings
 from ai_sub.jobs.base import Prompt
-from ai_sub.protocol import TaskType
+from ai_sub.protocol import TaskClaimResponse, TaskType
 
 
 class TaskStatus(str, Enum):
@@ -69,6 +70,35 @@ class ServerTask(BaseModel):
         description="Draft subtitles passed to lyrics refinement.",
     )
     result: dict[str, Any] | None = Field(default=None, description="Validated output received from worker.")
+
+    def to_claim_response(self, media_url: str, retry: RetrySettings) -> TaskClaimResponse:
+        """Serializes this task into the wire claim response sent to workers.
+
+        Args:
+            media_url: Relative URL endpoint where the worker downloads media.
+            retry: Server retry policy.
+
+        Returns:
+            TaskClaimResponse: Formatted response model.
+        """
+        return TaskClaimResponse(
+            task_id=self.task_id,
+            task_type=self.task_type,
+            pipeline_name=self.pipeline_name,
+            video_id=self.video_id,
+            model=self.model,
+            media_url=media_url,
+            video_duration_ms=self.video_duration_ms,
+            prompt_system=self.prompt.system,
+            prompt_user=self.prompt.user,
+            response_schema_name=self.response_schema_name,
+            traceparent=self.traceparent,
+            search_tools=self.search_tools,
+            agentic_video=self.agentic_video,
+            service_tier=self.service_tier,
+            detected_performances=self.detected_performances,
+            retry=retry,
+        )
 
 
 class ActiveVideo(BaseModel):

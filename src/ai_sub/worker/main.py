@@ -44,7 +44,6 @@ def main() -> None:
 
     settings = WorkerSettings.from_yaml(config_path)
 
-    # Register worker_id as the OpenTelemetry service_name
     setup_logging(LoggingSettings(level="info"), service_name=settings.worker_id)
     logfire.info(f"Loaded worker configuration from {config_path}")
 

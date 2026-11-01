@@ -12,6 +12,40 @@ import logfire
 from pydantic import BaseModel, RootModel
 
 
+def _extract_handle(entry: Mapping[str, Any]) -> str | None:
+    """Extracts YouTube handle from uploader ID or channel URLs.
+
+    Args:
+        entry: Video or channel metadata dictionary.
+
+    Returns:
+        str | None: Isolated handle string (e.g. '@Handle') or None.
+    """
+    if uploader_id := entry.get("uploader_id"):
+        return str(uploader_id)
+    for key in ("uploader_url", "channel_url"):
+        if url_val := entry.get(key):
+            if match := re.search(r"/(@[\w.-]+)", str(url_val)):
+                return match.group(1)
+    return None
+
+
+def _parse_entry_timestamp(entry: Mapping[str, Any]) -> int:
+    """Extracts integer timestamp from metadata entry.
+
+    Args:
+        entry: Video metadata dictionary.
+
+    Returns:
+        int: Unix timestamp in seconds.
+    """
+    ts = entry.get("timestamp") or entry.get("release_timestamp") or entry.get("available_at") or 0
+    try:
+        return int(ts)
+    except (ValueError, TypeError):
+        return 0
+
+
 class ChannelInfo(BaseModel):
     """Metadata for a mapped YouTube channel."""
 
@@ -27,7 +61,7 @@ class ChannelMap(RootModel[dict[str, ChannelInfo]]):
 
 
 class ChannelMapper:
-    """Manages persistent mapping of YouTube channel IDs to handle/uploader IDs and channel display names."""
+    """Manages persistent mapping of YouTube channel IDs to handle IDs and channel display names."""
 
     mapping_file: Path
     mapping: ChannelMap
@@ -84,21 +118,9 @@ class ChannelMapper:
             if not entry:
                 continue
             channel_id = entry.get("channel_id")
-            uploader_id = entry.get("uploader_id")
+            uploader_id = _extract_handle(entry)
             channel_name = entry.get("channel") or entry.get("uploader")
-            ts = entry.get("timestamp") or entry.get("release_timestamp") or entry.get("available_at") or 0
-            try:
-                ts_int = int(ts)
-            except (ValueError, TypeError):
-                ts_int = 0
-
-            # Fall back to uploader_url or channel_url if uploader_id is missing from entry
-            if not uploader_id:
-                for url_key in ("uploader_url", "channel_url"):
-                    if u_url := entry.get(url_key):
-                        if m := re.search(r"/(@[\w.-]+)", str(u_url)):
-                            uploader_id = m.group(1)
-                            break
+            ts_int = _parse_entry_timestamp(entry)
 
             if channel_id and uploader_id:
                 c_str = str(channel_id)
@@ -129,22 +151,10 @@ class ChannelMapper:
         Returns:
             str | None: Resolved uploader identifier or None.
         """
-        uploader_id = entry.get("uploader_id")
+        uploader_id = _extract_handle(entry)
         channel_id = entry.get("channel_id")
         channel_name = entry.get("channel") or entry.get("uploader")
-        ts = entry.get("timestamp") or entry.get("release_timestamp") or entry.get("available_at") or 0
-        try:
-            ts_int = int(ts)
-        except (ValueError, TypeError):
-            ts_int = 0
-
-        # Extract handle from URLs if uploader_id is absent
-        if not uploader_id:
-            for url_key in ("uploader_url", "channel_url"):
-                if u_url := entry.get(url_key):
-                    if m := re.search(r"/(@[\w.-]+)", str(u_url)):
-                        uploader_id = m.group(1)
-                        break
+        ts_int = _parse_entry_timestamp(entry)
 
         if uploader_id:
             u_str = str(uploader_id)
@@ -195,12 +205,6 @@ class ChannelMapper:
     ) -> tuple[str, str]:
         """Resolves sanitized uploader ID and channel display name using fallback hierarchy.
 
-        Uploader ID strictly resolves to an ID/handle (never a display name):
-        1. entry uploader_id (or cached ID via entry channel_id)
-        2. parent tab uploader_id (or cached ID via parent channel_id)
-        3. url_context (e.g. '@ChannelHandle')
-        4. Fallback 'youtube'
-
         Args:
             entry: Optional video entry metadata from yt-dlp.
             parent: Optional parent playlist/channel tab metadata from yt-dlp.
@@ -210,11 +214,10 @@ class ChannelMapper:
             tuple[str, str]: Resolved (uploader_id, channel_name) pair.
         """
         uploader: str | None = None
-
         if entry:
-            uploader = self.get_uploader_id(entry) or entry.get("uploader_id")
+            uploader = self.get_uploader_id(entry)
         if not uploader and parent:
-            uploader = self.get_uploader_id(parent) or parent.get("uploader_id")
+            uploader = self.get_uploader_id(parent)
         if not uploader and url_context:
             uploader = url_context
         if not uploader:
@@ -226,7 +229,7 @@ class ChannelMapper:
         if entry:
             ch_name = self.get_channel_name(entry)
         if not ch_name and parent:
-            ch_name = self.get_channel_name(parent) or parent.get("channel") or parent.get("uploader")
+            ch_name = self.get_channel_name(parent)
         if not ch_name and url_context:
             ch_name = url_context.lstrip("@")
         if not ch_name:

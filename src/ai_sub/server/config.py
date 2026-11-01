@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -61,7 +61,7 @@ class PipelineConfig(BaseModel):
     )
     search_tools: list[str] | None = Field(
         default=None,
-        description="Optional pipeline-specific search tools override. Inherits from global search.tools if null.",
+        description="Optional pipeline-specific search tools override.",
     )
 
 
@@ -122,7 +122,7 @@ class YoutubeSourceConfig(EnvPrioritySettings):
     )
     rescan_jitter_minutes: int = Field(
         default=15,
-        description="Maximum additive random delay in minutes added to the YouTube rescan interval (e.g. 60-75m).",
+        description="Maximum additive random delay in minutes added to the YouTube rescan interval.",
     )
     channel_delay_seconds: float = Field(
         default=5.0,
@@ -138,7 +138,7 @@ class YoutubeSourceConfig(EnvPrioritySettings):
     )
     channels_file: Path = Field(
         default=Path("channels.json"),
-        description="Path to the YouTube channel ID to uploader handle mapping JSON cache.",
+        description="Path to the YouTube channel mapping JSON cache.",
     )
     max_title_bytes: int = Field(
         default=100,
@@ -146,7 +146,7 @@ class YoutubeSourceConfig(EnvPrioritySettings):
     )
     enable_pot_provider: bool = Field(
         default=True,
-        description="Whether to automatically clone, update, and build bgutil-ytdlp-pot-provider.",
+        description="Whether to automatically build and run bgutil-ytdlp-pot-provider.",
     )
     pot_dir: Path = Field(
         default=Path("bgutil-ytdlp-pot-provider"),
@@ -154,7 +154,7 @@ class YoutubeSourceConfig(EnvPrioritySettings):
     )
     pot_update_interval_hours: int = Field(
         default=24,
-        description="Minimum interval in hours between bgutil-ytdlp-pot-provider git update checks.",
+        description="Minimum interval in hours between PO token provider git update checks.",
     )
     max_consecutive_failures: int = Field(
         default=3,
@@ -167,7 +167,7 @@ class YoutubeSourceConfig(EnvPrioritySettings):
 
 
 class SourcesConfig(EnvPrioritySettings):
-    """Container for distinct intake source categories (local filesystem and YouTube)."""
+    """Container for distinct intake source categories."""
 
     model_config = SettingsConfigDict(
         env_prefix="AISUB_SERVER_SOURCES_",
@@ -191,7 +191,7 @@ class ServerOptions(EnvPrioritySettings):
     work_dir: Path = Field(default=Path("./work"), description="Base working directory for pipeline state.")
     heartbeat_timeout_seconds: int = Field(
         default=300,
-        description="Seconds before an unresponsive worker lease expires (10 missed 30s heartbeats = 300s).",
+        description="Seconds before an unresponsive worker lease expires.",
     )
     validation_buffer_ms: int = Field(
         default=2000,
@@ -236,7 +236,7 @@ class ServerRetrySettings(EnvPrioritySettings, RetrySettings):
 
 
 def _get_default_pipelines() -> list[PipelineConfig]:
-    """Generates the three standard combinations requested.
+    """Generates the three standard default combination pipelines.
 
     Returns:
         list[PipelineConfig]: Standard default pipelines.
@@ -272,7 +272,10 @@ class ServerSettings(YamlFileSettings):
     )
 
     server: ServerOptions = Field(default_factory=ServerOptions)
-    git: GitConfig | None = Field(default=None)
+    git: GitConfig | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AISUB_SERVER_GIT", "git"),
+    )
     sources: SourcesConfig = Field(default_factory=SourcesConfig)
     reencode: ServerReEncodeSettings = Field(default_factory=ServerReEncodeSettings)
     search: ServerSearchSettings = Field(default_factory=ServerSearchSettings)
@@ -291,7 +294,9 @@ class ServerSettings(YamlFileSettings):
         Returns:
             Any: Updated input data dictionary.
         """
-        if isinstance(values, dict):
-            if values.get("git") is None and os.getenv("AISUB_SERVER_GIT_REPO_URL"):
+        if isinstance(values, dict) and values.get("git") is None:
+            import os
+
+            if os.getenv("AISUB_SERVER_GIT_REPO_URL"):
                 values["git"] = {}
         return values

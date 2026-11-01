@@ -5,17 +5,14 @@ from __future__ import annotations
 import string
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 
-import logfire
-import yaml
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
     NonNegativeInt,
     PositiveInt,
-    ValidationError,
     ValidationInfo,
     model_validator,
 )
@@ -23,10 +20,10 @@ from pydantic.json_schema import SkipJsonSchema
 from pysubs2 import SSAEvent, SSAFile
 
 from ai_sub.jobs.base import (
-    BaseJob,
+    AiJob,
+    CleanTimestamp,
     Prompt,
     WorkerContext,
-    clean_timestamp_string,
     format_ms_timestamp,
     parse_timestamp_string_ms,
     serialize_prompt_context,
@@ -168,25 +165,8 @@ class DetectedMusicalPerformance(BaseModel):
         default=None,
         description="Original artist, group, or composer in native script if known; otherwise null. Independent of title.",  # noqa: E501
     )
-    start: str = Field(description="Approximate start timecode within this segment (e.g. '00:15').")
-    end: str = Field(description="Approximate end timecode within this segment (e.g. '03:45').")
-
-    @model_validator(mode="before")
-    @classmethod
-    def clean_leakage(cls, data: Any) -> Any:
-        """Cleans LLM structural leakage from timecodes.
-
-        Args:
-            data: Raw input dictionary.
-
-        Returns:
-            Any: Cleaned input dictionary.
-        """
-        if isinstance(data, dict):
-            for key in ("start", "end"):
-                if key in data and isinstance(data[key], str):
-                    data[key] = clean_timestamp_string(data[key])
-        return data
+    start: CleanTimestamp = Field(description="Approximate start timecode within this segment (e.g. '00:15').")
+    end: CleanTimestamp = Field(description="Approximate end timecode within this segment (e.g. '03:45').")
 
 
 class Subtitles(BaseModel):
@@ -194,27 +174,10 @@ class Subtitles(BaseModel):
 
     model_config = ConfigDict(validate_by_name=True, validate_by_alias=True)
 
-    start: str = Field(alias="s", description="Start timecode in 'MM:SS.mmm' format.")
-    end: str = Field(alias="e", description="End timecode in 'MM:SS.mmm' format.")
+    start: CleanTimestamp = Field(alias="s", description="Start timecode in 'MM:SS.mmm' format.")
+    end: CleanTimestamp = Field(alias="e", description="End timecode in 'MM:SS.mmm' format.")
     original: str = Field(alias="og", description="Transcription in original spoken language or tagged visual text.")
     english: str = Field(alias="en", description="Context-aware natural English translation with matching visual tag.")
-
-    @model_validator(mode="before")
-    @classmethod
-    def clean_leakage(cls, data: Any) -> Any:
-        """Cleans LLM structural leakage from timecodes.
-
-        Args:
-            data: Raw input dictionary.
-
-        Returns:
-            Any: Cleaned input dictionary.
-        """
-        if isinstance(data, dict):
-            for key in ("start", "s", "end", "e"):
-                if key in data and isinstance(data[key], str):
-                    data[key] = clean_timestamp_string(data[key])
-        return data
 
     @model_validator(mode="after")
     def validate_timestamps(self) -> Self:
@@ -300,7 +263,7 @@ class SubtitlesAiResponse(BaseSubtitleAiResponse):
     )
 
 
-class BaseSubtitleJob(BaseJob):
+class BaseSubtitleJob(AiJob):
     """Base job container holding common subtitle state and export routines."""
 
     video_duration_ms: PositiveInt = Field(description="Segment duration in milliseconds.")
@@ -329,6 +292,9 @@ class BaseSubtitleJob(BaseJob):
 
 class SubtitlesJob(BaseSubtitleJob):
     """Job container holding generated subtitle state for a video segment."""
+
+    prompt_version_field: ClassVar[str] = "subtitles_prompt_version"
+    prompt_version: ClassVar[int] = SUBTITLES_PROMPT_VERSION
 
     subtitles_prompt_version: int = Field(
         default=SUBTITLES_PROMPT_VERSION,
@@ -368,40 +334,3 @@ class SubtitlesJob(BaseSubtitleJob):
         self.response = res
         self.total_attempts += 1
         return res
-
-    @classmethod
-    def load(cls, save_path: Path, validation_buffer_ms: int) -> SubtitlesJob | None:
-        """Loads and validates a saved YAML state file.
-
-        Args:
-            save_path: State file path.
-            validation_buffer_ms: Duration tolerance in milliseconds.
-
-        Returns:
-            SubtitlesJob | None: Loaded job instance, or None if invalid or version mismatch.
-        """
-        if not save_path.is_file():
-            return None
-
-        with open(save_path, "r", encoding="utf-8") as f:
-            try:
-                data = yaml.safe_load(f)
-                if not isinstance(data, dict):
-                    logfire.warning(f"Corrupt YAML in {save_path.name}. Re-processing.")
-                    return None
-                job = cls.model_validate(
-                    data,
-                    context={"validation_buffer_ms": validation_buffer_ms},
-                )
-            except (yaml.YAMLError, ValidationError) as e:
-                logfire.warning(f"Validation failed for {save_path.name}: {e}. Re-processing.")
-                return None
-
-        if job.subtitles_prompt_version != SUBTITLES_PROMPT_VERSION:
-            logfire.info(
-                f"Subtitles prompt version mismatch for {job.name} "
-                f"(file: v{job.subtitles_prompt_version}, current: v{SUBTITLES_PROMPT_VERSION}). Re-processing."
-            )
-            return None
-
-        return job

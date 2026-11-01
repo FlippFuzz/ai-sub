@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import socket
 from pathlib import Path
 
 from pydantic import (
+    AliasChoices,
     Field,
     HttpUrl,
     NonNegativeFloat,
@@ -69,6 +69,7 @@ class WorkerSettings(YamlFileSettings):
     gemini_key: SecretStr | None = Field(
         default=None,
         description="Google Gemini API key.",
+        validation_alias=AliasChoices("AISUB_WORKER_GEMINI_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_key"),
     )
     search: WorkerSearchSettings = Field(
         default_factory=WorkerSearchSettings,
@@ -80,15 +81,24 @@ class WorkerSettings(YamlFileSettings):
     )
     claim_poll_interval_minutes: PositiveFloat = Field(
         default=3.0,
-        description="Interval in minutes to wait before polling the server again when active slots are busy.",
+        description="Interval in minutes to wait before polling when active slots are busy or waiting on idle cycles.",
+    )
+    max_consecutive_idle: PositiveInt = Field(
+        default=3,
+        description="Maximum consecutive idle poll cycles with no available tasks before worker exits.",
+        validation_alias=AliasChoices(
+            "AISUB_WORKER_MAX_CONSECUTIVE_IDLE",
+            "max_consecutive_idle",
+            "max_consecutive_idle_claims",
+        ),
     )
     max_duration_minutes: NonNegativeFloat = Field(
         default=0.0,
-        description="Maximum execution time in minutes before stopping new claims and draining (0 disables).",
+        description="Maximum execution time in minutes before stopping new claims (0 disables).",
     )
     max_tasks: NonNegativeInt = Field(
         default=0,
-        description="Maximum tasks to execute before exiting (0 runs until queue is empty or quotas exhausted).",
+        description="Maximum tasks to execute before exiting (0 runs until queue is empty).",
     )
     temp_dir: Path = Field(
         default=Path("/tmp/ai_sub_worker"),
@@ -112,10 +122,4 @@ class WorkerSettings(YamlFileSettings):
         Returns:
             SecretStr | None: Secret key instance if configured, or None.
         """
-        if self.gemini_key:
-            return self.gemini_key
-        if env_k := (
-            os.getenv("AISUB_WORKER_GEMINI_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        ):
-            return SecretStr(env_k.strip().strip('"').strip("'"))
-        return None
+        return self.gemini_key

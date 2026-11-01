@@ -34,7 +34,7 @@ def create_search_provider(tool_name: str, settings: SearchSettings) -> BaseSear
     """Instantiates a single search provider by name.
 
     Args:
-        tool_name: Name of the search provider ('builtin', 'duckduckgo', 'ollama', 'langsearch', 'tinyfish', 'lrclib').
+        tool_name: Name of the search provider.
         settings: Search configuration settings.
 
     Returns:
@@ -69,11 +69,11 @@ def create_search_providers(
     seen: set[str] = set()
 
     for tool in target_tools:
-        clean_name = tool.strip().lower()
-        if not clean_name or clean_name in seen:
+        clean = tool.strip().lower()
+        if not clean or clean in seen:
             continue
-        seen.add(clean_name)
-        providers.append(create_search_provider(clean_name, settings))
+        seen.add(clean)
+        providers.append(create_search_provider(clean, settings))
 
     return providers
 

@@ -13,7 +13,7 @@ from ai_sub.server.config import (
 )
 from ai_sub.server.coordinator import PipelineCoordinator
 from ai_sub.server.git_sync import GitSyncManager
-from ai_sub.server.ingestion import DiscoveredVideo, IngestionManager, ensure_pot_provider
+from ai_sub.server.ingestion import DiscoveredVideo, IngestionManager
 from ai_sub.server.models import (
     ActiveVideo,
     ActivityEvent,
@@ -22,6 +22,7 @@ from ai_sub.server.models import (
     generate_w3c_traceparent,
 )
 from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
+from ai_sub.server.pot_provider import ensure_pot_provider, is_node_runtime_available
 
 __all__ = [
     "ActiveVideo",
@@ -47,4 +48,5 @@ __all__ = [
     "create_app",
     "ensure_pot_provider",
     "generate_w3c_traceparent",
+    "is_node_runtime_available",
 ]
