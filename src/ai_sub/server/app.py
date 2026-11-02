@@ -126,13 +126,17 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
         Args:
             task_id: Unique task identifier.
-            req: Heartbeat request containing worker ID.
+            req: Heartbeat request containing worker ID and optional traceparent.
 
         Returns:
             TaskHeartbeatResponse: Acknowledgment status confirming whether lease was renewed.
         """
         clean_task_id = urllib.parse.unquote(task_id)
-        acknowledged = await coordinator.record_heartbeat(clean_task_id, req.worker_id)
+        acknowledged = await coordinator.record_heartbeat(
+            clean_task_id,
+            req.worker_id,
+            traceparent=req.traceparent,
+        )
         return TaskHeartbeatResponse(acknowledged=acknowledged)
 
     @app.get("/api/v1/tasks/{task_id}/media")
@@ -169,7 +173,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
         Args:
             task_id: Unique task identifier.
-            req: Completion request containing task result data.
+            req: Completion request containing task result data and optional traceparent.
 
         Returns:
             dict[str, str]: Operation status confirmation dictionary.
@@ -178,7 +182,12 @@ def create_app(settings: ServerSettings) -> FastAPI:
             HTTPException: If the task was not claimed by this worker or has already completed.
         """
         clean_task_id = urllib.parse.unquote(task_id)
-        success = await coordinator.complete_task(clean_task_id, req.worker_id, req.result)
+        success = await coordinator.complete_task(
+            clean_task_id,
+            req.worker_id,
+            req.result,
+            traceparent=req.traceparent,
+        )
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -205,7 +214,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
         Args:
             task_id: Unique task identifier.
-            req: Failure report request containing reason and optional error details.
+            req: Failure report request containing reason, optional error details, and traceparent.
 
         Returns:
             dict[str, str]: Operation status confirmation dictionary.
@@ -219,6 +228,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
             worker_id=req.worker_id,
             reason=req.reason,
             error_message=req.error_message,
+            traceparent=req.traceparent,
         )
         if not success:
             raise HTTPException(

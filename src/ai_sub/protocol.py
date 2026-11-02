@@ -45,7 +45,6 @@ class TaskClaimResponse(BaseModel):
         default="",
         description="Target response schema ('SummaryAiResponse', 'SubtitlesAiResponse', or 'LyricsAiResponse').",
     )
-    traceparent: str | None = Field(default=None, description="W3C traceparent header for distributed Logfire tracing.")
     search_tools: list[str] = Field(default_factory=list, description="Search tools permitted for this task.")
     agentic_video: bool = Field(default=False, description="Whether to enable agentic video inspection.")
     service_tier: str | None = Field(default=None, description="Optional Google Gemini service tier.")
@@ -63,7 +62,10 @@ class TaskHeartbeatRequest(BaseModel):
     """Heartbeat ping payload sent by a worker to maintain its task lease."""
 
     worker_id: str = Field(description="Unique identifier of the worker holding the lease.")
-    traceparent: str | None = Field(default=None, description="Optional W3C traceparent header.")
+    traceparent: str | None = Field(
+        default=None,
+        description="Optional W3C traceparent header reported by the worker.",
+    )
 
 
 class TaskHeartbeatResponse(BaseModel):
@@ -79,6 +81,10 @@ class TaskCompleteRequest(BaseModel):
     task_id: str = Field(description="Unique task identifier.")
     task_type: TaskType = Field(description="Task type completed.")
     result: dict[str, Any] = Field(description="Parsed and validated AI output dictionary.")
+    traceparent: str | None = Field(
+        default=None,
+        description="Optional W3C traceparent header reported by the worker.",
+    )
 
 
 class TaskFailRequest(BaseModel):
@@ -89,3 +95,7 @@ class TaskFailRequest(BaseModel):
     reason: str = Field(description="Failure code (e.g. 'QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').")
     model: str | None = Field(default=None, description="Model identifier that failed, if applicable.")
     error_message: str | None = Field(default=None, description="Optional error description or traceback.")
+    traceparent: str | None = Field(
+        default=None,
+        description="Optional W3C traceparent header reported by the worker.",
+    )

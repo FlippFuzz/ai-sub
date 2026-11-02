@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from contextlib import AsyncExitStack, nullcontext
+from contextlib import AsyncExitStack
 from pathlib import Path
 from time import time
 from typing import Any, Callable, cast
@@ -117,16 +117,16 @@ class WorkerRunner:
         stop_event: asyncio.Event,
         lease_revoked: asyncio.Event,
         on_lease_rejected: Callable[[], None],
+        traceparent: str | None = None,
     ) -> None:
         """Background task sending periodic heartbeats to maintain the task lease.
-
-        Inherits traceparent automatically from the task creation scope.
 
         Args:
             task_id: Unique task identifier.
             stop_event: Event signaling when task execution finishes normally.
             lease_revoked: Event set when the server rejects a heartbeat lease renewal.
             on_lease_rejected: Callback to cancel any currently active work immediately.
+            traceparent: Optional W3C traceparent header reported to server. Defaults to None.
         """
         interval = self.settings.heartbeat_interval_seconds
         hb_num = 0
@@ -137,7 +137,11 @@ class WorkerRunner:
                 if not stop_event.is_set():
                     hb_num += 1
                     with logfire.span("Heartbeat Ping #{num}", num=hb_num, task_id=task_id, _level="debug"):
-                        acked = await self.client.send_heartbeat(task_id, self.settings.worker_id)
+                        acked = await self.client.send_heartbeat(
+                            task_id=task_id,
+                            worker_id=self.settings.worker_id,
+                            traceparent=traceparent,
+                        )
                         if acked is None:
                             logfire.warning(
                                 f"Heartbeat #{hb_num} for '{task_id}' was unacknowledged (transient error)."
@@ -216,6 +220,7 @@ class WorkerRunner:
         task: TaskClaimResponse,
         executor: GeminiExecutor,
         search_providers: list[BaseSearchProvider],
+        traceparent: str | None = None,
     ) -> dict[str, Any]:
         """Downloads media, runs GeminiExecutor with lease-revocation monitoring, and returns validated output.
 
@@ -223,11 +228,13 @@ class WorkerRunner:
             task: Assigned task details from the server including retry policy.
             executor: Configured GeminiExecutor instance.
             search_providers: Active search provider instances.
+            traceparent: Optional W3C traceparent header reported during heartbeats. Defaults to None.
 
         Returns:
             dict[str, Any]: Validated output data dictionary.
 
         Raises:
+            asyncio.CancelledError: If task execution is cancelled while waiting for download or inference.
             LeaseRevokedError: If the server rejects task lease during download or inference.
         """
         raw_name = Path(task.media_url).name
@@ -251,6 +258,7 @@ class WorkerRunner:
                 stop_event=stop_heartbeat,
                 lease_revoked=lease_revoked,
                 on_lease_rejected=_cancel_active,
+                traceparent=traceparent,
             )
         )
 
@@ -315,93 +323,100 @@ class WorkerRunner:
             asyncio.CancelledError: If the worker slot task itself is cancelled.
         """
         slot_label = f"{model}#{slot_id}"
-        carrier = {"traceparent": claim.traceparent} if claim.traceparent else None
-        trace_ctx = logfire.attach_context(carrier) if carrier else nullcontext()
 
-        # Set once upon successful claim - all async tasks and coroutines spawned here inherit this context!
-        with trace_ctx:
-            with logfire.span(
-                "Worker Task: {task_id}",
-                task_id=claim.task_id,
-                pipeline=claim.pipeline_name,
-                video_id=claim.video_id,
-                model=claim.model,
-                task_type=claim.task_type.value,
-                worker_id=self.settings.worker_id,
-                slot=slot_id,
-            ):
-                try:
-                    result_dict = await self._execute_task(claim, executor, search_providers)
-                    accepted = await self.client.complete_task(
-                        task_id=claim.task_id,
-                        worker_id=self.settings.worker_id,
-                        task_type=claim.task_type,
-                        result=result_dict,
-                    )
-                    if accepted:
-                        async with self._lock:
-                            count = self._tasks_completed_per_model.get(model, 0) + 1
-                            self._tasks_completed_per_model[model] = count
-                            if 0 < self.settings.max_tasks <= count and model not in self._capped_models:
-                                self._capped_models.add(model)
-                                logfire.info(
-                                    f"[{slot_label}] Reached max tasks limit ({self.settings.max_tasks}) "
-                                    f"for model '{model}'. Stopping new task claims for this model."
-                                )
-                                if model in self._model_stop_events:
-                                    self._model_stop_events[model].set()
-                                if self._all_models_finished():
-                                    logfire.info(
-                                        "All configured models have reached their task limits or exhausted quotas. "
-                                        "Shutting down worker."
-                                    )
-                                    self._trigger_shutdown()
-                        logfire.info(f"[{slot_label}] Task '{claim.task_id}' processed and accepted by server.")
-                    else:
-                        logfire.warning(f"[{slot_label}] Task '{claim.task_id}' completion was not accepted by server.")
+        # Worker initiates the legitimate root span for task execution (no artificial parent)
+        with logfire.span(
+            "Worker Task: {task_id}",
+            task_id=claim.task_id,
+            pipeline=claim.pipeline_name,
+            video_id=claim.video_id,
+            model=claim.model,
+            task_type=claim.task_type.value,
+            worker_id=self.settings.worker_id,
+            slot=slot_id,
+        ):
+            # Extract real W3C traceparent from the active root span to propagate to server
+            context_carrier = logfire.get_context()
+            traceparent = context_carrier.get("traceparent")
 
-                except LeaseRevokedError as e:
-                    logfire.warning(f"[{slot_label}] {e}")
-
-                except asyncio.CancelledError:
-                    # Distinguish slot task cancellation (Ctrl-C/shutdown) from inference subtask lease revocation
-                    current = asyncio.current_task()
-                    if current is not None and current.cancelling():
-                        raise
-                    logfire.warning(
-                        f"[{slot_label}] Task '{claim.task_id}' was cancelled "
-                        "(lease revoked by server or slot draining)."
-                    )
-
-                except QuotaExceededError as e:
-                    logfire.warning(f"[{slot_label}] Daily quota reached for model '{claim.model}': {e}")
-                    await self.client.fail_task(
-                        task_id=claim.task_id,
-                        worker_id=self.settings.worker_id,
-                        reason="QUOTA_EXHAUSTED",
-                        model=claim.model,
-                        error_message=str(e),
-                    )
+            try:
+                result_dict = await self._execute_task(
+                    task=claim,
+                    executor=executor,
+                    search_providers=search_providers,
+                    traceparent=traceparent,
+                )
+                accepted = await self.client.complete_task(
+                    task_id=claim.task_id,
+                    worker_id=self.settings.worker_id,
+                    task_type=claim.task_type,
+                    result=result_dict,
+                    traceparent=traceparent,
+                )
+                if accepted:
                     async with self._lock:
-                        self._exhausted_models.add(model)
-                        if model in self._model_stop_events:
-                            self._model_stop_events[model].set()
-                        if self._all_models_finished():
+                        count = self._tasks_completed_per_model.get(model, 0) + 1
+                        self._tasks_completed_per_model[model] = count
+                        if 0 < self.settings.max_tasks <= count and model not in self._capped_models:
+                            self._capped_models.add(model)
                             logfire.info(
-                                "All configured models have exhausted quotas or reached task limits. "
-                                "Shutting down worker."
+                                f"[{slot_label}] Reached max tasks limit ({self.settings.max_tasks}) "
+                                f"for model '{model}'. Stopping new task claims for this model."
                             )
-                            self._trigger_shutdown()
+                            if model in self._model_stop_events:
+                                self._model_stop_events[model].set()
+                            if self._all_models_finished():
+                                logfire.info(
+                                    "All configured models have reached their task limits or exhausted quotas. "
+                                    "Shutting down worker."
+                                )
+                                self._trigger_shutdown()
+                    logfire.info(f"[{slot_label}] Task '{claim.task_id}' processed and accepted by server.")
+                else:
+                    logfire.warning(f"[{slot_label}] Task '{claim.task_id}' completion was not accepted by server.")
 
-                except Exception as e:
-                    logfire.exception(f"[{slot_label}] Execution error on task '{claim.task_id}': {e}")
-                    await self.client.fail_task(
-                        task_id=claim.task_id,
-                        worker_id=self.settings.worker_id,
-                        reason="EXECUTION_ERROR",
-                        model=claim.model,
-                        error_message=str(e),
-                    )
+            except LeaseRevokedError as e:
+                logfire.warning(f"[{slot_label}] {e}")
+
+            except asyncio.CancelledError:
+                # Distinguish slot task cancellation (Ctrl-C/shutdown) from inference subtask lease revocation
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                logfire.warning(
+                    f"[{slot_label}] Task '{claim.task_id}' was cancelled (lease revoked by server or slot draining)."
+                )
+
+            except QuotaExceededError as e:
+                logfire.warning(f"[{slot_label}] Daily quota reached for model '{claim.model}': {e}")
+                await self.client.fail_task(
+                    task_id=claim.task_id,
+                    worker_id=self.settings.worker_id,
+                    reason="QUOTA_EXHAUSTED",
+                    model=claim.model,
+                    error_message=str(e),
+                    traceparent=traceparent,
+                )
+                async with self._lock:
+                    self._exhausted_models.add(model)
+                    if model in self._model_stop_events:
+                        self._model_stop_events[model].set()
+                    if self._all_models_finished():
+                        logfire.info(
+                            "All configured models have exhausted quotas or reached task limits. Shutting down worker."
+                        )
+                        self._trigger_shutdown()
+
+            except Exception as e:
+                logfire.exception(f"[{slot_label}] Execution error on task '{claim.task_id}': {e}")
+                await self.client.fail_task(
+                    task_id=claim.task_id,
+                    worker_id=self.settings.worker_id,
+                    reason="EXECUTION_ERROR",
+                    model=claim.model,
+                    error_message=str(e),
+                    traceparent=traceparent,
+                )
 
     async def _model_slot_loop(
         self,

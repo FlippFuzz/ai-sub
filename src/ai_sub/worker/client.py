@@ -143,6 +143,7 @@ class WorkerClient:
         worker_id: str,
         task_type: TaskType,
         result: dict[str, Any],
+        traceparent: str | None = None,
     ) -> bool:
         """Submits completed and validated structured AI results to the server.
 
@@ -151,6 +152,7 @@ class WorkerClient:
             worker_id: Unique identifier of this worker.
             task_type: Type of task completed.
             result: Validated AI result data dictionary.
+            traceparent: Optional W3C traceparent header for distributed Logfire tracing. Defaults to None.
 
         Returns:
             bool: True if completion was accepted; False otherwise.
@@ -161,6 +163,7 @@ class WorkerClient:
             task_id=task_id,
             task_type=task_type,
             result=result,
+            traceparent=traceparent,
         )
         try:
             resp: Response = await self.client.post(
@@ -179,6 +182,7 @@ class WorkerClient:
         reason: str,
         model: str | None = None,
         error_message: str | None = None,
+        traceparent: str | None = None,
     ) -> bool:
         """Notifies the server of a task failure or daily quota limit exhaustion.
 
@@ -187,7 +191,8 @@ class WorkerClient:
             worker_id: Unique identifier of this worker.
             reason: Failure code ('QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').
             model: Gemini model identifier that failed, if applicable. Defaults to None.
-            error_message: Optional error message or traceback. Defaults to None.
+            error_message: Optional error description or traceback. Defaults to None.
+            traceparent: Optional W3C traceparent header for distributed Logfire tracing. Defaults to None.
 
         Returns:
             bool: True if failure was acknowledged; False otherwise.
@@ -199,6 +204,7 @@ class WorkerClient:
             reason=reason,
             model=model,
             error_message=error_message,
+            traceparent=traceparent,
         )
         try:
             resp: Response = await self.client.post(

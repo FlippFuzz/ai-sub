@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Generator
 from contextlib import contextmanager
 from enum import Enum
@@ -24,17 +23,6 @@ class TaskStatus(str, Enum):
     CLAIMED = "claimed"
     COMPLETED = "completed"
     FAILED = "failed"
-
-
-def generate_w3c_traceparent() -> str:
-    """Generates a standard W3C traceparent header for distributed Logfire tracing.
-
-    Returns:
-        str: W3C traceparent string formatted as '00-{trace_id}-{span_id}-01'.
-    """
-    trace_id = os.urandom(16).hex()
-    span_id = os.urandom(8).hex()
-    return f"00-{trace_id}-{span_id}-01"
 
 
 class ServerTask(BaseModel):
@@ -62,7 +50,10 @@ class ServerTask(BaseModel):
     search_tools: list[str] = Field(default_factory=list, description="Permitted search tool names.")
     agentic_video: bool = Field(default=False, description="Whether agentic video inspection is enabled.")
     service_tier: str | None = Field(default=None, description="Optional Google Gemini service tier.")
-    traceparent: str = Field(default_factory=generate_w3c_traceparent, description="Distributed traceparent header.")
+    traceparent: str | None = Field(
+        default=None,
+        description="Distributed traceparent header reported by the claiming worker.",
+    )
 
     detected_performances: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -76,7 +67,7 @@ class ServerTask(BaseModel):
 
     @contextmanager
     def trace_context(self) -> Generator[None, None, None]:
-        """Context manager attaching this task's W3C traceparent to Logfire.
+        """Context manager attaching this task's W3C traceparent to Logfire if available.
 
         Yields:
             None: Context during execution under this task's trace.
@@ -108,7 +99,6 @@ class ServerTask(BaseModel):
             prompt_system=self.prompt.system,
             prompt_user=self.prompt.user,
             response_schema_name=self.response_schema_name,
-            traceparent=self.traceparent,
             search_tools=self.search_tools,
             agentic_video=self.agentic_video,
             service_tier=self.service_tier,

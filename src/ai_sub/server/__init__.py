@@ -19,7 +19,6 @@ from ai_sub.server.models import (
     ActivityEvent,
     ServerTask,
     TaskStatus,
-    generate_w3c_traceparent,
 )
 from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
 from ai_sub.server.pot_provider import ensure_pot_provider, is_node_runtime_available
@@ -47,6 +46,5 @@ __all__ = [
     "YoutubeSourceConfig",
     "create_app",
     "ensure_pot_provider",
-    "generate_w3c_traceparent",
     "is_node_runtime_available",
 ]

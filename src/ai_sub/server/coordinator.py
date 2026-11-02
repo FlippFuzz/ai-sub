@@ -30,7 +30,8 @@ def _format_logfire_query(task: ServerTask) -> str:
     Returns:
         str: Formatted Logfire search query string.
     """
-    trace_id = task.traceparent.split("-")[1] if "-" in task.traceparent else ""
+    parts = task.traceparent.split("-") if task.traceparent else []
+    trace_id = parts[1] if len(parts) >= 2 else ""
     if trace_id:
         return f"trace_id == '{trace_id}' or task_id == '{task.task_id}'"
     return f"task_id == '{task.task_id}'"
@@ -203,6 +204,8 @@ class PipelineCoordinator:
                                                 detail=diag_msg,
                                             )
 
+                                    task.traceparent = None  # Clear traceparent for next attempt
+
                     sweep_span.set_attribute("active_leases", active_leases)
                     sweep_span.set_attribute("expired_leases", expired_count)
 
@@ -256,24 +259,23 @@ class PipelineCoordinator:
                         task.claimed_at = now
                         task.last_heartbeat = now
 
-                        with task.trace_context():
-                            with logfire.span(
-                                "Server Task Claimed: {task_id}",
-                                task_id=task.task_id,
-                                worker_id=worker_id,
-                                model=task.model,
-                                task_type=task.task_type.value,
-                            ):
-                                self._log_activity(event_type="claim", task=task, worker_id=worker_id)
-                                claim_span.set_attribute("result", "claimed")
-                                claim_span.set_attribute("task_id", task.task_id)
-                                claim_span.set_attribute("task_type", task.task_type.value)
-                                claim_span.set_attribute("model", task.model)
+                        with logfire.span(
+                            "Server Task Claimed: {task_id}",
+                            task_id=task.task_id,
+                            worker_id=worker_id,
+                            model=task.model,
+                            task_type=task.task_type.value,
+                        ):
+                            self._log_activity(event_type="claim", task=task, worker_id=worker_id)
+                            claim_span.set_attribute("result", "claimed")
+                            claim_span.set_attribute("task_id", task.task_id)
+                            claim_span.set_attribute("task_type", task.task_type.value)
+                            claim_span.set_attribute("model", task.model)
 
-                                logfire.info(
-                                    f"Task '{task.task_id}' claimed by worker '{worker_id}' "
-                                    f"(model: {task.model}, type: {task.task_type.value})."
-                                )
+                            logfire.info(
+                                f"Task '{task.task_id}' claimed by worker '{worker_id}' "
+                                f"(model: {task.model}, type: {task.task_type.value})."
+                            )
 
                         media_url = f"/api/v1/tasks/{task.task_id}/media/{task.media_path.name}"
                         return task.to_claim_response(media_url=media_url, retry=self.settings.retry)
@@ -281,12 +283,18 @@ class PipelineCoordinator:
                 claim_span.set_attribute("result", "none_available")
                 return None
 
-    async def record_heartbeat(self, task_id: str, worker_id: str) -> bool:
+    async def record_heartbeat(
+        self,
+        task_id: str,
+        worker_id: str,
+        traceparent: str | None = None,
+    ) -> bool:
         """Renews a task's lease timestamp upon receiving a worker heartbeat.
 
         Args:
             task_id: Unique task identifier.
             worker_id: Worker claiming the lease.
+            traceparent: Optional W3C traceparent header reported by worker. Defaults to None.
 
         Returns:
             bool: True if lease was successfully renewed, False otherwise.
@@ -296,8 +304,10 @@ class PipelineCoordinator:
             for pipe in self.pipelines.values():
                 if task_id in pipe.tasks:
                     task = pipe.tasks[task_id]
-                    with task.trace_context():
-                        if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
+                    if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
+                        if traceparent:
+                            task.traceparent = traceparent
+                        with task.trace_context():
                             task.last_heartbeat = now
                             with logfire.span(
                                 "Server Heartbeat Received: {task_id}",
@@ -307,12 +317,12 @@ class PipelineCoordinator:
                             ):
                                 pass
                             return True
-                        else:
-                            logfire.warning(
-                                f"Heartbeat rejected for '{task_id}': status={task.status.value}, "
-                                f"assigned_worker={task.worker_id}, requesting_worker={worker_id}"
-                            )
-                            return False
+                    else:
+                        logfire.warning(
+                            f"Heartbeat rejected for '{task_id}': status={task.status.value}, "
+                            f"assigned_worker={task.worker_id}, requesting_worker={worker_id}"
+                        )
+                        return False
 
         logfire.warning(f"Heartbeat rejected: task '{task_id}' not found.")
         return False
@@ -340,6 +350,7 @@ class PipelineCoordinator:
         task.worker_id = None
         task.claimed_at = None
         task.last_heartbeat = None
+        task.traceparent = None  # Reset traceparent so next worker creates fresh trace context
 
         if reason != "QUOTA_EXHAUSTED":
             task.attempts += 1
@@ -358,6 +369,7 @@ class PipelineCoordinator:
         task_id: str,
         worker_id: str,
         result: dict[str, Any],
+        traceparent: str | None = None,
     ) -> bool:
         """Records task completion and hands the result to the pipeline runner.
 
@@ -365,6 +377,7 @@ class PipelineCoordinator:
             task_id: Unique task identifier.
             worker_id: Worker completing the task.
             result: Validated AI result dictionary.
+            traceparent: Optional W3C traceparent header reported by worker. Defaults to None.
 
         Returns:
             bool: True if completion was accepted, False otherwise.
@@ -374,6 +387,8 @@ class PipelineCoordinator:
                 if task_id in pipe.tasks:
                     task = pipe.tasks[task_id]
                     if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
+                        if traceparent:
+                            task.traceparent = traceparent
                         with task.trace_context():
                             with logfire.span(
                                 "Process Complete Task: {task_id}", task_id=task_id, worker_id=worker_id
@@ -428,6 +443,7 @@ class PipelineCoordinator:
         worker_id: str,
         reason: str,
         error_message: str | None = None,
+        traceparent: str | None = None,
     ) -> bool:
         """Handles task failure, releasing the lease or marking permanently failed.
 
@@ -436,6 +452,7 @@ class PipelineCoordinator:
             worker_id: Worker reporting the failure.
             reason: Error code ('QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').
             error_message: Optional error details. Defaults to None.
+            traceparent: Optional W3C traceparent header reported by worker. Defaults to None.
 
         Returns:
             bool: True if failure was recorded, False otherwise.
@@ -445,6 +462,8 @@ class PipelineCoordinator:
                 if task_id in pipe.tasks:
                     task = pipe.tasks[task_id]
                     if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
+                        if traceparent:
+                            task.traceparent = traceparent
                         with task.trace_context():
                             with logfire.span(
                                 "Process Task Failure: {task_id}",
