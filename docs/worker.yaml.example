@@ -8,12 +8,12 @@ server_auth: "worker_user:your_secure_password"
 worker_id: "test-worker-1" # Defaults to machine hostname if omitted
 
 # Concurrency & Work Limits
-concurrency: 2 # Number of video chunk tasks to process simultaneously (Default: 2)
-max_tasks: 0 # Exit after N tasks (0 runs until queue is empty or quotas exhausted)
+concurrency: 2 # Number of chunk tasks per model (e.g. 2 slots x 3 models = 6 concurrent slots)
+idle_timeout_minutes: 15.0 # Minutes all slots must remain idle before worker exits (0 exits immediately if queue is empty)
+claim_poll_interval_minutes: 3.0 # Interval in minutes between poll attempts when a slot has no tasks
 max_duration_minutes: 0 # Exit after N minutes, draining active tasks (0 runs without time limit)
+max_tasks: 0 # Exit after N tasks across all models (0 runs until idle timeout or quotas exhausted)
 heartbeat_interval_seconds: 30.0
-claim_poll_interval_minutes: 3.0 # Standby poll interval in minutes when waiting on busy slots or idle cycles
-max_consecutive_idle: 3 # Exit after N consecutive idle cycles when all slots are empty (Default: 3)
 
 # Gemini API Configuration
 gemini_key: "AIzaSyYourGeminiApiKeyHere"

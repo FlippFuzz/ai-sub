@@ -120,6 +120,7 @@ class IngestionManager:
     _youtube_rescan_task: asyncio.Task[None] | None
     _scan_lock: asyncio.Lock
     _feed_lock: asyncio.Lock
+    _stopped: bool
 
     def __init__(
         self,
@@ -163,6 +164,7 @@ class IngestionManager:
         self._youtube_rescan_task = None
         self._scan_lock = asyncio.Lock()
         self._feed_lock = asyncio.Lock()
+        self._stopped = False
 
         self._log_startup_diagnostics()
 
@@ -260,6 +262,9 @@ class IngestionManager:
         Args:
             reason: Context description for the log warning. Defaults to "".
         """
+        if self._stopped:
+            return
+
         cooldown_sec = self.config.youtube.cooldown_minutes * 60.0
         self._youtube_cooldown_until = time() + cooldown_sec
         self._youtube_cooldown_reason = reason or "Download failure threshold reached"
@@ -271,12 +276,16 @@ class IngestionManager:
         async def _wake_on_cooldown_expiry() -> None:
             try:
                 await asyncio.sleep(cooldown_sec)
+                if self._stopped:
+                    return
                 logfire.info("YouTube intake cooldown expired. Resuming YouTube job feeding...")
                 await self.feed_idle_pipelines()
             except asyncio.CancelledError:
                 pass
 
         def _schedule() -> None:
+            if self._stopped:
+                return
             if self._cooldown_wake_task and not self._cooldown_wake_task.done():
                 self._cooldown_wake_task.cancel()
             self._cooldown_wake_task = asyncio.create_task(_wake_on_cooldown_expiry())
@@ -599,6 +608,9 @@ class IngestionManager:
 
     async def feed_idle_pipelines(self) -> None:
         """Assigns the newest available video to each idle pipeline."""
+        if self._stopped:
+            return
+
         async with self._feed_lock:
             idle_pipelines = [p for p in self.coordinator.pipelines.values() if p.is_idle()]
             if not idle_pipelines:
@@ -635,6 +647,9 @@ class IngestionManager:
                 max_failures = self.config.youtube.max_download_failures
 
                 for video in eligible:
+                    if self._stopped:
+                        return
+
                     if video.source_type == "local":
                         if not video.local_path or not video.local_path.is_file():
                             video.status = "failed"
@@ -712,6 +727,7 @@ class IngestionManager:
 
     async def start(self) -> None:
         """Starts the ingestion manager with an initial scan, followed by periodic delta intake loops."""
+        self._stopped = False
         self._loop = asyncio.get_running_loop()
         await self.scan_watch_folders_async()
         await self.scan_youtube_sources_async(deep_scan=True)
@@ -722,6 +738,8 @@ class IngestionManager:
 
     async def stop(self) -> None:
         """Stops the periodic intake loops gracefully."""
+        self._stopped = True
+
         if self._cooldown_wake_task:
             self._cooldown_wake_task.cancel()
             try:
@@ -743,8 +761,10 @@ class IngestionManager:
     async def _periodic_files_loop(self) -> None:
         """Periodically scans local watch folders."""
         interval_sec = max(5, self.config.files.rescan_interval_minutes * 60)
-        while True:
+        while not self._stopped:
             await asyncio.sleep(interval_sec)
+            if self._stopped:
+                break
             try:
                 logfire.debug("Running periodic watch folder scan...")
                 await self.scan_watch_folders_async()
@@ -755,7 +775,7 @@ class IngestionManager:
 
     async def _periodic_youtube_loop(self) -> None:
         """Periodically scans YouTube sources using symmetric jittered intervals."""
-        while True:
+        while not self._stopped:
             base_sec = self.config.youtube.rescan_interval_minutes * 60.0
             jitter_sec = max(0.0, self.config.youtube.rescan_jitter_minutes * 60.0)
             delay_sec = max(5.0, base_sec + random.uniform(-jitter_sec, jitter_sec))
@@ -766,6 +786,8 @@ class IngestionManager:
                 f"jitter: ±{self.config.youtube.rescan_jitter_minutes}m)."
             )
             await asyncio.sleep(delay_sec)
+            if self._stopped:
+                break
 
             try:
                 logfire.debug("Running periodic YouTube delta scan...")

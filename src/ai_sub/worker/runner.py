@@ -1,4 +1,4 @@
-"""Core worker execution loop, distributed trace context attachment, and concurrent task processing."""
+"""Core worker execution loop, per-model slot management, and concurrent task processing."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ import re
 from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 from time import time
-from typing import Any
+from typing import Any, cast
 
 import logfire
 from pydantic import BaseModel
 
-from ai_sub.config import AiSettings
+from ai_sub.config import AiSettings, ServiceTier
 from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError
 from ai_sub.jobs.base import Prompt
 from ai_sub.jobs.lyrics import LyricsAiResponse, prefetch_lyrics
@@ -31,17 +31,18 @@ TASK_RESPONSE_SCHEMAS: dict[TaskType, type[BaseModel]] = {
 
 
 class WorkerRunner:
-    """Manages the lifecycle, concurrent execution slots, and in-memory quota states of a worker node."""
+    """Manages the lifecycle, per-model execution slots, and in-memory quota states of a worker node."""
 
     settings: WorkerSettings
     client: WorkerClient
-    usable_models: list[str]
-    _deadline: float | None
     _lock: asyncio.Lock
-    _task_completed_event: asyncio.Event
+    _shutdown_event: asyncio.Event
+    _exhausted_models: set[str]
     _active_tasks: int
+    _in_flight_claims: int
     _tasks_completed: int
-    _last_claim_timestamp: float
+    _last_busy_timestamp: float
+    _deadline: float | None
 
     def __init__(self, settings: WorkerSettings) -> None:
         """Initializes the worker runner.
@@ -52,15 +53,16 @@ class WorkerRunner:
         self.settings = settings
         self.client = WorkerClient(
             base_url=str(settings.server_url),
-            auth=settings.get_basic_auth_tuple(),
+            auth=settings.basic_auth,
         )
-        self.usable_models = list(settings.models)
-        self._deadline = None
         self._lock = asyncio.Lock()
-        self._task_completed_event = asyncio.Event()
+        self._shutdown_event = asyncio.Event()
+        self._exhausted_models = set()
         self._active_tasks = 0
+        self._in_flight_claims = 0
         self._tasks_completed = 0
-        self._last_claim_timestamp = 0.0
+        self._last_busy_timestamp = time()
+        self._deadline = None
 
     async def _heartbeat_loop(
         self,
@@ -140,7 +142,7 @@ class WorkerRunner:
             video_duration_ms=task.video_duration_ms,
             response_type=response_cls,
             model_name=task.model,
-            service_tier=task.service_tier,  # type: ignore[arg-type]
+            service_tier=cast(ServiceTier | None, task.service_tier),
             tools=active_tools if active_tools else None,
             agentic_video=task.agentic_video,
             task_label=task.task_type.value,
@@ -191,195 +193,222 @@ class WorkerRunner:
                 except OSError:
                     pass
 
-    async def _slot_loop(
+    async def _process_claimed_task(
         self,
+        claim: TaskClaimResponse,
+        model: str,
         slot_id: int,
         executor: GeminiExecutor,
         search_providers: list[BaseSearchProvider],
     ) -> None:
-        """Independent task-claiming and execution loop for a single concurrent worker slot.
+        """Processes a claimed task, reporting results or failure back to the server.
 
         Args:
-            slot_id: Identifier index of this concurrency slot.
+            claim: Assigned task payload from the server.
+            model: Model identifier bound to this slot.
+            slot_id: Concurrency slot index.
+            executor: Configured Gemini executor.
+            search_providers: Active search provider instances.
+
+        Raises:
+            asyncio.CancelledError: If the worker slot task itself is cancelled.
+        """
+        slot_label = f"{model}#{slot_id}"
+        carrier = {"traceparent": claim.traceparent} if claim.traceparent else None
+        trace_ctx = logfire.attach_context(carrier) if carrier else nullcontext()
+
+        with trace_ctx:
+            with logfire.span(
+                "Worker Task: {task_id}",
+                task_id=claim.task_id,
+                pipeline=claim.pipeline_name,
+                video_id=claim.video_id,
+                model=claim.model,
+                task_type=claim.task_type.value,
+                worker_id=self.settings.worker_id,
+                slot=slot_id,
+            ):
+                try:
+                    result_dict = await self._execute_task(claim, executor, search_providers)
+                    accepted = await self.client.complete_task(
+                        task_id=claim.task_id,
+                        worker_id=self.settings.worker_id,
+                        task_type=claim.task_type,
+                        result=result_dict,
+                    )
+                    if accepted:
+                        async with self._lock:
+                            self._tasks_completed += 1
+                            if 0 < self.settings.max_tasks <= self._tasks_completed:
+                                logfire.info(
+                                    f"[{slot_label}] Reached max tasks limit ({self.settings.max_tasks}). "
+                                    "Stopping new task claims."
+                                )
+                                self._shutdown_event.set()
+                        logfire.info(f"[{slot_label}] Task '{claim.task_id}' processed and accepted by server.")
+                    else:
+                        logfire.warning(f"[{slot_label}] Task '{claim.task_id}' completion was not accepted by server.")
+
+                except asyncio.CancelledError:
+                    # Distinguish slot task cancellation (Ctrl-C/shutdown) from inference subtask lease revocation
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                    logfire.warning(
+                        f"[{slot_label}] Task '{claim.task_id}' was cancelled "
+                        "(lease revoked by server or slot draining)."
+                    )
+
+                except QuotaExceededError as e:
+                    logfire.warning(f"[{slot_label}] Daily quota reached for model '{claim.model}': {e}")
+                    await self.client.fail_task(
+                        task_id=claim.task_id,
+                        worker_id=self.settings.worker_id,
+                        reason="QUOTA_EXHAUSTED",
+                        model=claim.model,
+                        error_message=str(e),
+                    )
+                    async with self._lock:
+                        self._exhausted_models.add(model)
+                        all_exhausted = set(self.settings.models).issubset(self._exhausted_models)
+                        if all_exhausted:
+                            logfire.info("All configured models have exhausted quotas. Shutting down worker.")
+                            self._shutdown_event.set()
+
+                except Exception as e:
+                    logfire.exception(f"[{slot_label}] Execution error on task '{claim.task_id}': {e}")
+                    await self.client.fail_task(
+                        task_id=claim.task_id,
+                        worker_id=self.settings.worker_id,
+                        reason="EXECUTION_ERROR",
+                        model=claim.model,
+                        error_message=str(e),
+                    )
+
+    async def _model_slot_loop(
+        self,
+        model: str,
+        slot_id: int,
+        executor: GeminiExecutor,
+        search_providers: list[BaseSearchProvider],
+    ) -> None:
+        """Independent execution loop dedicated to a single model concurrency slot.
+
+        Args:
+            model: Target Gemini model identifier assigned to this slot.
+            slot_id: Concurrency index for this model.
             executor: Configured Gemini executor.
             search_providers: List of initialized search providers.
         """
-        slot_consecutive_idle = 0
-        last_observed_claim = self._last_claim_timestamp
+        slot_label = f"{model}#{slot_id}"
 
-        while True:
-            if 0 < self.settings.max_tasks <= self._tasks_completed:
-                logfire.debug(f"[Slot {slot_id}] Reached max tasks limit ({self.settings.max_tasks}). Exiting.")
-                break
+        while not self._shutdown_event.is_set():
+            async with self._lock:
+                if model in self._exhausted_models:
+                    logfire.info(f"[{slot_label}] Model quota exhausted. Exiting slot.")
+                    break
 
-            if self._deadline is not None and time() >= self._deadline:
-                logfire.info(
-                    f"[Slot {slot_id}] Maximum run duration ({self.settings.max_duration_minutes:.1f}m) "
-                    "reached. Draining slot and exiting."
-                )
-                break
+                if 0 < self.settings.max_tasks <= self._tasks_completed:
+                    self._shutdown_event.set()
+                    break
+
+                if self._deadline is not None and time() >= self._deadline:
+                    logfire.info(
+                        f"[{slot_label}] Maximum run duration ({self.settings.max_duration_minutes:.1f}m) "
+                        "reached. Draining slot and exiting."
+                    )
+                    self._shutdown_event.set()
+                    break
+
+                self._in_flight_claims += 1
 
             claim = None
             claim_failed = False
-            async with self._lock:
-                if 0 < self.settings.max_tasks <= self._tasks_completed:
-                    break
-                if self._deadline is not None and time() >= self._deadline:
-                    break
-                if not self.usable_models:
-                    logfire.info(f"[Slot {slot_id}] No usable models remaining. Exiting.")
-                    break
-
-                try:
-                    claim = await self.client.claim_task(
-                        worker_id=self.settings.worker_id,
-                        models=list(self.usable_models),
-                        search_tools=self.settings.search.tools,
-                    )
-                    if claim is not None:
-                        self._active_tasks += 1
-                        self._last_claim_timestamp = time()
-                        slot_consecutive_idle = 0
-                        self._task_completed_event.clear()
-                except Exception as e:
-                    claim_failed = True
-                    logfire.warning(f"[Slot {slot_id}] Failed to claim task from server: {e}. Retrying in 5s...")
+            try:
+                claim = await self.client.claim_task(
+                    worker_id=self.settings.worker_id,
+                    models=[model],
+                    search_tools=self.settings.search.tools,
+                )
+            except Exception as e:
+                claim_failed = True
+                logfire.warning(f"[{slot_label}] Failed to claim task from server: {e}. Retrying in 5s...")
+            finally:
+                async with self._lock:
+                    self._in_flight_claims -= 1
 
             if claim_failed:
-                await asyncio.sleep(5.0)
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
                 continue
 
-            if claim is None:
-                # Reset idle counter if another slot claimed work in the interim
-                if self._last_claim_timestamp > last_observed_claim:
-                    slot_consecutive_idle = 0
-                    last_observed_claim = self._last_claim_timestamp
-
+            if claim is not None:
                 async with self._lock:
-                    active = self._active_tasks
+                    self._active_tasks += 1
+                    self._last_busy_timestamp = time()
 
-                if active > 0:
-                    poll_timeout = self.settings.claim_poll_interval_minutes * 60.0
-                    try:
-                        await asyncio.wait_for(self._task_completed_event.wait(), timeout=poll_timeout)
-                    except asyncio.TimeoutError:
-                        pass
-                    continue
+                try:
+                    await self._process_claimed_task(claim, model, slot_id, executor, search_providers)
+                finally:
+                    async with self._lock:
+                        self._active_tasks -= 1
+                        self._last_busy_timestamp = time()
+                continue
+
+            # claim is None (HTTP 204: no task available for this model)
+            async with self._lock:
+                active_or_claiming = self._active_tasks + self._in_flight_claims
+                idle_duration = time() - self._last_busy_timestamp
+                idle_timeout_seconds = self.settings.idle_timeout_minutes * 60.0
+
+                if active_or_claiming == 0 and idle_duration >= idle_timeout_seconds:
+                    logfire.info(
+                        f"[{slot_label}] All slots have been idle for {idle_duration / 60:.1f}m "
+                        f"(timeout: {self.settings.idle_timeout_minutes:.1f}m). Shutting down worker."
+                    )
+                    self._shutdown_event.set()
+                    break
+
+                poll_seconds = self.settings.claim_poll_interval_minutes * 60.0
+                if active_or_claiming == 0:
+                    remaining_idle = max(1.0, idle_timeout_seconds - idle_duration)
+                    sleep_duration = min(poll_seconds, remaining_idle)
                 else:
-                    slot_consecutive_idle += 1
-                    max_idle = self.settings.max_consecutive_idle
+                    sleep_duration = poll_seconds
 
-                    if slot_consecutive_idle >= max_idle:
-                        logfire.info(
-                            f"[Slot {slot_id}] Reached maximum consecutive idle poll cycles "
-                            f"({slot_consecutive_idle}/{max_idle}) with no active slots. Exiting."
-                        )
-                        break
-                    else:
-                        poll_seconds = self.settings.claim_poll_interval_minutes * 60.0
-                        logfire.info(
-                            f"[Slot {slot_id}] No matching tasks on server "
-                            f"(idle cycle {slot_consecutive_idle}/{max_idle}). "
-                            f"Waiting {self.settings.claim_poll_interval_minutes:.1f}m before polling again..."
-                        )
-                        await asyncio.sleep(poll_seconds)
-                        continue
-
-            last_observed_claim = self._last_claim_timestamp
-            carrier = {"traceparent": claim.traceparent} if claim.traceparent else None
-            trace_ctx = (
-                logfire.attach_context(carrier) if carrier and hasattr(logfire, "attach_context") else nullcontext()
-            )
-
-            with trace_ctx:
-                with logfire.span(
-                    "Worker Task: {task_id}",
-                    task_id=claim.task_id,
-                    pipeline=claim.pipeline_name,
-                    video_id=claim.video_id,
-                    model=claim.model,
-                    task_type=claim.task_type.value,
-                    worker_id=self.settings.worker_id,
-                    slot=slot_id,
-                ):
-                    try:
-                        result_dict = await self._execute_task(claim, executor, search_providers)
-                        accepted = await self.client.complete_task(
-                            task_id=claim.task_id,
-                            worker_id=self.settings.worker_id,
-                            task_type=claim.task_type,
-                            result=result_dict,
-                        )
-                        if accepted:
-                            async with self._lock:
-                                self._tasks_completed += 1
-                            logfire.info(f"[Slot {slot_id}] Task '{claim.task_id}' processed and accepted by server.")
-                        else:
-                            logfire.warning(
-                                f"[Slot {slot_id}] Task '{claim.task_id}' completion was not accepted by server."
-                            )
-
-                    except asyncio.CancelledError:
-                        logfire.warning(
-                            f"[Slot {slot_id}] Task '{claim.task_id}' was cancelled "
-                            "(lease revoked by server or slot draining)."
-                        )
-
-                    except QuotaExceededError as e:
-                        logfire.warning(f"[Slot {slot_id}] Daily quota reached for model '{claim.model}': {e}")
-                        await self.client.fail_task(
-                            task_id=claim.task_id,
-                            worker_id=self.settings.worker_id,
-                            reason="QUOTA_EXHAUSTED",
-                            model=claim.model,
-                            error_message=str(e),
-                        )
-                        async with self._lock:
-                            if claim.model in self.usable_models:
-                                self.usable_models.remove(claim.model)
-                                logfire.info(
-                                    f"[Slot {slot_id}] Disabled model '{claim.model}' in memory. "
-                                    f"Remaining available models: {self.usable_models}"
-                                )
-
-                    except Exception as e:
-                        logfire.exception(f"[Slot {slot_id}] Execution error on task '{claim.task_id}': {e}")
-                        await self.client.fail_task(
-                            task_id=claim.task_id,
-                            worker_id=self.settings.worker_id,
-                            reason="EXECUTION_ERROR",
-                            model=claim.model,
-                            error_message=str(e),
-                        )
-
-                    finally:
-                        async with self._lock:
-                            self._active_tasks -= 1
-                            self._task_completed_event.set()
-
-        self._task_completed_event.set()
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=sleep_duration)
+                break
+            except asyncio.TimeoutError:
+                pass
 
     async def run(self) -> int:
-        """Executes concurrent worker slots until the queue is drained or quotas are exhausted.
+        """Executes concurrent per-model worker slots until queues are drained or quotas are exhausted.
 
         Returns:
             int: Application exit code (0 for clean finish).
         """
-        gemini_key = self.settings.get_gemini_api_key()
-        if not gemini_key:
+        if not self.settings.gemini_key:
             logfire.error("Gemini API key is missing in worker configuration. Specify gemini_key in worker YAML.")
             return 1
 
-        if not self.usable_models:
+        models = list(dict.fromkeys(self.settings.models))
+        if not models:
             logfire.info("No configured models available. Exiting cleanly.")
             return 0
 
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
-        ai_settings = AiSettings(key=gemini_key, search=self.settings.search)
+        ai_settings = AiSettings(key=self.settings.gemini_key, search=self.settings.search)
         executor = GeminiExecutor(ai_settings)
 
         concurrency = self.settings.concurrency
-        logfire.info(f"Starting worker '{self.settings.worker_id}' with {concurrency} concurrent execution slot(s).")
+        total_slots = len(models) * concurrency
+        logfire.info(
+            f"Starting worker '{self.settings.worker_id}' with {len(models)} model(s) and "
+            f"{concurrency} slot(s) per model ({total_slots} total concurrent slot(s))."
+        )
 
         if self.settings.max_duration_minutes > 0:
             self._deadline = time() + (self.settings.max_duration_minutes * 60.0)
@@ -394,7 +423,8 @@ class WorkerRunner:
                 await stack.enter_async_context(sp)
 
             slots = [
-                asyncio.create_task(self._slot_loop(slot_id, executor, search_providers))
+                asyncio.create_task(self._model_slot_loop(model, slot_id, executor, search_providers))
+                for model in models
                 for slot_id in range(concurrency)
             ]
             await asyncio.gather(*slots)

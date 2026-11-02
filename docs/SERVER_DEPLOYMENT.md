@@ -249,6 +249,7 @@ Add scheduled runs:
 
 ### Worker Operational Behavior
 
-- When the server task queue is empty, the worker exits cleanly in ~1 second.
-- In-flight tasks drain gracefully before exiting when the duration limit is reached.
-- Quota exhaustion (HTTP 429) automatically disables the affected model in memory for the remainder of the worker run without disrupting other models or tasks.
+- **Per-Model Concurrency:** `concurrency` applies per configured model (e.g. `concurrency: 2` with 3 models executes up to 6 concurrent tasks simultaneously, fully utilizing per-model quotas).
+- **Time-Based Idle Shutdown:** If all slots across all models remain idle for `idle_timeout_minutes` (default: 15 minutes), the worker exits cleanly. Setting `AISUB_WORKER_IDLE_TIMEOUT_MINUTES=0` exits immediately in ~1 second if the server queue is empty.
+- **Graceful Draining:** In-flight tasks drain gracefully before exiting when `max_duration_minutes` or `max_tasks` is reached.
+- **Quota Isolation:** Quota exhaustion (HTTP 429) shuts down only the slots assigned to that specific model for the remainder of the worker run, while slots for other models continue running uninterrupted.

@@ -57,16 +57,15 @@ class WorkerClient:
         models: list[str],
         search_tools: list[str],
     ) -> TaskClaimResponse | None:
-        """Requests an available pending task from the server.
+        """Requests an available pending task matching the worker's specified models.
 
         Args:
             worker_id: Unique identifier of this worker.
-            models: List of unexhausted Gemini models available on the worker.
+            models: List of model identifiers offered for this claim request.
             search_tools: List of search tools configured on the worker.
 
         Returns:
             TaskClaimResponse | None: Claimed task details if available, or None if queue is empty.
-
         """
         req = TaskClaimRequest(
             worker_id=worker_id,
@@ -112,17 +111,16 @@ class WorkerClient:
         """Downloads a media chunk file from the server.
 
         Args:
-            media_url: Relative media endpoint URL on the server.
+            media_url: Relative media endpoint URL on the server or absolute URL.
             destination: Local path where the file should be saved.
 
         Returns:
             Path: Path to the validated downloaded file.
         """
         destination.parent.mkdir(parents=True, exist_ok=True)
-        url = media_url if media_url.startswith("http") else f"{self.base_url}{media_url}"
 
-        with logfire.span("Downloading media chunk from {url}", url=url):
-            async with self.client.stream("GET", url) as stream_resp:
+        with logfire.span("Downloading media chunk: {url}", url=media_url):
+            async with self.client.stream("GET", media_url) as stream_resp:
                 stream_resp.raise_for_status()
                 with open(destination, "wb") as f:
                     async for chunk in stream_resp.aiter_bytes():
