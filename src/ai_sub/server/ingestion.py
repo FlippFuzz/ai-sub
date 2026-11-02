@@ -213,21 +213,22 @@ class IngestionManager:
         """
         extractor_args: dict[str, Any] = {"youtubetab": {"approximate_date": [""]}}
         if self.pot_server_dir and self.pot_server_dir.exists():
-            extractor_args["youtubepot-bgutilscript"] = {"server_home": str(self.pot_server_dir)}
+            extractor_args["youtubepot-bgutilscript"] = {"server_home": [str(self.pot_server_dir.resolve())]}
 
         ffmpeg_bin, _ = ensure_ffmpeg()
+        node_bin = shutil.which("node")
         opts: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
             "noprogress": True,
             "ignoreerrors": False,
             "windowsfilenames": True,
-            "js_runtimes": {"node": {}},
+            "js_runtimes": {"node": {"path": node_bin}} if node_bin else {"node": {}},
             "ffmpeg_location": ffmpeg_bin,
             "extractor_args": extractor_args,
         }
         if self.config.youtube.proxy:
-            opts["proxy"] = str(self.config.youtube.proxy)
+            opts["proxy"] = str(self.config.youtube.proxy).rstrip("/")
         if self.config.youtube.cookie_file and self.config.youtube.cookie_file.is_file():
             opts["cookiefile"] = str(self.config.youtube.cookie_file.resolve())
 
