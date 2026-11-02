@@ -93,7 +93,8 @@ def create_app(settings: ServerSettings) -> FastAPI:
             dict[str, Any]: Complete dashboard state dictionary.
         """
         pipeline_queues = ingestion.get_all_pipeline_queues()
-        return coordinator.get_dashboard_data(pipeline_queues)
+        cooldown_info = ingestion.get_youtube_cooldown_info()
+        return coordinator.get_dashboard_data(pipeline_queues, youtube_cooldown=cooldown_info)
 
     @app.post(
         "/api/v1/tasks/claim",

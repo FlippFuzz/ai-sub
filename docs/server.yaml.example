@@ -38,7 +38,7 @@ sources:
       - "https://www.youtube.com/playlist?list=PLxxxxxxxxxxxxxxxx"
       - "https://www.youtube.com/@ChannelName/videos"
     rescan_interval_minutes: 60  # Base interval between YouTube scans
-    rescan_jitter_minutes: 15    # Additive random delay (e.g., 60-75 mins total)
+    rescan_jitter_minutes: 15    # Symmetric jitter (+/- 15 mins -> 45 to 75 mins total)
     channel_delay_seconds: 5.0   # Jittered pause between scraping individual channels
 
     channels_file: "channels.json"
@@ -48,10 +48,9 @@ sources:
 
     enable_pot_provider: true
     pot_dir: "bgutil-ytdlp-pot-provider"
-    pot_update_interval_hours: 24
 
-    download_test_duration_s: 10
-    max_consecutive_failures: 3
+    max_download_failures: 3     # Consecutive download failures before pausing YouTube intake
+    cooldown_minutes: 60         # Duration in minutes to pause YouTube intake on bot check or failure limit
 
 # Video Re-encoding and Compression Controls
 reencode:

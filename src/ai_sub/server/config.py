@@ -122,7 +122,7 @@ class YoutubeSourceConfig(EnvPrioritySettings):
     )
     rescan_jitter_minutes: int = Field(
         default=15,
-        description="Maximum additive random delay in minutes added to the YouTube rescan interval.",
+        description="Symmetric random delay variation in minutes added or subtracted from rescan interval.",
     )
     channel_delay_seconds: float = Field(
         default=5.0,
@@ -152,17 +152,13 @@ class YoutubeSourceConfig(EnvPrioritySettings):
         default=Path("bgutil-ytdlp-pot-provider"),
         description="Directory path for bgutil-ytdlp-pot-provider repository.",
     )
-    pot_update_interval_hours: int = Field(
-        default=24,
-        description="Minimum interval in hours between PO token provider git update checks.",
-    )
-    max_consecutive_failures: int = Field(
+    max_download_failures: int = Field(
         default=3,
-        description="Maximum consecutive video download failures triggering a circuit-breaker pause.",
+        description="Maximum consecutive video download failures in a cycle before entering cooldown.",
     )
-    download_test_duration_s: int = Field(
-        default=10,
-        description="Length in seconds of the audio stream pre-flight availability download test.",
+    cooldown_minutes: int = Field(
+        default=60,
+        description="Cooldown duration in minutes when bot detection or download failure limit is reached.",
     )
 
 

@@ -13,7 +13,7 @@ from ai_sub.server.config import (
 )
 from ai_sub.server.coordinator import PipelineCoordinator
 from ai_sub.server.git_sync import GitSyncManager
-from ai_sub.server.ingestion import DiscoveredVideo, IngestionManager
+from ai_sub.server.ingestion import IngestionManager, QueuedVideo
 from ai_sub.server.models import (
     ActiveVideo,
     ActivityEvent,
@@ -31,7 +31,6 @@ __all__ = [
     "ChannelMap",
     "ChannelMapper",
     "ComboPipeline",
-    "DiscoveredVideo",
     "FilesSourceConfig",
     "GitConfig",
     "GitSyncManager",
@@ -39,6 +38,7 @@ __all__ = [
     "PipelineConfig",
     "PipelineCoordinator",
     "PipelineStatus",
+    "QueuedVideo",
     "ServerOptions",
     "ServerSettings",
     "ServerTask",

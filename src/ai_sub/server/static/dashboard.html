@@ -102,7 +102,8 @@
         border: 1px solid rgba(56, 189, 248, 0.4);
       }
       .badge-complete,
-      .badge-completed {
+      .badge-completed,
+      .badge-ready {
         background: rgba(34, 197, 94, 0.2);
         color: #86efac;
         border: 1px solid rgba(34, 197, 94, 0.4);
@@ -115,7 +116,8 @@
         border: 1px solid rgba(239, 68, 68, 0.4);
       }
       .badge-timeout,
-      .badge-preparing {
+      .badge-preparing,
+      .badge-unplayable {
         background: rgba(234, 179, 8, 0.2);
         color: #fde047;
         border: 1px solid rgba(234, 179, 8, 0.4);
@@ -141,6 +143,18 @@
         background: rgba(56, 189, 248, 0.15);
         color: #7dd3fc;
         border: 1px solid rgba(56, 189, 248, 0.3);
+      }
+      .banner-cooldown {
+        background: rgba(234, 179, 8, 0.12);
+        border: 1px solid rgba(234, 179, 8, 0.35);
+        border-left: 4px solid var(--yellow);
+        border-radius: 6px;
+        padding: 12px 16px;
+        margin-bottom: 20px;
+        font-size: 13px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
       }
       .btn {
         background: #334155;
@@ -248,6 +262,7 @@
       </div>
     </div>
 
+    <div id="cooldown-banner-container"></div>
     <div class="tabs" id="pipeline-tabs"></div>
     <div id="tab-content"></div>
 
@@ -287,6 +302,68 @@
         )
       }
 
+      function formatLocalTime(epochSec) {
+        if (!epochSec) return "-"
+        return new Date(epochSec * 1000).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        })
+      }
+
+      function formatLocalDate(epochSec) {
+        if (!epochSec) return "-"
+        return new Date(epochSec * 1000).toLocaleDateString([], {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+        })
+      }
+
+      function formatDuration(sec) {
+        if (sec == null || sec <= 0) return "0s"
+        const hours = Math.floor(sec / 3600)
+        const mins = Math.floor((sec % 3600) / 60)
+        const s = Math.floor(sec % 60)
+        if (hours > 0) return `${hours}h ${mins}m`
+        if (mins > 0) return `${mins}m ${s}s`
+        return `${s}s`
+      }
+
+      function renderStageCard({
+        stepNumber,
+        title,
+        done,
+        inProgress,
+        total,
+        infoText,
+      }) {
+        const donePct = total > 0 ? Math.round((done / total) * 100) : 0
+        const progPct = total > 0 ? Math.round((inProgress / total) * 100) : 0
+
+        return `
+          <div class="stage-card">
+            <div>
+              <b style="font-size: 13px;">${stepNumber}. ${esc(title)}</b>
+              <div style="display:flex; justify-content:space-between; font-size: 11px; margin-top: 6px;">
+                <span>
+                  ${inProgress > 0 ? `<span style="color:var(--blue); font-weight:600;">${inProgress} In Progress</span> · ` : ""}
+                  <b style="color:var(--green);">${done} Done</b>
+                </span>
+                <span style="color:var(--muted);">Total: ${total} (${donePct}%)</span>
+              </div>
+              <div class="progress-bar">
+                <div class="progress-fill-done" style="width: ${donePct}%;"></div>
+                <div class="progress-fill-prog" style="width: ${progPct}%;"></div>
+              </div>
+            </div>
+            <div style="font-size: 11px; color: var(--muted); margin-top: 4px;">
+              ${infoText}
+            </div>
+          </div>
+        `
+      }
+
       let currentData = null
       let selectedPipelineIndex = 0
 
@@ -305,6 +382,26 @@
 
       function renderPipelineView() {
         if (!currentData || !currentData.pipelines) return
+
+        // Render global YouTube Cooldown banner if active
+        const cd = currentData.youtube_cooldown
+        const bannerContainer = document.getElementById(
+          "cooldown-banner-container",
+        )
+        if (cd && cd.in_cooldown) {
+          bannerContainer.innerHTML = `
+            <div class="banner-cooldown">
+              <span>⚠️</span>
+              <div>
+                <b>YouTube Intake Paused:</b> ${esc(cd.reason || "Download failure threshold reached")}.
+                Resuming in <b>${formatDuration(cd.remaining_seconds)}</b>. Local intake files continue to process unhindered.
+              </div>
+            </div>
+          `
+        } else {
+          bannerContainer.innerHTML = ""
+        }
+
         const pipe =
           currentData.pipelines[selectedPipelineIndex] ||
           currentData.pipelines[0]
@@ -315,11 +412,11 @@
           .map((p, idx) => {
             const pStatus = p.status || (p.idle ? "idle" : "processing")
             return `
-          <button class="tab-btn ${idx === selectedPipelineIndex ? "active" : ""}" onclick="selectTab(${idx})">
-            ${esc(p.name)}
-            <span class="badge badge-${esc(pStatus)}">${esc(pStatus)}</span>
-          </button>
-        `
+              <button class="tab-btn ${idx === selectedPipelineIndex ? "active" : ""}" onclick="selectTab(${idx})">
+                ${esc(p.name)}
+                <span class="badge badge-${esc(pStatus)}">${esc(pStatus)}</span>
+              </button>
+            `
           })
           .join("")
 
@@ -333,183 +430,103 @@
           const sub = st.subtitles
           const lyr = st.lyrics
 
-          const sumDonePct = sum.done > 0 ? 100 : 0
-          const sumProgPct = sum.in_progress > 0 ? 100 : 0
-
-          const reencDonePct =
-            reenc.total > 0 ? Math.round((reenc.done / reenc.total) * 100) : 0
-          const reencProgPct =
-            reenc.total > 0
-              ? Math.round((reenc.in_progress / reenc.total) * 100)
-              : 0
-
-          const subDonePct =
-            sub.total > 0 ? Math.round((sub.done / sub.total) * 100) : 0
-          const subProgPct =
-            sub.total > 0 ? Math.round((sub.in_progress / sub.total) * 100) : 0
-
-          const lyrDonePct =
-            lyr.total > 0 ? Math.round((lyr.done / lyr.total) * 100) : 0
-          const lyrProgPct =
-            lyr.total > 0 ? Math.round((lyr.in_progress / lyr.total) * 100) : 0
-
           const durMin = Math.floor(v.duration_ms / 60000)
           const durSec = Math.floor((v.duration_ms % 60000) / 1000)
           const durationFormatted =
             durMin > 0 ? `${durMin}m ${durSec}s` : `${durSec}s`
 
+          const sumInfo =
+            sum.done > 0
+              ? "Macro knowledge index & chapters ready."
+              : sum.in_progress > 0
+                ? `Running by worker <b>${esc(sum.worker_id)}</b> (${sum.elapsed_s}s)`
+                : "Waiting for worker pickup."
+
+          const reencInfo =
+            reenc.total === 0
+              ? "Waiting for video segmentation..."
+              : reenc.pending > 0
+                ? `${reenc.pending} chunk(s) pending compression`
+                : "All chunks compressed and ready."
+
+          const subInfo =
+            sub.in_progress > 0
+              ? `${sub.in_progress} chunk(s) actively running on workers`
+              : sub.done === sub.total && sub.total > 0
+                ? "All subtitle chunks transcribed."
+                : sum.done === 0
+                  ? "Waiting for whole-video summary to complete."
+                  : "Waiting for worker pickup."
+
+          const lyrInfo =
+            lyr.status === "pending"
+              ? "Vocal performances will be detected during transcription."
+              : lyr.status === "skipped"
+                ? "No vocal singing detected across all chunks."
+                : lyr.in_progress > 0
+                  ? lyr.active_leases
+                      .map(
+                        (l) =>
+                          `Refining with <b>${esc(l.worker_id)}</b> (${l.elapsed_s}s)`,
+                      )
+                      .join(", ")
+                  : lyr.done === lyr.total
+                    ? "All singing chunks refined."
+                    : "Waiting for worker pickup."
+
           activeSection = `
-          <div class="card" style="margin-bottom: 20px;">
-            <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom: 16px;">
-              <div>
-                <div style="display:flex; gap: 8px; align-items:center; margin-bottom: 6px;">
-                  <span class="badge badge-complete">Active Video</span>
-                  <span class="badge badge-${esc(v.source_type)}">${esc(v.source_type)}</span>
-                  <span class="badge badge-${esc(pipe.status || "processing")}">${esc(pipe.status || "processing")}</span>
+            <div class="card" style="margin-bottom: 20px;">
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom: 16px;">
+                <div>
+                  <div style="display:flex; gap: 8px; align-items:center; margin-bottom: 6px;">
+                    <span class="badge badge-complete">Active Video</span>
+                    <span class="badge badge-${esc(v.source_type)}">${esc(v.source_type)}</span>
+                    <span class="badge badge-${esc(pipe.status || "processing")}">${esc(pipe.status || "processing")}</span>
+                  </div>
+                  <h3 style="margin-bottom: 4px;">${esc(v.title)}</h3>
+                  <div style="color: var(--muted); font-size: 13px;">
+                    Channel: <b>${esc(v.channel_name || v.uploader)}</b> (@${esc(v.uploader)}) | Duration: ${durationFormatted}
+                  </div>
                 </div>
-                <h3 style="margin-bottom: 4px;">${esc(v.title)}</h3>
-                <div style="color: var(--muted); font-size: 13px;">
-                  Channel: <b>${esc(v.channel_name || v.uploader)}</b> (@${esc(v.uploader)}) | Duration: ${durationFormatted}
+                <div style="text-align: right; display: flex; flex-direction: column; gap: 4px;">
+                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Summary:</span> ${esc(pipe.models.summary.split(":").pop())}</div>
+                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Subtitles:</span> ${esc(pipe.models.subtitles.split(":").pop())}</div>
+                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Lyrics:</span> ${esc(pipe.models.lyrics.split(":").pop())}</div>
                 </div>
               </div>
-              <div style="text-align: right; display: flex; flex-direction: column; gap: 4px;">
-                <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Summary:</span> ${esc(pipe.models.summary.split(":").pop())}</div>
-                <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Subtitles:</span> ${esc(pipe.models.subtitles.split(":").pop())}</div>
-                <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Lyrics:</span> ${esc(pipe.models.lyrics.split(":").pop())}</div>
+
+              <div class="grid">
+                ${renderStageCard({ stepNumber: 1, title: "Whole-Video Summary", done: sum.done, inProgress: sum.in_progress, total: sum.total, infoText: sumInfo })}
+                ${renderStageCard({ stepNumber: 2, title: "Chunk Compression", done: reenc.done, inProgress: reenc.in_progress, total: reenc.total, infoText: reencInfo })}
+                ${renderStageCard({ stepNumber: 3, title: "Subtitles Transcription", done: sub.done, inProgress: sub.in_progress, total: sub.total, infoText: subInfo })}
+                ${renderStageCard({ stepNumber: 4, title: "Lyrics Refinement", done: lyr.done, inProgress: lyr.in_progress, total: lyr.total, infoText: lyrInfo })}
+              </div>
+
+              <div style="font-size: 12px; margin-top: 8px;">
+                <b>Active Leases:</b>
+                ${
+                  pipe.tasks
+                    .filter((t) => t.status === "claimed")
+                    .map((t) => {
+                      const parts = t.task_id.split("::")
+                      const lastPart = parts.pop()
+                      const taskLabel =
+                        lastPart === t.type ? t.type : `${t.type} ${lastPart}`
+                      return `<span class="badge badge-claim mono">${esc(taskLabel)} (${esc(t.worker_id)}) [${t.elapsed_s}s]</span>`
+                    })
+                    .join(" ") ||
+                  '<span style="color:var(--muted);">No active worker leases at this moment</span>'
+                }
               </div>
             </div>
-
-            <div class="grid">
-              <div class="stage-card">
-                <div>
-                  <b style="font-size: 13px;">1. Whole-Video Summary</b>
-                  <div style="display:flex; justify-content:space-between; font-size: 11px; margin-top: 6px;">
-                    <span>
-                      ${sum.in_progress > 0 ? `<span style="color:var(--blue); font-weight:600;">${sum.in_progress} In Progress</span> · ` : ""}
-                      <b style="color:var(--green);">${sum.done} Done</b>
-                    </span>
-                    <span style="color:var(--muted);">Total: ${sum.total} (${sumDonePct}%)</span>
-                  </div>
-                  <div class="progress-bar">
-                    <div class="progress-fill-done" style="width: ${sumDonePct}%;"></div>
-                    <div class="progress-fill-prog" style="width: ${sumProgPct}%;"></div>
-                  </div>
-                </div>
-                <div style="font-size: 11px; color: var(--muted); margin-top: 4px;">
-                  ${sum.done > 0 ? "Macro knowledge index & chapters ready." : sum.in_progress > 0 ? `Running by worker <b>${esc(sum.worker_id)}</b> (${sum.elapsed_s}s)` : "Waiting for worker pickup."}
-                </div>
-              </div>
-
-              <div class="stage-card">
-                <div>
-                  <b style="font-size: 13px;">2. Chunk Compression</b>
-                  <div style="display:flex; justify-content:space-between; font-size: 11px; margin-top: 6px;">
-                    <span>
-                      ${reenc.in_progress > 0 ? `<span style="color:var(--blue); font-weight:600;">${reenc.in_progress} In Progress</span> · ` : ""}
-                      <b style="color:var(--green);">${reenc.done} Done</b>
-                    </span>
-                    <span style="color:var(--muted);">Total: ${reenc.total} (${reencDonePct}%)</span>
-                  </div>
-                  <div class="progress-bar">
-                    <div class="progress-fill-done" style="width: ${reencDonePct}%;"></div>
-                    <div class="progress-fill-prog" style="width: ${reencProgPct}%;"></div>
-                  </div>
-                </div>
-                <div style="font-size: 11px; color: var(--muted); margin-top: 4px;">
-                  ${reenc.total === 0 ? "Waiting for video segmentation..." : reenc.pending > 0 ? `${reenc.pending} chunk(s) pending compression` : "All chunks compressed and ready."}
-                </div>
-              </div>
-
-              <div class="stage-card">
-                <div>
-                  <b style="font-size: 13px;">3. Subtitles Transcription</b>
-                  <div style="display:flex; justify-content:space-between; font-size: 11px; margin-top: 6px;">
-                    <span>
-                      ${sub.in_progress > 0 ? `<span style="color:var(--blue); font-weight:600;">${sub.in_progress} In Progress</span> · ` : ""}
-                      <b style="color:var(--green);">${sub.done} Done</b>
-                    </span>
-                    <span style="color:var(--muted);">Total: ${sub.total} (${subDonePct}%)</span>
-                  </div>
-                  <div class="progress-bar">
-                    <div class="progress-fill-done" style="width: ${subDonePct}%;"></div>
-                    <div class="progress-fill-prog" style="width: ${subProgPct}%;"></div>
-                  </div>
-                </div>
-                <div style="font-size: 11px; color: var(--muted); margin-top: 4px;">
-                  ${
-                    sub.in_progress > 0
-                      ? `${sub.in_progress} chunk(s) actively running on workers`
-                      : sub.done === sub.total && sub.total > 0
-                        ? "All subtitle chunks transcribed."
-                        : sum.done === 0
-                          ? "Waiting for whole-video summary to complete."
-                          : "Waiting for worker pickup."
-                  }
-                </div>
-              </div>
-
-              <div class="stage-card">
-                <div>
-                  <b style="font-size: 13px;">4. Lyrics Refinement</b>
-                  <div style="display:flex; justify-content:space-between; font-size: 11px; margin-top: 6px;">
-                    <span>
-                      ${
-                        lyr.status === "pending"
-                          ? '<span style="color:var(--muted);">Waiting for Subtitles</span>'
-                          : lyr.status === "skipped"
-                            ? '<span style="color:var(--muted);">No Singing Detected (Skipped)</span>'
-                            : `${lyr.in_progress > 0 ? `<span style="color:var(--blue); font-weight:600;">${lyr.in_progress} In Progress</span> · ` : ""}<b style="color:var(--green);">${lyr.done} Done</b>`
-                      }
-                    </span>
-                    <span style="color:var(--muted);">${lyr.total > 0 ? `Total: ${lyr.total} (${lyrDonePct}%)` : "Total: 0"}</span>
-                  </div>
-                  <div class="progress-bar">
-                    <div class="progress-fill-done" style="width: ${lyrDonePct}%;"></div>
-                    <div class="progress-fill-prog" style="width: ${lyrProgPct}%;"></div>
-                  </div>
-                </div>
-                <div style="font-size: 11px; color: var(--muted); margin-top: 4px;">
-                  ${
-                    lyr.status === "pending"
-                      ? "Vocal performances will be detected during transcription."
-                      : lyr.status === "skipped"
-                        ? "No vocal singing detected across all chunks."
-                        : lyr.in_progress > 0
-                          ? lyr.active_leases
-                              .map(
-                                (l) =>
-                                  `Refining with <b>${esc(l.worker_id)}</b> (${l.elapsed_s}s)`,
-                              )
-                              .join(", ")
-                          : lyr.done === lyr.total
-                            ? "All singing chunks refined."
-                            : "Waiting for worker pickup."
-                  }
-                </div>
-              </div>
-            </div>
-
-            <div style="font-size: 12px; margin-top: 8px;">
-              <b>Active Leases:</b>
-              ${
-                pipe.tasks
-                  .filter((t) => t.status === "claimed")
-                  .map((t) => {
-                    const parts = t.task_id.split("::")
-                    const lastPart = parts.pop()
-                    const taskLabel =
-                      lastPart === t.type ? t.type : `${t.type} ${lastPart}`
-                    return `<span class="badge badge-claim mono">${esc(taskLabel)} (${esc(t.worker_id)}) [${t.elapsed_s}s]</span>`
-                  })
-                  .join(" ") ||
-                '<span style="color:var(--muted);">No active worker leases at this moment</span>'
-              }
-            </div>
-          </div>
-        `
+          `
         } else {
           let statusTitle = `${pipe.name} is currently idle`
           let statusDesc = "Waiting for next video from intake sources..."
+
+          if (cd && cd.in_cooldown) {
+            statusDesc = `Waiting for next video (YouTube intake is paused on cooldown for another ${formatDuration(cd.remaining_seconds)}, local files still process).`
+          }
 
           if (pipe.status === "preparing") {
             statusTitle = `${pipe.name} is preparing media`
@@ -526,43 +543,55 @@
           }
 
           activeSection = `
-          <div class="card" style="margin-bottom: 20px; padding: 36px; text-align: center;">
-            <div style="margin-bottom: 10px;">
-              <span class="badge badge-${esc(pipe.status || "idle")}">${esc(pipe.status || "idle")}</span>
+            <div class="card" style="margin-bottom: 20px; padding: 36px; text-align: center;">
+              <div style="margin-bottom: 10px;">
+                <span class="badge badge-${esc(pipe.status || "idle")}">${esc(pipe.status || "idle")}</span>
+              </div>
+              <h3 style="margin-bottom: 6px;">${esc(statusTitle)}</h3>
+              <p style="color: var(--muted); margin: 0;">${esc(statusDesc)}</p>
+              <div class="mono" style="font-size: 12px; margin-top: 14px; color: var(--muted);">
+                Models: ${esc(pipe.models.summary.split(":").pop())} / ${esc(pipe.models.subtitles.split(":").pop())} / ${esc(pipe.models.lyrics.split(":").pop())}
+              </div>
             </div>
-            <h3 style="margin-bottom: 6px;">${esc(statusTitle)}</h3>
-            <p style="color: var(--muted); margin: 0;">${esc(statusDesc)}</p>
-            <div class="mono" style="font-size: 12px; margin-top: 14px; color: var(--muted);">
-              Models: ${esc(pipe.models.summary.split(":").pop())} / ${esc(pipe.models.subtitles.split(":").pop())} / ${esc(pipe.models.lyrics.split(":").pop())}
-            </div>
-          </div>
-        `
+          `
         }
 
         const queueTable =
           (pipe.next_in_queue || [])
-            .map(
-              (q) => `
-        <tr>
-          <td>${esc(q.title)}</td>
-          <td><b>${esc(q.channel_name || q.uploader)}</b> <span class="mono" style="color:var(--muted);">(@${esc(q.uploader)})</span></td>
-          <td><span class="badge badge-${esc(q.source_type)}">${esc(q.source_type)}</span></td>
-        </tr>
-      `,
-            )
+            .map((q) => {
+              let statusCell = `<span class="badge badge-complete">Ready</span>`
+              if (q.status === "unplayable") {
+                statusCell = `<span class="badge badge-timeout">Unplayable</span> <span style="font-size:11px; color:var(--muted);">${esc(q.error_reason || "Ineligible")} · Retry in ${formatDuration(q.retry_in_s)}</span>`
+              } else if (q.status === "failed") {
+                statusCell = `<span class="badge badge-fail">Failed</span> <span style="font-size:11px; color:var(--muted);">${esc(q.error_reason || "Error")} · Retry in ${formatDuration(q.retry_in_s)}</span>`
+              }
+
+              const dateDisplay =
+                q.timestamp > 0 ? formatLocalDate(q.timestamp) : "-"
+
+              return `
+                <tr>
+                  <td>${esc(q.title)}</td>
+                  <td><b>${esc(q.channel_name || q.uploader)}</b> <span class="mono" style="color:var(--muted);">(@${esc(q.uploader)})</span></td>
+                  <td class="mono" style="font-size:12px;">${esc(dateDisplay)}</td>
+                  <td><span class="badge badge-${esc(q.source_type)}">${esc(q.source_type)}</span></td>
+                  <td>${statusCell}</td>
+                </tr>
+              `
+            })
             .join("") ||
-          '<tr><td colspan="3" style="color: var(--muted);">No pending videos in queue for this pipeline.</td></tr>'
+          '<tr><td colspan="5" style="color: var(--muted);">No pending videos in queue for this pipeline.</td></tr>'
 
         document.getElementById("tab-content").innerHTML = `
-        ${activeSection}
-        <div class="card">
-          <h3>Next In Queue for ${esc(pipe.name)}</h3>
-          <table>
-            <thead><tr><th>Video Title</th><th>Channel / Uploader</th><th>Source</th></tr></thead>
-            <tbody>${queueTable}</tbody>
-          </table>
-        </div>
-      `
+          ${activeSection}
+          <div class="card">
+            <h3>Next In Queue for ${esc(pipe.name)}</h3>
+            <table>
+              <thead><tr><th>Video Title</th><th>Channel / Uploader</th><th>Published</th><th>Source</th><th>Status</th></tr></thead>
+              <tbody>${queueTable}</tbody>
+            </table>
+          </div>
+        `
       }
 
       async function updateDashboard() {
@@ -581,8 +610,10 @@
             statusBadge.className = "badge badge-complete"
             statusBadge.innerText = "Live (auto-refresh 60s)"
           }
+
+          const localTimeStr = formatLocalTime(currentData.server_time)
           document.getElementById("server-time").innerText =
-            "Server Time: " + currentData.server_time
+            `Local Time: ${localTimeStr}`
 
           renderPipelineView()
 
@@ -596,25 +627,26 @@
                   parts.length > 2
                     ? parts.slice(2).join(" ")
                     : parts[1] || a.task_id
+                const activityTime = formatLocalTime(a.timestamp)
                 return `
-            <tr>
-              <td class="mono">${esc(a.time_str)}</td>
-              <td class="mono"><b>${esc(a.worker_id)}</b></td>
-              <td class="mono">${esc(a.pipeline)}</td>
-              <td class="mono">${esc(cleanTaskId)}</td>
-              <td><span class="badge badge-${esc(a.event_type)}">${esc(a.event_type)} ${a.duration_s ? a.duration_s + "s" : ""}</span></td>
-              <td>${a.detail ? `<button class="expand-btn" onclick="toggleDetail(${idx})">Details</button>` : "-"}</td>
-            </tr>
-            ${
-              a.detail
-                ? `
-              <tr class="detail-row" id="detail-${idx}">
-                <td colspan="6"><div class="detail-box ${a.event_type === "fail" ? "detail-box-fail" : ""}">${esc(a.detail)}</div></td>
-              </tr>
-            `
-                : ""
-            }
-          `
+                  <tr>
+                    <td class="mono">${esc(activityTime)}</td>
+                    <td class="mono"><b>${esc(a.worker_id)}</b></td>
+                    <td class="mono">${esc(a.pipeline)}</td>
+                    <td class="mono">${esc(cleanTaskId)}</td>
+                    <td><span class="badge badge-${esc(a.event_type)}">${esc(a.event_type)} ${a.duration_s ? a.duration_s + "s" : ""}</span></td>
+                    <td>${a.detail ? `<button class="expand-btn" onclick="toggleDetail(${idx})">Details</button>` : "-"}</td>
+                  </tr>
+                  ${
+                    a.detail
+                      ? `
+                    <tr class="detail-row" id="detail-${idx}">
+                      <td colspan="6"><div class="detail-box ${a.event_type === "fail" ? "detail-box-fail" : ""}">${esc(a.detail)}</div></td>
+                    </tr>
+                  `
+                      : ""
+                  }
+                `
               })
               .join("") ||
             '<tr><td colspan="6" style="color: var(--muted);">No worker activity recorded yet.</td></tr>'

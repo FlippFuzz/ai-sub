@@ -21,12 +21,11 @@ def is_node_runtime_available() -> bool:
     return bool(shutil.which("node") and shutil.which("npm") and shutil.which("npx"))
 
 
-def ensure_pot_provider(pot_dir: Path, check_updates: bool = False) -> Path | None:
-    """Clones, syncs tags, and compiles bgutil-ytdlp-pot-provider.
+def ensure_pot_provider(pot_dir: Path) -> Path | None:
+    """Clones, syncs tags, and compiles bgutil-ytdlp-pot-provider once at startup.
 
     Args:
         pot_dir: Directory where the PO token provider repository is located.
-        check_updates: Whether to check GitHub for updates if unpinned. Defaults to False.
 
     Returns:
         Path | None: Server home directory if built and valid, None otherwise.
@@ -67,15 +66,6 @@ def ensure_pot_provider(pot_dir: Path, check_updates: bool = False) -> Path | No
                 repo.remotes.origin.fetch(tags=True)
                 repo.git.checkout(target_version, force=True)
                 needs_build = True
-            elif check_updates and not target_version:
-                old_hash = repo.head.commit.hexsha
-                repo.remotes.origin.fetch()
-                try:
-                    repo.git.reset("--hard", "@{u}")
-                except Exception:
-                    repo.git.reset("--hard", "origin/master")
-                if old_hash != repo.head.commit.hexsha:
-                    needs_build = True
 
         build_dir = server_dir / "build"
         dist_dir = server_dir / "dist"

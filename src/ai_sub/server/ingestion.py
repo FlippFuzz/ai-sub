@@ -21,7 +21,7 @@ from ai_sub.server.channel_mapping import ChannelMapper
 from ai_sub.server.config import SourcesConfig
 from ai_sub.server.coordinator import PipelineCoordinator
 from ai_sub.server.git_sync import GitSyncManager
-from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
+from ai_sub.server.pipeline import ComboPipeline
 from ai_sub.server.pot_provider import ensure_pot_provider
 from ai_sub.video import ensure_ffmpeg
 
@@ -38,14 +38,40 @@ def _is_bot_detection_error(err_msg: str) -> bool:
     lower = err_msg.lower()
     return (
         "not a bot" in lower
-        or "sign in to confirm" in lower
+        or "confirm you’re not a bot" in lower
+        or "confirm you're not a bot" in lower
+        or "confirm you are not a bot" in lower
         or "http error 429" in lower
         or "too many requests" in lower
+        or "recaptcha" in lower
     )
 
 
-class DiscoveredVideo(BaseModel):
-    """Metadata container for a video discovered from local files or YouTube feeds."""
+def _is_permanent_video_error(err_msg: str) -> str | None:
+    """Detects whether an error message from yt-dlp indicates an unrecoverable video-level error.
+
+    Args:
+        err_msg: Raw error message string.
+
+    Returns:
+        str | None: Clean error description (e.g. 'Region locked', 'Members only') or None.
+    """
+    lower = err_msg.lower()
+    if "georestricted" in lower or "not available in your country" in lower:
+        return "Region locked"
+    if "members-only" in lower or "members only" in lower or "join this channel" in lower:
+        return "Members only"
+    if "private video" in lower or "this video is private" in lower or "granted access" in lower:
+        return "Private video"
+    if "removed by the uploader" in lower or "video has been removed" in lower or "terms of service" in lower:
+        return "Deleted / Removed"
+    if "sign in to confirm your age" in lower:
+        return "Age restricted"
+    return None
+
+
+class QueuedVideo(BaseModel):
+    """Metadata and operational queue state for a video discovered from local files or YouTube feeds."""
 
     video_id: str = Field(description="Unique video identifier.")
     uploader: str = Field(description="Channel or uploader handle identifier.")
@@ -55,6 +81,23 @@ class DiscoveredVideo(BaseModel):
     source_ref: str = Field(description="Filesystem path or YouTube URL.")
     timestamp: int = Field(default=0, description="Upload or file modification Unix timestamp.")
     local_path: Path | None = Field(default=None, description="Path to local file if available.")
+
+    status: Literal["ready", "failed", "unplayable"] = Field(
+        default="ready",
+        description="Current operational queue status.",
+    )
+    error_reason: str | None = Field(
+        default=None,
+        description="Reason for failure or unplayable status (e.g. 'Region locked', 'Download timeout').",
+    )
+    retry_after: float | None = Field(
+        default=None,
+        description="Unix timestamp when this video becomes eligible to be retried.",
+    )
+    failure_count: int = Field(
+        default=0,
+        description="Total failed download attempts for this video.",
+    )
 
 
 class IngestionManager:
@@ -67,15 +110,12 @@ class IngestionManager:
     pot_dir: Path
     pot_server_dir: Path | None
     base_work_dir: Path
-    test_download_dir: Path
-    consecutive_failures: int
-    failed_video_counts: dict[str, int]
-    cached_local_videos: dict[str, DiscoveredVideo]
-    cached_youtube_videos: dict[str, DiscoveredVideo]
-    cached_videos: list[DiscoveredVideo]
-    _youtube_blocked_until: float
-    _preparing_videos: set[str]
-    _last_pot_update: float
+    local_videos: dict[str, QueuedVideo]
+    youtube_videos: dict[str, QueuedVideo]
+    _youtube_cooldown_until: float
+    _youtube_cooldown_reason: str | None
+    _loop: asyncio.AbstractEventLoop | None
+    _cooldown_wake_task: asyncio.Task[None] | None
     _files_rescan_task: asyncio.Task[None] | None
     _youtube_rescan_task: asyncio.Task[None] | None
     _scan_lock: asyncio.Lock
@@ -111,21 +151,14 @@ class IngestionManager:
             pot_dir = base_work_dir / pot_dir
         self.pot_dir = pot_dir
 
-        self.pot_server_dir = (
-            ensure_pot_provider(pot_dir, check_updates=False) if config.youtube.enable_pot_provider else None
-        )
+        self.pot_server_dir = ensure_pot_provider(pot_dir) if config.youtube.enable_pot_provider else None
 
-        self.test_download_dir = base_work_dir / "tmp_test"
-        self.test_download_dir.mkdir(parents=True, exist_ok=True)
-
-        self.consecutive_failures = 0
-        self.failed_video_counts = {}
-        self.cached_local_videos = {}
-        self.cached_youtube_videos = {}
-        self.cached_videos = []
-        self._youtube_blocked_until = 0.0
-        self._preparing_videos = set()
-        self._last_pot_update = time()
+        self.local_videos = {}
+        self.youtube_videos = {}
+        self._youtube_cooldown_until = 0.0
+        self._youtube_cooldown_reason = None
+        self._loop = None
+        self._cooldown_wake_task = None
         self._files_rescan_task = None
         self._youtube_rescan_task = None
         self._scan_lock = asyncio.Lock()
@@ -198,69 +231,102 @@ class IngestionManager:
 
         return opts
 
-    def is_youtube_blocked(self) -> bool:
-        """Checks if YouTube operations are temporarily suspended due to bot detection.
+    def is_youtube_in_cooldown(self) -> bool:
+        """Checks if YouTube operations are temporarily suspended due to bot detection or failure limit.
 
         Returns:
-            bool: True if YouTube operations are within a bot block cooldown window, False otherwise.
+            bool: True if YouTube operations are within a cooldown window, False otherwise.
         """
-        return time() < self._youtube_blocked_until
+        return time() < self._youtube_cooldown_until
 
-    def _trigger_youtube_bot_block(self, reason: str = "") -> None:
-        """Sets a cooldown timer on all YouTube operations following bot detection.
+    def get_youtube_cooldown_info(self) -> dict[str, Any]:
+        """Returns details on the current YouTube intake cooldown status.
+
+        Returns:
+            dict[str, Any]: Cooldown state dictionary including remaining seconds and reason.
+        """
+        in_cooldown = self.is_youtube_in_cooldown()
+        remaining = max(0.0, self._youtube_cooldown_until - time()) if in_cooldown else 0.0
+        return {
+            "in_cooldown": in_cooldown,
+            "cooldown_until": self._youtube_cooldown_until if in_cooldown else 0.0,
+            "reason": self._youtube_cooldown_reason if in_cooldown else None,
+            "remaining_seconds": round(remaining, 1),
+        }
+
+    def _trigger_youtube_cooldown(self, reason: str = "") -> None:
+        """Sets a cooldown timer on all YouTube operations and schedules an automatic wake-up.
 
         Args:
             reason: Context description for the log warning. Defaults to "".
         """
-        base_sec = self.config.youtube.rescan_interval_minutes * 60.0
-        jitter_sec = max(0.0, self.config.youtube.rescan_jitter_minutes * 60.0)
-        cooldown_sec = base_sec + random.uniform(0.0, jitter_sec)
-        self._youtube_blocked_until = time() + cooldown_sec
+        cooldown_sec = self.config.youtube.cooldown_minutes * 60.0
+        self._youtube_cooldown_until = time() + cooldown_sec
+        self._youtube_cooldown_reason = reason or "Download failure threshold reached"
         logfire.warning(
-            f"Bot detection triggered{f' ({reason})' if reason else ''}. "
-            f"Halting all YouTube requests for {cooldown_sec / 60:.1f} minutes "
-            f"(until next scheduled rescan window)."
+            f"YouTube intake cooldown triggered ({self._youtube_cooldown_reason}). "
+            f"Pausing YouTube downloads for {self.config.youtube.cooldown_minutes} minutes."
         )
 
-    def _update_combined_cache(self) -> None:
-        """Merges discovered local and YouTube videos into the master cache, sorted newest-first."""
-        all_vids = list(self.cached_local_videos.values()) + list(self.cached_youtube_videos.values())
-        deduped: dict[str, DiscoveredVideo] = {v.video_id: v for v in all_vids}
-        self.cached_videos = sorted(deduped.values(), key=lambda v: v.timestamp, reverse=True)
+        async def _wake_on_cooldown_expiry() -> None:
+            try:
+                await asyncio.sleep(cooldown_sec)
+                logfire.info("YouTube intake cooldown expired. Resuming YouTube job feeding...")
+                await self.feed_idle_pipelines()
+            except asyncio.CancelledError:
+                pass
 
-    def scan_watch_folders(self) -> list[DiscoveredVideo]:
+        def _schedule() -> None:
+            if self._cooldown_wake_task and not self._cooldown_wake_task.done():
+                self._cooldown_wake_task.cancel()
+            self._cooldown_wake_task = asyncio.create_task(_wake_on_cooldown_expiry())
+
+        if self._loop is not None and self._loop.is_running():
+            self._loop.call_soon_threadsafe(_schedule)
+
+    def scan_watch_folders(self) -> list[QueuedVideo]:
         """Scans watched directories recursively for video media files.
 
         Returns:
-            list[DiscoveredVideo]: Discovered local video items.
+            list[QueuedVideo]: Newly discovered or updated local video items.
         """
         valid_extensions = {".mp4", ".mkv", ".mov", ".webm", ".flv", ".ts"}
-        discovered: list[DiscoveredVideo] = []
+        discovered_ids: set[str] = set()
 
         for folder in self.config.files.folders:
             if not folder.is_dir():
                 continue
             for file_path in folder.rglob("*"):
                 if file_path.is_file() and file_path.suffix.lower() in valid_extensions:
+                    vid = file_path.stem
+                    discovered_ids.add(vid)
                     mtime = int(file_path.stat().st_mtime)
                     uploader = file_path.parent.name or "local"
                     uploader = uploader.strip("@")[:20]
 
-                    discovered.append(
-                        DiscoveredVideo(
-                            video_id=file_path.stem,
+                    if vid not in self.local_videos:
+                        self.local_videos[vid] = QueuedVideo(
+                            video_id=vid,
                             uploader=uploader,
                             channel_name=uploader,
-                            title=file_path.stem,
+                            title=vid,
                             source_type="local",
                             source_ref=str(file_path.resolve()),
                             timestamp=mtime,
                             local_path=file_path.resolve(),
                         )
-                    )
-        return discovered
+                    else:
+                        existing = self.local_videos[vid]
+                        existing.local_path = file_path.resolve()
+                        existing.timestamp = mtime
 
-    def scan_youtube_sources(self, deep_scan: bool = False) -> list[DiscoveredVideo]:
+        # Prune local files that were removed from the watch directory
+        for vid in set(self.local_videos.keys()) - discovered_ids:
+            self.local_videos.pop(vid, None)
+
+        return list(self.local_videos.values())
+
+    def scan_youtube_sources(self, deep_scan: bool = False) -> list[QueuedVideo]:
         """Fetches metadata for YouTube sources using flat single-request extraction.
 
         Args:
@@ -268,10 +334,10 @@ class IngestionManager:
             Defaults to False.
 
         Returns:
-            list[DiscoveredVideo]: Discovered YouTube video items.
+            list[QueuedVideo]: Discovered YouTube video items.
         """
-        if not self.config.youtube.urls or self.is_youtube_blocked():
-            return []
+        if not self.config.youtube.urls or self.is_youtube_in_cooldown():
+            return list(self.youtube_videos.values())
 
         ydl_opts = self._get_base_ytdlp_opts()
         ydl_opts["extract_flat"] = True
@@ -298,7 +364,7 @@ class IngestionManager:
             else:
                 target_items.append((clean_url, url_handle))
 
-        discovered: list[DiscoveredVideo] = []
+        discovered_new = 0
 
         with logfire.span(
             "Scanning YouTube Sources",
@@ -353,7 +419,6 @@ class IngestionManager:
                                     except ValueError:
                                         ts = 0
 
-                                # Continue across pinned or out-of-order videos instead of breaking
                                 if not deep_scan and ts > 0 and ts < cutoff_ts:
                                     continue
 
@@ -363,8 +428,9 @@ class IngestionManager:
                                     parent=result,
                                     url_context=url_context_handle,
                                 )
-                                discovered.append(
-                                    DiscoveredVideo(
+
+                                if vid not in self.youtube_videos:
+                                    self.youtube_videos[vid] = QueuedVideo(
                                         video_id=vid,
                                         uploader=uploader,
                                         channel_name=ch_name,
@@ -373,7 +439,13 @@ class IngestionManager:
                                         source_ref=f"https://www.youtube.com/watch?v={vid}",
                                         timestamp=ts,
                                     )
-                                )
+                                    discovered_new += 1
+                                else:
+                                    existing = self.youtube_videos[vid]
+                                    if title and existing.title != title:
+                                        existing.title = title
+                                    if ts > 0:
+                                        existing.timestamp = ts
 
                             self.channel_mapper.update_from_entries(entries_processed)
                             url_span.set_attribute("discovered_count", len(entries_processed))
@@ -382,26 +454,26 @@ class IngestionManager:
                             logfire.warning(f"Error scanning YouTube source {url}: {err_msg}")
                             url_span.set_attribute("error", err_msg)
                             if _is_bot_detection_error(err_msg):
-                                self._trigger_youtube_bot_block(reason=f"scanning source {url}")
+                                self._trigger_youtube_cooldown(reason=f"scanning source {url}")
                                 break
 
-            scan_span.set_attribute("total_discovered", len(discovered))
-            logfire.info(f"Discovered {len(discovered)} video(s) across YouTube sources.")
-            return discovered
+            scan_span.set_attribute("total_youtube_videos", len(self.youtube_videos))
+            logfire.info(
+                f"YouTube scan complete: {discovered_new} new video(s) added "
+                f"({len(self.youtube_videos)} total tracked in memory)."
+            )
+            return list(self.youtube_videos.values())
 
-    async def scan_watch_folders_async(self) -> list[DiscoveredVideo]:
+    async def scan_watch_folders_async(self) -> list[QueuedVideo]:
         """Scans local watch directories off-thread and updates in-memory cache.
 
         Returns:
-            list[DiscoveredVideo]: Discovered local video items.
+            list[QueuedVideo]: Discovered local video items.
         """
         async with self._scan_lock:
-            discovered = await asyncio.to_thread(self.scan_watch_folders)
-            self.cached_local_videos = {v.video_id: v for v in discovered}
-            self._update_combined_cache()
-            return discovered
+            return await asyncio.to_thread(self.scan_watch_folders)
 
-    async def scan_youtube_sources_async(self, deep_scan: bool = False) -> list[DiscoveredVideo]:
+    async def scan_youtube_sources_async(self, deep_scan: bool = False) -> list[QueuedVideo]:
         """Scans YouTube sources off-thread and updates in-memory cache.
 
         Args:
@@ -409,87 +481,32 @@ class IngestionManager:
             Defaults to False.
 
         Returns:
-            list[DiscoveredVideo]: Discovered YouTube video items.
+            list[QueuedVideo]: Discovered YouTube video items.
         """
-        if self.is_youtube_blocked():
-            remaining_m = (self._youtube_blocked_until - time()) / 60.0
-            logfire.info(f"Skipping YouTube scan: bot block cooldown active ({remaining_m:.1f}m remaining).")
-            return list(self.cached_youtube_videos.values())
+        if self.is_youtube_in_cooldown():
+            remaining_m = (self._youtube_cooldown_until - time()) / 60.0
+            logfire.info(f"Skipping YouTube scan: bot cooldown active ({remaining_m:.1f}m remaining).")
+            return list(self.youtube_videos.values())
 
         async with self._scan_lock:
-            discovered = await asyncio.to_thread(self.scan_youtube_sources, deep_scan)
-            self.cached_youtube_videos.update({v.video_id: v for v in discovered})
-            self._update_combined_cache()
-            return discovered
+            return await asyncio.to_thread(self.scan_youtube_sources, deep_scan)
 
-    async def scan_all_sources(self, deep_scan: bool = False) -> list[DiscoveredVideo]:
+    async def scan_all_sources(self, deep_scan: bool = False) -> list[QueuedVideo]:
         """Executes rescan of both local watch folders and YouTube sources off-thread.
 
         Args:
             deep_scan: If True, crawls full channel history on YouTube. Defaults to False.
 
         Returns:
-            list[DiscoveredVideo]: List of all discovered videos sorted newest-first.
+            list[QueuedVideo]: List of all discovered videos sorted newest-first.
         """
         await self.scan_watch_folders_async()
         await self.scan_youtube_sources_async(deep_scan=deep_scan)
-        return self.cached_videos
+        all_videos = list(self.local_videos.values()) + list(self.youtube_videos.values())
+        all_videos.sort(key=lambda v: (-v.timestamp, v.title.lower()))
+        return all_videos
 
-    def check_video_availability(self, video: DiscoveredVideo) -> tuple[bool, bool]:
-        """Tests video availability by downloading a brief snippet.
-
-        Args:
-            video: Discovered video metadata.
-
-        Returns:
-            tuple[bool, bool]: (is_available, is_bot_blocked).
-        """
-        if video.source_type == "local":
-            return (video.local_path is not None and video.local_path.is_file()), False
-
-        test_opts = self._get_base_ytdlp_opts()
-        duration_s = self.config.youtube.download_test_duration_s
-        outtmpl = str(self.test_download_dir / f"test_{video.video_id}.%(ext)s")
-
-        test_opts.update(
-            {
-                "format": "bestaudio/best",
-                "download_ranges": lambda info, _: [{"start_time": 0, "end_time": duration_s}],
-                "force_keyframes_at_cuts": False,
-                "outtmpl": outtmpl,
-            }
-        )
-
-        try:
-            with YoutubeDL(cast(Any, test_opts)) as ydl:
-                info = ydl.extract_info(video.source_ref, download=True)
-                test_files = list(self.test_download_dir.glob(f"test_{video.video_id}.*"))
-                has_file = bool(test_files and test_files[0].is_file())
-
-                for p in test_files:
-                    try:
-                        p.unlink()
-                    except OSError:
-                        pass
-
-                if info:
-                    self.channel_mapper.update_from_entries([info])
-                    if video.uploader == "youtube":
-                        video.uploader, video.channel_name = self.channel_mapper.resolve(info)
-
-                return (bool(info and has_file), False)
-        except Exception as e:
-            for p in self.test_download_dir.glob(f"test_{video.video_id}.*"):
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
-            err_msg = str(e)
-            is_bot = _is_bot_detection_error(err_msg)
-            logfire.warning(f"Availability check failed for '{video.title}' ({video.video_id}): {err_msg}")
-            return False, is_bot
-
-    async def download_youtube_to_combo_dir(self, video: DiscoveredVideo, combo_work_dir: Path) -> Path:
+    async def download_youtube_to_combo_dir(self, video: QueuedVideo, combo_work_dir: Path) -> Path:
         """Downloads a video stream into the combination directory.
 
         Args:
@@ -535,7 +552,7 @@ class IngestionManager:
             return downloaded
 
     def get_pipeline_queue(self, pipeline: ComboPipeline) -> list[dict[str, Any]]:
-        """Gathers outstanding queued videos for a given pipeline from memory cache.
+        """Gathers outstanding queued videos for a given pipeline from memory cache with operational details.
 
         Args:
             pipeline: Combination pipeline instance.
@@ -543,12 +560,16 @@ class IngestionManager:
         Returns:
             list[dict[str, Any]]: List of queued video items pending for this pipeline.
         """
+        candidates = list(self.local_videos.values()) + list(self.youtube_videos.values())
         outstanding = []
-        for v in self.cached_videos:
+        now = time()
+
+        for v in candidates:
             if pipeline.active_video and pipeline.active_video.video_id == v.video_id:
                 continue
 
             if not self.git_sync.is_video_completed(v.uploader, v.video_id, pipeline.full_shortcode):
+                retry_in_s = max(0, int(v.retry_after - now)) if v.retry_after and v.retry_after > now else None
                 outstanding.append(
                     {
                         "video_id": v.video_id,
@@ -557,9 +578,16 @@ class IngestionManager:
                         "channel_name": v.channel_name,
                         "source_type": v.source_type,
                         "timestamp": v.timestamp,
+                        "status": v.status,
+                        "error_reason": v.error_reason,
+                        "retry_after": v.retry_after,
+                        "retry_in_s": retry_in_s,
+                        "failure_count": v.failure_count,
                     }
                 )
-        return outstanding[:30]
+
+        outstanding.sort(key=lambda x: (-x["timestamp"], x["title"].lower()))
+        return outstanding[:50]
 
     def get_all_pipeline_queues(self) -> dict[str, list[dict[str, Any]]]:
         """Computes outstanding queues for all active pipelines without network calls.
@@ -572,112 +600,119 @@ class IngestionManager:
     async def feed_idle_pipelines(self) -> None:
         """Assigns the newest available video to each idle pipeline."""
         async with self._feed_lock:
-            if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
-                logfire.warning("Halting feed: max consecutive download failures reached. Will retry on next scan.")
-                return
-
             idle_pipelines = [p for p in self.coordinator.pipelines.values() if p.is_idle()]
             if not idle_pipelines:
                 return
 
-            if not self.cached_videos:
+            if not self.local_videos and not self.youtube_videos:
                 await self.scan_all_sources(deep_scan=False)
 
-            assignments: list[tuple[ComboPipeline, DiscoveredVideo]] = []
+            now = time()
+
             for pipe in idle_pipelines:
-                for candidate in self.cached_videos:
-                    if candidate.source_type == "youtube" and self.is_youtube_blocked():
-                        continue
-                    if candidate.video_id in self._preparing_videos:
-                        continue
-                    if self.failed_video_counts.get(candidate.video_id, 0) >= 3:
-                        continue
-                    if self.git_sync.is_video_completed(candidate.uploader, candidate.video_id, pipe.full_shortcode):
-                        continue
+                # 1. Gather local candidates
+                candidates: list[QueuedVideo] = list(self.local_videos.values())
 
-                    pipe.status = PipelineStatus.PREPARING
-                    self._preparing_videos.add(candidate.video_id)
-                    assignments.append((pipe, candidate))
-                    break
+                # 2. Include YouTube candidates only if not in cooldown
+                if not self.is_youtube_in_cooldown():
+                    candidates.extend(self.youtube_videos.values())
 
-        pending_assignments = list(assignments)
-        if not pending_assignments:
-            return
+                # 3. Filter candidates: not completed in Git, and not in active retry cooldown
+                eligible = [
+                    v
+                    for v in candidates
+                    if not self.git_sync.is_video_completed(v.uploader, v.video_id, pipe.full_shortcode)
+                    and (v.retry_after is None or now >= v.retry_after)
+                ]
 
-        try:
-            while pending_assignments:
-                pipe, candidate = pending_assignments.pop(0)
-                is_available, is_bot = await asyncio.to_thread(self.check_video_availability, candidate)
+                # 4. Sort newest-first with alphabetical title tiebreaker
+                eligible.sort(key=lambda v: (-v.timestamp, v.title.lower()))
 
-                if not is_available:
-                    pipe.status = PipelineStatus.IDLE
-                    async with self._feed_lock:
-                        self._preparing_videos.discard(candidate.video_id)
-
-                    if is_bot:
-                        self._trigger_youtube_bot_block(reason=f"availability check for '{candidate.title}'")
-                        return
-
-                    self.consecutive_failures += 1
-                    self.failed_video_counts[candidate.video_id] = (
-                        self.failed_video_counts.get(candidate.video_id, 0) + 1
-                    )
-                    logfire.warning(
-                        f"Video '{candidate.title}' ({candidate.video_id}) unavailable "
-                        f"(attempt {self.failed_video_counts[candidate.video_id]}/3)."
-                    )
-                    if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
-                        return
+                if not eligible:
                     continue
 
-                try:
-                    if candidate.source_type == "local" and candidate.local_path:
-                        media_path = candidate.local_path
-                    else:
-                        media_path = await self.download_youtube_to_combo_dir(candidate, pipe.work_dir)
+                consecutive_download_failures = 0
+                max_failures = self.config.youtube.max_download_failures
 
-                    self.consecutive_failures = 0
-                    logfire.info(f"Feeding '{pipe.config.name}' with '{candidate.title}' ({candidate.video_id}).")
-                    await pipe.prepare_and_set_video(
-                        video_id=candidate.video_id,
-                        uploader=candidate.uploader,
-                        title=candidate.title,
-                        raw_video_path=media_path,
-                        channel_name=candidate.channel_name,
-                        source_type=candidate.source_type,
-                        timestamp=candidate.timestamp,
-                    )
-                except Exception as e:
-                    pipe.status = PipelineStatus.IDLE
-                    pipe.active_video = None
-                    shutil.rmtree(pipe.work_dir / candidate.video_id, ignore_errors=True)
+                for video in eligible:
+                    if video.source_type == "local":
+                        if not video.local_path or not video.local_path.is_file():
+                            video.status = "failed"
+                            video.error_reason = "File missing from disk"
+                            video.retry_after = now + 120  # Retry in 2 min
+                            continue
 
-                    err_str = str(e)
-                    if _is_bot_detection_error(err_str):
-                        self._trigger_youtube_bot_block(reason=f"downloading '{candidate.title}'")
-                        return
+                        logfire.info(
+                            f"Feeding '{pipe.config.name}' with local file '{video.title}' ({video.video_id})."
+                        )
+                        await pipe.prepare_and_set_video(
+                            video_id=video.video_id,
+                            uploader=video.uploader,
+                            title=video.title,
+                            raw_video_path=video.local_path,
+                            channel_name=video.channel_name,
+                            source_type="local",
+                            timestamp=video.timestamp,
+                        )
+                        break
 
-                    self.consecutive_failures += 1
-                    self.failed_video_counts[candidate.video_id] = (
-                        self.failed_video_counts.get(candidate.video_id, 0) + 1
-                    )
-                    logfire.error(f"Failed to prepare '{candidate.title}' for {pipe.config.name}: {e}")
-                    if self.consecutive_failures >= self.config.youtube.max_consecutive_failures:
-                        return
-                finally:
-                    async with self._feed_lock:
-                        self._preparing_videos.discard(candidate.video_id)
-        finally:
-            # Clean up any unreached assignments on early exit (bot block, failure threshold, or cancellation)
-            if pending_assignments:
-                async with self._feed_lock:
-                    for pipe, candidate in pending_assignments:
-                        if pipe.status == PipelineStatus.PREPARING:
-                            pipe.status = PipelineStatus.IDLE
-                        self._preparing_videos.discard(candidate.video_id)
+                    # YouTube candidate - attempt direct download
+                    try:
+                        media_path = await self.download_youtube_to_combo_dir(video, pipe.work_dir)
+                        video.status = "ready"
+                        video.error_reason = None
+                        video.retry_after = None
+
+                        logfire.info(f"Feeding '{pipe.config.name}' with '{video.title}' ({video.video_id}).")
+                        await pipe.prepare_and_set_video(
+                            video_id=video.video_id,
+                            uploader=video.uploader,
+                            title=video.title,
+                            raw_video_path=media_path,
+                            channel_name=video.channel_name,
+                            source_type="youtube",
+                            timestamp=video.timestamp,
+                        )
+                        break
+
+                    except Exception as e:
+                        err_msg = str(e)
+                        shutil.rmtree(pipe.work_dir / video.video_id, ignore_errors=True)
+
+                        # Check permanent video errors first so age gates/geo-blocks do not trigger bot cooldown
+                        perm_reason = _is_permanent_video_error(err_msg)
+                        if perm_reason:
+                            video.status = "unplayable"
+                            video.error_reason = perm_reason
+                            video.retry_after = now + (24 * 3600)  # Retry in 24 hours
+                            video.failure_count += 1
+                            logfire.warning(f"Video '{video.title}' is unplayable ({perm_reason}). Retrying in 24h.")
+                            continue
+
+                        if _is_bot_detection_error(err_msg):
+                            self._trigger_youtube_cooldown(reason="Bot check detected")
+                            break
+
+                        # Transient download failure
+                        video.status = "failed"
+                        video.error_reason = "Download failed"
+                        video.retry_after = now + (30 * 60)  # Retry in 30 minutes
+                        video.failure_count += 1
+                        consecutive_download_failures += 1
+                        logfire.warning(
+                            f"Download failed for '{video.title}' "
+                            f"({consecutive_download_failures}/{max_failures}): {err_msg}"
+                        )
+
+                        if consecutive_download_failures >= max_failures:
+                            self._trigger_youtube_cooldown(
+                                reason=f"{consecutive_download_failures} consecutive download failures"
+                            )
+                            break
 
     async def start(self) -> None:
-        """Starts the ingestion manager with a deep scan on boot, followed by periodic delta intake loops."""
+        """Starts the ingestion manager with an initial scan, followed by periodic delta intake loops."""
+        self._loop = asyncio.get_running_loop()
         await self.scan_watch_folders_async()
         await self.scan_youtube_sources_async(deep_scan=True)
         await self.feed_idle_pipelines()
@@ -687,6 +722,14 @@ class IngestionManager:
 
     async def stop(self) -> None:
         """Stops the periodic intake loops gracefully."""
+        if self._cooldown_wake_task:
+            self._cooldown_wake_task.cancel()
+            try:
+                await self._cooldown_wake_task
+            except asyncio.CancelledError:
+                pass
+            self._cooldown_wake_task = None
+
         for task in (self._files_rescan_task, self._youtube_rescan_task):
             if task:
                 task.cancel()
@@ -698,7 +741,7 @@ class IngestionManager:
         self._youtube_rescan_task = None
 
     async def _periodic_files_loop(self) -> None:
-        """Periodically scans local watch folders without bot detection throttling."""
+        """Periodically scans local watch folders."""
         interval_sec = max(5, self.config.files.rescan_interval_minutes * 60)
         while True:
             await asyncio.sleep(interval_sec)
@@ -711,38 +754,20 @@ class IngestionManager:
                 logfire.warning(f"Error during periodic watch folder scan: {e}")
 
     async def _periodic_youtube_loop(self) -> None:
-        """Periodically scans YouTube sources using time-based delta lookback and anti-bot pacing."""
+        """Periodically scans YouTube sources using symmetric jittered intervals."""
         while True:
-            base_sec = self.config.youtube.rescan_interval_minutes * 60
+            base_sec = self.config.youtube.rescan_interval_minutes * 60.0
             jitter_sec = max(0.0, self.config.youtube.rescan_jitter_minutes * 60.0)
-            delay_sec = base_sec + random.uniform(0.0, jitter_sec)
+            delay_sec = max(5.0, base_sec + random.uniform(-jitter_sec, jitter_sec))
 
             logfire.debug(
                 f"Next YouTube delta rescan scheduled in {delay_sec / 60:.1f} minutes "
                 f"(base: {self.config.youtube.rescan_interval_minutes}m, "
-                f"jitter: +{(delay_sec - base_sec) / 60:.1f}m)."
+                f"jitter: ±{self.config.youtube.rescan_jitter_minutes}m)."
             )
             await asyncio.sleep(delay_sec)
 
-            if self.is_youtube_blocked():
-                remaining_sec = self._youtube_blocked_until - time()
-                if remaining_sec > 0:
-                    logfire.info(
-                        "Bot block cooldown active. "
-                        f"Waiting {remaining_sec / 60:.1f}m before attempting YouTube rescan..."
-                    )
-                    await asyncio.sleep(remaining_sec)
-
-            self.consecutive_failures = 0
             try:
-                if self.config.youtube.enable_pot_provider:
-                    now = time()
-                    interval_sec = self.config.youtube.pot_update_interval_hours * 3600
-                    if (now - self._last_pot_update) >= interval_sec:
-                        self._last_pot_update = now
-                        logfire.info("Checking for bgutil-ytdlp-pot-provider upstream updates...")
-                        self.pot_server_dir = await asyncio.to_thread(ensure_pot_provider, self.pot_dir, True)
-
                 logfire.debug("Running periodic YouTube delta scan...")
                 await self.scan_youtube_sources_async(deep_scan=False)
                 await self.coordinator.check_and_finalize_completed_pipelines()

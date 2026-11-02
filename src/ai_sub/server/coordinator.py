@@ -499,11 +499,16 @@ class PipelineCoordinator:
                 finalized.append(pipe)
         return finalized
 
-    def get_dashboard_data(self, pipeline_queues: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    def get_dashboard_data(
+        self,
+        pipeline_queues: dict[str, list[dict[str, Any]]],
+        youtube_cooldown: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Gathers macroscopic metrics and active states for the live WebUI dashboard.
 
         Args:
             pipeline_queues: Mapping of pipeline names to their outstanding queued videos.
+            youtube_cooldown: Optional YouTube intake cooldown status dictionary.
 
         Returns:
             dict[str, Any]: Complete dashboard state dictionary.
@@ -629,7 +634,9 @@ class PipelineCoordinator:
             )
 
         return {
-            "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "server_time": now,
+            "server_time_str": datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
+            "youtube_cooldown": youtube_cooldown or {"in_cooldown": False},
             "pipelines": pipeline_data,
             "recent_activity": [event.model_dump() for event in self.activity_log],
         }
