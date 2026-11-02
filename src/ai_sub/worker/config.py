@@ -93,7 +93,7 @@ class WorkerSettings(YamlFileSettings):
     )
     max_tasks: NonNegativeInt = Field(
         default=0,
-        description="Maximum tasks to execute across all models before exiting (0 runs until idle timeout).",
+        description="Maximum tasks to execute per configured model before exiting (0 runs until idle timeout).",
     )
     temp_dir: Path = Field(
         default=Path("/tmp/ai_sub_worker"),

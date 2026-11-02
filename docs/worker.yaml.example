@@ -12,7 +12,7 @@ concurrency: 2 # Number of chunk tasks per model (e.g. 2 slots x 3 models = 6 co
 idle_timeout_minutes: 15.0 # Minutes all slots must remain idle before worker exits (0 exits immediately if queue is empty)
 claim_poll_interval_minutes: 3.0 # Interval in minutes between poll attempts when a slot has no tasks
 max_duration_minutes: 0 # Exit after N minutes, draining active tasks (0 runs without time limit)
-max_tasks: 0 # Exit after N tasks across all models (0 runs until idle timeout or quotas exhausted)
+max_tasks: 0 # Exit after N tasks per model (0 runs until idle timeout or quotas exhausted)
 heartbeat_interval_seconds: 30.0
 
 # Gemini API Configuration
