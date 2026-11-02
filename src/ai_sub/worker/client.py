@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -80,20 +81,27 @@ class WorkerClient:
         resp.raise_for_status()
         return TaskClaimResponse.model_validate(resp.json())
 
-    async def send_heartbeat(self, task_id: str, worker_id: str) -> bool | None:
+    async def send_heartbeat(
+        self,
+        task_id: str,
+        worker_id: str,
+        traceparent: str | None = None,
+    ) -> bool | None:
         """Sends a heartbeat ping to renew an active task lease.
 
         Args:
             task_id: Unique task identifier.
             worker_id: Unique identifier of this worker.
+            traceparent: Optional W3C traceparent header for distributed Logfire tracing.
 
         Returns:
             bool | None: True if acknowledged; False if lease expired; None if a transient transport error occurred.
         """
-        req = TaskHeartbeatRequest(worker_id=worker_id)
+        encoded_task_id = urllib.parse.quote(task_id, safe=":")
+        req = TaskHeartbeatRequest(worker_id=worker_id, traceparent=traceparent)
         try:
             resp: Response = await self.client.post(
-                f"/api/v1/tasks/{task_id}/heartbeat",
+                f"/api/v1/tasks/{encoded_task_id}/heartbeat",
                 json=req.model_dump(mode="json"),
             )
             if resp.status_code == 200:
@@ -102,9 +110,10 @@ class WorkerClient:
             if resp.status_code >= 500:
                 logfire.warning(f"Heartbeat received server error {resp.status_code} for task '{task_id}'")
                 return None
+            logfire.warning(f"Heartbeat returned unexpected status {resp.status_code} for task '{task_id}'")
             return False
         except Exception as e:
-            logfire.warning(f"Heartbeat failed for task '{task_id}': {e}")
+            logfire.warning(f"Heartbeat network error for task '{task_id}': {e}")
             return None
 
     async def download_media(self, media_url: str, destination: Path) -> Path:
@@ -146,6 +155,7 @@ class WorkerClient:
         Returns:
             bool: True if completion was accepted; False otherwise.
         """
+        encoded_task_id = urllib.parse.quote(task_id, safe=":")
         req = TaskCompleteRequest(
             worker_id=worker_id,
             task_id=task_id,
@@ -154,7 +164,7 @@ class WorkerClient:
         )
         try:
             resp: Response = await self.client.post(
-                f"/api/v1/tasks/{task_id}/complete",
+                f"/api/v1/tasks/{encoded_task_id}/complete",
                 json=req.model_dump(mode="json"),
             )
             return resp.status_code == 200
@@ -182,6 +192,7 @@ class WorkerClient:
         Returns:
             bool: True if failure was acknowledged; False otherwise.
         """
+        encoded_task_id = urllib.parse.quote(task_id, safe=":")
         req = TaskFailRequest(
             worker_id=worker_id,
             task_id=task_id,
@@ -191,7 +202,7 @@ class WorkerClient:
         )
         try:
             resp: Response = await self.client.post(
-                f"/api/v1/tasks/{task_id}/fail",
+                f"/api/v1/tasks/{encoded_task_id}/fail",
                 json=req.model_dump(mode="json"),
             )
             return resp.status_code == 200

@@ -7,7 +7,7 @@ import re
 from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 from time import time
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import logfire
 from pydantic import BaseModel
@@ -28,6 +28,10 @@ TASK_RESPONSE_SCHEMAS: dict[TaskType, type[BaseModel]] = {
     TaskType.SUBTITLES: SubtitlesAiResponse,
     TaskType.LYRICS: LyricsAiResponse,
 }
+
+
+class LeaseRevokedError(Exception):
+    """Raised when a task lease is revoked or rejected by the server."""
 
 
 class WorkerRunner:
@@ -111,28 +115,42 @@ class WorkerRunner:
         self,
         task_id: str,
         stop_event: asyncio.Event,
-        execution_task: asyncio.Task[Any],
+        lease_revoked: asyncio.Event,
+        on_lease_rejected: Callable[[], None],
     ) -> None:
         """Background task sending periodic heartbeats to maintain the task lease.
+
+        Inherits traceparent automatically from the task creation scope.
 
         Args:
             task_id: Unique task identifier.
             stop_event: Event signaling when task execution finishes normally.
-            execution_task: Active Gemini execution task to cancel if lease is revoked.
+            lease_revoked: Event set when the server rejects a heartbeat lease renewal.
+            on_lease_rejected: Callback to cancel any currently active work immediately.
         """
         interval = self.settings.heartbeat_interval_seconds
+        hb_num = 0
         while not stop_event.is_set():
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 if not stop_event.is_set():
-                    acked = await self.client.send_heartbeat(task_id, self.settings.worker_id)
-                    if acked is None:
-                        continue
-                    if not acked:
-                        logfire.warning(f"Heartbeat for task '{task_id}' was rejected. Aborting execution immediately.")
-                        execution_task.cancel()
-                        break
+                    hb_num += 1
+                    with logfire.span("Heartbeat Ping #{num}", num=hb_num, task_id=task_id, _level="debug"):
+                        acked = await self.client.send_heartbeat(task_id, self.settings.worker_id)
+                        if acked is None:
+                            logfire.warning(
+                                f"Heartbeat #{hb_num} for '{task_id}' was unacknowledged (transient error)."
+                            )
+                            continue
+                        if not acked:
+                            logfire.warning(
+                                f"Heartbeat #{hb_num} for task '{task_id}' was rejected. "
+                                "Aborting execution immediately."
+                            )
+                            lease_revoked.set()
+                            on_lease_rejected()
+                            break
 
     async def _run_inference(
         self,
@@ -208,6 +226,9 @@ class WorkerRunner:
 
         Returns:
             dict[str, Any]: Validated output data dictionary.
+
+        Raises:
+            LeaseRevokedError: If the server rejects task lease during download or inference.
         """
         raw_name = Path(task.media_url).name
         if not Path(raw_name).suffix:
@@ -215,15 +236,52 @@ class WorkerRunner:
 
         safe_task_id = re.sub(r"[^a-zA-Z0-9_\-]+", "_", task.task_id)
         chunk_path = self.settings.temp_dir / f"{safe_task_id}_{raw_name}"
-        await self.client.download_media(task.media_url, chunk_path)
 
         stop_heartbeat = asyncio.Event()
-        current_coro = self._run_inference(task, executor, chunk_path, search_providers)
-        inference_task = asyncio.create_task(current_coro)
-        heartbeat_task = asyncio.create_task(self._heartbeat_loop(task.task_id, stop_heartbeat, inference_task))
+        lease_revoked = asyncio.Event()
+        active_subtask: asyncio.Task[Any] | None = None
+
+        def _cancel_active() -> None:
+            if active_subtask and not active_subtask.done():
+                active_subtask.cancel()
+
+        heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(
+                task_id=task.task_id,
+                stop_event=stop_heartbeat,
+                lease_revoked=lease_revoked,
+                on_lease_rejected=_cancel_active,
+            )
+        )
 
         try:
-            return await inference_task
+            if lease_revoked.is_set():
+                raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected before download started.")
+
+            # 1. Download media under lease-revocation monitoring
+            with logfire.span("Downloading Task Media", url=task.media_url):
+                download_task = asyncio.create_task(self.client.download_media(task.media_url, chunk_path))
+                active_subtask = download_task
+                try:
+                    await download_task
+                except asyncio.CancelledError:
+                    if lease_revoked.is_set():
+                        raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected during media download.")
+                    raise
+
+            if lease_revoked.is_set():
+                raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected before inference started.")
+
+            # 2. Run inference under lease-revocation monitoring
+            current_coro = self._run_inference(task, executor, chunk_path, search_providers)
+            inference_task = asyncio.create_task(current_coro)
+            active_subtask = inference_task
+            try:
+                return await inference_task
+            except asyncio.CancelledError:
+                if lease_revoked.is_set():
+                    raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected during inference.")
+                raise
         finally:
             stop_heartbeat.set()
             try:
@@ -260,6 +318,7 @@ class WorkerRunner:
         carrier = {"traceparent": claim.traceparent} if claim.traceparent else None
         trace_ctx = logfire.attach_context(carrier) if carrier else nullcontext()
 
+        # Set once upon successful claim - all async tasks and coroutines spawned here inherit this context!
         with trace_ctx:
             with logfire.span(
                 "Worker Task: {task_id}",
@@ -300,6 +359,9 @@ class WorkerRunner:
                         logfire.info(f"[{slot_label}] Task '{claim.task_id}' processed and accepted by server.")
                     else:
                         logfire.warning(f"[{slot_label}] Task '{claim.task_id}' completion was not accepted by server.")
+
+                except LeaseRevokedError as e:
+                    logfire.warning(f"[{slot_label}] {e}")
 
                 except asyncio.CancelledError:
                     # Distinguish slot task cancellation (Ctrl-C/shutdown) from inference subtask lease revocation

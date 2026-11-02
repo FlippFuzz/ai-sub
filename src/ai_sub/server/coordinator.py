@@ -21,6 +21,21 @@ from ai_sub.server.models import ActivityEvent, ServerTask, TaskStatus
 from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
 
 
+def _format_logfire_query(task: ServerTask) -> str:
+    """Formats the Logfire trace and task search query for a server task.
+
+    Args:
+        task: Target server task instance.
+
+    Returns:
+        str: Formatted Logfire search query string.
+    """
+    trace_id = task.traceparent.split("-")[1] if "-" in task.traceparent else ""
+    if trace_id:
+        return f"trace_id == '{trace_id}' or task_id == '{task.task_id}'"
+    return f"task_id == '{task.task_id}'"
+
+
 class PipelineCoordinator:
     """Orchestrates in-memory pipeline runners, worker task leases, and dashboard telemetry."""
 
@@ -67,7 +82,7 @@ class PipelineCoordinator:
         duration_s: float | None = None,
         detail: str | None = None,
     ) -> None:
-        """Appends an event to the circular activity buffer.
+        """Appends an event to the circular activity buffer with Logfire query string on errors.
 
         Args:
             event_type: Event classification ('claim', 'complete', 'fail', 'timeout').
@@ -78,6 +93,15 @@ class PipelineCoordinator:
         """
         now = time()
         time_str = datetime.fromtimestamp(now).strftime("%H:%M:%S")
+
+        # Ensure all error and timeout details include the direct Logfire search query
+        if event_type in ("fail", "timeout"):
+            query_str = f"Logfire search: {_format_logfire_query(task)}"
+            if detail and "Logfire search:" not in detail:
+                detail = f"{detail} | {query_str}"
+            elif not detail:
+                detail = query_str
+
         self.activity_log.appendleft(
             ActivityEvent(
                 timestamp=now,
@@ -142,34 +166,42 @@ class PipelineCoordinator:
                                 if elapsed > timeout:
                                     expired_count += 1
                                     worker_id = task.worker_id or "unknown"
+                                    total_active_s = round(now - (task.claimed_at or now), 1)
+
+                                    diag_msg = (
+                                        f"Lease timed out after {timeout}s without heartbeat "
+                                        f"(active: {total_active_s}s)."
+                                    )
+
                                     task.worker_id = None
                                     task.claimed_at = None
                                     task.last_heartbeat = None
                                     task.attempts += 1
 
-                                    if task.attempts >= max_runs:
-                                        task.status = TaskStatus.FAILED
-                                        logfire.error(
-                                            f"Task '{task.task_id}' lease expired ({elapsed:.1f}s). Marked FAILED."
-                                        )
-                                        self._log_activity(
-                                            event_type="fail",
-                                            task=task,
-                                            worker_id=worker_id,
-                                            detail=f"Lease timed out after {timeout}s: max runs exhausted",
-                                        )
-                                    else:
-                                        task.status = TaskStatus.PENDING
-                                        logfire.warning(
-                                            f"Task '{task.task_id}' lease expired (worker: {worker_id}). "
-                                            "Set to PENDING."
-                                        )
-                                        self._log_activity(
-                                            event_type="timeout",
-                                            task=task,
-                                            worker_id=worker_id,
-                                            detail=f"Lease timed out after {timeout}s without heartbeat",
-                                        )
+                                    with task.trace_context():
+                                        if task.attempts >= max_runs:
+                                            task.status = TaskStatus.FAILED
+                                            logfire.error(
+                                                f"Task '{task.task_id}' lease expired ({elapsed:.1f}s). Marked FAILED."
+                                            )
+                                            self._log_activity(
+                                                event_type="fail",
+                                                task=task,
+                                                worker_id=worker_id,
+                                                detail=f"{diag_msg} (max runs exhausted)",
+                                            )
+                                        else:
+                                            task.status = TaskStatus.PENDING
+                                            logfire.warning(
+                                                f"Task '{task.task_id}' lease expired (worker: {worker_id}). "
+                                                "Set to PENDING."
+                                            )
+                                            self._log_activity(
+                                                event_type="timeout",
+                                                task=task,
+                                                worker_id=worker_id,
+                                                detail=diag_msg,
+                                            )
 
                     sweep_span.set_attribute("active_leases", active_leases)
                     sweep_span.set_attribute("expired_leases", expired_count)
@@ -224,16 +256,24 @@ class PipelineCoordinator:
                         task.claimed_at = now
                         task.last_heartbeat = now
 
-                        self._log_activity(event_type="claim", task=task, worker_id=worker_id)
-                        claim_span.set_attribute("result", "claimed")
-                        claim_span.set_attribute("task_id", task.task_id)
-                        claim_span.set_attribute("task_type", task.task_type.value)
-                        claim_span.set_attribute("model", task.model)
+                        with task.trace_context():
+                            with logfire.span(
+                                "Server Task Claimed: {task_id}",
+                                task_id=task.task_id,
+                                worker_id=worker_id,
+                                model=task.model,
+                                task_type=task.task_type.value,
+                            ):
+                                self._log_activity(event_type="claim", task=task, worker_id=worker_id)
+                                claim_span.set_attribute("result", "claimed")
+                                claim_span.set_attribute("task_id", task.task_id)
+                                claim_span.set_attribute("task_type", task.task_type.value)
+                                claim_span.set_attribute("model", task.model)
 
-                        logfire.info(
-                            f"Task '{task.task_id}' claimed by worker '{worker_id}' "
-                            f"(model: {task.model}, type: {task.task_type.value})."
-                        )
+                                logfire.info(
+                                    f"Task '{task.task_id}' claimed by worker '{worker_id}' "
+                                    f"(model: {task.model}, type: {task.task_type.value})."
+                                )
 
                         media_url = f"/api/v1/tasks/{task.task_id}/media/{task.media_path.name}"
                         return task.to_claim_response(media_url=media_url, retry=self.settings.retry)
@@ -251,13 +291,30 @@ class PipelineCoordinator:
         Returns:
             bool: True if lease was successfully renewed, False otherwise.
         """
+        now = time()
         async with self._lock:
             for pipe in self.pipelines.values():
                 if task_id in pipe.tasks:
                     task = pipe.tasks[task_id]
-                    if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
-                        task.last_heartbeat = time()
-                        return True
+                    with task.trace_context():
+                        if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
+                            task.last_heartbeat = now
+                            with logfire.span(
+                                "Server Heartbeat Received: {task_id}",
+                                task_id=task_id,
+                                worker_id=worker_id,
+                                _level="debug",
+                            ):
+                                pass
+                            return True
+                        else:
+                            logfire.warning(
+                                f"Heartbeat rejected for '{task_id}': status={task.status.value}, "
+                                f"assigned_worker={task.worker_id}, requesting_worker={worker_id}"
+                            )
+                            return False
+
+        logfire.warning(f"Heartbeat rejected: task '{task_id}' not found.")
         return False
 
     def _fail_task_locked(
@@ -313,54 +370,57 @@ class PipelineCoordinator:
             bool: True if completion was accepted, False otherwise.
         """
         async with self._lock:
-            with logfire.span("Process Complete Task: {task_id}", task_id=task_id, worker_id=worker_id) as comp_span:
-                for pipe in self.pipelines.values():
-                    if task_id in pipe.tasks:
-                        task = pipe.tasks[task_id]
-                        if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
-                            duration = time() - (task.claimed_at or time())
-                            try:
-                                pipe.on_task_completed(task_id, result)
-                            except Exception as val_err:
-                                logfire.warning(f"Task '{task_id}' validation failed: {val_err}. Routing to fail.")
-                                comp_span.set_attribute("result", "validation_failed")
-                                comp_span.set_attribute("error", str(val_err))
-                                self._fail_task_locked(
+            for pipe in self.pipelines.values():
+                if task_id in pipe.tasks:
+                    task = pipe.tasks[task_id]
+                    if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
+                        with task.trace_context():
+                            with logfire.span(
+                                "Process Complete Task: {task_id}", task_id=task_id, worker_id=worker_id
+                            ) as comp_span:
+                                duration = time() - (task.claimed_at or time())
+                                try:
+                                    pipe.on_task_completed(task_id, result)
+                                except Exception as val_err:
+                                    logfire.warning(f"Task '{task_id}' validation failed: {val_err}. Routing to fail.")
+                                    comp_span.set_attribute("result", "validation_failed")
+                                    comp_span.set_attribute("error", str(val_err))
+                                    self._fail_task_locked(
+                                        task=task,
+                                        worker_id=worker_id,
+                                        reason="EXECUTION_ERROR",
+                                        error_message=f"Server validation error: {val_err}",
+                                    )
+                                    return False
+
+                                detail = None
+                                if task.task_type == TaskType.SUMMARY:
+                                    ch_len = len(result.get("chapters", []))
+                                    ent_len = len(result.get("entities", []))
+                                    detail = f"Summary: {ch_len} chapters, {ent_len} entities extracted"
+                                elif task.task_type == TaskType.SUBTITLES:
+                                    sub_len = len(result.get("subs", result.get("subtitles", [])))
+                                    music_len = len(result.get("detected_musical_performances", []))
+                                    detail = f"Subtitles: {sub_len} lines transcribed ({music_len} songs detected)"
+                                elif task.task_type == TaskType.LYRICS:
+                                    lyr_len = len(result.get("subs", result.get("subtitles", [])))
+                                    detail = f"Lyrics: {lyr_len} lines refined"
+
+                                self._log_activity(
+                                    event_type="complete",
                                     task=task,
                                     worker_id=worker_id,
-                                    reason="EXECUTION_ERROR",
-                                    error_message=f"Server validation error: {val_err}",
+                                    duration_s=duration,
+                                    detail=detail,
                                 )
-                                return False
+                                comp_span.set_attribute("result", "accepted")
+                                comp_span.set_attribute("duration_s", round(duration, 1))
+                                logfire.info(f"Task '{task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
+                                return True
 
-                            detail = None
-                            if task.task_type == TaskType.SUMMARY:
-                                ch_len = len(result.get("chapters", []))
-                                ent_len = len(result.get("entities", []))
-                                detail = f"Summary: {ch_len} chapters, {ent_len} entities extracted"
-                            elif task.task_type == TaskType.SUBTITLES:
-                                sub_len = len(result.get("subs", result.get("subtitles", [])))
-                                music_len = len(result.get("detected_musical_performances", []))
-                                detail = f"Subtitles: {sub_len} lines transcribed ({music_len} songs detected)"
-                            elif task.task_type == TaskType.LYRICS:
-                                lyr_len = len(result.get("subs", result.get("subtitles", [])))
-                                detail = f"Lyrics: {lyr_len} lines refined"
-
-                            self._log_activity(
-                                event_type="complete",
-                                task=task,
-                                worker_id=worker_id,
-                                duration_s=duration,
-                                detail=detail,
-                            )
-                            comp_span.set_attribute("result", "accepted")
-                            comp_span.set_attribute("duration_s", round(duration, 1))
-                            logfire.info(f"Task '{task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
-                            return True
-
-                comp_span.set_attribute("result", "rejected_not_claimed")
+            with logfire.span("Process Complete Task Rejected: {task_id}", task_id=task_id, worker_id=worker_id):
                 logfire.warning(f"Task '{task_id}' completion from worker '{worker_id}' was rejected.")
-                return False
+            return False
 
     async def fail_task(
         self,
@@ -381,28 +441,30 @@ class PipelineCoordinator:
             bool: True if failure was recorded, False otherwise.
         """
         async with self._lock:
-            with logfire.span(
-                "Process Task Failure: {task_id}",
-                task_id=task_id,
-                worker_id=worker_id,
-                reason=reason,
-            ) as fail_span:
-                for pipe in self.pipelines.values():
-                    if task_id in pipe.tasks:
-                        task = pipe.tasks[task_id]
-                        if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
-                            success = self._fail_task_locked(
-                                task=task,
+            for pipe in self.pipelines.values():
+                if task_id in pipe.tasks:
+                    task = pipe.tasks[task_id]
+                    if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
+                        with task.trace_context():
+                            with logfire.span(
+                                "Process Task Failure: {task_id}",
+                                task_id=task_id,
                                 worker_id=worker_id,
                                 reason=reason,
-                                error_message=error_message,
-                            )
-                            fail_span.set_attribute("result", task.status.value)
-                            fail_span.set_attribute("attempts", task.attempts)
-                            return success
+                            ) as fail_span:
+                                success = self._fail_task_locked(
+                                    task=task,
+                                    worker_id=worker_id,
+                                    reason=reason,
+                                    error_message=error_message,
+                                )
+                                fail_span.set_attribute("result", task.status.value)
+                                fail_span.set_attribute("attempts", task.attempts)
+                                return success
 
-                fail_span.set_attribute("result", "task_not_found")
-                return False
+            with logfire.span("Process Task Failure Rejected: {task_id}", task_id=task_id, worker_id=worker_id):
+                logfire.warning(f"Task '{task_id}' failure report from worker '{worker_id}' was rejected (not found).")
+            return False
 
     def get_task_media_path(self, task_id: str) -> Path | None:
         """Retrieves the local media file path for an active task.

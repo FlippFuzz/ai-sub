@@ -63,6 +63,7 @@ class TaskHeartbeatRequest(BaseModel):
     """Heartbeat ping payload sent by a worker to maintain its task lease."""
 
     worker_id: str = Field(description="Unique identifier of the worker holding the lease.")
+    traceparent: str | None = Field(default=None, description="Optional W3C traceparent header.")
 
 
 class TaskHeartbeatResponse(BaseModel):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -130,7 +131,8 @@ def create_app(settings: ServerSettings) -> FastAPI:
         Returns:
             TaskHeartbeatResponse: Acknowledgment status confirming whether lease was renewed.
         """
-        acknowledged = await coordinator.record_heartbeat(task_id, req.worker_id)
+        clean_task_id = urllib.parse.unquote(task_id)
+        acknowledged = await coordinator.record_heartbeat(clean_task_id, req.worker_id)
         return TaskHeartbeatResponse(acknowledged=acknowledged)
 
     @app.get("/api/v1/tasks/{task_id}/media")
@@ -148,7 +150,8 @@ def create_app(settings: ServerSettings) -> FastAPI:
         Raises:
             HTTPException: If the media chunk file is not found on disk.
         """
-        media_path = coordinator.get_task_media_path(task_id)
+        clean_task_id = urllib.parse.unquote(task_id)
+        media_path = coordinator.get_task_media_path(clean_task_id)
         if not media_path or not media_path.is_file():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media chunk file not found.")
 
@@ -174,7 +177,8 @@ def create_app(settings: ServerSettings) -> FastAPI:
         Raises:
             HTTPException: If the task was not claimed by this worker or has already completed.
         """
-        success = await coordinator.complete_task(task_id, req.worker_id, req.result)
+        clean_task_id = urllib.parse.unquote(task_id)
+        success = await coordinator.complete_task(clean_task_id, req.worker_id, req.result)
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -209,8 +213,9 @@ def create_app(settings: ServerSettings) -> FastAPI:
         Raises:
             HTTPException: If the task could not be found or was not held by this worker.
         """
+        clean_task_id = urllib.parse.unquote(task_id)
         success = await coordinator.fail_task(
-            task_id=task_id,
+            task_id=clean_task_id,
             worker_id=req.worker_id,
             reason=req.reason,
             error_message=req.error_message,
