@@ -92,10 +92,17 @@ class TaskFailRequest(BaseModel):
 
     worker_id: str = Field(description="Unique identifier of the worker.")
     task_id: str = Field(description="Unique task identifier.")
-    reason: str = Field(description="Failure code (e.g. 'QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').")
+    reason: str = Field(
+        description="Failure code (e.g. 'QUOTA_EXHAUSTED', 'TRANSIENT_API_ERROR', or 'EXECUTION_ERROR')."
+    )
     model: str | None = Field(default=None, description="Model identifier that failed, if applicable.")
     error_message: str | None = Field(default=None, description="Optional error description or traceback.")
     traceparent: str | None = Field(
         default=None,
         description="Optional W3C traceparent header reported by the worker.",
+    )
+    is_transient: bool = Field(
+        default=False,
+        description="Whether the failure is transient (e.g. upstream 5xx, timeout) "
+        "and should not penalize attempt counts.",
     )

@@ -183,16 +183,18 @@ class WorkerClient:
         model: str | None = None,
         error_message: str | None = None,
         traceparent: str | None = None,
+        is_transient: bool = False,
     ) -> bool:
         """Notifies the server of a task failure or daily quota limit exhaustion.
 
         Args:
             task_id: Unique task identifier.
             worker_id: Unique identifier of this worker.
-            reason: Failure code ('QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').
+            reason: Failure code (e.g. 'QUOTA_EXHAUSTED', 'TRANSIENT_API_ERROR', or 'EXECUTION_ERROR').
             model: Gemini model identifier that failed, if applicable. Defaults to None.
             error_message: Optional error description or traceback. Defaults to None.
             traceparent: Optional W3C traceparent header for distributed Logfire tracing. Defaults to None.
+            is_transient: Whether the failure is transient and should not penalize server attempts. Defaults to False.
 
         Returns:
             bool: True if failure was acknowledged; False otherwise.
@@ -205,6 +207,7 @@ class WorkerClient:
             model=model,
             error_message=error_message,
             traceparent=traceparent,
+            is_transient=is_transient,
         )
         try:
             resp: Response = await self.client.post(

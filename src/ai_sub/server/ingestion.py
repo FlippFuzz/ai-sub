@@ -114,6 +114,7 @@ class IngestionManager:
     youtube_videos: dict[str, QueuedVideo]
     _youtube_cooldown_until: float
     _youtube_cooldown_reason: str | None
+    _last_idle_summary: dict[str, str]
     _loop: asyncio.AbstractEventLoop | None
     _cooldown_wake_task: asyncio.Task[None] | None
     _files_rescan_task: asyncio.Task[None] | None
@@ -161,6 +162,7 @@ class IngestionManager:
         self.youtube_videos = {}
         self._youtube_cooldown_until = 0.0
         self._youtube_cooldown_reason = None
+        self._last_idle_summary = {}
         self._loop = None
         self._cooldown_wake_task = None
         self._files_rescan_task = None
@@ -337,6 +339,9 @@ class IngestionManager:
         for vid in set(self.local_videos.keys()) - discovered_ids:
             self.local_videos.pop(vid, None)
 
+        if self.local_videos:
+            logfire.debug(f"Watch folders scan complete: {len(self.local_videos)} local file(s) tracked.")
+
         return list(self.local_videos.values())
 
     def scan_youtube_sources(self, deep_scan: bool = False) -> list[QueuedVideo]:
@@ -472,8 +477,8 @@ class IngestionManager:
 
             scan_span.set_attribute("total_youtube_videos", len(self.youtube_videos))
             logfire.info(
-                f"YouTube scan complete: {discovered_new} new video(s) added "
-                f"({len(self.youtube_videos)} total tracked in memory)."
+                f"YouTube scan complete: {len(self.youtube_videos)} metadata entry(s) tracked in memory "
+                f"({discovered_new} newly discovered)."
             )
             return list(self.youtube_videos.values())
 
@@ -638,18 +643,43 @@ class IngestionManager:
                     candidates.extend(self.youtube_videos.values())
 
                 # 3. Filter candidates: not completed in Git, and not in active retry cooldown
-                eligible = [
-                    v
-                    for v in candidates
-                    if not self.git_sync.is_video_completed(v.uploader, v.video_id, pipe.full_shortcode)
-                    and (v.retry_after is None or now >= v.retry_after)
-                ]
+                completed_in_git = 0
+                in_cooldown = 0
+                eligible: list[QueuedVideo] = []
+
+                for v in candidates:
+                    if self.git_sync.is_video_completed(v.uploader, v.video_id, pipe.full_shortcode):
+                        completed_in_git += 1
+                    elif v.retry_after is not None and now < v.retry_after:
+                        in_cooldown += 1
+                    else:
+                        eligible.append(v)
 
                 # 4. Sort newest-first with alphabetical title tiebreaker
                 eligible.sort(key=lambda v: (-v.timestamp, v.title.lower()))
 
                 if not eligible:
+                    if candidates:
+                        reason_parts: list[str] = []
+                        if completed_in_git:
+                            reason_parts.append(f"{completed_in_git} completed in Git")
+                        if in_cooldown:
+                            reason_parts.append(f"{in_cooldown} in cooldown")
+                        reason_str = ", ".join(reason_parts) if reason_parts else "none available"
+                        summary_key = f"{len(candidates)}:{reason_str}"
+
+                        msg = (
+                            f"Pipeline '{pipe.config.name}' is idle: 0 pending videos "
+                            f"({len(candidates)} tracked: {reason_str})."
+                        )
+                        if self._last_idle_summary.get(pipe.config.name) != summary_key:
+                            self._last_idle_summary[pipe.config.name] = summary_key
+                            logfire.info(msg)
+                        else:
+                            logfire.debug(msg)
                     continue
+
+                self._last_idle_summary.pop(pipe.config.name, None)
 
                 consecutive_download_failures = 0
                 max_failures = self.config.youtube.max_download_failures

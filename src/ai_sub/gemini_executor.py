@@ -41,6 +41,31 @@ class QuotaExceededError(Exception):
     """Raised when an AI model provider's daily quota limit is exhausted."""
 
 
+def is_retryable_error(e: Exception) -> bool:
+    """Determines if an error is a transient network or server error eligible for retry.
+
+    Args:
+        e: Caught exception.
+
+    Returns:
+        bool: True if error can be retried, False otherwise.
+    """
+    if _is_daily_quota_exceeded(e):
+        return False
+
+    if isinstance(e, (TransportError, TimeoutException, ConnectionError, asyncio.TimeoutError, TimeoutError)):
+        return True
+
+    status_code = getattr(e, "code", None)
+    if isinstance(status_code, int):
+        return status_code in (408, 429, 500, 502, 503, 504)
+
+    err_str = str(e).lower()
+    if re.search(r"\b(408|500|502|503|504)\b", err_str):
+        return True
+    return any(term in err_str for term in ("connection", "timeout", "temporarily unavailable"))
+
+
 def _get_unique_display_name(file_path: Path) -> str:
     """Constructs a unique display name using workspace folder and filename.
 
@@ -109,31 +134,6 @@ def _is_daily_quota_exceeded(e: Exception) -> bool:
     if e.__cause__ and "requests per day on free tier" in str(e.__cause__).lower():
         return True
     return False
-
-
-def _is_retryable_error(e: Exception) -> bool:
-    """Determines if an error is a transient network or server error eligible for search turn retry.
-
-    Args:
-        e: Caught exception.
-
-    Returns:
-        bool: True if error can be retried on the same search turn, False otherwise.
-    """
-    if _is_daily_quota_exceeded(e):
-        return False
-
-    if isinstance(e, (TransportError, TimeoutException, ConnectionError, asyncio.TimeoutError, TimeoutError)):
-        return True
-
-    status_code = getattr(e, "code", None)
-    if isinstance(status_code, int):
-        return status_code in (408, 429, 500, 502, 503, 504)
-
-    err_str = str(e).lower()
-    if re.search(r"\b(408|500|502|503|504)\b", err_str):
-        return True
-    return any(term in err_str for term in ("connection", "timeout", "temporarily unavailable"))
 
 
 def _extract_thought_text(step: Any) -> str | None:
@@ -596,7 +596,7 @@ class GeminiExecutor:
                     logfire.warning(f"Daily quota exhausted for {model_id}: {err}")
                     raise QuotaExceededError(str(err)) from err
 
-                if _is_retryable_error(err) and search_turn_attempt < retry.per_run:
+                if is_retryable_error(err) and search_turn_attempt < retry.per_run:
                     backoff = min(
                         float(retry.max_wait_seconds),
                         float(retry.min_wait_seconds) * (float(retry.multiplier) ** search_turn_attempt),

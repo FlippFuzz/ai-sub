@@ -142,3 +142,7 @@ class ActivityEvent(BaseModel):
     model: str = Field(description="Target model.")
     duration_s: float | None = Field(default=None, description="Execution duration in seconds if complete.")
     detail: str | None = Field(default=None, description="Optional extra detail or error string.")
+    logfire_query: str | None = Field(
+        default=None,
+        description="Dedicated Logfire search query string for tracing this task attempt.",
+    )

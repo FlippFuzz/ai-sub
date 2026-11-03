@@ -35,8 +35,8 @@ def _format_logfire_query(task: ServerTask) -> str:
     parts = task.traceparent.split("-") if task.traceparent else []
     trace_id = parts[1] if len(parts) >= 2 else ""
     if trace_id:
-        return f"trace_id == '{trace_id}' or task_id == '{task.task_id}'"
-    return f"task_id == '{task.task_id}'"
+        return f"trace_id == '{trace_id}'"
+    return f"attributes['task_id'] == '{task.task_id}'"
 
 
 class PipelineCoordinator:
@@ -100,14 +100,7 @@ class PipelineCoordinator:
         """
         now = time()
         time_str = datetime.fromtimestamp(now).strftime("%H:%M:%S")
-
-        # Ensure all error and timeout details include the direct Logfire search query
-        if event_type in ("fail", "timeout"):
-            query_str = f"Logfire search: {_format_logfire_query(task)}"
-            if detail and "Logfire search:" not in detail:
-                detail = f"{detail} | {query_str}"
-            elif not detail:
-                detail = query_str
+        query_str = _format_logfire_query(task) if event_type in ("fail", "timeout") else None
 
         self.activity_log.appendleft(
             ActivityEvent(
@@ -120,6 +113,7 @@ class PipelineCoordinator:
                 model=task.model,
                 duration_s=round(duration_s, 1) if duration_s is not None else None,
                 detail=detail,
+                logfire_query=query_str,
             )
         )
 
@@ -343,26 +337,32 @@ class PipelineCoordinator:
         worker_id: str,
         reason: str,
         error_message: str | None = None,
+        is_transient: bool = False,
     ) -> bool:
         """Processes task failure and updates lease state while lock is held.
 
         Args:
             task: Affected server task.
             worker_id: Worker reporting the failure.
-            reason: Error code ('QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').
+            reason: Error code or exception description.
             error_message: Optional error details. Defaults to None.
+            is_transient: Whether failure is transient and exempt from attempt counting. Defaults to False.
 
         Returns:
             bool: True indicating the task failure was processed.
         """
-        detail = f"[{reason}] {error_message or 'No message provided'}"
+        if error_message and error_message not in reason:
+            detail = f"[{reason}] {error_message}"
+        else:
+            detail = reason or error_message or "Unknown failure"
+
         self._log_activity(event_type="fail", task=task, worker_id=worker_id, detail=detail)
         task.worker_id = None
         task.claimed_at = None
         task.last_heartbeat = None
         task.traceparent = None  # Reset traceparent so next worker creates fresh trace context
 
-        if reason != "QUOTA_EXHAUSTED":
+        if not is_transient and reason != "QUOTA_EXHAUSTED":
             task.attempts += 1
             max_runs = self.settings.retry.max_runs
             if task.attempts >= max_runs:
@@ -371,7 +371,10 @@ class PipelineCoordinator:
                 return True
 
         task.status = TaskStatus.PENDING
-        logfire.warning(f"Task '{task.task_id}' failed by worker '{worker_id}' ({reason}). Reset to PENDING.")
+        logfire.warning(
+            f"Task '{task.task_id}' failed by worker '{worker_id}' (reason: {reason}, "
+            f"transient: {is_transient}). Reset to PENDING."
+        )
         return True
 
     async def complete_task(
@@ -415,6 +418,7 @@ class PipelineCoordinator:
                                         worker_id=worker_id,
                                         reason="EXECUTION_ERROR",
                                         error_message=f"Server validation error: {val_err}",
+                                        is_transient=False,
                                     )
                                     return False
 
@@ -454,15 +458,17 @@ class PipelineCoordinator:
         reason: str,
         error_message: str | None = None,
         traceparent: str | None = None,
+        is_transient: bool = False,
     ) -> bool:
         """Handles task failure, releasing the lease or marking permanently failed.
 
         Args:
             task_id: Unique task identifier.
             worker_id: Worker reporting the failure.
-            reason: Error code ('QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').
+            reason: Error code or exception description.
             error_message: Optional error details. Defaults to None.
             traceparent: Optional W3C traceparent header reported by worker. Defaults to None.
+            is_transient: Whether failure is transient and exempt from attempt counting. Defaults to False.
 
         Returns:
             bool: True if failure was recorded, False otherwise.
@@ -486,6 +492,7 @@ class PipelineCoordinator:
                                     worker_id=worker_id,
                                     reason=reason,
                                     error_message=error_message,
+                                    is_transient=is_transient,
                                 )
                                 fail_span.set_attribute("result", task.status.value)
                                 fail_span.set_attribute("attempts", task.attempts)
@@ -621,12 +628,14 @@ class PipelineCoordinator:
         self,
         pipeline_queues: dict[str, list[dict[str, Any]]],
         youtube_cooldown: dict[str, Any] | None = None,
+        total_tracked_videos: int = 0,
     ) -> dict[str, Any]:
         """Gathers macroscopic metrics and active states for the live WebUI dashboard.
 
         Args:
             pipeline_queues: Mapping of pipeline names to their outstanding queued videos.
             youtube_cooldown: Optional YouTube intake cooldown status dictionary.
+            total_tracked_videos: Count of all media files and streams tracked in memory. Defaults to 0.
 
         Returns:
             dict[str, Any]: Complete dashboard state dictionary.
@@ -730,6 +739,7 @@ class PipelineCoordinator:
                     "worker_id": t.worker_id,
                     "attempts": t.attempts,
                     "elapsed_s": int(now - t.claimed_at) if t.claimed_at else None,
+                    "logfire_query": _format_logfire_query(t),
                 }
                 for t in pipe.tasks.values()
             ]
@@ -756,6 +766,7 @@ class PipelineCoordinator:
             "server_time": now,
             "server_time_str": datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
             "youtube_cooldown": youtube_cooldown or {"in_cooldown": False},
+            "total_tracked_videos": total_tracked_videos,
             "pipelines": pipeline_data,
             "recent_activity": [event.model_dump() for event in self.activity_log],
         }

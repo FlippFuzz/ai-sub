@@ -13,7 +13,7 @@ import logfire
 from pydantic import BaseModel
 
 from ai_sub.config import AiSettings, ServiceTier
-from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError
+from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError, is_retryable_error
 from ai_sub.jobs.base import Prompt
 from ai_sub.jobs.lyrics import LyricsAiResponse, prefetch_lyrics
 from ai_sub.jobs.subtitles import DetectedMusicalPerformance, SubtitlesAiResponse
@@ -130,31 +130,36 @@ class WorkerRunner:
         """
         interval = self.settings.heartbeat_interval_seconds
         hb_num = 0
-        while not stop_event.is_set():
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                if not stop_event.is_set():
-                    hb_num += 1
-                    with logfire.span("Heartbeat Ping #{num}", num=hb_num, task_id=task_id, _level="debug"):
-                        acked = await self.client.send_heartbeat(
-                            task_id=task_id,
-                            worker_id=self.settings.worker_id,
-                            traceparent=traceparent,
-                        )
-                        if acked is None:
-                            logfire.warning(
-                                f"Heartbeat #{hb_num} for '{task_id}' was unacknowledged (transient error)."
+
+        # Wrap all heartbeats under a single collapsible debug span
+        with logfire.span("Heartbeats", task_id=task_id, _level="debug"):
+            while not stop_event.is_set():
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    if not stop_event.is_set():
+                        hb_num += 1
+                        with logfire.span("Heartbeat Ping #{num}", num=hb_num, task_id=task_id, _level="debug"):
+                            # Extract traceparent inside this specific ping span so server nests as child
+                            ping_traceparent = logfire.get_context().get("traceparent") or traceparent
+                            acked = await self.client.send_heartbeat(
+                                task_id=task_id,
+                                worker_id=self.settings.worker_id,
+                                traceparent=ping_traceparent,
                             )
-                            continue
-                        if not acked:
-                            logfire.warning(
-                                f"Heartbeat #{hb_num} for task '{task_id}' was rejected. "
-                                "Aborting execution immediately."
-                            )
-                            lease_revoked.set()
-                            on_lease_rejected()
-                            break
+                            if acked is None:
+                                logfire.warning(
+                                    f"Heartbeat #{hb_num} for '{task_id}' was unacknowledged (transient error)."
+                                )
+                                continue
+                            if not acked:
+                                logfire.warning(
+                                    f"Heartbeat #{hb_num} for task '{task_id}' was rejected. "
+                                    "Aborting execution immediately."
+                                )
+                                lease_revoked.set()
+                                on_lease_rejected()
+                                break
 
     async def _run_inference(
         self,
@@ -389,13 +394,15 @@ class WorkerRunner:
 
             except QuotaExceededError as e:
                 logfire.warning(f"[{slot_label}] Daily quota reached for model '{claim.model}': {e}")
+                err_msg = str(e).strip() or "Daily quota limit reached"
                 await self.client.fail_task(
                     task_id=claim.task_id,
                     worker_id=self.settings.worker_id,
-                    reason="QUOTA_EXHAUSTED",
+                    reason=f"QUOTA_EXHAUSTED: {err_msg}",
                     model=claim.model,
-                    error_message=str(e),
+                    error_message=err_msg,
                     traceparent=traceparent,
+                    is_transient=True,
                 )
                 async with self._lock:
                     self._exhausted_models.add(model)
@@ -408,14 +415,19 @@ class WorkerRunner:
                         self._trigger_shutdown()
 
             except Exception as e:
+                is_transient = is_retryable_error(e)
+                err_msg = str(e).strip() or type(e).__name__
+                prefix = "TRANSIENT_ERROR" if is_transient else "EXECUTION_ERROR"
+                fail_reason = f"[{prefix}] {err_msg}"
                 logfire.exception(f"[{slot_label}] Execution error on task '{claim.task_id}': {e}")
                 await self.client.fail_task(
                     task_id=claim.task_id,
                     worker_id=self.settings.worker_id,
-                    reason="EXECUTION_ERROR",
+                    reason=fail_reason,
                     model=claim.model,
-                    error_message=str(e),
+                    error_message=err_msg,
                     traceparent=traceparent,
+                    is_transient=is_transient,
                 )
 
     async def _model_slot_loop(

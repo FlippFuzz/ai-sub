@@ -95,7 +95,12 @@ def create_app(settings: ServerSettings) -> FastAPI:
         """
         pipeline_queues = ingestion.get_all_pipeline_queues()
         cooldown_info = ingestion.get_youtube_cooldown_info()
-        return coordinator.get_dashboard_data(pipeline_queues, youtube_cooldown=cooldown_info)
+        total_tracked = len(ingestion.local_videos) + len(ingestion.youtube_videos)
+        return coordinator.get_dashboard_data(
+            pipeline_queues=pipeline_queues,
+            youtube_cooldown=cooldown_info,
+            total_tracked_videos=total_tracked,
+        )
 
     @app.post(
         "/api/v1/tasks/claim",
@@ -229,6 +234,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
             reason=req.reason,
             error_message=req.error_message,
             traceparent=req.traceparent,
+            is_transient=req.is_transient,
         )
         if not success:
             raise HTTPException(
