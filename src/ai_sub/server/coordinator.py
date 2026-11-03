@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections import deque
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from time import time
@@ -47,6 +49,8 @@ class PipelineCoordinator:
     _lock: asyncio.Lock
     _finalizing_pipes: set[str]
     _sweep_task: asyncio.Task[None] | None
+    _background_tasks: set[asyncio.Task[Any]]
+    on_pipelines_finalized: Callable[[], Any] | None
 
     def __init__(self, settings: ServerSettings, git_sync: GitSyncManager | None = None) -> None:
         """Initializes the central pipeline coordinator.
@@ -62,6 +66,8 @@ class PipelineCoordinator:
         self._lock = asyncio.Lock()
         self._finalizing_pipes = set()
         self._sweep_task = None
+        self._background_tasks = set()
+        self.on_pipelines_finalized = None
 
         work_base = settings.server.work_dir
         for p_cfg in settings.pipelines:
@@ -145,6 +151,10 @@ class PipelineCoordinator:
             except asyncio.CancelledError:
                 pass
             self._sweep_task = None
+
+        for bg_task in list(self._background_tasks):
+            bg_task.cancel()
+        self._background_tasks.clear()
 
     async def _lease_sweeper_loop(self) -> None:
         """Continuously checks for expired worker leases every 15 seconds."""
@@ -568,6 +578,20 @@ class PipelineCoordinator:
             async with self._lock:
                 self._finalizing_pipes.discard(pipe.config.name)
 
+    @staticmethod
+    async def _run_intake_callback(coro: Any) -> None:
+        """Executes the intake callback in the background and reports any failures.
+
+        Args:
+            coro: Awaitable intake coroutine.
+        """
+        try:
+            await coro
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logfire.exception(f"Background intake callback failed: {e}")
+
     async def check_and_finalize_completed_pipelines(self) -> list[ComboPipeline]:
         """Inspects all pipelines, finalizing any that have reached completion.
 
@@ -578,6 +602,19 @@ class PipelineCoordinator:
         for pipe in list(self.pipelines.values()):
             if await self.finalize_pipeline_if_complete(pipe):
                 finalized.append(pipe)
+
+        # Notify registered intake callback in the background so callers (such as the
+        # lease sweeper) are never blocked while long video downloads are in progress.
+        if finalized and self.on_pipelines_finalized is not None:
+            try:
+                res = self.on_pipelines_finalized()
+                if inspect.isawaitable(res):
+                    bg_task = asyncio.create_task(self._run_intake_callback(res))
+                    self._background_tasks.add(bg_task)
+                    bg_task.add_done_callback(self._background_tasks.discard)
+            except Exception as e:
+                logfire.exception(f"Error scheduling on_pipelines_finalized callback: {e}")
+
         return finalized
 
     def get_dashboard_data(
@@ -708,6 +745,7 @@ class PipelineCoordinator:
                     },
                     "idle": pipe.is_idle(),
                     "active_video": active_info,
+                    "preparing_video": pipe.preparing_video_info,
                     "stages": stages_info,
                     "tasks": tasks_list,
                     "next_in_queue": pipeline_queues.get(name, []),

@@ -81,6 +81,7 @@ class ComboPipeline:
 
     status: PipelineStatus
     active_video: ActiveVideo | None
+    preparing_video_info: dict[str, Any] | None
     tasks: dict[str, ServerTask]
     summary_response: SummaryAiResponse | None
     _reencode_task: asyncio.Task[None] | None
@@ -130,6 +131,7 @@ class ComboPipeline:
 
         self.status = PipelineStatus.IDLE
         self.active_video = None
+        self.preparing_video_info = None
         self.tasks = {}
         self.summary_response = None
         self._reencode_task = None
@@ -141,6 +143,38 @@ class ComboPipeline:
             bool: True if pipeline status is IDLE, False otherwise.
         """
         return self.status == PipelineStatus.IDLE
+
+    def set_preparing(
+        self,
+        video_id: str,
+        title: str,
+        uploader: str,
+        channel_name: str | None = None,
+        source_type: Literal["local", "youtube"] = "youtube",
+    ) -> None:
+        """Marks pipeline as PREPARING immediately while media is being downloaded or chunked.
+
+        Args:
+            video_id: Unique video identifier.
+            title: Title of the video.
+            uploader: Channel or uploader handle identifier.
+            channel_name: Human-readable channel display name. Defaults to None.
+            source_type: Ingestion source type ('local' or 'youtube'). Defaults to 'youtube'.
+        """
+        self.status = PipelineStatus.PREPARING
+        self.preparing_video_info = {
+            "video_id": video_id,
+            "title": title,
+            "uploader": uploader,
+            "channel_name": channel_name,
+            "source_type": source_type,
+        }
+
+    def clear_preparing(self) -> None:
+        """Resets preparing state back to IDLE if download or chunk generation fails."""
+        if not self.active_video:
+            self.status = PipelineStatus.IDLE
+        self.preparing_video_info = None
 
     def is_task_ready_for_claim(self, task: ServerTask) -> bool:
         """Determines if a task is eligible to be claimed by a worker.
@@ -275,6 +309,13 @@ class ComboPipeline:
             timestamp: Video publication or intake Unix timestamp. Defaults to 0.
         """
         self.status = PipelineStatus.PREPARING
+        self.preparing_video_info = {
+            "video_id": video_id,
+            "uploader": uploader,
+            "channel_name": channel_name,
+            "title": title,
+            "source_type": source_type,
+        }
         job_dir = self.work_dir / video_id
         job_dir.mkdir(parents=True, exist_ok=True)
         filename_stem = sanitize_filename(raw_video_path.stem)
@@ -373,6 +414,7 @@ class ComboPipeline:
             self.active_video.user_context = self._build_user_context()
             self.tasks.clear()
             self.summary_response = None
+            self.preparing_video_info = None
 
             self.status = PipelineStatus.PROCESSING
             self._queue_summary_task()
@@ -696,6 +738,7 @@ class ComboPipeline:
             job_dirs = [d for d in self.work_dir.iterdir() if d.is_dir() and d.name != "reencoded"]
             if not job_dirs:
                 self.status = PipelineStatus.IDLE
+                self.preparing_video_info = None
                 resume_span.set_attribute("result", "idle")
                 return False
 
@@ -704,6 +747,7 @@ class ComboPipeline:
             if not meta_file.is_file():
                 shutil.rmtree(job_dir, ignore_errors=True)
                 self.status = PipelineStatus.IDLE
+                self.preparing_video_info = None
                 resume_span.set_attribute("result", "purged_invalid_folder")
                 return False
 
@@ -723,6 +767,7 @@ class ComboPipeline:
                 timestamp = int(meta.get("timestamp", 0))
             except Exception:
                 self.status = PipelineStatus.IDLE
+                self.preparing_video_info = None
                 resume_span.set_attribute("result", "corrupt_metadata")
                 return False
 
@@ -743,6 +788,19 @@ class ComboPipeline:
                     mtime_match = source_type != "local" or timestamp <= 0 or actual_mtime == timestamp
                     if size_match and mtime_match:
                         raw_video_path = candidate
+
+            # If a local source file was modified, replaced, or removed after segmentation,
+            # discard the stale job directory completely so it can be re-ingested freshly.
+            if source_type == "local" and not raw_video_path:
+                logfire.warning(
+                    f"Local source file for '{video_id}' at '{raw_path_meta}' is missing or has changed "
+                    f"(mtime/size mismatch). Discarding stale job directory {job_dir.name}."
+                )
+                shutil.rmtree(job_dir, ignore_errors=True)
+                self.status = PipelineStatus.IDLE
+                self.preparing_video_info = None
+                resume_span.set_attribute("result", "purged_stale_local_job")
+                return False
 
             if not raw_video_path and raw_filename:
                 candidate = job_dir / str(raw_filename)
@@ -773,6 +831,7 @@ class ComboPipeline:
                 else:
                     shutil.rmtree(job_dir, ignore_errors=True)
                     self.status = PipelineStatus.IDLE
+                    self.preparing_video_info = None
                     resume_span.set_attribute("result", "no_chunks_or_raw")
                     return False
 
@@ -847,6 +906,7 @@ class ComboPipeline:
             self.active_video.user_context = self._build_user_context()
             active = self.active_video
             self.tasks.clear()
+            self.preparing_video_info = None
             self._reencode_task = asyncio.create_task(self._reencode_segments_background())
 
             summary_file = job_dir / f"summary.{self.summary_shortcode}.yaml"
@@ -983,6 +1043,7 @@ class ComboPipeline:
 
             clear_span.set_attribute("purged_directory", purged_path or "none")
             self.active_video = None
+            self.preparing_video_info = None
             self.tasks.clear()
             self.summary_response = None
             self.status = PipelineStatus.IDLE

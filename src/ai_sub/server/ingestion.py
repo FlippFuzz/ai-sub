@@ -142,6 +142,9 @@ class IngestionManager:
         self.git_sync = git_sync
         self.base_work_dir = base_work_dir
 
+        # Register callback to feed idle pipelines immediately whenever any pipeline finalizes
+        self.coordinator.on_pipelines_finalized = self.feed_idle_pipelines
+
         channels_path = config.youtube.channels_file
         if not channels_path.is_absolute():
             channels_path = base_work_dir / channels_path
@@ -575,7 +578,11 @@ class IngestionManager:
         now = time()
 
         for v in candidates:
+            # Skip video if it is currently active or being prepared by this pipeline
             if pipeline.active_video and pipeline.active_video.video_id == v.video_id:
+                continue
+
+            if pipeline.preparing_video_info and pipeline.preparing_video_info.get("video_id") == v.video_id:
                 continue
 
             if not self.git_sync.is_video_completed(v.uploader, v.video_id, pipeline.full_shortcode):
@@ -646,6 +653,7 @@ class IngestionManager:
 
                 consecutive_download_failures = 0
                 max_failures = self.config.youtube.max_download_failures
+                fed = False
 
                 for video in eligible:
                     if self._stopped:
@@ -658,21 +666,49 @@ class IngestionManager:
                             video.retry_after = now + 120  # Retry in 2 min
                             continue
 
-                        logfire.info(
-                            f"Feeding '{pipe.config.name}' with local file '{video.title}' ({video.video_id})."
-                        )
-                        await pipe.prepare_and_set_video(
+                        pipe.set_preparing(
                             video_id=video.video_id,
-                            uploader=video.uploader,
                             title=video.title,
-                            raw_video_path=video.local_path,
+                            uploader=video.uploader,
                             channel_name=video.channel_name,
                             source_type="local",
-                            timestamp=video.timestamp,
                         )
-                        break
+                        try:
+                            logfire.info(
+                                f"Feeding '{pipe.config.name}' with local file '{video.title}' ({video.video_id})."
+                            )
+                            await pipe.prepare_and_set_video(
+                                video_id=video.video_id,
+                                uploader=video.uploader,
+                                title=video.title,
+                                raw_video_path=video.local_path,
+                                channel_name=video.channel_name,
+                                source_type="local",
+                                timestamp=video.timestamp,
+                            )
+                            fed = True
+                            break
+                        except Exception as e:
+                            pipe.clear_preparing()
+                            # Clean up the failed local job directory to prevent leaving behind corrupt state
+                            shutil.rmtree(pipe.work_dir / video.video_id, ignore_errors=True)
+                            logfire.warning(
+                                f"Failed to prepare local video '{video.title}' for '{pipe.config.name}': {e}"
+                            )
+                            video.status = "failed"
+                            video.error_reason = f"Preparation error: {e}"
+                            video.retry_after = now + 120
+                            continue
 
-                    # YouTube candidate - attempt direct download
+                    # YouTube candidate - notify pipeline of PREPARING state immediately before download begins
+                    pipe.set_preparing(
+                        video_id=video.video_id,
+                        title=video.title,
+                        uploader=video.uploader,
+                        channel_name=video.channel_name,
+                        source_type="youtube",
+                    )
+
                     try:
                         media_path = await self.download_youtube_to_combo_dir(video, pipe.work_dir)
                         video.status = "ready"
@@ -689,9 +725,11 @@ class IngestionManager:
                             source_type="youtube",
                             timestamp=video.timestamp,
                         )
+                        fed = True
                         break
 
                     except Exception as e:
+                        pipe.clear_preparing()
                         err_msg = str(e)
                         shutil.rmtree(pipe.work_dir / video.video_id, ignore_errors=True)
 
@@ -725,6 +763,9 @@ class IngestionManager:
                                 reason=f"{consecutive_download_failures} consecutive download failures"
                             )
                             break
+
+                if not fed:
+                    pipe.clear_preparing()
 
     async def start(self) -> None:
         """Starts the ingestion manager with an initial scan, followed by periodic delta intake loops."""

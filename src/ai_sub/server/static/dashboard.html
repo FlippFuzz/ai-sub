@@ -523,15 +523,31 @@
         } else {
           let statusTitle = `${pipe.name} is currently idle`
           let statusDesc = "Waiting for next video from intake sources..."
+          let prepDetail = ""
 
           if (cd && cd.in_cooldown) {
             statusDesc = `Waiting for next video (YouTube intake is paused on cooldown for another ${formatDuration(cd.remaining_seconds)}, local files still process).`
           }
 
           if (pipe.status === "preparing") {
-            statusTitle = `${pipe.name} is preparing media`
-            statusDesc =
-              "Downloading video stream or generating segment chunks..."
+            const prep = pipe.preparing_video
+            if (prep && prep.title) {
+              statusTitle = `${pipe.name} is preparing media`
+              statusDesc =
+                "Downloading video stream or generating segment chunks..."
+              const channelDisplay = prep.channel_name || prep.uploader
+              prepDetail = `
+                <div style="margin-top: 14px; display: inline-flex; align-items: center; gap: 8px; background: rgba(234, 179, 8, 0.1); border: 1px solid rgba(234, 179, 8, 0.3); border-radius: 6px; padding: 6px 14px; font-size: 13px;">
+                  <span class="badge badge-${esc(prep.source_type || "youtube")}">${esc(prep.source_type || "youtube")}</span>
+                  <b>${esc(prep.title)}</b>
+                  <span style="color: var(--muted);">(${esc(channelDisplay)} @${esc(prep.uploader)})</span>
+                </div>
+              `
+            } else {
+              statusTitle = `${pipe.name} is preparing media`
+              statusDesc =
+                "Downloading video stream or generating segment chunks..."
+            }
           } else if (pipe.status === "finalizing") {
             statusTitle = `${pipe.name} is finalizing subtitles`
             statusDesc =
@@ -549,6 +565,7 @@
               </div>
               <h3 style="margin-bottom: 6px;">${esc(statusTitle)}</h3>
               <p style="color: var(--muted); margin: 0;">${esc(statusDesc)}</p>
+              ${prepDetail}
               <div class="mono" style="font-size: 12px; margin-top: 14px; color: var(--muted);">
                 Models: ${esc(pipe.models.summary.split(":").pop())} / ${esc(pipe.models.subtitles.split(":").pop())} / ${esc(pipe.models.lyrics.split(":").pop())}
               </div>
