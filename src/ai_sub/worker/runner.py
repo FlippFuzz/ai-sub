@@ -117,7 +117,6 @@ class WorkerRunner:
         stop_event: asyncio.Event,
         lease_revoked: asyncio.Event,
         on_lease_rejected: Callable[[], None],
-        traceparent: str | None = None,
     ) -> None:
         """Background task sending periodic heartbeats to maintain the task lease.
 
@@ -126,7 +125,6 @@ class WorkerRunner:
             stop_event: Event signaling when task execution finishes normally.
             lease_revoked: Event set when the server rejects a heartbeat lease renewal.
             on_lease_rejected: Callback to cancel any currently active work immediately.
-            traceparent: Optional W3C traceparent header reported to server. Defaults to None.
         """
         interval = self.settings.heartbeat_interval_seconds
         hb_num = 0
@@ -140,12 +138,9 @@ class WorkerRunner:
                     if not stop_event.is_set():
                         hb_num += 1
                         with logfire.span("Heartbeat Ping #{num}", num=hb_num, task_id=task_id, _level="debug"):
-                            # Extract traceparent inside this specific ping span so server nests as child
-                            ping_traceparent = logfire.get_context().get("traceparent") or traceparent
                             acked = await self.client.send_heartbeat(
                                 task_id=task_id,
                                 worker_id=self.settings.worker_id,
-                                traceparent=ping_traceparent,
                             )
                             if acked is None:
                                 logfire.warning(
@@ -225,7 +220,6 @@ class WorkerRunner:
         task: TaskClaimResponse,
         executor: GeminiExecutor,
         search_providers: list[BaseSearchProvider],
-        traceparent: str | None = None,
     ) -> dict[str, Any]:
         """Downloads media, runs GeminiExecutor with lease-revocation monitoring, and returns validated output.
 
@@ -233,7 +227,6 @@ class WorkerRunner:
             task: Assigned task details from the server including retry policy.
             executor: Configured GeminiExecutor instance.
             search_providers: Active search provider instances.
-            traceparent: Optional W3C traceparent header reported during heartbeats. Defaults to None.
 
         Returns:
             dict[str, Any]: Validated output data dictionary.
@@ -263,7 +256,6 @@ class WorkerRunner:
                 stop_event=stop_heartbeat,
                 lease_revoked=lease_revoked,
                 on_lease_rejected=_cancel_active,
-                traceparent=traceparent,
             )
         )
 
@@ -329,7 +321,6 @@ class WorkerRunner:
         """
         slot_label = f"{model}#{slot_id}"
 
-        # Worker initiates the legitimate root span for task execution (no artificial parent)
         with logfire.span(
             "Worker Task: {task_id}",
             task_id=claim.task_id,
@@ -340,23 +331,17 @@ class WorkerRunner:
             worker_id=self.settings.worker_id,
             slot=slot_id,
         ):
-            # Extract real W3C traceparent from the active root span to propagate to server
-            context_carrier = logfire.get_context()
-            traceparent = context_carrier.get("traceparent")
-
             try:
                 result_dict = await self._execute_task(
                     task=claim,
                     executor=executor,
                     search_providers=search_providers,
-                    traceparent=traceparent,
                 )
                 accepted = await self.client.complete_task(
                     task_id=claim.task_id,
                     worker_id=self.settings.worker_id,
                     task_type=claim.task_type,
                     result=result_dict,
-                    traceparent=traceparent,
                 )
                 if accepted:
                     async with self._lock:
@@ -401,7 +386,6 @@ class WorkerRunner:
                     reason=f"QUOTA_EXHAUSTED: {err_msg}",
                     model=claim.model,
                     error_message=err_msg,
-                    traceparent=traceparent,
                     is_transient=True,
                 )
                 async with self._lock:
@@ -426,7 +410,6 @@ class WorkerRunner:
                     reason=fail_reason,
                     model=claim.model,
                     error_message=err_msg,
-                    traceparent=traceparent,
                     is_transient=is_transient,
                 )
 

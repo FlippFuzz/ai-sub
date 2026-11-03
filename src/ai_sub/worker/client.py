@@ -85,20 +85,18 @@ class WorkerClient:
         self,
         task_id: str,
         worker_id: str,
-        traceparent: str | None = None,
     ) -> bool | None:
         """Sends a heartbeat ping to renew an active task lease.
 
         Args:
             task_id: Unique task identifier.
             worker_id: Unique identifier of this worker.
-            traceparent: Optional W3C traceparent header for distributed Logfire tracing.
 
         Returns:
             bool | None: True if acknowledged; False if lease expired; None if a transient transport error occurred.
         """
         encoded_task_id = urllib.parse.quote(task_id, safe=":")
-        req = TaskHeartbeatRequest(worker_id=worker_id, traceparent=traceparent)
+        req = TaskHeartbeatRequest(worker_id=worker_id)
         try:
             resp: Response = await self.client.post(
                 f"/api/v1/tasks/{encoded_task_id}/heartbeat",
@@ -143,7 +141,6 @@ class WorkerClient:
         worker_id: str,
         task_type: TaskType,
         result: dict[str, Any],
-        traceparent: str | None = None,
     ) -> bool:
         """Submits completed and validated structured AI results to the server.
 
@@ -152,7 +149,6 @@ class WorkerClient:
             worker_id: Unique identifier of this worker.
             task_type: Type of task completed.
             result: Validated AI result data dictionary.
-            traceparent: Optional W3C traceparent header for distributed Logfire tracing. Defaults to None.
 
         Returns:
             bool: True if completion was accepted; False otherwise.
@@ -163,7 +159,6 @@ class WorkerClient:
             task_id=task_id,
             task_type=task_type,
             result=result,
-            traceparent=traceparent,
         )
         try:
             resp: Response = await self.client.post(
@@ -182,7 +177,6 @@ class WorkerClient:
         reason: str,
         model: str | None = None,
         error_message: str | None = None,
-        traceparent: str | None = None,
         is_transient: bool = False,
     ) -> bool:
         """Notifies the server of a task failure or daily quota limit exhaustion.
@@ -190,10 +184,9 @@ class WorkerClient:
         Args:
             task_id: Unique task identifier.
             worker_id: Unique identifier of this worker.
-            reason: Failure code (e.g. 'QUOTA_EXHAUSTED', 'TRANSIENT_API_ERROR', or 'EXECUTION_ERROR').
+            reason: Failure code or exception description.
             model: Gemini model identifier that failed, if applicable. Defaults to None.
             error_message: Optional error description or traceback. Defaults to None.
-            traceparent: Optional W3C traceparent header for distributed Logfire tracing. Defaults to None.
             is_transient: Whether the failure is transient and should not penalize server attempts. Defaults to False.
 
         Returns:
@@ -206,7 +199,6 @@ class WorkerClient:
             reason=reason,
             model=model,
             error_message=error_message,
-            traceparent=traceparent,
             is_transient=is_transient,
         )
         try:

@@ -24,7 +24,7 @@ from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
 
 
 def _format_logfire_query(task: ServerTask) -> str:
-    """Formats the Logfire trace and task search query for a server task.
+    """Formats the Logfire search query for a server task using its unique task ID.
 
     Args:
         task: Target server task instance.
@@ -32,11 +32,7 @@ def _format_logfire_query(task: ServerTask) -> str:
     Returns:
         str: Formatted Logfire search query string.
     """
-    parts = task.traceparent.split("-") if task.traceparent else []
-    trace_id = parts[1] if len(parts) >= 2 else ""
-    if trace_id:
-        return f"trace_id == '{trace_id}'"
-    return f"attributes['task_id'] == '{task.task_id}'"
+    return f"attributes->>'task_id' = '{task.task_id}'"
 
 
 class PipelineCoordinator:
@@ -183,32 +179,29 @@ class PipelineCoordinator:
                                     task.last_heartbeat = None
                                     task.attempts += 1
 
-                                    with task.trace_context():
-                                        if task.attempts >= max_runs:
-                                            task.status = TaskStatus.FAILED
-                                            logfire.error(
-                                                f"Task '{task.task_id}' lease expired ({elapsed:.1f}s). Marked FAILED."
-                                            )
-                                            self._log_activity(
-                                                event_type="fail",
-                                                task=task,
-                                                worker_id=worker_id,
-                                                detail=f"{diag_msg} (max runs exhausted)",
-                                            )
-                                        else:
-                                            task.status = TaskStatus.PENDING
-                                            logfire.warning(
-                                                f"Task '{task.task_id}' lease expired (worker: {worker_id}). "
-                                                "Set to PENDING."
-                                            )
-                                            self._log_activity(
-                                                event_type="timeout",
-                                                task=task,
-                                                worker_id=worker_id,
-                                                detail=diag_msg,
-                                            )
-
-                                    task.traceparent = None  # Clear traceparent for next attempt
+                                    if task.attempts >= max_runs:
+                                        task.status = TaskStatus.FAILED
+                                        logfire.error(
+                                            f"Task '{task.task_id}' lease expired ({elapsed:.1f}s). Marked FAILED."
+                                        )
+                                        self._log_activity(
+                                            event_type="fail",
+                                            task=task,
+                                            worker_id=worker_id,
+                                            detail=f"{diag_msg} (max runs exhausted)",
+                                        )
+                                    else:
+                                        task.status = TaskStatus.PENDING
+                                        logfire.warning(
+                                            f"Task '{task.task_id}' lease expired (worker: {worker_id}). "
+                                            "Set to PENDING."
+                                        )
+                                        self._log_activity(
+                                            event_type="timeout",
+                                            task=task,
+                                            worker_id=worker_id,
+                                            detail=diag_msg,
+                                        )
 
                     sweep_span.set_attribute("active_leases", active_leases)
                     sweep_span.set_attribute("expired_leases", expired_count)
@@ -291,14 +284,12 @@ class PipelineCoordinator:
         self,
         task_id: str,
         worker_id: str,
-        traceparent: str | None = None,
     ) -> bool:
         """Renews a task's lease timestamp upon receiving a worker heartbeat.
 
         Args:
             task_id: Unique task identifier.
             worker_id: Worker claiming the lease.
-            traceparent: Optional W3C traceparent header reported by worker. Defaults to None.
 
         Returns:
             bool: True if lease was successfully renewed, False otherwise.
@@ -309,18 +300,15 @@ class PipelineCoordinator:
                 if task_id in pipe.tasks:
                     task = pipe.tasks[task_id]
                     if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
-                        if traceparent:
-                            task.traceparent = traceparent
-                        with task.trace_context():
-                            task.last_heartbeat = now
-                            with logfire.span(
-                                "Server Heartbeat Received: {task_id}",
-                                task_id=task_id,
-                                worker_id=worker_id,
-                                _level="debug",
-                            ):
-                                pass
-                            return True
+                        task.last_heartbeat = now
+                        with logfire.span(
+                            "Server Heartbeat Received: {task_id}",
+                            task_id=task_id,
+                            worker_id=worker_id,
+                            _level="debug",
+                        ):
+                            pass
+                        return True
                     else:
                         logfire.warning(
                             f"Heartbeat rejected for '{task_id}': status={task.status.value}, "
@@ -360,9 +348,8 @@ class PipelineCoordinator:
         task.worker_id = None
         task.claimed_at = None
         task.last_heartbeat = None
-        task.traceparent = None  # Reset traceparent so next worker creates fresh trace context
 
-        if not is_transient and reason != "QUOTA_EXHAUSTED":
+        if not is_transient:
             task.attempts += 1
             max_runs = self.settings.retry.max_runs
             if task.attempts >= max_runs:
@@ -382,7 +369,6 @@ class PipelineCoordinator:
         task_id: str,
         worker_id: str,
         result: dict[str, Any],
-        traceparent: str | None = None,
     ) -> bool:
         """Records task completion and hands the result to the pipeline runner.
 
@@ -390,7 +376,6 @@ class PipelineCoordinator:
             task_id: Unique task identifier.
             worker_id: Worker completing the task.
             result: Validated AI result dictionary.
-            traceparent: Optional W3C traceparent header reported by worker. Defaults to None.
 
         Returns:
             bool: True if completion was accepted, False otherwise.
@@ -400,52 +385,49 @@ class PipelineCoordinator:
                 if task_id in pipe.tasks:
                     task = pipe.tasks[task_id]
                     if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
-                        if traceparent:
-                            task.traceparent = traceparent
-                        with task.trace_context():
-                            with logfire.span(
-                                "Process Complete Task: {task_id}", task_id=task_id, worker_id=worker_id
-                            ) as comp_span:
-                                duration = time() - (task.claimed_at or time())
-                                try:
-                                    pipe.on_task_completed(task_id, result)
-                                except Exception as val_err:
-                                    logfire.warning(f"Task '{task_id}' validation failed: {val_err}. Routing to fail.")
-                                    comp_span.set_attribute("result", "validation_failed")
-                                    comp_span.set_attribute("error", str(val_err))
-                                    self._fail_task_locked(
-                                        task=task,
-                                        worker_id=worker_id,
-                                        reason="EXECUTION_ERROR",
-                                        error_message=f"Server validation error: {val_err}",
-                                        is_transient=False,
-                                    )
-                                    return False
-
-                                detail = None
-                                if task.task_type == TaskType.SUMMARY:
-                                    ch_len = len(result.get("chapters", []))
-                                    ent_len = len(result.get("entities", []))
-                                    detail = f"Summary: {ch_len} chapters, {ent_len} entities extracted"
-                                elif task.task_type == TaskType.SUBTITLES:
-                                    sub_len = len(result.get("subs", result.get("subtitles", [])))
-                                    music_len = len(result.get("detected_musical_performances", []))
-                                    detail = f"Subtitles: {sub_len} lines transcribed ({music_len} songs detected)"
-                                elif task.task_type == TaskType.LYRICS:
-                                    lyr_len = len(result.get("subs", result.get("subtitles", [])))
-                                    detail = f"Lyrics: {lyr_len} lines refined"
-
-                                self._log_activity(
-                                    event_type="complete",
+                        with logfire.span(
+                            "Process Complete Task: {task_id}", task_id=task_id, worker_id=worker_id
+                        ) as comp_span:
+                            duration = time() - (task.claimed_at or time())
+                            try:
+                                pipe.on_task_completed(task_id, result)
+                            except Exception as val_err:
+                                logfire.warning(f"Task '{task_id}' validation failed: {val_err}. Routing to fail.")
+                                comp_span.set_attribute("result", "validation_failed")
+                                comp_span.set_attribute("error", str(val_err))
+                                self._fail_task_locked(
                                     task=task,
                                     worker_id=worker_id,
-                                    duration_s=duration,
-                                    detail=detail,
+                                    reason="EXECUTION_ERROR",
+                                    error_message=f"Server validation error: {val_err}",
+                                    is_transient=False,
                                 )
-                                comp_span.set_attribute("result", "accepted")
-                                comp_span.set_attribute("duration_s", round(duration, 1))
-                                logfire.info(f"Task '{task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
-                                return True
+                                return False
+
+                            detail = None
+                            if task.task_type == TaskType.SUMMARY:
+                                ch_len = len(result.get("chapters", []))
+                                ent_len = len(result.get("entities", []))
+                                detail = f"Summary: {ch_len} chapters, {ent_len} entities extracted"
+                            elif task.task_type == TaskType.SUBTITLES:
+                                sub_len = len(result.get("subs", result.get("subtitles", [])))
+                                music_len = len(result.get("detected_musical_performances", []))
+                                detail = f"Subtitles: {sub_len} lines transcribed ({music_len} songs detected)"
+                            elif task.task_type == TaskType.LYRICS:
+                                lyr_len = len(result.get("subs", result.get("subtitles", [])))
+                                detail = f"Lyrics: {lyr_len} lines refined"
+
+                            self._log_activity(
+                                event_type="complete",
+                                task=task,
+                                worker_id=worker_id,
+                                duration_s=duration,
+                                detail=detail,
+                            )
+                            comp_span.set_attribute("result", "accepted")
+                            comp_span.set_attribute("duration_s", round(duration, 1))
+                            logfire.info(f"Task '{task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
+                            return True
 
             with logfire.span("Process Complete Task Rejected: {task_id}", task_id=task_id, worker_id=worker_id):
                 logfire.warning(f"Task '{task_id}' completion from worker '{worker_id}' was rejected.")
@@ -457,7 +439,6 @@ class PipelineCoordinator:
         worker_id: str,
         reason: str,
         error_message: str | None = None,
-        traceparent: str | None = None,
         is_transient: bool = False,
     ) -> bool:
         """Handles task failure, releasing the lease or marking permanently failed.
@@ -467,7 +448,6 @@ class PipelineCoordinator:
             worker_id: Worker reporting the failure.
             reason: Error code or exception description.
             error_message: Optional error details. Defaults to None.
-            traceparent: Optional W3C traceparent header reported by worker. Defaults to None.
             is_transient: Whether failure is transient and exempt from attempt counting. Defaults to False.
 
         Returns:
@@ -478,25 +458,22 @@ class PipelineCoordinator:
                 if task_id in pipe.tasks:
                     task = pipe.tasks[task_id]
                     if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
-                        if traceparent:
-                            task.traceparent = traceparent
-                        with task.trace_context():
-                            with logfire.span(
-                                "Process Task Failure: {task_id}",
-                                task_id=task_id,
+                        with logfire.span(
+                            "Process Task Failure: {task_id}",
+                            task_id=task_id,
+                            worker_id=worker_id,
+                            reason=reason,
+                        ) as fail_span:
+                            success = self._fail_task_locked(
+                                task=task,
                                 worker_id=worker_id,
                                 reason=reason,
-                            ) as fail_span:
-                                success = self._fail_task_locked(
-                                    task=task,
-                                    worker_id=worker_id,
-                                    reason=reason,
-                                    error_message=error_message,
-                                    is_transient=is_transient,
-                                )
-                                fail_span.set_attribute("result", task.status.value)
-                                fail_span.set_attribute("attempts", task.attempts)
-                                return success
+                                error_message=error_message,
+                                is_transient=is_transient,
+                            )
+                            fail_span.set_attribute("result", task.status.value)
+                            fail_span.set_attribute("attempts", task.attempts)
+                            return success
 
             with logfire.span("Process Task Failure Rejected: {task_id}", task_id=task_id, worker_id=worker_id):
                 logfire.warning(f"Task '{task_id}' failure report from worker '{worker_id}' was rejected (not found).")

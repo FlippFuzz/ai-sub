@@ -690,8 +690,8 @@
           if (cd && cd.in_cooldown) {
             statusDesc = `Waiting for next video (YouTube intake is paused on cooldown for another ${formatDuration(cd.remaining_seconds)}, local files still process).`
           } else if (totalTracked > 0 && qCount === 0) {
-            statusTitle = `${pipe.name} is idle — all videos complete`
-            statusDesc = `All ${totalTracked} tracked video(s) are completed in Git archive. Waiting for new uploads or files...`
+            statusTitle = `${pipe.name} is idle — all videos complete for this pipeline`
+            statusDesc = `All ${totalTracked} tracked video(s) have finished processing for ${pipe.name}. Waiting for new uploads or files...`
           }
 
           if (pipe.status === "preparing") {
@@ -757,7 +757,7 @@
         const totalTrackedAll = currentData.total_tracked_videos || 0
         const emptyQueueMsg =
           totalTrackedAll > 0 && queueCount === 0
-            ? `All ${totalTrackedAll} tracked video(s) are completed in Git archive.`
+            ? `All ${totalTrackedAll} tracked video(s) have finished processing for ${pipe.name}.`
             : "No pending videos in queue for this pipeline."
 
         const queueTable =

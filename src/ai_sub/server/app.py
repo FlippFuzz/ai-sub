@@ -131,7 +131,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
         Args:
             task_id: Unique task identifier.
-            req: Heartbeat request containing worker ID and optional traceparent.
+            req: Heartbeat request containing worker ID.
 
         Returns:
             TaskHeartbeatResponse: Acknowledgment status confirming whether lease was renewed.
@@ -140,7 +140,6 @@ def create_app(settings: ServerSettings) -> FastAPI:
         acknowledged = await coordinator.record_heartbeat(
             clean_task_id,
             req.worker_id,
-            traceparent=req.traceparent,
         )
         return TaskHeartbeatResponse(acknowledged=acknowledged)
 
@@ -178,7 +177,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
         Args:
             task_id: Unique task identifier.
-            req: Completion request containing task result data and optional traceparent.
+            req: Completion request containing task result data.
 
         Returns:
             dict[str, str]: Operation status confirmation dictionary.
@@ -191,7 +190,6 @@ def create_app(settings: ServerSettings) -> FastAPI:
             clean_task_id,
             req.worker_id,
             req.result,
-            traceparent=req.traceparent,
         )
         if not success:
             raise HTTPException(
@@ -219,7 +217,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
         Args:
             task_id: Unique task identifier.
-            req: Failure report request containing reason, optional error details, and traceparent.
+            req: Failure report request containing reason, optional error details, and transient flag.
 
         Returns:
             dict[str, str]: Operation status confirmation dictionary.
@@ -233,7 +231,6 @@ def create_app(settings: ServerSettings) -> FastAPI:
             worker_id=req.worker_id,
             reason=req.reason,
             error_message=req.error_message,
-            traceparent=req.traceparent,
             is_transient=req.is_transient,
         )
         if not success:

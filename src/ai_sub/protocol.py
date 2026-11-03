@@ -62,10 +62,6 @@ class TaskHeartbeatRequest(BaseModel):
     """Heartbeat ping payload sent by a worker to maintain its task lease."""
 
     worker_id: str = Field(description="Unique identifier of the worker holding the lease.")
-    traceparent: str | None = Field(
-        default=None,
-        description="Optional W3C traceparent header reported by the worker.",
-    )
 
 
 class TaskHeartbeatResponse(BaseModel):
@@ -81,10 +77,6 @@ class TaskCompleteRequest(BaseModel):
     task_id: str = Field(description="Unique task identifier.")
     task_type: TaskType = Field(description="Task type completed.")
     result: dict[str, Any] = Field(description="Parsed and validated AI output dictionary.")
-    traceparent: str | None = Field(
-        default=None,
-        description="Optional W3C traceparent header reported by the worker.",
-    )
 
 
 class TaskFailRequest(BaseModel):
@@ -97,12 +89,9 @@ class TaskFailRequest(BaseModel):
     )
     model: str | None = Field(default=None, description="Model identifier that failed, if applicable.")
     error_message: str | None = Field(default=None, description="Optional error description or traceback.")
-    traceparent: str | None = Field(
-        default=None,
-        description="Optional W3C traceparent header reported by the worker.",
-    )
     is_transient: bool = Field(
         default=False,
-        description="Whether the failure is transient (e.g. upstream 5xx, timeout) "
-        "and should not penalize attempt counts.",
+        description=(
+            "Whether the failure is transient (e.g. upstream 5xx, timeout) and should not penalize attempt counts."
+        ),
     )

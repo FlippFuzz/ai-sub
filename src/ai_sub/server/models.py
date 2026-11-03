@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
-from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-import logfire
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_sub.config import RetrySettings
@@ -50,10 +47,6 @@ class ServerTask(BaseModel):
     search_tools: list[str] = Field(default_factory=list, description="Permitted search tool names.")
     agentic_video: bool = Field(default=False, description="Whether agentic video inspection is enabled.")
     service_tier: str | None = Field(default=None, description="Optional Google Gemini service tier.")
-    traceparent: str | None = Field(
-        default=None,
-        description="Distributed traceparent header reported by the claiming worker.",
-    )
 
     detected_performances: list[dict[str, Any]] = Field(
         default_factory=list,
@@ -64,19 +57,6 @@ class ServerTask(BaseModel):
         description="Draft subtitles passed to lyrics refinement.",
     )
     result: dict[str, Any] | None = Field(default=None, description="Validated output received from worker.")
-
-    @contextmanager
-    def trace_context(self) -> Generator[None, None, None]:
-        """Context manager attaching this task's W3C traceparent to Logfire if available.
-
-        Yields:
-            None: Context during execution under this task's trace.
-        """
-        if self.traceparent:
-            with logfire.attach_context({"traceparent": self.traceparent}):
-                yield
-        else:
-            yield
 
     def to_claim_response(self, media_url: str, retry: RetrySettings) -> TaskClaimResponse:
         """Serializes this task into the wire claim response sent to workers.

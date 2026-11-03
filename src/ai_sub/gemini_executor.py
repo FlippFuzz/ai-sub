@@ -50,13 +50,17 @@ def is_retryable_error(e: Exception) -> bool:
     Returns:
         bool: True if error can be retried, False otherwise.
     """
+    # Deterministic validation or client programming errors are never transient
+    if isinstance(e, (ValidationError, ValueError, TypeError, KeyError)):
+        return False
+
     if _is_daily_quota_exceeded(e):
         return False
 
     if isinstance(e, (TransportError, TimeoutException, ConnectionError, asyncio.TimeoutError, TimeoutError)):
         return True
 
-    status_code = getattr(e, "code", None)
+    status_code = getattr(e, "code", None) or getattr(e, "status_code", None)
     if isinstance(status_code, int):
         return status_code in (408, 429, 500, 502, 503, 504)
 
