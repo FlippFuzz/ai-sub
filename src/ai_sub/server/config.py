@@ -76,6 +76,10 @@ class GitConfig(EnvPrioritySettings):
     repo_url: HttpUrl = Field(description="Remote git repository URL for pushing completed subtitles.")
     branch: str = Field(default="main", description="Git branch to checkout and push to.")
     pat: SecretStr = Field(description="GitHub Personal Access Token.")
+    player_base_url: HttpUrl = Field(
+        default=HttpUrl("https://flippfuzz.github.io/ai-sub-player"),
+        description="Base URL of the GitHub Pages subtitle player.",
+    )
 
     def get_pat_value(self) -> str:
         """Resolves the Personal Access Token string.

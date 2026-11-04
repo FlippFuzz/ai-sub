@@ -9,7 +9,6 @@ import random
 import shutil
 import stat
 import time
-from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -32,11 +31,8 @@ def _handle_readonly_rmtree(func: Any, path: str, exc_info: Any) -> None:
         path: Path to the read-only file.
         exc_info: Exception information tuple.
     """
-    if not os.access(path, os.W_OK):
-        os.chmod(path, stat.S_IWRITE)
-        func(path)
-    else:
-        raise
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
 
 
 class GitSyncManager:
@@ -44,6 +40,7 @@ class GitSyncManager:
 
     config: GitConfig | None
     local_repo_dir: Path
+    player_base_url: str
     _lock: asyncio.Lock
 
     def __init__(self, config: GitConfig | None, base_work_dir: Path) -> None:
@@ -56,10 +53,15 @@ class GitSyncManager:
         self.config = config
         self._lock = asyncio.Lock()
         repo_name = "subtitles-archive"
+
         if config:
             url_str = str(config.repo_url).rstrip("/")
             raw_name = url_str.split("/")[-1]
             repo_name = raw_name[:-4] if raw_name.endswith(".git") else raw_name
+            self.player_base_url = str(config.player_base_url).rstrip("/")
+        else:
+            default_url = GitConfig.model_fields["player_base_url"].default
+            self.player_base_url = str(default_url).rstrip("/")
 
         self.local_repo_dir = base_work_dir / "git_repo" / repo_name
 
@@ -67,12 +69,15 @@ class GitSyncManager:
         """Constructs a Git remote URL with embedded authentication tokens.
 
         Returns:
-            str: Authenticated Git URL string.
+            str: Authenticated Git URL string, or raw URL if PAT is empty.
         """
         if not self.config:
             return ""
+
         raw_url = str(self.config.repo_url)
-        pat = self.config.get_pat_value()
+        pat = self.config.get_pat_value().strip()
+
+        # Preserve the raw URL if no PAT is configured to allow anonymous clones
         if not pat:
             return raw_url
 
@@ -82,6 +87,7 @@ class GitSyncManager:
             if auth_url.endswith(".git"):
                 auth_url += "/"
             return auth_url
+
         return raw_url
 
     def _ensure_repo_sync(self) -> None:
@@ -139,6 +145,31 @@ class GitSyncManager:
             if not srt_path.name.startswith("part_") and srt_path.stat().st_size > 0:
                 return True
         return False
+
+    def _discover_video_subtitles(self, video_dir: Path) -> list[str]:
+        """Discovers all finalized and intermediate SRT files relative to the video directory.
+
+        Args:
+            video_dir: Target video directory (uploader/v/<video_id>).
+
+        Returns:
+            list[str]: Sorted list of relative POSIX paths to valid subtitle files.
+        """
+        subtitles: list[str] = []
+
+        # 1. Primary/Finalized SRTs directly in v/<video_id>/
+        for srt in sorted(video_dir.glob("*.srt")):
+            if srt.is_file() and not srt.name.startswith("part_") and srt.stat().st_size > 0:
+                subtitles.append(srt.relative_to(video_dir).as_posix())
+
+        # 2. Raw / intermediate SRTs in .int/
+        int_base_dir = video_dir / ".int"
+        if int_base_dir.is_dir():
+            for srt in sorted(int_base_dir.glob("**/*.srt")):
+                if srt.is_file() and not srt.name.startswith("part_") and srt.stat().st_size > 0:
+                    subtitles.append(srt.relative_to(video_dir).as_posix())
+
+        return subtitles
 
     def _update_channel_readme_sync(self, uploader: str) -> None:
         """Regenerates the channel README.md index by scanning all video_meta.json files in v/.
@@ -217,9 +248,11 @@ class GitSyncManager:
             clean_title = item["title"].replace("|", "\\|").replace("\n", " ").strip()
             vid = item["video_id"]
             if item["source_type"] == "youtube":
-                title_cell = f"[{clean_title}](https://youtu.be/{vid})"
+                player_url = f"{self.player_base_url}/?uploader={uploader}&v={vid}"
+                title_cell = f"[{clean_title}]({player_url})"
             else:
                 title_cell = clean_title
+
             sub_cell = f"[Browse](./v/{vid})"
             lines.append(f"| {item['date_str']} | {title_cell} | {sub_cell} |")
 
@@ -233,11 +266,20 @@ class GitSyncManager:
         uploader: str,
         video_id: str,
         full_shortcode: str,
-        srt_files: Sequence[Path] | Path,
+        srt_files: list[Path],
         yaml_files: list[Path],
         meta_file: Path | None = None,
     ) -> None:
-        """Synchronous implementation of committing and pushing finalized subtitles."""
+        """Synchronous implementation of committing and pushing finalized subtitles.
+
+        Args:
+            uploader: Channel or uploader identifier.
+            video_id: Video identifier.
+            full_shortcode: Model shortcode.
+            srt_files: List of generated subtitle files to commit.
+            yaml_files: List of intermediate YAML state files.
+            meta_file: Optional video metadata JSON file. Defaults to None.
+        """
         uploader_dir = self.local_repo_dir / uploader
         video_dir = uploader_dir / "v" / video_id
         video_dir.mkdir(parents=True, exist_ok=True)
@@ -245,8 +287,7 @@ class GitSyncManager:
         int_dir = video_dir / ".int" / full_shortcode
         int_dir.mkdir(parents=True, exist_ok=True)
 
-        files_list = [srt_files] if isinstance(srt_files, Path) else srt_files
-        for sf in files_list:
+        for sf in srt_files:
             target_srt = int_dir / sf.name if ".raw-" in sf.name else video_dir / sf.name
             shutil.copy2(sf, target_srt)
             logfire.info(f"Copied finalized subtitles to {target_srt}")
@@ -254,7 +295,7 @@ class GitSyncManager:
         for yf in yaml_files:
             shutil.copy2(yf, int_dir / yf.name)
 
-        # Sanitize metadata: extract only safe public fields to prevent leaking local paths
+        # Sanitize metadata: extract safe public fields to prevent leaking local paths
         clean_meta: dict[str, Any] = {
             "video_id": video_id,
             "uploader": uploader,
@@ -263,6 +304,7 @@ class GitSyncManager:
             "source_type": "youtube",
             "timestamp": 0,
         }
+
         if meta_file and meta_file.is_file():
             try:
                 with open(meta_file, "r", encoding="utf-8") as f:
@@ -273,12 +315,17 @@ class GitSyncManager:
                     clean_meta["source_type"] = str(raw.get("source_type") or "youtube")
                     clean_meta["timestamp"] = int(raw.get("timestamp") or 0)
             except Exception as e:
-                logfire.warning(f"Failed to sanitize metadata from {meta_file}: {e}")
+                logfire.warning(f"Failed to read metadata from {meta_file}: {e}")
+
+        # Discover all available finalized and raw subtitles in this folder
+        clean_meta["subtitles"] = self._discover_video_subtitles(video_dir)
 
         target_meta = video_dir / "video_meta.json"
         with open(target_meta, "w", encoding="utf-8") as f:
             json.dump(clean_meta, f, indent=2, ensure_ascii=False)
-        logfire.info(f"Saved clean public metadata to {target_meta.name}")
+        logfire.info(
+            f"Saved clean public metadata with {len(clean_meta['subtitles'])} subtitle track(s) to {target_meta.name}"
+        )
 
         self._update_channel_readme_sync(uploader)
 
@@ -320,13 +367,11 @@ class GitSyncManager:
                     try:
                         repo.git.pull("origin", self.config.branch, "--rebase")
                     except GitCommandError:
-                        # Check which files have merge conflicts using -z to avoid Git C-style path quoting
                         try:
                             unmerged_output = repo.git.diff("-z", "--diff-filter=U", "--name-only")
                             unmerged_files = [f for f in unmerged_output.split("\0") if f]
                             readme_rel = f"{uploader}/README.md"
 
-                            # Only auto-resolve if the conflict is strictly on the channel README
                             if unmerged_files == [readme_rel]:
                                 self._update_channel_readme_sync(uploader)
                                 repo.git.add(readme_rel)
@@ -350,7 +395,7 @@ class GitSyncManager:
         uploader: str,
         video_id: str,
         full_shortcode: str,
-        srt_files: Sequence[Path] | Path,
+        srt_files: list[Path],
         yaml_files: list[Path],
         meta_file: Path | None = None,
     ) -> None:
@@ -360,7 +405,7 @@ class GitSyncManager:
             uploader: Channel or uploader identifier.
             video_id: Video identifier.
             full_shortcode: Model shortcode.
-            srt_files: One or more generated subtitle files to commit.
+            srt_files: List of generated subtitle files to commit.
             yaml_files: List of intermediate YAML state files.
             meta_file: Optional video metadata JSON file. Defaults to None.
         """
