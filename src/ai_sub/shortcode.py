@@ -123,7 +123,9 @@ class SubtitleTrackInfo:
     """Structured metadata and ranking indicators parsed from a subtitle shortcode or file path."""
 
     model: str
+    track_name: str
     display_label: str
+    prompt_version_str: str
     shortcode: str
     is_refined: bool
     tier_rank: int
@@ -247,16 +249,24 @@ def parse_subtitle_track(path_or_name: str | Path) -> SubtitleTrackInfo:
 
         tier_label = "lite" if tier_char == "l" else tier_name
         base_label = f"{v_str}-{tier_label}"
+
+        # Track name for video players (includes prompt version and Draft indicator)
+        base_track_name = f"{model_name} ({prompt_digits})" if prompt_digits else model_name
+        track_name = base_track_name if is_refined else f"{base_track_name} (Draft)"
         display_label = base_label if is_refined else f"{base_label} (Draft)"
     else:
         model_name = model_code
         tier_rank = 0
         v_tuple = (0, 0)
+        base_track_name = f"{model_code} ({prompt_digits})" if prompt_digits else model_code
+        track_name = base_track_name if is_refined else f"{base_track_name} (Draft)"
         display_label = model_code if is_refined else f"{model_code} (Draft)"
 
     return SubtitleTrackInfo(
         model=model_name,
+        track_name=track_name,
         display_label=display_label,
+        prompt_version_str=prompt_digits,
         shortcode=shortcode,
         is_refined=is_refined,
         tier_rank=tier_rank,

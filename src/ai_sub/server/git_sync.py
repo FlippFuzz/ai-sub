@@ -156,7 +156,7 @@ class GitSyncManager:
             video_dir: Target video directory (uploader/v/<video_id>).
 
         Returns:
-            list[dict[str, str]]: Ordered list of dictionaries containing 'model' and relative 'path'.
+            list[dict[str, str]]: Ordered list of dictionaries containing 'name' and relative 'path'.
         """
         discovered_paths: list[Path] = []
 
@@ -180,7 +180,7 @@ class GitSyncManager:
             track_info = parse_subtitle_track(srt_path)
             subtitles.append(
                 {
-                    "model": track_info.model,
+                    "name": track_info.track_name,
                     "path": srt_path.relative_to(video_dir).as_posix(),
                 }
             )
@@ -233,12 +233,14 @@ class GitSyncManager:
             if timestamp > 0:
                 try:
                     dt = datetime.fromtimestamp(timestamp, tz=JST)
-                    date_str = dt.strftime("%Y-%m-%d")
+                    # Non-breaking hyphens prevent the date from awkwardly splitting across lines
+                    date_str = dt.strftime("%Y-%m-%d").replace("-", "&#8209;")
                 except Exception:
                     date_str = "Unknown"
 
             # Determine best model display from pre-sorted subtitles array
             best_model_label = "-"
+            best_version_str = ""
             subtitles_list = meta_data.get("subtitles")
             if isinstance(subtitles_list, list) and subtitles_list:
                 first_track = subtitles_list[0]
@@ -247,6 +249,7 @@ class GitSyncManager:
                     if track_path:
                         track_info = parse_subtitle_track(track_path)
                         best_model_label = track_info.display_label
+                        best_version_str = track_info.prompt_version_str
 
             entries.append(
                 {
@@ -256,6 +259,7 @@ class GitSyncManager:
                     "timestamp": timestamp,
                     "date_str": date_str,
                     "best_model_label": best_model_label,
+                    "best_version_str": best_version_str,
                 }
             )
 
@@ -269,25 +273,34 @@ class GitSyncManager:
             f"# {channel_display_name}",
             "",
             "| Date (JST) | Thumbnail | Title | Best Model |",
-            "| :--- | :---: | :--- | :---: |",
+            "| :---: | :---: | :--- | :---: |",
         ]
+
+        clean_player_url = self.player_base_url.rstrip("/")
 
         for item in entries:
             clean_title = (item["title"] or item["video_id"]).replace("|", "\\|").replace("\n", " ").strip()
             vid = item["video_id"]
             model_label = item["best_model_label"]
+            version_str = item["best_version_str"]
 
             if item["source_type"] == "youtube":
-                player_url = f"{self.player_base_url}/?uploader={uploader}&v={vid}"
+                yt_url = f"https://youtu.be/{vid}"
+                p_url = f"{clean_player_url}/?uploader={uploader}&v={vid}"
                 thumb_cell = (
-                    f'<a href="{player_url}"><img src="https://i.ytimg.com/vi/{vid}/mqdefault.jpg" width="100" /></a>'
+                    f'<a href="{yt_url}"><img src="https://i.ytimg.com/vi/{vid}/mqdefault.jpg" width="100" /></a>'
                 )
-                title_cell = f"[{clean_title}]({player_url})"
+                title_cell = f"[{clean_title}]({p_url})"
             else:
                 thumb_cell = "-"
                 title_cell = clean_title
 
-            model_cell = f"[{model_label}](./v/{vid})" if model_label != "-" else "-"
+            if model_label != "-":
+                cell_content = f"{model_label}<br>{version_str}" if version_str else model_label
+                model_cell = f"[{cell_content}](./v/{vid})"
+            else:
+                model_cell = "-"
+
             lines.append(f"| {item['date_str']} | {thumb_cell} | {title_cell} | {model_cell} |")
 
         lines.append("")
