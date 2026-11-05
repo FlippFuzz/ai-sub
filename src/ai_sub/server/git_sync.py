@@ -18,6 +18,7 @@ from git import Repo
 from git.exc import GitCommandError, InvalidGitRepositoryError
 
 from ai_sub.server.config import GitConfig
+from ai_sub.shortcode import parse_subtitle_track, subtitle_track_sort_key
 
 os.environ["GIT_TERMINAL_PROMPT"] = "0"
 JST = timezone(timedelta(hours=9))
@@ -146,28 +147,43 @@ class GitSyncManager:
                 return True
         return False
 
-    def _discover_video_subtitles(self, video_dir: Path) -> list[str]:
-        """Discovers all finalized and intermediate SRT files relative to the video directory.
+    def _discover_video_subtitles(self, video_dir: Path) -> list[dict[str, str]]:
+        """Discovers and ranks all finalized and intermediate SRT files relative to the video directory.
+
+        Tracks are pre-sorted descending by quality (refined > raw, model tier, model version, prompt version).
 
         Args:
             video_dir: Target video directory (uploader/v/<video_id>).
 
         Returns:
-            list[str]: Sorted list of relative POSIX paths to valid subtitle files.
+            list[dict[str, str]]: Ordered list of dictionaries containing 'model' and relative 'path'.
         """
-        subtitles: list[str] = []
+        discovered_paths: list[Path] = []
 
         # 1. Primary/Finalized SRTs directly in v/<video_id>/
-        for srt in sorted(video_dir.glob("*.srt")):
+        for srt in video_dir.glob("*.srt"):
             if srt.is_file() and not srt.name.startswith("part_") and srt.stat().st_size > 0:
-                subtitles.append(srt.relative_to(video_dir).as_posix())
+                discovered_paths.append(srt)
 
         # 2. Raw / intermediate SRTs in .int/
         int_base_dir = video_dir / ".int"
         if int_base_dir.is_dir():
-            for srt in sorted(int_base_dir.glob("**/*.srt")):
+            for srt in int_base_dir.glob("**/*.srt"):
                 if srt.is_file() and not srt.name.startswith("part_") and srt.stat().st_size > 0:
-                    subtitles.append(srt.relative_to(video_dir).as_posix())
+                    discovered_paths.append(srt)
+
+        # Sort descending from highest to lowest quality
+        sorted_paths = sorted(discovered_paths, key=subtitle_track_sort_key, reverse=True)
+
+        subtitles: list[dict[str, str]] = []
+        for srt_path in sorted_paths:
+            track_info = parse_subtitle_track(srt_path)
+            subtitles.append(
+                {
+                    "model": track_info.model,
+                    "path": srt_path.relative_to(video_dir).as_posix(),
+                }
+            )
 
         return subtitles
 
@@ -221,6 +237,17 @@ class GitSyncManager:
                 except Exception:
                     date_str = "Unknown"
 
+            # Determine best model display from pre-sorted subtitles array
+            best_model_label = "-"
+            subtitles_list = meta_data.get("subtitles")
+            if isinstance(subtitles_list, list) and subtitles_list:
+                first_track = subtitles_list[0]
+                if isinstance(first_track, dict):
+                    track_path = first_track.get("path")
+                    if track_path:
+                        track_info = parse_subtitle_track(track_path)
+                        best_model_label = track_info.display_label
+
             entries.append(
                 {
                     "video_id": vid,
@@ -228,6 +255,7 @@ class GitSyncManager:
                     "source_type": source_type,
                     "timestamp": timestamp,
                     "date_str": date_str,
+                    "best_model_label": best_model_label,
                 }
             )
 
@@ -240,21 +268,27 @@ class GitSyncManager:
         lines: list[str] = [
             f"# {channel_display_name}",
             "",
-            "| Date (JST) | Title | Subtitles |",
-            "| :--- | :--- | :--- |",
+            "| Date (JST) | Thumbnail | Title | Best Model |",
+            "| :--- | :---: | :--- | :---: |",
         ]
 
         for item in entries:
-            clean_title = item["title"].replace("|", "\\|").replace("\n", " ").strip()
+            clean_title = (item["title"] or item["video_id"]).replace("|", "\\|").replace("\n", " ").strip()
             vid = item["video_id"]
+            model_label = item["best_model_label"]
+
             if item["source_type"] == "youtube":
                 player_url = f"{self.player_base_url}/?uploader={uploader}&v={vid}"
+                thumb_cell = (
+                    f'<a href="{player_url}"><img src="https://i.ytimg.com/vi/{vid}/mqdefault.jpg" width="100" /></a>'
+                )
                 title_cell = f"[{clean_title}]({player_url})"
             else:
+                thumb_cell = "-"
                 title_cell = clean_title
 
-            sub_cell = f"[Browse](./v/{vid})"
-            lines.append(f"| {item['date_str']} | {title_cell} | {sub_cell} |")
+            model_cell = f"[{model_label}](./v/{vid})" if model_label != "-" else "-"
+            lines.append(f"| {item['date_str']} | {thumb_cell} | {title_cell} | {model_cell} |")
 
         lines.append("")
         readme_path = uploader_dir / "README.md"
@@ -317,7 +351,7 @@ class GitSyncManager:
             except Exception as e:
                 logfire.warning(f"Failed to read metadata from {meta_file}: {e}")
 
-        # Discover all available finalized and raw subtitles in this folder
+        # Discover and rank all available finalized and raw subtitles in this folder
         clean_meta["subtitles"] = self._discover_video_subtitles(video_dir)
 
         target_meta = video_dir / "video_meta.json"
