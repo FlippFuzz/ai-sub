@@ -43,6 +43,7 @@ class GitSyncManager:
     local_repo_dir: Path
     player_base_url: str
     _lock: asyncio.Lock
+    _completed_cache: set[tuple[str, str, str]]
 
     def __init__(self, config: GitConfig | None, base_work_dir: Path) -> None:
         """Initializes the Git synchronization manager.
@@ -53,6 +54,7 @@ class GitSyncManager:
         """
         self.config = config
         self._lock = asyncio.Lock()
+        self._completed_cache = set()
         repo_name = "subtitles-archive"
 
         if config:
@@ -91,9 +93,41 @@ class GitSyncManager:
 
         return raw_url
 
+    def _rebuild_completed_cache_sync(self) -> None:
+        """Scans the local repository directory to rebuild the in-memory completed subtitles cache."""
+        cache: set[tuple[str, str, str]] = set()
+        if not self.local_repo_dir.is_dir():
+            self._completed_cache = cache
+            return
+
+        try:
+            for uploader_dir in self.local_repo_dir.iterdir():
+                if not uploader_dir.is_dir() or uploader_dir.name.startswith("."):
+                    continue
+                v_dir = uploader_dir / "v"
+                if not v_dir.is_dir():
+                    continue
+                for video_dir in v_dir.iterdir():
+                    if not video_dir.is_dir() or video_dir.name.startswith("."):
+                        continue
+                    uploader = uploader_dir.name
+                    video_id = video_dir.name
+                    for srt in video_dir.glob("*.srt"):
+                        if srt.is_file() and not srt.name.startswith("part_") and ".raw-" not in srt.name:
+                            if srt.stat().st_size > 0:
+                                track_info = parse_subtitle_track(srt)
+                                if track_info.shortcode:
+                                    cache.add((uploader, video_id, track_info.shortcode))
+        except Exception as e:
+            logfire.warning(f"Error rebuilding completed subtitles cache: {e}")
+
+        self._completed_cache = cache
+        logfire.debug(f"Rebuilt completed subtitles cache: {len(self._completed_cache)} entry(s).")
+
     def _ensure_repo_sync(self) -> None:
         """Synchronous implementation of cloning or updating the local repository."""
         if not self.config:
+            self._rebuild_completed_cache_sync()
             return
 
         auth_url = self._get_authenticated_url()
@@ -108,6 +142,7 @@ class GitSyncManager:
                 repo.git.checkout(branch)
                 repo.git.reset("--hard", f"origin/{branch}")
                 repo.git.clean("-fd")
+                self._rebuild_completed_cache_sync()
                 logfire.info(f"Git repo successfully updated to origin/{branch}.")
                 return
             except (InvalidGitRepositoryError, GitCommandError, AssertionError) as e:
@@ -118,17 +153,19 @@ class GitSyncManager:
         logfire.info(f"Cloning {self.config.repo_url} to {self.local_repo_dir}")
         repo = Repo.clone_from(auth_url, self.local_repo_dir)
         repo.git.checkout(branch)
+        self._rebuild_completed_cache_sync()
         logfire.info("Git repository successfully cloned.")
 
     async def ensure_repo(self) -> None:
         """Clones or updates the local Git repository checkout under mutex protection."""
         if not self.config:
+            await asyncio.to_thread(self._rebuild_completed_cache_sync)
             return
         async with self._lock:
             await asyncio.to_thread(self._ensure_repo_sync)
 
     def is_video_completed(self, uploader: str, video_id: str, full_shortcode: str) -> bool:
-        """Checks if completed subtitles for a video and shortcode exist in the repository.
+        """Checks if completed subtitles for a video and shortcode exist in the in-memory repository cache.
 
         Args:
             uploader: Channel or uploader identifier.
@@ -138,14 +175,7 @@ class GitSyncManager:
         Returns:
             bool: True if completed subtitles exist; False otherwise.
         """
-        video_dir = self.local_repo_dir / uploader / "v" / video_id
-        if not video_dir.exists():
-            return False
-
-        for srt_path in video_dir.glob(f"*.{full_shortcode}.srt"):
-            if not srt_path.name.startswith("part_") and srt_path.stat().st_size > 0:
-                return True
-        return False
+        return (uploader, video_id, full_shortcode) in self._completed_cache
 
     def _discover_video_subtitles(self, video_dir: Path) -> list[dict[str, str]]:
         """Discovers and ranks all finalized and intermediate SRT files relative to the video directory.
@@ -342,6 +372,9 @@ class GitSyncManager:
         for yf in yaml_files:
             shutil.copy2(yf, int_dir / yf.name)
 
+        # Update in-memory completion cache immediately
+        self._completed_cache.add((uploader, video_id, full_shortcode))
+
         # Sanitize metadata: extract safe public fields to prevent leaking local paths
         clean_meta: dict[str, Any] = {
             "video_id": video_id,
@@ -413,6 +446,7 @@ class GitSyncManager:
                     time.sleep(backoff)
                     try:
                         repo.git.pull("origin", self.config.branch, "--rebase")
+                        self._rebuild_completed_cache_sync()
                     except GitCommandError:
                         try:
                             unmerged_output = repo.git.diff("-z", "--diff-filter=U", "--name-only")
@@ -423,6 +457,7 @@ class GitSyncManager:
                                 self._update_channel_readme_sync(uploader)
                                 repo.git.add(readme_rel)
                                 repo.git.rebase("--continue", env={**os.environ, "GIT_EDITOR": "true"})
+                                self._rebuild_completed_cache_sync()
                                 logfire.info("Resolved channel README conflict and continued rebase.")
                             else:
                                 logfire.warning(f"Non-README conflict encountered ({unmerged_files}). Aborting rebase.")

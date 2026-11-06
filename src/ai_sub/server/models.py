@@ -120,6 +120,7 @@ class ActivityEvent(BaseModel):
     pipeline: str = Field(description="Pipeline name.")
     worker_id: str = Field(description="Worker identifier.")
     model: str = Field(description="Target model.")
+    video_id: str | None = Field(default=None, description="Video identifier associated with this task.")
     duration_s: float | None = Field(default=None, description="Execution duration in seconds if complete.")
     detail: str | None = Field(default=None, description="Optional extra detail or error string.")
     logfire_query: str | None = Field(

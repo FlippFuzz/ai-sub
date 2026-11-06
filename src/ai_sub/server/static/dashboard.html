@@ -309,6 +309,15 @@
         flex-shrink: 0;
         background: #0b1120;
       }
+      .queue-thumb {
+        width: 64px;
+        aspect-ratio: 16 / 9;
+        object-fit: cover;
+        border-radius: 4px;
+        border: 1px solid var(--border);
+        display: block;
+        background: #0b1120;
+      }
       .thumb-prep {
         width: 80px;
         aspect-ratio: 16 / 9;
@@ -323,12 +332,15 @@
   <body>
     <div class="header">
       <div>
-        <h1>AI Sub Coordinator</h1>
-        <span class="mono" style="color: var(--muted)" id="server-time"
-          >Loading...</span
-        >
+        <h1 style="margin: 0">AI Sub Coordinator</h1>
       </div>
-      <div style="display: flex; gap: 10px; align-items: center">
+      <div style="display: flex; gap: 12px; align-items: center">
+        <span
+          class="mono"
+          style="color: var(--muted); font-size: 12px"
+          id="last-updated-text"
+          >Updated just now</span
+        >
         <button class="btn" onclick="updateDashboard()">Refresh UI</button>
         <span class="badge badge-complete" id="connection-status"
           >Live (auto-refresh 60s)</span
@@ -340,28 +352,9 @@
     <div class="tabs" id="pipeline-tabs"></div>
     <div id="tab-content"></div>
 
-    <div class="card" style="margin-top: 24px">
-      <h3>Recent Worker Activity</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>Time</th>
-            <th>Worker</th>
-            <th>Pipeline</th>
-            <th>Task</th>
-            <th>Event</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody id="activity-tbody">
-          <tr>
-            <td colspan="6" style="color: var(--muted)">Loading...</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-
     <script>
+      let lastSuccessTime = Date.now()
+
       function esc(s) {
         return String(s ?? "").replace(
           /[&<>"']/g,
@@ -404,6 +397,23 @@
         if (mins > 0) return `${mins}m ${s}s`
         return `${s}s`
       }
+
+      function updateRelativeTime() {
+        const el = document.getElementById("last-updated-text")
+        if (!el) return
+        const sec = Math.floor((Date.now() - lastSuccessTime) / 1000)
+        if (sec < 3) {
+          el.innerText = "Updated just now"
+        } else if (sec < 60) {
+          el.innerText = `Updated ${sec}s ago`
+        } else {
+          const mins = Math.floor(sec / 60)
+          const remSec = sec % 60
+          el.innerText = `Updated ${mins}m ${remSec}s ago`
+        }
+      }
+
+      setInterval(updateRelativeTime, 1000)
 
       function copyTextFallback(text) {
         const prev = document.activeElement
@@ -681,7 +691,7 @@
           `
         } else {
           const totalTracked = currentData.total_tracked_videos || 0
-          const qCount = (pipe.next_in_queue || []).length
+          const qTotal = pipe.queue_total ?? (pipe.next_in_queue || []).length
 
           let statusTitle = `${pipe.name} is currently idle`
           let statusDesc = "Waiting for next video from intake sources..."
@@ -689,7 +699,7 @@
 
           if (cd && cd.in_cooldown) {
             statusDesc = `Waiting for next video (YouTube intake is paused on cooldown for another ${formatDuration(cd.remaining_seconds)}, local files still process).`
-          } else if (totalTracked > 0 && qCount === 0) {
+          } else if (totalTracked > 0 && qTotal === 0) {
             statusTitle = `${pipe.name} is idle — all videos complete for this pipeline`
             statusDesc = `All ${totalTracked} tracked video(s) have finished processing for ${pipe.name}. Waiting for new uploads or files...`
           }
@@ -753,15 +763,21 @@
           `
         }
 
-        const queueCount = (pipe.next_in_queue || []).length
+        const qItems = pipe.next_in_queue || []
+        const qTotal = pipe.queue_total ?? qItems.length
         const totalTrackedAll = currentData.total_tracked_videos || 0
         const emptyQueueMsg =
-          totalTrackedAll > 0 && queueCount === 0
+          totalTrackedAll > 0 && qTotal === 0
             ? `All ${totalTrackedAll} tracked video(s) have finished processing for ${pipe.name}.`
             : "No pending videos in queue for this pipeline."
 
+        const queueTitleSuffix =
+          qTotal > qItems.length
+            ? `(Showing ${qItems.length} of ${qTotal})`
+            : `(${qTotal})`
+
         const queueTable =
-          (pipe.next_in_queue || [])
+          qItems
             .map((q) => {
               let statusCell = `<span class="badge badge-complete">Ready</span>`
               if (q.status === "unplayable") {
@@ -778,8 +794,14 @@
                   ? `<a href="https://youtu.be/${esc(q.video_id)}" target="_blank" rel="noopener noreferrer" class="video-title-link">${esc(q.title)}</a>`
                   : esc(q.title)
 
+              const qThumbHtml =
+                isQYt && q.video_id
+                  ? `<img class="queue-thumb" src="https://i.ytimg.com/vi/${esc(q.video_id)}/default.jpg" alt="" onerror="this.style.display='none'">`
+                  : `<span style="color:var(--muted);">-</span>`
+
               return `
                 <tr>
+                  <td>${qThumbHtml}</td>
                   <td>${qTitleHtml}</td>
                   <td><b>${esc(q.channel_name || q.uploader)}</b> <span class="mono" style="color:var(--muted);">(@${esc(q.uploader)})</span></td>
                   <td class="mono" style="font-size:12px;">${esc(dateDisplay)}</td>
@@ -789,16 +811,67 @@
               `
             })
             .join("") ||
-          `<tr><td colspan="5" style="color: var(--muted);">${esc(emptyQueueMsg)}</td></tr>`
+          `<tr><td colspan="6" style="color: var(--muted);">${esc(emptyQueueMsg)}</td></tr>`
+
+        const activityTable =
+          (pipe.recent_activity || [])
+            .map((a, idx) => {
+              const parts = a.task_id.split("::")
+              const cleanTaskId =
+                parts.length > 2
+                  ? parts.slice(2).join(" ")
+                  : parts[1] || a.task_id
+              const activityTime = formatLocalTime(a.timestamp)
+              const durText = a.duration_s ? formatDuration(a.duration_s) : ""
+              const hasDetail = Boolean(a.detail || a.logfire_query)
+              const videoIdDisplay = a.video_id || parts[1] || "-"
+
+              const queryHtml = a.logfire_query
+                ? `
+                <div class="detail-query-bar">
+                  <div>Logfire Query: <code class="detail-query-code">${esc(a.logfire_query)}</code></div>
+                  <button class="btn" data-query="${esc(a.logfire_query)}" onclick="copyQueryFromData(this)">Copy Query</button>
+                </div>
+              `
+                : ""
+
+              return `
+                <tr>
+                  <td class="mono">${esc(activityTime)}</td>
+                  <td class="mono"><b>${esc(a.worker_id)}</b></td>
+                  <td class="mono">${esc(videoIdDisplay)}</td>
+                  <td class="mono">${esc(cleanTaskId)}</td>
+                  <td><span class="badge badge-${esc(a.event_type)}">${esc(a.event_type)} ${durText}</span></td>
+                  <td>${hasDetail ? `<button class="expand-btn" onclick="toggleDetail(${idx})">Details</button>` : "-"}</td>
+                </tr>
+                ${
+                  hasDetail
+                    ? `
+                  <tr class="detail-row" id="detail-${idx}">
+                    <td colspan="6">
+                      <div class="detail-box ${a.event_type === "fail" ? "detail-box-fail" : ""}">
+                        <div>${esc(a.detail || "No error details recorded.")}</div>
+                        ${queryHtml}
+                      </div>
+                    </td>
+                  </tr>
+                `
+                    : ""
+                }
+              `
+            })
+            .join("") ||
+          `<tr><td colspan="6" style="color: var(--muted);">No worker activity recorded yet for ${esc(pipe.name)}.</td></tr>`
 
         document.getElementById("tab-content").innerHTML = `
           ${activeSection}
           <div class="card">
-            <h3>Next In Queue for ${esc(pipe.name)} (${queueCount})</h3>
+            <h3>Next In Queue for ${esc(pipe.name)} ${esc(queueTitleSuffix)}</h3>
             <div class="table-container">
               <table>
                 <thead>
                   <tr>
+                    <th style="width: 70px;">Thumbnail</th>
                     <th>Video Title</th>
                     <th>Channel / Uploader</th>
                     <th>Published</th>
@@ -807,6 +880,24 @@
                   </tr>
                 </thead>
                 <tbody>${queueTable}</tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card" style="margin-top: 20px;">
+            <h3>Recent Worker Activity for ${esc(pipe.name)}</h3>
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Worker</th>
+                    <th>Video ID</th>
+                    <th>Task</th>
+                    <th>Event</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>${activityTable}</tbody>
               </table>
             </div>
           </div>
@@ -825,67 +916,15 @@
             return
           }
           currentData = await res.json()
+          lastSuccessTime = Date.now()
+          updateRelativeTime()
+
           if (statusBadge) {
             statusBadge.className = "badge badge-complete"
             statusBadge.innerText = "Live (auto-refresh 60s)"
           }
 
-          const localTimeStr = formatLocalTime(currentData.server_time)
-          document.getElementById("server-time").innerText =
-            `Local Time: ${localTimeStr}`
-
           renderPipelineView()
-
-          const aBody = document.getElementById("activity-tbody")
-          aBody.innerHTML =
-            (currentData.recent_activity || [])
-              .slice(0, 30)
-              .map((a, idx) => {
-                const parts = a.task_id.split("::")
-                const cleanTaskId =
-                  parts.length > 2
-                    ? parts.slice(2).join(" ")
-                    : parts[1] || a.task_id
-                const activityTime = formatLocalTime(a.timestamp)
-                const durText = a.duration_s ? formatDuration(a.duration_s) : ""
-                const hasDetail = Boolean(a.detail || a.logfire_query)
-
-                const queryHtml = a.logfire_query
-                  ? `
-                  <div class="detail-query-bar">
-                    <div>Logfire Query: <code class="detail-query-code">${esc(a.logfire_query)}</code></div>
-                    <button class="btn" data-query="${esc(a.logfire_query)}" onclick="copyQueryFromData(this)">Copy Query</button>
-                  </div>
-                `
-                  : ""
-
-                return `
-                  <tr>
-                    <td class="mono">${esc(activityTime)}</td>
-                    <td class="mono"><b>${esc(a.worker_id)}</b></td>
-                    <td class="mono">${esc(a.pipeline)}</td>
-                    <td class="mono">${esc(cleanTaskId)}</td>
-                    <td><span class="badge badge-${esc(a.event_type)}">${esc(a.event_type)} ${durText}</span></td>
-                    <td>${hasDetail ? `<button class="expand-btn" onclick="toggleDetail(${idx})">Details</button>` : "-"}</td>
-                  </tr>
-                  ${
-                    hasDetail
-                      ? `
-                    <tr class="detail-row" id="detail-${idx}">
-                      <td colspan="6">
-                        <div class="detail-box ${a.event_type === "fail" ? "detail-box-fail" : ""}">
-                          <div>${esc(a.detail || "No error details recorded.")}</div>
-                          ${queryHtml}
-                        </div>
-                      </td>
-                    </tr>
-                  `
-                      : ""
-                  }
-                `
-              })
-              .join("") ||
-            '<tr><td colspan="6" style="color: var(--muted);">No worker activity recorded yet.</td></tr>'
         } catch (err) {
           console.error(err)
           if (statusBadge) {

@@ -9,6 +9,7 @@ server:
   work_dir: "./work"
   heartbeat_timeout_seconds: 300
   validation_buffer_ms: 2000
+  activity_log_maxlen: 50      # Maximum worker activity events preserved per combination pipeline
 
 # Task Execution and Distributed Retry Controls
 retry:

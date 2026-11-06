@@ -75,7 +75,7 @@ class WorkerSettings(YamlFileSettings):
         default_factory=WorkerSearchSettings,
         description="Web search configuration and provider API keys.",
     )
-    heartbeat_interval_seconds: float = Field(
+    heartbeat_interval_seconds: PositiveFloat = Field(
         default=30.0,
         description="Interval in seconds between task heartbeat pings.",
     )

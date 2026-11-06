@@ -41,7 +41,7 @@ class PipelineCoordinator:
     settings: ServerSettings
     git_sync: GitSyncManager | None
     pipelines: dict[str, ComboPipeline]
-    activity_log: deque[ActivityEvent]
+    pipeline_activity_logs: dict[str, deque[ActivityEvent]]
     _lock: asyncio.Lock
     _finalizing_pipes: set[str]
     _sweep_task: asyncio.Task[None] | None
@@ -58,7 +58,9 @@ class PipelineCoordinator:
         self.settings = settings
         self.git_sync = git_sync
         self.pipelines = {}
-        self.activity_log = deque(maxlen=50)
+        self.pipeline_activity_logs = {
+            p_cfg.name: deque(maxlen=settings.server.activity_log_maxlen) for p_cfg in settings.pipelines
+        }
         self._lock = asyncio.Lock()
         self._finalizing_pipes = set()
         self._sweep_task = None
@@ -85,7 +87,7 @@ class PipelineCoordinator:
         duration_s: float | None = None,
         detail: str | None = None,
     ) -> None:
-        """Appends an event to the circular activity buffer with Logfire query string on errors.
+        """Appends an event to the per-pipeline circular activity buffer with Logfire query string on errors.
 
         Args:
             event_type: Event classification ('claim', 'complete', 'fail', 'timeout').
@@ -98,20 +100,24 @@ class PipelineCoordinator:
         time_str = datetime.fromtimestamp(now).strftime("%H:%M:%S")
         query_str = _format_logfire_query(task) if event_type in ("fail", "timeout") else None
 
-        self.activity_log.appendleft(
-            ActivityEvent(
-                timestamp=now,
-                time_str=time_str,
-                event_type=event_type,
-                task_id=task.task_id,
-                pipeline=task.pipeline_name,
-                worker_id=worker_id,
-                model=task.model,
-                duration_s=round(duration_s, 1) if duration_s is not None else None,
-                detail=detail,
-                logfire_query=query_str,
-            )
+        event = ActivityEvent(
+            timestamp=now,
+            time_str=time_str,
+            event_type=event_type,
+            task_id=task.task_id,
+            pipeline=task.pipeline_name,
+            worker_id=worker_id,
+            model=task.model,
+            video_id=task.video_id,
+            duration_s=round(duration_s, 1) if duration_s is not None else None,
+            detail=detail,
+            logfire_query=query_str,
         )
+
+        pipe_log = self.pipeline_activity_logs.setdefault(
+            task.pipeline_name, deque(maxlen=self.settings.server.activity_log_maxlen)
+        )
+        pipe_log.appendleft(event)
 
     async def start(self) -> None:
         """Starts background lease monitoring and attempts disk resumption on all pipelines."""
@@ -603,14 +609,14 @@ class PipelineCoordinator:
 
     def get_dashboard_data(
         self,
-        pipeline_queues: dict[str, list[dict[str, Any]]],
+        pipeline_queues: dict[str, dict[str, Any]],
         youtube_cooldown: dict[str, Any] | None = None,
         total_tracked_videos: int = 0,
     ) -> dict[str, Any]:
         """Gathers macroscopic metrics and active states for the live WebUI dashboard.
 
         Args:
-            pipeline_queues: Mapping of pipeline names to their outstanding queued videos.
+            pipeline_queues: Mapping of pipeline names to their outstanding queue dictionaries.
             youtube_cooldown: Optional YouTube intake cooldown status dictionary.
             total_tracked_videos: Count of all media files and streams tracked in memory. Defaults to 0.
 
@@ -721,6 +727,10 @@ class PipelineCoordinator:
                 for t in pipe.tasks.values()
             ]
 
+            q_info = pipeline_queues.get(name, {"total_count": 0, "items": []})
+            queue_total = q_info.get("total_count", 0)
+            next_in_queue = q_info.get("items", [])
+
             pipeline_data.append(
                 {
                     "name": name,
@@ -735,7 +745,9 @@ class PipelineCoordinator:
                     "preparing_video": pipe.preparing_video_info,
                     "stages": stages_info,
                     "tasks": tasks_list,
-                    "next_in_queue": pipeline_queues.get(name, []),
+                    "queue_total": queue_total,
+                    "next_in_queue": next_in_queue,
+                    "recent_activity": [event.model_dump() for event in self.pipeline_activity_logs.get(name, [])],
                 }
             )
 
@@ -745,5 +757,4 @@ class PipelineCoordinator:
             "youtube_cooldown": youtube_cooldown or {"in_cooldown": False},
             "total_tracked_videos": total_tracked_videos,
             "pipelines": pipeline_data,
-            "recent_activity": [event.model_dump() for event in self.activity_log],
         }

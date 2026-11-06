@@ -647,7 +647,7 @@ class RetrySettings(BaseSettings):
         description="Maximum internal retries by the executor on transient network or schema failures.",
         default=5,
     )
-    max_runs: NonNegativeInt = Field(
+    max_runs: PositiveInt = Field(
         description="Maximum total attempt limit persisted across application executions per segment.",
         default=3,
     )

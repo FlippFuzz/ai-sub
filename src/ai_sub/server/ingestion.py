@@ -569,14 +569,14 @@ class IngestionManager:
                 raise RuntimeError(f"Downloaded file not found for {video.title} (expected: {downloaded.name})")
             return downloaded
 
-    def get_pipeline_queue(self, pipeline: ComboPipeline) -> list[dict[str, Any]]:
-        """Gathers outstanding queued videos for a given pipeline from memory cache with operational details.
+    def get_pipeline_queue(self, pipeline: ComboPipeline) -> dict[str, Any]:
+        """Gathers outstanding queued videos for a given pipeline with total count and top 50 items.
 
         Args:
             pipeline: Combination pipeline instance.
 
         Returns:
-            list[dict[str, Any]]: List of queued video items pending for this pipeline.
+            dict[str, Any]: Dictionary containing 'total_count' and top 50 'items'.
         """
         candidates = list(self.local_videos.values()) + list(self.youtube_videos.values())
         outstanding = []
@@ -609,13 +609,16 @@ class IngestionManager:
                 )
 
         outstanding.sort(key=lambda x: (-x["timestamp"], x["title"].lower()))
-        return outstanding[:50]
+        return {
+            "total_count": len(outstanding),
+            "items": outstanding[:50],
+        }
 
-    def get_all_pipeline_queues(self) -> dict[str, list[dict[str, Any]]]:
+    def get_all_pipeline_queues(self) -> dict[str, dict[str, Any]]:
         """Computes outstanding queues for all active pipelines without network calls.
 
         Returns:
-            dict[str, list[dict[str, Any]]]: Mapping of pipeline names to their outstanding videos.
+            dict[str, dict[str, Any]]: Mapping of pipeline names to their queue dictionaries.
         """
         return {name: self.get_pipeline_queue(pipe) for name, pipe in self.coordinator.pipelines.items()}
 
