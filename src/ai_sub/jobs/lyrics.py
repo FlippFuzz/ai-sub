@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from textwrap import dedent
-from typing import Any
+from typing import Any, ClassVar
 
 import logfire
-import yaml
-from pydantic import (
-    Field,
-    ValidationError,
-)
+from pydantic import Field
 
 from ai_sub.jobs.base import (
     Prompt,
@@ -239,6 +234,9 @@ class LyricsAiResponse(BaseSubtitleAiResponse):
 class LyricsJob(BaseSubtitleJob):
     """Job container holding refined subtitles for a segment with musical performance."""
 
+    prompt_version_field: ClassVar[str] = "lyrics_prompt_version"
+    prompt_version: ClassVar[int] = LYRICS_PROMPT_VERSION
+
     lyrics_prompt_version: int = Field(
         default=LYRICS_PROMPT_VERSION,
         description="Prompt version employed for this refinement response.",
@@ -294,40 +292,3 @@ class LyricsJob(BaseSubtitleJob):
         self.response = res
         self.total_attempts += 1
         return res
-
-    @classmethod
-    def load(cls, save_path: Path, validation_buffer_ms: int) -> LyricsJob | None:
-        """Loads and validates a saved YAML state file.
-
-        Args:
-            save_path: State file path.
-            validation_buffer_ms: Duration tolerance in milliseconds.
-
-        Returns:
-            LyricsJob | None: Loaded job instance, or None if invalid or version mismatch.
-        """
-        if not save_path.is_file():
-            return None
-
-        with open(save_path, "r", encoding="utf-8") as f:
-            try:
-                data = yaml.safe_load(f)
-                if not isinstance(data, dict):
-                    logfire.warning(f"Corrupt YAML in {save_path.name}. Re-processing.")
-                    return None
-                job = cls.model_validate(
-                    data,
-                    context={"validation_buffer_ms": validation_buffer_ms},
-                )
-            except (yaml.YAMLError, ValidationError) as e:
-                logfire.warning(f"Validation failed for {save_path.name}: {e}. Re-processing.")
-                return None
-
-        if job.lyrics_prompt_version != LYRICS_PROMPT_VERSION:
-            logfire.info(
-                f"Lyrics prompt version mismatch for {job.name} "
-                f"(file: v{job.lyrics_prompt_version}, current: v{LYRICS_PROMPT_VERSION}). Re-processing."
-            )
-            return None
-
-        return job

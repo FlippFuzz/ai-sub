@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -57,11 +58,11 @@ class WorkerClient:
         models: list[str],
         search_tools: list[str],
     ) -> TaskClaimResponse | None:
-        """Requests an available pending task from the server.
+        """Requests an available pending task matching the worker's specified models.
 
         Args:
             worker_id: Unique identifier of this worker.
-            models: List of unexhausted Gemini models available on the worker.
+            models: List of model identifiers offered for this claim request.
             search_tools: List of search tools configured on the worker.
 
         Returns:
@@ -80,7 +81,11 @@ class WorkerClient:
         resp.raise_for_status()
         return TaskClaimResponse.model_validate(resp.json())
 
-    async def send_heartbeat(self, task_id: str, worker_id: str) -> bool | None:
+    async def send_heartbeat(
+        self,
+        task_id: str,
+        worker_id: str,
+    ) -> bool | None:
         """Sends a heartbeat ping to renew an active task lease.
 
         Args:
@@ -88,13 +93,13 @@ class WorkerClient:
             worker_id: Unique identifier of this worker.
 
         Returns:
-            bool | None: True if acknowledged; False if lease expired or was revoked;
-                None if a transient transport error or 5xx server error occurred.
+            bool | None: True if acknowledged; False if lease expired; None if a transient transport error occurred.
         """
+        encoded_task_id = urllib.parse.quote(task_id, safe=":")
         req = TaskHeartbeatRequest(worker_id=worker_id)
         try:
             resp: Response = await self.client.post(
-                f"/api/v1/tasks/{task_id}/heartbeat",
+                f"/api/v1/tasks/{encoded_task_id}/heartbeat",
                 json=req.model_dump(mode="json"),
             )
             if resp.status_code == 200:
@@ -103,26 +108,26 @@ class WorkerClient:
             if resp.status_code >= 500:
                 logfire.warning(f"Heartbeat received server error {resp.status_code} for task '{task_id}'")
                 return None
+            logfire.warning(f"Heartbeat returned unexpected status {resp.status_code} for task '{task_id}'")
             return False
         except Exception as e:
-            logfire.warning(f"Heartbeat failed for task '{task_id}': {e}")
+            logfire.warning(f"Heartbeat network error for task '{task_id}': {e}")
             return None
 
     async def download_media(self, media_url: str, destination: Path) -> Path:
         """Downloads a media chunk file from the server.
 
         Args:
-            media_url: Relative media endpoint URL on the server.
+            media_url: Relative media endpoint URL on the server or absolute URL.
             destination: Local path where the file should be saved.
 
         Returns:
             Path: Path to the validated downloaded file.
         """
         destination.parent.mkdir(parents=True, exist_ok=True)
-        url = media_url if media_url.startswith("http") else f"{self.base_url}{media_url}"
 
-        with logfire.span("Downloading media chunk from {url}", url=url):
-            async with self.client.stream("GET", url) as stream_resp:
+        with logfire.span("Downloading media chunk: {url}", url=media_url):
+            async with self.client.stream("GET", media_url) as stream_resp:
                 stream_resp.raise_for_status()
                 with open(destination, "wb") as f:
                     async for chunk in stream_resp.aiter_bytes():
@@ -148,6 +153,7 @@ class WorkerClient:
         Returns:
             bool: True if completion was accepted; False otherwise.
         """
+        encoded_task_id = urllib.parse.quote(task_id, safe=":")
         req = TaskCompleteRequest(
             worker_id=worker_id,
             task_id=task_id,
@@ -156,7 +162,7 @@ class WorkerClient:
         )
         try:
             resp: Response = await self.client.post(
-                f"/api/v1/tasks/{task_id}/complete",
+                f"/api/v1/tasks/{encoded_task_id}/complete",
                 json=req.model_dump(mode="json"),
             )
             return resp.status_code == 200
@@ -171,29 +177,33 @@ class WorkerClient:
         reason: str,
         model: str | None = None,
         error_message: str | None = None,
+        is_transient: bool = False,
     ) -> bool:
         """Notifies the server of a task failure or daily quota limit exhaustion.
 
         Args:
             task_id: Unique task identifier.
             worker_id: Unique identifier of this worker.
-            reason: Failure code ('QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').
-            model: Gemini model identifier that failed, if applicable.
-            error_message: Optional error message or traceback.
+            reason: Failure code or exception description.
+            model: Gemini model identifier that failed, if applicable. Defaults to None.
+            error_message: Optional error description or traceback. Defaults to None.
+            is_transient: Whether the failure is transient and should not penalize server attempts. Defaults to False.
 
         Returns:
             bool: True if failure was acknowledged; False otherwise.
         """
+        encoded_task_id = urllib.parse.quote(task_id, safe=":")
         req = TaskFailRequest(
             worker_id=worker_id,
             task_id=task_id,
             reason=reason,
             model=model,
             error_message=error_message,
+            is_transient=is_transient,
         )
         try:
             resp: Response = await self.client.post(
-                f"/api/v1/tasks/{task_id}/fail",
+                f"/api/v1/tasks/{encoded_task_id}/fail",
                 json=req.model_dump(mode="json"),
             )
             return resp.status_code == 200

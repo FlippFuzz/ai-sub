@@ -36,7 +36,12 @@ class _BoundedCache(OrderedDict[str, Any]):
         self.max_size = max_size
 
     def __setitem__(self, key: str, value: Any) -> None:
-        """Sets a key, moving it to the end or evicting oldest when capacity is exceeded."""
+        """Sets a key, moving it to the end or evicting oldest when capacity is exceeded.
+
+        Args:
+            key: Cache key string.
+            value: Value to store.
+        """
         if key in self:
             self.move_to_end(key)
         super().__setitem__(key, value)
@@ -94,8 +99,7 @@ def parse_retry_after(header_value: str | None) -> float | None:
         dt = parsedate_to_datetime(cleaned)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        return max(0.0, (dt - now).total_seconds())
+        return max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
     except Exception:
         return None
 
@@ -150,9 +154,8 @@ class BaseSearchProvider(ABC):
         """
         ...
 
-    @abstractmethod
     async def search_single(self, query: str) -> list[WebSearchResult]:
-        """Performs a single search query returning normalized search results.
+        """Performs a single search query with caching and telemetry spans.
 
         Args:
             query: Search query keywords.
@@ -160,7 +163,32 @@ class BaseSearchProvider(ABC):
         Returns:
             list[WebSearchResult]: Formatted search result items.
         """
-        ...
+        cache_key = normalize_query(query)
+        if cache_key in self._cache:
+            logfire.debug(
+                "Using cached {provider} query result for {query=}",
+                provider=self.provider_name,
+                query=query,
+            )
+            return self._cache[cache_key]
+
+        with logfire.span("{provider}_search: {query=}", provider=self.provider_name, query=query):
+            results = await self._do_search(query)
+
+        if results:
+            self._cache[cache_key] = results
+        return results
+
+    async def _do_search(self, query: str) -> list[WebSearchResult]:
+        """Executes provider-specific single search query. Subclasses override this.
+
+        Args:
+            query: Search query keywords.
+
+        Returns:
+            list[WebSearchResult]: Formatted search result items.
+        """
+        return []
 
     async def _gather_multi_search(
         self,
@@ -172,7 +200,7 @@ class BaseSearchProvider(ABC):
 
         Args:
             queries: A list of search query strings to execute concurrently.
-            search_fn: Optional custom callable taking a single query. Defaults to self.search_single.
+            search_fn: Optional custom callable taking a single query. Defaults to None.
             max_queries: Optional limit on the number of queries to process. Defaults to None.
 
         Returns:
@@ -209,19 +237,14 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
         Args:
             settings: Search configuration settings.
             provider_name: Name identifier of the search provider.
-            requires_api_key: Whether an API key is mandatory to initialize the client session.
+            requires_api_key: Whether an API key is mandatory. Defaults to True.
         """
         super().__init__(settings, provider_name=provider_name)
         self.requires_api_key = requires_api_key
         self._client = None
 
-        if self.settings.qps < 1:
-            rate = 1
-            duration = int(math.ceil(1 / self.settings.qps)) * Duration.SECOND
-        else:
-            rate = int(self.settings.qps)
-            duration = Duration.SECOND
-
+        rate = 1 if self.settings.qps < 1 else int(self.settings.qps)
+        duration = int(math.ceil(1 / self.settings.qps)) * Duration.SECOND if self.settings.qps < 1 else Duration.SECOND
         self._limiter = limiter_factory.create_inmemory_limiter(rate_per_duration=rate, duration=duration)
 
     def _get_api_key(self) -> SecretStr | None:
@@ -252,9 +275,7 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
         """
         if self.requires_api_key and self._get_api_key() is None:
             raise ValueError(f"{self.provider_name.capitalize()} API key is required but not configured.")
-
-        headers = self._get_headers()
-        self._client = AsyncClient(headers=headers, timeout=self.settings.timeout)
+        self._client = AsyncClient(headers=self._get_headers(), timeout=self.settings.timeout)
         await self._client.__aenter__()
         return self
 
@@ -281,18 +302,18 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
         Args:
             method: HTTP method (e.g. 'GET', 'POST').
             url: Destination endpoint URL.
-            **kwargs: Extra parameters passed to the HTTP client (e.g. params, json).
+            **kwargs: Extra parameters passed to the HTTP client.
 
         Returns:
             Response: Validated HTTP response.
 
         Raises:
-            RuntimeError: If client is uninitialized or retries exhausted.
-            HTTPStatusError: If unretryable status code occurs or retries exhausted.
-            TransportError: If network transport fails and retries exhausted.
-            TimeoutException: If request times out and retries exhausted.
-            ConnectionError: If connection fails and retries exhausted.
-            TimeoutError: If async task times out and retries exhausted.
+            ConnectionError: If connection fails and retries are exhausted.
+            HTTPStatusError: If HTTP status code indicates an error and retries are exhausted.
+            RuntimeError: If client session is not active or retries are exhausted.
+            TimeoutError: If async task times out and retries are exhausted.
+            TimeoutException: If request times out and retries are exhausted.
+            TransportError: If network transport fails and retries are exhausted.
         """
         if self._client is None:
             raise RuntimeError(
@@ -317,13 +338,14 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
                     e.response.status_code in (429, 500, 502, 503, 504) if isinstance(e, HTTPStatusError) else True
                 )
                 if is_retryable and attempt < self.settings.retries:
-                    retry_after: float | None = None
-                    if isinstance(e, HTTPStatusError):
-                        retry_after = parse_retry_after(e.response.headers.get("retry-after"))
-
+                    retry_after = (
+                        parse_retry_after(e.response.headers.get("retry-after"))
+                        if isinstance(e, HTTPStatusError)
+                        else None
+                    )
                     exp_backoff = self.settings.min_wait_seconds * (self.settings.multiplier**attempt)
-                    effective_backoff = max(exp_backoff, retry_after or 0.0)
-                    backoff = min(self.settings.max_wait_seconds, effective_backoff) + random.uniform(0, 1)
+                    effective = max(exp_backoff, retry_after or 0.0)
+                    backoff = min(self.settings.max_wait_seconds, effective) + random.uniform(0, 1)
 
                     logfire.warning(
                         f"{self.provider_name.capitalize()} {method} to {url} failed with {e} "

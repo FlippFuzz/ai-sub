@@ -2,22 +2,17 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from textwrap import dedent
-from typing import Any
+from typing import ClassVar
 
-import logfire
-import yaml
 from pydantic import (
     BaseModel,
     Field,
     PositiveInt,
-    ValidationError,
-    model_validator,
 )
 from pydantic.json_schema import SkipJsonSchema
 
-from ai_sub.jobs.base import BaseJob, Prompt, WorkerContext, clean_timestamp_string
+from ai_sub.jobs.base import AiJob, CleanTimestamp, Prompt, WorkerContext
 
 SUMMARY_PROMPT_VERSION = 1
 
@@ -108,8 +103,8 @@ def get_summary_prompt(user_context: str | None = None) -> Prompt:
 class ChapterItem(BaseModel):
     """Represents a macroscopic chapter, section, or musical milestone in the video."""
 
-    start: str = Field(description="Approximate start timestamp in 'MM:SS' or 'HH:MM:SS' format.")
-    end: str = Field(description="Approximate end timestamp in 'MM:SS' or 'HH:MM:SS' format.")
+    start: CleanTimestamp = Field(description="Approximate start timestamp in 'MM:SS' or 'HH:MM:SS' format.")
+    end: CleanTimestamp = Field(description="Approximate end timestamp in 'MM:SS' or 'HH:MM:SS' format.")
     title: str = Field(description="Concise chapter title summarizing the section.")
     description: str = Field(description="Overview of topics, activities, gameplay events, or performance.")
     song_title: str | None = Field(
@@ -120,23 +115,6 @@ class ChapterItem(BaseModel):
         default=None,
         description="Original artist, group, or composer in native script if known; otherwise null. Independent of song_title.",  # noqa: E501
     )
-
-    @model_validator(mode="before")
-    @classmethod
-    def clean_leakage(cls, data: Any) -> Any:
-        """Cleans LLM structural leakage from timestamp strings.
-
-        Args:
-            data: Raw input dictionary.
-
-        Returns:
-            Any: Cleaned dictionary.
-        """
-        if isinstance(data, dict):
-            for key in ("start", "end"):
-                if key in data and isinstance(data[key], str):
-                    data[key] = clean_timestamp_string(data[key])
-        return data
 
 
 class EntityItem(BaseModel):
@@ -205,8 +183,11 @@ class SummaryAiResponse(BaseModel):
         return {item.term: item.meaning for item in self.domain_glossary}
 
 
-class SummaryJob(BaseJob):
+class SummaryJob(AiJob):
     """Job container holding global summary state for an entire video."""
+
+    prompt_version_field: ClassVar[str] = "summary_prompt_version"
+    prompt_version: ClassVar[int] = SUMMARY_PROMPT_VERSION
 
     video_duration_ms: PositiveInt = Field(description="Total video duration in milliseconds.")
     summary_prompt_version: int = Field(
@@ -242,43 +223,3 @@ class SummaryJob(BaseJob):
         self.response = res
         self.total_attempts += 1
         return res
-
-    @classmethod
-    def load(cls, save_path: Path, validation_buffer_ms: int = 0) -> SummaryJob | None:
-        """Loads and validates a saved YAML state file.
-
-        Args:
-            save_path: State file path.
-            validation_buffer_ms: Optional duration tolerance buffer in milliseconds.
-
-        Returns:
-            SummaryJob | None: Loaded job instance, or None if invalid or version mismatch.
-        """
-        if not save_path.is_file():
-            return None
-
-        with open(save_path, "r", encoding="utf-8") as f:
-            try:
-                data = yaml.safe_load(f)
-                if not isinstance(data, dict):
-                    logfire.warning(f"Corrupt YAML in {save_path.name}. Re-processing.")
-                    return None
-                job = cls.model_validate(
-                    data,
-                    context={
-                        "video_duration_ms": data.get("video_duration_ms"),
-                        "validation_buffer_ms": validation_buffer_ms,
-                    },
-                )
-            except (yaml.YAMLError, ValidationError) as e:
-                logfire.warning(f"Validation failed for {save_path.name}: {e}. Re-processing.")
-                return None
-
-        if job.summary_prompt_version != SUMMARY_PROMPT_VERSION:
-            logfire.info(
-                f"Summary prompt version mismatch for {job.name} "
-                f"(file: v{job.summary_prompt_version}, current: v{SUMMARY_PROMPT_VERSION}). Re-processing."
-            )
-            return None
-
-        return job

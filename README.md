@@ -17,10 +17,9 @@ It handles fast Japanese speech, livestream banter, video game terms, and live s
 - [Usage](#usage)
   - [Option 1: Recommended Setup (Gemini + Tinyfish)](#option-1-recommended-setup-gemini--tinyfish)
   - [Option 2: Free Search Setup (DuckDuckGo)](#option-2-free-search-setup-duckduckgo)
-  - [Option 3: Multi-Tool Search Setup](#option-3-multi-tool-search-setup)
-  - [Option 4: Providing Custom Notes & Lore](#option-4-providing-custom-notes--lore)
-  - [Option 5: Speed Mode (Skipping Steps)](#option-5-speed-mode-skipping-steps)
+  - [Option 3: Providing Custom Notes & Lore](#option-3-providing-custom-notes--lore)
 - [Intermediate Files & Resuming](#intermediate-files--resuming)
+- [Distributed Server & Worker Deployment](#distributed-server--worker-deployment)
 - [Configuration](#configuration)
 
 ---
@@ -36,11 +35,11 @@ AI Sub breaks down video subtitling into a clean, human-like workflow:
  1. The Big Picture (Summary)
     The AI takes a quick bird's-eye view of the entire video to learn who is in it,
     what they are doing (chatting, gaming, singing), and any inside jokes or names.
-    (If this stage fails, the pipeline halts immediately to save quota).
        │
        ▼
  2. Divide into 5-Minute Chunks
-    Long videos are split into 5-minute pieces so processing is fast and manageable.
+    Long videos are split into 5-minute pieces to prevent the AI from losing track due
+    to context bloat.
        │
        ▼
  3. Listen & Transcribe (Subtitles)
@@ -53,13 +52,11 @@ AI Sub breaks down video subtitling into a clean, human-like workflow:
     - If the segment was just talking or gaming: This step is skipped completely!
     - If someone sang a song: The AI looks up official lyrics in LRCLIB and web search
       to ensure tricky lyrics, puns, and Kanji are spelled and translated perfectly.
-    - If lyrics lookup fails: An error is explicitly logged for that part in the final
-      subtitles so you know it requires attention.
        │
        ▼
  5. Stitched Subtitle File (.srt)
     All pieces are assembled into a single subtitle file ready to drag-and-drop into
-    VLC, MPV, or YouTube.
+    VLC, MPV, or Substital.
 ```
 
 ---
@@ -90,7 +87,7 @@ AI Sub breaks down video subtitling into a clean, human-like workflow:
 
 ### Windows
 
-1. Open **Command Prompt** or **PowerShell** and create a virtual environment:
+1. Open **PowerShell** and create a virtual environment:
 
    ```powershell
    python -m venv venv
@@ -128,15 +125,6 @@ $env:TINYFISH_API_KEY="your_tinyfish_api_key_here"
 ai-sub --ai.search.tools=tinyfish,lrclib "path\to\video.mp4"
 ```
 
-#### On Windows (Command Prompt):
-
-```cmd
-set GEMINI_API_KEY=your_gemini_api_key_here
-set TINYFISH_API_KEY=your_tinyfish_api_key_here
-
-ai-sub --ai.search.tools=tinyfish,lrclib "path\to\video.mp4"
-```
-
 ---
 
 ### Option 2: Free Search Setup (DuckDuckGo)
@@ -161,17 +149,7 @@ ai-sub --ai.search.tools=duckduckgo,lrclib "path\to\video.mp4"
 
 ---
 
-### Option 3: Multi-Tool Search Setup
-
-You can provide multiple search providers simultaneously. The AI agent will select between them:
-
-```bash
-ai-sub --ai.search.tools=tinyfish,ollama,lrclib "path/to/video.mp4"
-```
-
----
-
-### Option 4: Providing Custom Notes & Lore
+### Option 3: Providing Custom Notes & Lore
 
 You can feed custom notes to the AI (such as character names, spelling preferences, or specific terms) using `--context` or a text file:
 
@@ -185,50 +163,29 @@ ai-sub --context-file "notes.txt" "video.mp4"
 
 ---
 
-### Option 5: Speed Mode (Skipping Steps)
+## Intermediate Files & Forcing Regeneration
 
-If you are subtitling a pure talking/gaming stream with no singing, or if you want to skip the whole-video preview to save time:
+Inside the temporary directory (`tmp_<video_name>`), AI Sub generates standalone state files (`.yaml`) and intermediate subtitles (`.srt`) tracking the progress of each video chunk and global summary:
 
-```bash
-# Skip the whole-video summary preview
-ai-sub --concurrency.summary=0 "video.mp4"
+- `summary.<summary_shortcode>.yaml`: Caches the global video summary and metadata (where `<summary_shortcode>` combines the summary model shortcode and prompt version, e.g., `g35l-01`).
+- `<part_name>.subtitles.<subtitles_shortcode>.yaml` & `.srt`: Caches raw segment dialogue transcription and timing (where `<subtitles_shortcode>` incorporates summary lineage and subtitle model shortcode/version, e.g., `g35l-01_g38f-19`).
+- `<part_name>.lyrics.<lyrics_shortcode>.yaml` & `.srt`: Caches refined song lyrics and translations when musical performances are detected (where `<lyrics_shortcode>` incorporates subtitle lineage and lyrics model shortcode/version, e.g., `g35l-01_g38f-19_g35l-10`).
 
-# Skip lyric searches and music refinement
-ai-sub --concurrency.lyrics=0 "video.mp4"
-
-# Fast dialogue-only mode (skip both preview and lyrics refinement)
-ai-sub --concurrency.summary=0 --concurrency.lyrics=0 "video.mp4"
-```
+Delete the corresponding `.yaml` state files in the temporary directory to force a regeneration of a specific summary, chunk transcription, or lyrics pass.
 
 ---
 
-## Intermediate Files & Resuming
+## Distributed Server & Worker Deployment
 
-AI Sub automatically saves its work in a temporary folder (`tmp_<video_name>`).
+For 24/7 automated video ingestion (e.g. watch folders or YouTube feeds) and distributed multi-node task processing:
 
-If your internet drops, your computer shuts down, or an API error occurs, **you do not lose your progress**. Simply run the exact same command again:
+- **Central Server (`ai-sub-server`)**: Coordinates jobs, task leases, ingestion, and Git synchronization.
+- **Workers (`ai-sub-worker`)**: Ephemeral worker nodes that lease chunks, execute multimodal Gemini inference, and return results.
 
-- AI Sub will automatically pick up where it left off.
-- It will reuse all completed chunks and only finish the missing pieces.
-
-### Comparing Intermediate Subtitles in VLC
-
-Inside the temporary directory (`tmp_<video_name>`), AI Sub generates standalone subtitle files for each video part with complete upstream lineage:
-
-- `part_000.subtitles-g35l-01_g38f-19.srt`: Initial dialogue transcription and timing (linked to the summary model).
-- `part_000.lyrics-g35l-01_g38f-19_g35l-10.srt`: Song lyrics and translation refinement (linked to both summary and subtitle models).
-
-When opened in VLC or MPV alongside the video chunk, the subtitle tracks are labeled with their full lineage for easy comparison.
-
-Once the entire process finishes, the final stitched subtitle file is saved alongside your video with a clean, concise filename:
-
-```text
-my_video.mp4
-my_video.g38f-011019.srt  <-- Drag this into your video player!
-```
+For complete setup instructions (systemd services, Nginx reverse proxy, Basic Auth, and Fail2ban security), see [`docs/SERVER_DEPLOYMENT.md`](docs/SERVER_DEPLOYMENT.md:1).
 
 ---
 
 ## Configuration
 
-For advanced settings (such as custom frame rates, custom models, rate limits, per-stage agentic video toggles, and storage cleanup rules), refer to [CONFIGURATION.md](docs/CONFIGURATION.md).
+For advanced settings (such as custom frame rates, custom models, rate limits, per-stage agentic video toggles, and storage cleanup rules), refer to [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md:1).

@@ -1,7 +1,10 @@
 """Modular job types and pipeline schemas across all processing phases."""
 
 from ai_sub.jobs.base import (
+    AiJob,
     BaseJob,
+    CleanTimestamp,
+    MediaJob,
     Prompt,
     WorkerContext,
     clean_timestamp_string,
@@ -39,16 +42,19 @@ from ai_sub.jobs.summary import (
 )
 
 __all__ = [
+    "AiJob",
     "BaseJob",
     "BaseSubtitleAiResponse",
     "BaseSubtitleJob",
     "ChapterItem",
+    "CleanTimestamp",
     "DetectedMusicalPerformance",
     "EntityItem",
     "GlossaryItem",
     "LYRICS_PROMPT_VERSION",
     "LyricsAiResponse",
     "LyricsJob",
+    "MediaJob",
     "Prompt",
     "ReencodeJob",
     "SUBTITLES_PROMPT_VERSION",

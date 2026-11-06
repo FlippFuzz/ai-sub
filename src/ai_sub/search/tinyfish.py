@@ -7,11 +7,7 @@ from typing import Any, Callable
 import logfire
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import (
-    BaseHttpSearchProvider,
-    WebSearchResult,
-    normalize_query,
-)
+from ai_sub.search.base import BaseHttpSearchProvider, WebSearchResult, normalize_query
 
 
 class TinyfishSearchProvider(BaseHttpSearchProvider):
@@ -33,10 +29,7 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
         """
         key = self._get_api_key()
         assert key is not None
-        return {
-            "X-API-Key": key.get_secret_value(),
-            "Content-Type": "application/json",
-        }
+        return {"X-API-Key": key.get_secret_value(), "Content-Type": "application/json"}
 
     def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
         """Returns search and fetch tool callables for Gemini model registration.
@@ -67,33 +60,21 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
             logfire.debug("Using cached Tinyfish search result for {query=}", query=query)
             return self._cache[cache_key]
 
-        params: dict[str, str] = {
-            "query": query,
-            "purpose": purpose,
-        }
+        params: dict[str, str] = {"query": query, "purpose": purpose}
         if language:
             params["language"] = language
 
-        with logfire.span(
-            "tinyfish_search: {query=}",
-            query=query,
-            purpose=purpose,
-            language=language or "auto",
-        ):
+        with logfire.span("tinyfish_search: {query=}", query=query, purpose=purpose, language=language or "auto"):
             response = await self._request("GET", "https://api.search.tinyfish.ai", params=params)
-            data = response.json()
-            raw_results = data.get("results", [])
+            raw_results = response.json().get("results", [])
 
             results: list[WebSearchResult] = []
             max_len = self.settings.max_length
             for item in raw_results:
-                title = item.get("title")
-                url = item.get("url")
-                raw_snippet = item.get("snippet")
-                if title and url and raw_snippet:
-                    content = str(raw_snippet)[:max_len]
+                title, url, snippet = item.get("title"), item.get("url"), item.get("snippet")
+                if title and url and snippet:
                     try:
-                        results.append(WebSearchResult(title=title, url=url, content=content))
+                        results.append(WebSearchResult(title=title, url=url, content=str(snippet)[:max_len]))
                     except Exception:
                         continue
 
@@ -151,27 +132,20 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
             logfire.debug("Using cached Tinyfish fetch results for {urls=}", urls=valid_urls)
             return self._cache[cache_key]
 
-        payload = {
-            "urls": valid_urls,
-            "purpose": purpose,
-            "format": "markdown",
-        }
-
+        payload = {"urls": valid_urls, "purpose": purpose, "format": "markdown"}
         with logfire.span("tinyfish_fetch: {urls=}", urls=valid_urls, purpose=purpose):
             response = await self._request("POST", "https://api.fetch.tinyfish.ai", json=payload)
-            data = response.json()
-            raw_results = data.get("results", [])
+            raw_results = response.json().get("results", [])
 
             results: list[dict[str, Any]] = []
-            max_len = self.settings.max_length * 2  # Allow generous length for full articles and lyric pages
+            max_len = self.settings.max_length * 2
             for page in raw_results:
-                text = str(page.get("text") or "")[:max_len]
                 results.append(
                     {
                         "url": page.get("url"),
                         "title": page.get("title"),
                         "language": page.get("language"),
-                        "text": text,
+                        "text": str(page.get("text") or "")[:max_len],
                     }
                 )
 

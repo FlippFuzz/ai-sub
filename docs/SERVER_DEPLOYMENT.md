@@ -240,15 +240,17 @@ crontab -e
 Add scheduled runs:
 
 ```cron
-# Every 4 hours: Run up to 50 tasks using gemini-3.5-flash-lite, stopping new task claims after 3 hours (180 mins)
-7 */4 * * * cd /home/ubuntu/ai-sub-worker && AISUB_WORKER_MODELS='google-gla:gemini-3.5-flash-lite' AISUB_WORKER_MAX_TASKS=50 AISUB_WORKER_MAX_DURATION_MINUTES=180 ./worker.sh > /tmp/ai-sub-worker.log 2>&1
+# Every 4 hours: Run up to 15 tasks using only gemini-3.5-flash-lite
+7 1,5,9,13,17 * * * cd /home/ubuntu/ai-sub-worker && AISUB_WORKER_MODELS='google-gla:gemini-3.5-flash-lite' AISUB_WORKER_MAX_TASKS=15 AISUB_WORKER_MAX_DURATION_MINUTES=180 ./worker.sh > /tmp/ai-sub-worker-35fl.log 2>&1
 
-# Daily at 21:00 UTC: Offer gemini-3.8-flash and gemini-3.6-flash during peak availability windows
-0 21 * * * cd /home/ubuntu/ai-sub-worker && AISUB_WORKER_MODELS='google-gla:gemini-3.8-flash,google-gla:gemini-3.6-flash' AISUB_WORKER_MAX_DURATION_MINUTES=180 ./worker.sh > /tmp/ai-sub-worker-38f.log 2>&1
+# Daily at 21:00 UTC: Offer all models during peak availability windows
+7 21 * * * cd /home/ubuntu/ai-sub-worker && AISUB_WORKER_MODELS='google-gla:gemini-3.8-flash,google-gla:gemini-3.6-flash,google-gla:gemini-3.5-flash-lite' AISUB_WORKER_MAX_TASKS=50 AISUB_WORKER_MAX_DURATION_MINUTES=180 ./worker.sh > /tmp/ai-sub-worker-all.log 2>&1
 ```
 
 ### Worker Operational Behavior
 
-- When the server task queue is empty, the worker exits cleanly in ~1 second.
-- In-flight tasks drain gracefully before exiting when the duration limit is reached.
-- Quota exhaustion (HTTP 429) automatically disables the affected model in memory for the remainder of the worker run without disrupting other models or tasks.
+- **Per-Model Concurrency:** `concurrency` applies per configured model (e.g. `concurrency: 2` with 3 models executes up to 6 concurrent tasks simultaneously, fully utilizing per-model quotas).
+- **Per-Model Task Limits:** `max_tasks` applies per configured model (e.g. `max_tasks: 100` with 3 models executes up to 100 tasks for each model). Reaching the limit retires slots for that specific model while other models continue running uninterrupted.
+- **Time-Based Idle Shutdown:** If all slots across all models remain idle for `idle_timeout_minutes` (default: 15 minutes), the worker exits cleanly. Setting `AISUB_WORKER_IDLE_TIMEOUT_MINUTES=0` exits immediately in ~1 second if the server queue is empty.
+- **Graceful Draining:** In-flight tasks drain gracefully before exiting when `max_duration_minutes` or `max_tasks` is reached.
+- **Quota Isolation:** Quota exhaustion (HTTP 429) shuts down only the slots assigned to that specific model for the remainder of the worker run, while slots for other models continue running uninterrupted.

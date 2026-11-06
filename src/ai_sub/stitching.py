@@ -71,23 +71,20 @@ def stitch_subtitles(
     initial_offset_ms: int = 0,
     use_lyrics: bool = True,
 ) -> StitchResult:
-    """Stitches segment subtitle and lyrics state files into unified, offset-shifted SRT files.
-
-    Produces the primary subtitle file and, if musical performances were refined,
-    an additional raw dialogue subtitles file.
+    """Stitches segment subtitle and lyrics state files into unified, offset-shifted SRT files in a single pass.
 
     Args:
         segments: Sequence of (segment_stem, segment_duration_ms) pairs in order.
         state_dir: Directory containing intermediate YAML state files.
         output_primary_path: Filesystem path for the primary stitched SRT.
-        output_raw_path: Filesystem path for the raw dialogue SRT if singing was refined.
+        output_raw_path: Filesystem path for the raw dialogue SRT if singing was refined. Defaults to None.
         subtitles_shortcode: Model shortcode used for subtitle YAML state files.
         lyrics_shortcode: Model shortcode used for lyrics YAML state files.
         validation_buffer_ms: Validation buffer tolerance in milliseconds.
         settings_dump: Serialized configuration settings to embed in Event 0.
         max_runs: Maximum attempt limit for retries. Defaults to 3.
-        status_override: Explicit status string ('Completed', 'RetriesExceeded', 'InProgress'). Defaults to None.
-        summary_available: Whether whole-video summary was active and successful. Defaults to True.
+        status_override: Explicit status string. Defaults to None.
+        summary_available: Whether whole-video summary was active. Defaults to True.
         initial_offset_ms: Starting time offset in milliseconds. Defaults to 0.
         use_lyrics: Whether lyrics refinement was enabled. Defaults to True.
 
@@ -95,19 +92,21 @@ def stitch_subtitles(
         StitchResult: Generated file paths and completion metrics.
     """
     all_subs = SSAFile()
+    raw_subs = SSAFile() if output_raw_path is not None else None
     generated_files: list[Path] = []
     current_offset_ms = initial_offset_ms
+
     any_failed = False
     max_retries_exceeded = False
     any_pending = False
     lyrics_refined_any = False
 
     for stem, seg_dur_ms in segments:
-        lyrics_file = state_dir / f"{stem}.lyrics.{lyrics_shortcode}.yaml"
         sub_file = state_dir / f"{stem}.subtitles.{subtitles_shortcode}.yaml"
+        lyrics_file = state_dir / f"{stem}.lyrics.{lyrics_shortcode}.yaml"
 
-        lyrics_job = LyricsJob.load(lyrics_file, validation_buffer_ms)
         sub_job = SubtitlesJob.load(sub_file, validation_buffer_ms)
+        lyrics_job = LyricsJob.load(lyrics_file, validation_buffer_ms) if use_lyrics else None
 
         lyrics_required = bool(
             use_lyrics and sub_job and sub_job.response and sub_job.response.detected_musical_performances
@@ -118,9 +117,8 @@ def stitch_subtitles(
             if lyrics_job and lyrics_job.response:
                 active_resp = lyrics_job.response
                 lyrics_refined_any = True
-        else:
-            if sub_job and sub_job.response:
-                active_resp = sub_job.response
+        elif sub_job and sub_job.response:
+            active_resp = sub_job.response
 
         if active_resp:
             seg_subs = active_resp.get_ssafile()
@@ -135,26 +133,35 @@ def stitch_subtitles(
                 )
             )
             any_failed = True
-            if lyrics_required:
-                attempts = lyrics_job.total_attempts if lyrics_job else 0
-            else:
-                attempts = sub_job.total_attempts if sub_job else 0
-
+            attempts = (
+                (lyrics_job.total_attempts if lyrics_job else 0)
+                if lyrics_required
+                else (sub_job.total_attempts if sub_job else 0)
+            )
             if attempts >= max_runs:
                 max_retries_exceeded = True
             else:
                 any_pending = True
 
+        if raw_subs is not None:
+            if sub_job and sub_job.response:
+                seg_raw_subs = sub_job.response.get_ssafile()
+                seg_raw_subs.shift(ms=current_offset_ms)
+                raw_subs += seg_raw_subs
+            else:
+                raw_subs.append(
+                    SSAEvent(
+                        start=current_offset_ms,
+                        end=current_offset_ms + seg_dur_ms,
+                        text="Error processing subtitles for this segment.",
+                    )
+                )
+
         current_offset_ms += seg_dur_ms
 
-    if status_override:
-        final_status = status_override
-    elif not any_failed:
-        final_status = "Completed"
-    elif max_retries_exceeded:
-        final_status = "RetriesExceeded"
-    else:
-        final_status = "InProgress"
+    final_status = status_override or (
+        "Completed" if not any_failed else ("RetriesExceeded" if max_retries_exceeded else "InProgress")
+    )
 
     metadata = {
         "ai_sub_version": get_app_version(),
@@ -167,32 +174,11 @@ def stitch_subtitles(
     }
 
     apply_metadata_header(all_subs, metadata)
-
     output_primary_path.parent.mkdir(parents=True, exist_ok=True)
     all_subs.save(str(output_primary_path))
     generated_files.append(output_primary_path)
 
-    # Generate raw pre-lyrics subtitle track if musical performances were refined
-    if lyrics_refined_any and output_raw_path is not None:
-        raw_subs = SSAFile()
-        raw_offset_ms = initial_offset_ms
-        for stem, seg_dur_ms in segments:
-            sub_file = state_dir / f"{stem}.subtitles.{subtitles_shortcode}.yaml"
-            sub_job = SubtitlesJob.load(sub_file, validation_buffer_ms)
-            if sub_job and sub_job.response:
-                seg_raw_subs = sub_job.response.get_ssafile()
-                seg_raw_subs.shift(ms=raw_offset_ms)
-                raw_subs += seg_raw_subs
-            else:
-                raw_subs.append(
-                    SSAEvent(
-                        start=raw_offset_ms,
-                        end=raw_offset_ms + seg_dur_ms,
-                        text="Error processing subtitles for this segment.",
-                    )
-                )
-            raw_offset_ms += seg_dur_ms
-
+    if lyrics_refined_any and raw_subs is not None and output_raw_path is not None:
         apply_metadata_header(raw_subs, metadata)
         output_raw_path.parent.mkdir(parents=True, exist_ok=True)
         raw_subs.save(str(output_raw_path))

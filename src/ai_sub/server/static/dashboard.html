@@ -1,0 +1,941 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>AI Sub Coordinator</title>
+    <style>
+      :root {
+        --bg: #0f172a;
+        --panel: #1e293b;
+        --card-inner: #0f172a;
+        --text: #f8fafc;
+        --muted: #94a3b8;
+        --border: #334155;
+        --accent: #38bdf8;
+        --green: #22c55e;
+        --yellow: #eab308;
+        --red: #ef4444;
+        --blue: #38bdf8;
+        --purple: #a855f7;
+        --pink: #ec4899;
+      }
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        margin: 0;
+        padding: 24px;
+      }
+      h1,
+      h2,
+      h3,
+      h4 {
+        margin-top: 0;
+        font-weight: 600;
+      }
+      .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 16px;
+        margin-bottom: 24px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 16px;
+        margin-bottom: 20px;
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 20px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+      }
+      .stage-card {
+        background: var(--card-inner);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        min-height: 110px;
+      }
+      .progress-bar {
+        background: #1e293b;
+        border-radius: 9999px;
+        height: 8px;
+        overflow: hidden;
+        margin: 8px 0;
+        border: 1px solid var(--border);
+        display: flex;
+      }
+      .progress-fill-done {
+        background: var(--green);
+        height: 100%;
+        transition: width 0.3s;
+      }
+      .progress-fill-prog {
+        background: var(--blue);
+        height: 100%;
+        transition: width 0.3s;
+      }
+      .badge {
+        display: inline-block;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.025em;
+      }
+      .badge-claim,
+      .badge-claimed,
+      .badge-processing,
+      .badge-in_progress {
+        background: rgba(56, 189, 248, 0.2);
+        color: #7dd3fc;
+        border: 1px solid rgba(56, 189, 248, 0.4);
+      }
+      .badge-complete,
+      .badge-completed,
+      .badge-ready {
+        background: rgba(34, 197, 94, 0.2);
+        color: #86efac;
+        border: 1px solid rgba(34, 197, 94, 0.4);
+      }
+      .badge-fail,
+      .badge-failed,
+      .badge-push_failed {
+        background: rgba(239, 68, 68, 0.2);
+        color: #fca5a5;
+        border: 1px solid rgba(239, 68, 68, 0.4);
+      }
+      .badge-timeout,
+      .badge-preparing,
+      .badge-unplayable {
+        background: rgba(234, 179, 8, 0.2);
+        color: #fde047;
+        border: 1px solid rgba(234, 179, 8, 0.4);
+      }
+      .badge-pending,
+      .badge-idle,
+      .badge-skipped {
+        background: rgba(148, 163, 184, 0.15);
+        color: #cbd5e1;
+        border: 1px solid var(--border);
+      }
+      .badge-finalizing {
+        background: rgba(168, 85, 247, 0.2);
+        color: #d8b4fe;
+        border: 1px solid rgba(168, 85, 247, 0.4);
+      }
+      .badge-youtube {
+        background: rgba(239, 68, 68, 0.15);
+        color: #fca5a5;
+        border: 1px solid rgba(239, 68, 68, 0.3);
+      }
+      .badge-local {
+        background: rgba(56, 189, 248, 0.15);
+        color: #7dd3fc;
+        border: 1px solid rgba(56, 189, 248, 0.3);
+      }
+      .badge-clickable {
+        cursor: pointer;
+        transition:
+          background 0.15s,
+          border-color 0.15s;
+        user-select: none;
+      }
+      .badge-clickable:hover {
+        background: rgba(56, 189, 248, 0.35);
+        border-color: #38bdf8;
+        color: #fff;
+      }
+      .banner-cooldown {
+        background: rgba(234, 179, 8, 0.12);
+        border: 1px solid rgba(234, 179, 8, 0.35);
+        border-left: 4px solid var(--yellow);
+        border-radius: 6px;
+        padding: 12px 16px;
+        margin-bottom: 20px;
+        font-size: 13px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .btn {
+        background: #334155;
+        color: var(--text);
+        border: 1px solid var(--border);
+        padding: 6px 14px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 500;
+        transition:
+          background 0.15s,
+          border-color 0.15s;
+      }
+      .btn:hover {
+        background: #475569;
+      }
+      .table-container {
+        max-height: 380px;
+        overflow-y: auto;
+        position: relative;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+        text-align: left;
+      }
+      th,
+      td {
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--border);
+      }
+      th {
+        color: var(--muted);
+        font-weight: 500;
+      }
+      .table-container th {
+        position: sticky;
+        top: 0;
+        background: var(--panel);
+        z-index: 2;
+      }
+      .mono {
+        font-family:
+          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 12px;
+      }
+      .tabs {
+        display: flex;
+        gap: 8px;
+        border-bottom: 1px solid var(--border);
+        margin-bottom: 20px;
+      }
+      .tab-btn {
+        background: transparent;
+        border: none;
+        color: var(--muted);
+        padding: 10px 18px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .tab-btn.active {
+        color: var(--accent);
+        border-bottom-color: var(--accent);
+      }
+      .expand-btn {
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--muted);
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      .expand-btn:hover {
+        color: var(--text);
+        border-color: var(--muted);
+      }
+      .detail-row {
+        background: var(--card-inner);
+        font-size: 12px;
+        color: #cbd5e1;
+        display: none;
+      }
+      .detail-box {
+        padding: 12px 16px;
+        white-space: pre-wrap;
+        word-break: break-all;
+        margin: 0;
+        line-height: 1.5;
+      }
+      .detail-box-fail {
+        background: rgba(239, 68, 68, 0.08);
+        border-left: 3px solid var(--red);
+        color: #fca5a5;
+      }
+      .detail-query-bar {
+        margin-top: 10px;
+        padding-top: 10px;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        font-family:
+          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .detail-query-code {
+        color: #7dd3fc;
+        background: #0b1120;
+        padding: 4px 8px;
+        border-radius: 4px;
+        border: 1px solid var(--border);
+        word-break: break-all;
+      }
+      .video-title-link {
+        color: inherit;
+        text-decoration: none;
+      }
+      .video-title-link:hover {
+        text-decoration: underline;
+        color: var(--accent);
+      }
+      .video-thumb {
+        width: 140px;
+        aspect-ratio: 16 / 9;
+        object-fit: cover;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        flex-shrink: 0;
+        background: #0b1120;
+      }
+      .queue-thumb {
+        width: 64px;
+        aspect-ratio: 16 / 9;
+        object-fit: cover;
+        border-radius: 4px;
+        border: 1px solid var(--border);
+        display: block;
+        background: #0b1120;
+      }
+      .thumb-prep {
+        width: 80px;
+        aspect-ratio: 16 / 9;
+        object-fit: cover;
+        border-radius: 4px;
+        border: 1px solid rgba(234, 179, 8, 0.3);
+        flex-shrink: 0;
+        background: #0b1120;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <div>
+        <h1 style="margin: 0">AI Sub Coordinator</h1>
+      </div>
+      <div style="display: flex; gap: 12px; align-items: center">
+        <span
+          class="mono"
+          style="color: var(--muted); font-size: 12px"
+          id="last-updated-text"
+          >Updated just now</span
+        >
+        <button class="btn" onclick="updateDashboard()">Refresh UI</button>
+        <span class="badge badge-complete" id="connection-status"
+          >Live (auto-refresh 60s)</span
+        >
+      </div>
+    </div>
+
+    <div id="cooldown-banner-container"></div>
+    <div class="tabs" id="pipeline-tabs"></div>
+    <div id="tab-content"></div>
+
+    <script>
+      let lastSuccessTime = Date.now()
+
+      function esc(s) {
+        return String(s ?? "").replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[c],
+        )
+      }
+
+      function formatLocalTime(epochSec) {
+        if (!epochSec) return "-"
+        return new Date(epochSec * 1000).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        })
+      }
+
+      function formatLocalDate(epochSec) {
+        if (!epochSec) return "-"
+        return new Date(epochSec * 1000).toLocaleDateString([], {
+          year: "numeric",
+          month: "short",
+          day: "numeric",
+        })
+      }
+
+      function formatDuration(sec) {
+        if (sec == null || sec <= 0) return "0s"
+        const sNum = Number(sec)
+        const hours = Math.floor(sNum / 3600)
+        const mins = Math.floor((sNum % 3600) / 60)
+        const s = Math.floor(sNum % 60)
+        if (hours > 0) return `${hours}h ${mins}m`
+        if (mins > 0) return `${mins}m ${s}s`
+        return `${s}s`
+      }
+
+      function updateRelativeTime() {
+        const el = document.getElementById("last-updated-text")
+        if (!el) return
+        const sec = Math.floor((Date.now() - lastSuccessTime) / 1000)
+        if (sec < 3) {
+          el.innerText = "Updated just now"
+        } else if (sec < 60) {
+          el.innerText = `Updated ${sec}s ago`
+        } else {
+          const mins = Math.floor(sec / 60)
+          const remSec = sec % 60
+          el.innerText = `Updated ${mins}m ${remSec}s ago`
+        }
+      }
+
+      setInterval(updateRelativeTime, 1000)
+
+      function copyTextFallback(text) {
+        const prev = document.activeElement
+        const ta = document.createElement("textarea")
+        ta.value = text
+        ta.style.position = "fixed"
+        ta.style.opacity = "0"
+        document.body.appendChild(ta)
+        ta.focus()
+        ta.select()
+        let success = false
+        try {
+          success = document.execCommand("copy")
+        } catch (e) {
+          console.error("Fallback clipboard copy failed:", e)
+        } finally {
+          document.body.removeChild(ta)
+          if (prev && typeof prev.focus === "function") {
+            prev.focus()
+          }
+        }
+        return success
+      }
+
+      function copyQueryFromData(el) {
+        const query = el.getAttribute("data-query")
+        if (!query) return
+
+        const setStatus = (msg, colorVar) => {
+          const original = el.innerText
+          el.innerText = msg
+          el.style.borderColor = colorVar
+          el.style.color = colorVar
+          setTimeout(() => {
+            el.innerText = original
+            el.style.borderColor = ""
+            el.style.color = ""
+          }, 1500)
+        }
+
+        const onSuccess = () => setStatus("Copied Query!", "var(--green)")
+        const onFail = () => setStatus("Copy Failed", "var(--red)")
+
+        if (navigator.clipboard && window.isSecureContext) {
+          navigator.clipboard
+            .writeText(query)
+            .then(onSuccess)
+            .catch(() => {
+              if (copyTextFallback(query)) {
+                onSuccess()
+              } else {
+                onFail()
+              }
+            })
+        } else {
+          if (copyTextFallback(query)) {
+            onSuccess()
+          } else {
+            onFail()
+          }
+        }
+      }
+
+      function renderStageCard({
+        stepNumber,
+        title,
+        done,
+        inProgress,
+        total,
+        infoText,
+      }) {
+        const donePct = total > 0 ? Math.round((done / total) * 100) : 0
+        const progPct = total > 0 ? Math.round((inProgress / total) * 100) : 0
+
+        return `
+          <div class="stage-card">
+            <div>
+              <b style="font-size: 13px;">${stepNumber}. ${esc(title)}</b>
+              <div style="display:flex; justify-content:space-between; font-size: 11px; margin-top: 6px;">
+                <span>
+                  ${inProgress > 0 ? `<span style="color:var(--blue); font-weight:600;">${inProgress} In Progress</span> · ` : ""}
+                  <b style="color:var(--green);">${done} Done</b>
+                </span>
+                <span style="color:var(--muted);">Total: ${total} (${donePct}%)</span>
+              </div>
+              <div class="progress-bar">
+                <div class="progress-fill-done" style="width: ${donePct}%;"></div>
+                <div class="progress-fill-prog" style="width: ${progPct}%;"></div>
+              </div>
+            </div>
+            <div style="font-size: 11px; color: var(--muted); margin-top: 4px;">
+              ${infoText}
+            </div>
+          </div>
+        `
+      }
+
+      let currentData = null
+      let selectedPipelineIndex = 0
+
+      function selectTab(index) {
+        selectedPipelineIndex = index
+        renderPipelineView()
+      }
+
+      function toggleDetail(idx) {
+        const el = document.getElementById("detail-" + idx)
+        if (el) {
+          el.style.display =
+            el.style.display === "table-row" ? "none" : "table-row"
+        }
+      }
+
+      function renderPipelineView() {
+        if (!currentData || !currentData.pipelines) return
+
+        // Render global YouTube Cooldown banner if active
+        const cd = currentData.youtube_cooldown
+        const bannerContainer = document.getElementById(
+          "cooldown-banner-container",
+        )
+        if (cd && cd.in_cooldown) {
+          bannerContainer.innerHTML = `
+            <div class="banner-cooldown">
+              <span>⚠️</span>
+              <div>
+                <b>YouTube Intake Paused:</b> ${esc(cd.reason || "Download failure threshold reached")}.
+                Resuming in <b>${formatDuration(cd.remaining_seconds)}</b>. Local intake files continue to process unhindered.
+              </div>
+            </div>
+          `
+        } else {
+          bannerContainer.innerHTML = ""
+        }
+
+        const pipe =
+          currentData.pipelines[selectedPipelineIndex] ||
+          currentData.pipelines[0]
+        if (!pipe) return
+
+        const tabs = document.getElementById("pipeline-tabs")
+        tabs.innerHTML = currentData.pipelines
+          .map((p, idx) => {
+            const pStatus = p.status || (p.idle ? "idle" : "processing")
+            return `
+              <button class="tab-btn ${idx === selectedPipelineIndex ? "active" : ""}" onclick="selectTab(${idx})">
+                ${esc(p.name)}
+                <span class="badge badge-${esc(pStatus)}">${esc(pStatus)}</span>
+              </button>
+            `
+          })
+          .join("")
+
+        const v = pipe.active_video
+        const st = pipe.stages
+
+        let activeSection = ""
+        if (v && st) {
+          const sum = st.summary
+          const reenc = st.reencoding
+          const sub = st.subtitles
+          const lyr = st.lyrics
+
+          const durMin = Math.floor(v.duration_ms / 60000)
+          const durSec = Math.floor((v.duration_ms % 60000) / 1000)
+          const durationFormatted =
+            durMin > 0 ? `${durMin}m ${durSec}s` : `${durSec}s`
+
+          const sumInfo =
+            sum.done > 0
+              ? "Macro knowledge index & chapters ready."
+              : sum.in_progress > 0
+                ? `Running by worker <b>${esc(sum.worker_id)}</b> (${formatDuration(sum.elapsed_s)})`
+                : "Waiting for worker pickup."
+
+          const reencInfo =
+            reenc.total === 0
+              ? "Waiting for video segmentation..."
+              : reenc.pending > 0
+                ? `${reenc.pending} chunk(s) pending compression`
+                : "All chunks compressed and ready."
+
+          const subInfo =
+            sub.in_progress > 0
+              ? `${sub.in_progress} chunk(s) actively running on workers`
+              : sub.done === sub.total && sub.total > 0
+                ? "All subtitle chunks transcribed."
+                : sum.done === 0
+                  ? "Waiting for whole-video summary to complete."
+                  : "Waiting for worker pickup."
+
+          const lyrInfo =
+            lyr.status === "pending"
+              ? "Vocal performances will be detected during transcription."
+              : lyr.status === "skipped"
+                ? "No vocal singing detected across all chunks."
+                : lyr.in_progress > 0
+                  ? lyr.active_leases
+                      .map(
+                        (l) =>
+                          `Refining with <b>${esc(l.worker_id)}</b> (${formatDuration(l.elapsed_s)})`,
+                      )
+                      .join(", ")
+                  : lyr.done === lyr.total
+                    ? "All singing chunks refined."
+                    : "Waiting for worker pickup."
+
+          const isYt = v.source_type === "youtube"
+          const thumbHtml =
+            isYt && v.video_id
+              ? `<img class="video-thumb" src="https://i.ytimg.com/vi/${esc(v.video_id)}/mqdefault.jpg" alt="${esc(v.title)}" onerror="this.style.display='none'">`
+              : ""
+          const titleHtml =
+            isYt && v.video_id
+              ? `<a href="https://youtu.be/${esc(v.video_id)}" target="_blank" rel="noopener noreferrer" class="video-title-link">${esc(v.title)}</a>`
+              : esc(v.title)
+
+          activeSection = `
+            <div class="card" style="margin-bottom: 20px;">
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom: 16px; gap: 16px;">
+                <div style="display:flex; gap: 16px; align-items:flex-start;">
+                  ${thumbHtml}
+                  <div>
+                    <div style="display:flex; gap: 8px; align-items:center; margin-bottom: 6px;">
+                      <span class="badge badge-complete">Active Video</span>
+                      <span class="badge badge-${esc(v.source_type)}">${esc(v.source_type)}</span>
+                      <span class="badge badge-${esc(pipe.status || "processing")}">${esc(pipe.status || "processing")}</span>
+                    </div>
+                    <h3 style="margin-bottom: 4px;">${titleHtml}</h3>
+                    <div style="color: var(--muted); font-size: 13px;">
+                      Channel: <b>${esc(v.channel_name || v.uploader)}</b> (@${esc(v.uploader)}) | Duration: ${durationFormatted}
+                    </div>
+                  </div>
+                </div>
+                <div style="text-align: right; display: flex; flex-direction: column; gap: 4px; flex-shrink: 0;">
+                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Summary:</span> ${esc(pipe.models.summary.split(":").pop())}</div>
+                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Subtitles:</span> ${esc(pipe.models.subtitles.split(":").pop())}</div>
+                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Lyrics:</span> ${esc(pipe.models.lyrics.split(":").pop())}</div>
+                </div>
+              </div>
+
+              <div class="grid">
+                ${renderStageCard({ stepNumber: 1, title: "Whole-Video Summary", done: sum.done, inProgress: sum.in_progress, total: sum.total, infoText: sumInfo })}
+                ${renderStageCard({ stepNumber: 2, title: "Chunk Compression", done: reenc.done, inProgress: reenc.in_progress, total: reenc.total, infoText: reencInfo })}
+                ${renderStageCard({ stepNumber: 3, title: "Subtitles Transcription", done: sub.done, inProgress: sub.in_progress, total: sub.total, infoText: subInfo })}
+                ${renderStageCard({ stepNumber: 4, title: "Lyrics Refinement", done: lyr.done, inProgress: lyr.in_progress, total: lyr.total, infoText: lyrInfo })}
+              </div>
+
+              <div style="font-size: 12px; margin-top: 8px;">
+                <b>Active Leases:</b>
+                ${
+                  pipe.tasks
+                    .filter((t) => t.status === "claimed")
+                    .map((t) => {
+                      const parts = t.task_id.split("::")
+                      const lastPart = parts.pop()
+                      const taskLabel =
+                        lastPart === t.type ? t.type : `${t.type} ${lastPart}`
+                      const dur = formatDuration(t.elapsed_s)
+                      const query = t.logfire_query || ""
+                      return `
+                        <span class="badge badge-claim mono badge-clickable"
+                              data-query="${esc(query)}"
+                              onclick="copyQueryFromData(this)"
+                              title="Click to copy Logfire query: ${esc(query)}">
+                          ${esc(taskLabel)} (${esc(t.worker_id)}) [${dur}] 📋
+                        </span>
+                      `
+                    })
+                    .join(" ") ||
+                  '<span style="color:var(--muted);">No active worker leases at this moment</span>'
+                }
+              </div>
+            </div>
+          `
+        } else {
+          const totalTracked = currentData.total_tracked_videos || 0
+          const qTotal = pipe.queue_total ?? (pipe.next_in_queue || []).length
+
+          let statusTitle = `${pipe.name} is currently idle`
+          let statusDesc = "Waiting for next video from intake sources..."
+          let prepDetail = ""
+
+          if (cd && cd.in_cooldown) {
+            statusDesc = `Waiting for next video (YouTube intake is paused on cooldown for another ${formatDuration(cd.remaining_seconds)}, local files still process).`
+          } else if (totalTracked > 0 && qTotal === 0) {
+            statusTitle = `${pipe.name} is idle — all videos complete for this pipeline`
+            statusDesc = `All ${totalTracked} tracked video(s) have finished processing for ${pipe.name}. Waiting for new uploads or files...`
+          }
+
+          if (pipe.status === "preparing") {
+            const prep = pipe.preparing_video
+            if (prep && prep.title) {
+              statusTitle = `${pipe.name} is preparing media`
+              statusDesc =
+                "Downloading video stream or generating segment chunks..."
+              const channelDisplay = prep.channel_name || prep.uploader
+              const isPrepYt = (prep.source_type || "youtube") === "youtube"
+              const prepThumb =
+                isPrepYt && prep.video_id
+                  ? `<img class="thumb-prep" src="https://i.ytimg.com/vi/${esc(prep.video_id)}/mqdefault.jpg" alt="${esc(prep.title)}" onerror="this.style.display='none'">`
+                  : ""
+              const prepTitle =
+                isPrepYt && prep.video_id
+                  ? `<a href="https://youtu.be/${esc(prep.video_id)}" target="_blank" rel="noopener noreferrer" class="video-title-link"><b>${esc(prep.title)}</b></a>`
+                  : `<b>${esc(prep.title)}</b>`
+
+              prepDetail = `
+                <div style="margin-top: 14px; display: inline-flex; align-items: center; gap: 12px; background: rgba(234, 179, 8, 0.1); border: 1px solid rgba(234, 179, 8, 0.3); border-radius: 6px; padding: 8px 14px; font-size: 13px;">
+                  ${prepThumb}
+                  <div style="display:flex; flex-direction:column; align-items:flex-start; gap: 4px;">
+                    <div style="display:flex; align-items:center; gap: 8px;">
+                      <span class="badge badge-${esc(prep.source_type || "youtube")}">${esc(prep.source_type || "youtube")}</span>
+                      ${prepTitle}
+                    </div>
+                    <span style="color: var(--muted); font-size: 12px;">(${esc(channelDisplay)} @${esc(prep.uploader)})</span>
+                  </div>
+                </div>
+              `
+            } else {
+              statusTitle = `${pipe.name} is preparing media`
+              statusDesc =
+                "Downloading video stream or generating segment chunks..."
+            }
+          } else if (pipe.status === "finalizing") {
+            statusTitle = `${pipe.name} is finalizing subtitles`
+            statusDesc =
+              "Stitching completed subtitle segments and committing to Git..."
+          } else if (pipe.status === "push_failed") {
+            statusTitle = `${pipe.name} encountered a Git push failure`
+            statusDesc =
+              "Subtitles completed on disk. Retrying Git synchronization automatically on next cycle..."
+          }
+
+          activeSection = `
+            <div class="card" style="margin-bottom: 20px; padding: 36px; text-align: center;">
+              <div style="margin-bottom: 10px;">
+                <span class="badge badge-${esc(pipe.status || "idle")}">${esc(pipe.status || "idle")}</span>
+              </div>
+              <h3 style="margin-bottom: 6px;">${esc(statusTitle)}</h3>
+              <p style="color: var(--muted); margin: 0;">${esc(statusDesc)}</p>
+              ${prepDetail}
+              <div class="mono" style="font-size: 12px; margin-top: 14px; color: var(--muted);">
+                Models: ${esc(pipe.models.summary.split(":").pop())} / ${esc(pipe.models.subtitles.split(":").pop())} / ${esc(pipe.models.lyrics.split(":").pop())}
+              </div>
+            </div>
+          `
+        }
+
+        const qItems = pipe.next_in_queue || []
+        const qTotal = pipe.queue_total ?? qItems.length
+        const totalTrackedAll = currentData.total_tracked_videos || 0
+        const emptyQueueMsg =
+          totalTrackedAll > 0 && qTotal === 0
+            ? `All ${totalTrackedAll} tracked video(s) have finished processing for ${pipe.name}.`
+            : "No pending videos in queue for this pipeline."
+
+        const queueTitleSuffix =
+          qTotal > qItems.length
+            ? `(Showing ${qItems.length} of ${qTotal})`
+            : `(${qTotal})`
+
+        const queueTable =
+          qItems
+            .map((q) => {
+              let statusCell = `<span class="badge badge-complete">Ready</span>`
+              if (q.status === "unplayable") {
+                statusCell = `<span class="badge badge-timeout">Unplayable</span> <span style="font-size:11px; color:var(--muted);">${esc(q.error_reason || "Ineligible")} · Retry in ${formatDuration(q.retry_in_s)}</span>`
+              } else if (q.status === "failed") {
+                statusCell = `<span class="badge badge-fail">Failed</span> <span style="font-size:11px; color:var(--muted);">${esc(q.error_reason || "Error")} · Retry in ${formatDuration(q.retry_in_s)}</span>`
+              }
+
+              const dateDisplay =
+                q.timestamp > 0 ? formatLocalDate(q.timestamp) : "-"
+              const isQYt = q.source_type === "youtube"
+              const qTitleHtml =
+                isQYt && q.video_id
+                  ? `<a href="https://youtu.be/${esc(q.video_id)}" target="_blank" rel="noopener noreferrer" class="video-title-link">${esc(q.title)}</a>`
+                  : esc(q.title)
+
+              const qThumbHtml =
+                isQYt && q.video_id
+                  ? `<img class="queue-thumb" src="https://i.ytimg.com/vi/${esc(q.video_id)}/default.jpg" alt="" onerror="this.style.display='none'">`
+                  : `<span style="color:var(--muted);">-</span>`
+
+              return `
+                <tr>
+                  <td>${qThumbHtml}</td>
+                  <td>${qTitleHtml}</td>
+                  <td><b>${esc(q.channel_name || q.uploader)}</b> <span class="mono" style="color:var(--muted);">(@${esc(q.uploader)})</span></td>
+                  <td class="mono" style="font-size:12px;">${esc(dateDisplay)}</td>
+                  <td><span class="badge badge-${esc(q.source_type)}">${esc(q.source_type)}</span></td>
+                  <td>${statusCell}</td>
+                </tr>
+              `
+            })
+            .join("") ||
+          `<tr><td colspan="6" style="color: var(--muted);">${esc(emptyQueueMsg)}</td></tr>`
+
+        const activityTable =
+          (pipe.recent_activity || [])
+            .map((a, idx) => {
+              const parts = a.task_id.split("::")
+              const cleanTaskId =
+                parts.length > 2
+                  ? parts.slice(2).join(" ")
+                  : parts[1] || a.task_id
+              const activityTime = formatLocalTime(a.timestamp)
+              const durText = a.duration_s ? formatDuration(a.duration_s) : ""
+              const hasDetail = Boolean(a.detail || a.logfire_query)
+              const videoIdDisplay = a.video_id || parts[1] || "-"
+
+              const queryHtml = a.logfire_query
+                ? `
+                <div class="detail-query-bar">
+                  <div>Logfire Query: <code class="detail-query-code">${esc(a.logfire_query)}</code></div>
+                  <button class="btn" data-query="${esc(a.logfire_query)}" onclick="copyQueryFromData(this)">Copy Query</button>
+                </div>
+              `
+                : ""
+
+              return `
+                <tr>
+                  <td class="mono">${esc(activityTime)}</td>
+                  <td class="mono"><b>${esc(a.worker_id)}</b></td>
+                  <td class="mono">${esc(videoIdDisplay)}</td>
+                  <td class="mono">${esc(cleanTaskId)}</td>
+                  <td><span class="badge badge-${esc(a.event_type)}">${esc(a.event_type)} ${durText}</span></td>
+                  <td>${hasDetail ? `<button class="expand-btn" onclick="toggleDetail(${idx})">Details</button>` : "-"}</td>
+                </tr>
+                ${
+                  hasDetail
+                    ? `
+                  <tr class="detail-row" id="detail-${idx}">
+                    <td colspan="6">
+                      <div class="detail-box ${a.event_type === "fail" ? "detail-box-fail" : ""}">
+                        <div>${esc(a.detail || "No error details recorded.")}</div>
+                        ${queryHtml}
+                      </div>
+                    </td>
+                  </tr>
+                `
+                    : ""
+                }
+              `
+            })
+            .join("") ||
+          `<tr><td colspan="6" style="color: var(--muted);">No worker activity recorded yet for ${esc(pipe.name)}.</td></tr>`
+
+        document.getElementById("tab-content").innerHTML = `
+          ${activeSection}
+          <div class="card">
+            <h3>Next In Queue for ${esc(pipe.name)} ${esc(queueTitleSuffix)}</h3>
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width: 70px;">Thumbnail</th>
+                    <th>Video Title</th>
+                    <th>Channel / Uploader</th>
+                    <th>Published</th>
+                    <th>Source</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>${queueTable}</tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card" style="margin-top: 20px;">
+            <h3>Recent Worker Activity for ${esc(pipe.name)}</h3>
+            <div class="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Worker</th>
+                    <th>Video ID</th>
+                    <th>Task</th>
+                    <th>Event</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>${activityTable}</tbody>
+              </table>
+            </div>
+          </div>
+        `
+      }
+
+      async function updateDashboard() {
+        const statusBadge = document.getElementById("connection-status")
+        try {
+          const res = await fetch("/api/v1/dashboard/data")
+          if (!res.ok) {
+            if (statusBadge) {
+              statusBadge.className = "badge badge-fail"
+              statusBadge.innerText = "Server Error (" + res.status + ")"
+            }
+            return
+          }
+          currentData = await res.json()
+          lastSuccessTime = Date.now()
+          updateRelativeTime()
+
+          if (statusBadge) {
+            statusBadge.className = "badge badge-complete"
+            statusBadge.innerText = "Live (auto-refresh 60s)"
+          }
+
+          renderPipelineView()
+        } catch (err) {
+          console.error(err)
+          if (statusBadge) {
+            statusBadge.className = "badge badge-fail"
+            statusBadge.innerText = "Disconnected"
+          }
+        }
+      }
+
+      setInterval(updateDashboard, 60000)
+      updateDashboard()
+    </script>
+  </body>
+</html>

@@ -6,10 +6,18 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Self
 
+import logfire
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    ValidationError,
+)
 
 if TYPE_CHECKING:
     from ai_sub.gemini_executor import GeminiExecutor
@@ -44,23 +52,31 @@ _YamlDumper.add_representer(str, _str_presenter)
 def clean_timestamp_string(ts_str: str) -> str:
     """Extracts a valid timestamp pattern from a potentially noisy LLM string.
 
+    Supports both period and comma decimal delimiters (e.g. '01:23.450' and '01:23,450').
+
     Args:
         ts_str: Potentially noisy timestamp string.
 
     Returns:
-        str: Isolated timecode string.
+        str: Isolated timecode string normalized to period decimals.
     """
+    if not isinstance(ts_str, str):
+        return ts_str
     match = re.search(
-        r"(\d{1,2}:\d{2}:\d{2}(?!\d)(?:\.\d{1,3})?|\d{1,2}:\d{2}(?:[.]\d{1,3}|:\d{3}(?!\d))|\d{1,2}:\d{2}(?!\d))",
+        r"(\d{1,2}:\d{2}:\d{2}(?!\d)(?:[.,]\d{1,3})?|\d{1,2}:\d{2}(?:[.,]\d{1,3}|:\d{3}(?!\d))|\d{1,2}:\d{2}(?!\d))",
         ts_str,
     )
-    return match.group(1) if match else ts_str
+    return match.group(1).replace(",", ".") if match else ts_str
+
+
+CleanTimestamp = Annotated[str, BeforeValidator(clean_timestamp_string)]
 
 
 def parse_timestamp_string_ms(timestamp_string: str) -> int:
     """Parses standard timestamp formats into total milliseconds.
 
-    Supports 'MM:SS.mmm', 'HH:MM:SS.mmm', 'HH:MM:SS', 'MM:SS:mmm', and 'MM:SS'.
+    Supports 'MM:SS.mmm', 'HH:MM:SS.mmm', 'HH:MM:SS', 'MM:SS:mmm', 'MM:SS',
+    and comma millisecond delimiters (e.g., '01:23,450').
 
     Args:
         timestamp_string: Timestamp string to parse.
@@ -71,7 +87,7 @@ def parse_timestamp_string_ms(timestamp_string: str) -> int:
     Raises:
         ValueError: If the timestamp cannot be parsed into milliseconds.
     """
-    ts = timestamp_string.strip()
+    ts = timestamp_string.strip().replace(",", ".")
 
     if "." in ts:
         split1 = ts.split(".")
@@ -231,7 +247,7 @@ class WorkerContext:
 
 
 class BaseJob(BaseModel):
-    """Base class for all segment execution jobs with YAML state persistence."""
+    """Base class for all segment execution tasks."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -242,10 +258,27 @@ class BaseJob(BaseModel):
         default=0,
         description="Total processing attempts recorded across all executions.",
     )
+
+
+class MediaJob(BaseJob):
+    """Base class for media manipulation tasks (such as video transcoding)."""
+
     user_context: str | None = Field(
         default=None,
         description="Resolved user-supplied context string applied during execution.",
     )
+
+
+class AiJob(BaseJob):
+    """Base class for AI-executed jobs with YAML persistence and prompt version validation."""
+
+    user_context: str | None = Field(
+        default=None,
+        description="Resolved user-supplied context string applied during execution.",
+    )
+
+    prompt_version_field: ClassVar[str] = ""
+    prompt_version: ClassVar[int] = 0
 
     def save(self, filename: Path) -> None:
         """Serializes the job state to a human-readable YAML file.
@@ -256,3 +289,45 @@ class BaseJob(BaseModel):
         data: dict[str, Any] = self.model_dump(mode="json")
         with open(filename, "w", encoding="utf-8") as file:
             yaml.dump(data, file, Dumper=_YamlDumper, sort_keys=False, allow_unicode=True)
+
+    @classmethod
+    def load(cls, save_path: Path, validation_buffer_ms: int = 0) -> Self | None:
+        """Loads and validates a saved YAML state file.
+
+        Args:
+            save_path: State file path.
+            validation_buffer_ms: Duration tolerance in milliseconds.
+
+        Returns:
+            Self | None: Loaded job instance, or None if invalid or version mismatch.
+        """
+        if not save_path.is_file():
+            return None
+
+        with open(save_path, "r", encoding="utf-8") as f:
+            try:
+                data = yaml.safe_load(f)
+                if not isinstance(data, dict):
+                    logfire.warning(f"Corrupt YAML in {save_path.name}. Re-processing.")
+                    return None
+                job = cls.model_validate(
+                    data,
+                    context={
+                        "video_duration_ms": data.get("video_duration_ms"),
+                        "validation_buffer_ms": validation_buffer_ms,
+                    },
+                )
+            except (yaml.YAMLError, ValidationError) as e:
+                logfire.warning(f"Validation failed for {save_path.name}: {e}. Re-processing.")
+                return None
+
+        if cls.prompt_version_field and cls.prompt_version:
+            file_version = getattr(job, cls.prompt_version_field, None)
+            if file_version != cls.prompt_version:
+                logfire.info(
+                    f"Prompt version mismatch for {job.name} "
+                    f"(file: v{file_version}, current: v{cls.prompt_version}). Re-processing."
+                )
+                return None
+
+        return job

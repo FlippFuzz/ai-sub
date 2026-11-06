@@ -6,11 +6,11 @@ from pathlib import Path
 
 from pydantic import Field, NonNegativeInt, PositiveFloat, PositiveInt
 
-from ai_sub.jobs.base import BaseJob
+from ai_sub.jobs.base import MediaJob
 from ai_sub.video import reencode_video
 
 
-class ReencodeJob(BaseJob):
+class ReencodeJob(MediaJob):
     """Represents a video segment compression task using FFmpeg."""
 
     input_file: Path = Field(description="Source video segment path.")

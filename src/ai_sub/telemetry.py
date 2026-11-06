@@ -50,7 +50,17 @@ def get_app_version() -> str:
     Returns:
         str: Package version or fallback identifier.
     """
-    return version("ai-sub")
+    try:
+        from ai_sub._version import __version__  # pyright: ignore[reportMissingImports]
+
+        return __version__
+    except ImportError:
+        pass
+
+    try:
+        return version("ai-sub")
+    except Exception:
+        return "0.0.0.dev0"
 
 
 def setup_logging(

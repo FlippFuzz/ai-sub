@@ -13,15 +13,15 @@ from ai_sub.server.config import (
 )
 from ai_sub.server.coordinator import PipelineCoordinator
 from ai_sub.server.git_sync import GitSyncManager
-from ai_sub.server.ingestion import DiscoveredVideo, IngestionManager, ensure_pot_provider
+from ai_sub.server.ingestion import IngestionManager, QueuedVideo
 from ai_sub.server.models import (
     ActiveVideo,
     ActivityEvent,
     ServerTask,
     TaskStatus,
-    generate_w3c_traceparent,
 )
 from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
+from ai_sub.server.pot_provider import ensure_pot_provider, is_node_runtime_available
 
 __all__ = [
     "ActiveVideo",
@@ -30,7 +30,6 @@ __all__ = [
     "ChannelMap",
     "ChannelMapper",
     "ComboPipeline",
-    "DiscoveredVideo",
     "FilesSourceConfig",
     "GitConfig",
     "GitSyncManager",
@@ -38,6 +37,7 @@ __all__ = [
     "PipelineConfig",
     "PipelineCoordinator",
     "PipelineStatus",
+    "QueuedVideo",
     "ServerOptions",
     "ServerSettings",
     "ServerTask",
@@ -46,5 +46,5 @@ __all__ = [
     "YoutubeSourceConfig",
     "create_app",
     "ensure_pot_provider",
-    "generate_w3c_traceparent",
+    "is_node_runtime_available",
 ]

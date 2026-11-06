@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
-import os
 import socket
 from pathlib import Path
-from typing import Annotated, Any, ClassVar, Literal, Self, cast
+from typing import Annotated, Any, Literal, Self, cast
 
+import yaml
 from logfire import LevelName
 from pydantic import (
+    AliasChoices,
     BeforeValidator,
     Field,
     FilePath,
@@ -26,13 +27,13 @@ from pydantic_settings import (
     NoDecode,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
-    YamlConfigSettingsSource,
 )
 
 _BASE_CONFIG: SettingsConfigDict = {
     "env_file": ".env",
     "env_file_encoding": "utf-8",
     "extra": "ignore",
+    "populate_by_name": True,
 }
 
 ServiceTier = Literal["auto", "default", "flex", "priority"]
@@ -42,7 +43,7 @@ def parse_string_list(val: Any) -> list[str] | Any:
     """Parses a list of strings from a Python list, JSON array, or comma-separated string.
 
     Args:
-        val: Raw input value from environment variable or YAML.
+        val: Raw input value from environment variable, CLI, or YAML.
 
     Returns:
         list[str] | Any: Normalized list of strings or unparsed raw input.
@@ -90,7 +91,7 @@ PathList = Annotated[list[Path], NoDecode, BeforeValidator(parse_path_list)]
 
 
 class EnvPrioritySettings(BaseSettings):
-    """Base settings class for sub-components where environment variables override YAML kwargs."""
+    """Base settings model where environment variables take precedence over init kwargs."""
 
     @classmethod
     def settings_customise_sources(
@@ -101,25 +102,23 @@ class EnvPrioritySettings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Ensures environment variables take precedence over kwargs passed from parent YAML.
+        """Ensures environment variables override values supplied in init kwargs.
 
         Args:
-            settings_cls: BaseSettings class type.
+            settings_cls: Target settings class.
             init_settings: Injected initial settings kwargs.
             env_settings: Environment variable settings source.
-            dotenv_settings: Dotenv settings source (ignored).
-            file_secret_settings: File secrets settings source (ignored).
+            dotenv_settings: Dotenv settings source.
+            file_secret_settings: File secret settings source.
 
         Returns:
-            tuple[PydanticBaseSettingsSource, ...]: Custom source loading sequence.
+            tuple[PydanticBaseSettingsSource, ...]: Source priority sequence.
         """
         return (env_settings, init_settings)
 
 
 class YamlFileSettings(BaseSettings):
-    """Base class for settings loaded from a YAML configuration file with ENV variable overrides."""
-
-    _yaml_path: ClassVar[Path | None] = None
+    """Base settings model loaded from a YAML configuration file with ENV overrides."""
 
     @classmethod
     def settings_customise_sources(
@@ -130,80 +129,47 @@ class YamlFileSettings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Configures settings sources order: init arguments, environment variables, YAML file.
+        """Ensures environment variables override values loaded from YAML.
 
         Args:
-            settings_cls: BaseSettings class type.
-            init_settings: Injected initial settings kwargs.
+            settings_cls: Target settings class.
+            init_settings: Initial settings kwargs.
             env_settings: Environment variable settings source.
-            dotenv_settings: Dotenv settings source (ignored).
-            file_secret_settings: File secrets settings source (ignored).
+            dotenv_settings: Dotenv settings source.
+            file_secret_settings: File secret settings source.
 
         Returns:
-            tuple[PydanticBaseSettingsSource, ...]: Ordered settings sources.
+            tuple[PydanticBaseSettingsSource, ...]: Source priority sequence.
         """
-        yaml_file = getattr(settings_cls, "_yaml_path", None)
-        yaml_source = (
-            YamlConfigSettingsSource(settings_cls, yaml_file=yaml_file)
-            if yaml_file
-            else YamlConfigSettingsSource(settings_cls)
-        )
-        return (
-            init_settings,
-            env_settings,
-            yaml_source,
-        )
+        return (env_settings, init_settings)
 
     @classmethod
     def from_yaml(cls, yaml_path: Path | str) -> Self:
-        """Loads settings from a YAML file path with environment variable overrides.
+        """Loads and validates settings from a YAML configuration file.
 
         Args:
-            yaml_path: Filesystem path to the YAML configuration file.
+            yaml_path: Path to the YAML configuration file.
 
         Returns:
-            Self: Instantiated and validated settings object.
+            Self: Validated settings instance.
 
         Raises:
-            FileNotFoundError: If the specified configuration file does not exist.
+            FileNotFoundError: If the configuration file does not exist.
         """
         path = Path(yaml_path)
         if not path.is_file():
             raise FileNotFoundError(f"Configuration file not found: {path}")
-
-        class _LoadedSettings(cls):
-            _yaml_path: ClassVar[Path | None] = path
-
-            @classmethod
-            def settings_customise_sources(
-                cls,
-                settings_cls: type[BaseSettings],
-                init_settings: PydanticBaseSettingsSource,
-                env_settings: PydanticBaseSettingsSource,
-                dotenv_settings: PydanticBaseSettingsSource,
-                file_secret_settings: PydanticBaseSettingsSource,
-            ) -> tuple[PydanticBaseSettingsSource, ...]:
-                return (
-                    init_settings,
-                    env_settings,
-                    YamlConfigSettingsSource(settings_cls, yaml_file=path),
-                )
-
-        return cast(Self, _LoadedSettings())
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return cls.model_validate(data)
 
 
 def find_config_file(kind: Literal["server", "worker"], cli_arg: str | Path | None = None) -> Path:
     """Resolves configuration YAML file path following strict discovery rules.
 
-    Resolution order:
-    1. Explicit positional CLI argument supplied by user.
-    2. <hostname>.<kind>.yaml (and .yml)
-    3. <short_hostname>.<kind>.yaml (and .yml) if hostname contains domain dots
-    4. <kind>.yaml (and .yml)
-
     Args:
         kind: Configuration type ('server' or 'worker').
-        cli_arg: Optional explicit path passed as CLI argument.
+        cli_arg: Optional explicit path passed as CLI argument. Defaults to None.
 
     Returns:
         Path: Resolved, existing configuration file path.
@@ -224,28 +190,15 @@ def find_config_file(kind: Literal["server", "worker"], cli_arg: str | Path | No
     ]
     if "." in hostname:
         short_host = hostname.split(".")[0]
-        candidates.extend(
-            [
-                Path(f"{short_host}.{kind}.yaml"),
-                Path(f"{short_host}.{kind}.yml"),
-            ]
-        )
-    candidates.extend(
-        [
-            Path(f"{kind}.yaml"),
-            Path(f"{kind}.yml"),
-        ]
-    )
+        candidates.extend([Path(f"{short_host}.{kind}.yaml"), Path(f"{short_host}.{kind}.yml")])
+    candidates.extend([Path(f"{kind}.yaml"), Path(f"{kind}.yml")])
 
     for candidate in candidates:
         if candidate.is_file():
             return candidate
 
     checked_str = ", ".join(repr(str(c)) for c in candidates)
-    raise FileNotFoundError(
-        f"No {kind} configuration file found. Checked: {checked_str}. "
-        f"Please create '{kind}.yaml' or pass a configuration file path."
-    )
+    raise FileNotFoundError(f"No {kind} configuration file found. Checked: {checked_str}.")
 
 
 class StorageSettings(BaseSettings):
@@ -300,26 +253,48 @@ class SearchSettings(BaseSettings):
         **_BASE_CONFIG,
     }
 
-    tools: list[str] = Field(
-        description="List of search providers to enable (e.g. ['duckduckgo'], ['tinyfish', 'lrclib']). "
-        "Supported: 'builtin', 'duckduckgo', 'ollama', 'langsearch', 'tinyfish', 'lrclib'.",
+    tools: StringList = Field(
+        description="List of search providers to enable.",
         default_factory=lambda: ["duckduckgo"],
     )
     key: SecretStr | None = Field(
-        description="Fallback API key for search services (Ollama, Langsearch, or Tinyfish).",
+        description="Fallback API key for search services.",
         default=None,
+        validation_alias=AliasChoices(
+            "AISUB_AI_SEARCH_KEY",
+            "AISUB_SERVER_SEARCH_KEY",
+            "AISUB_WORKER_SEARCH_KEY",
+        ),
     )
     tinyfish_key: SecretStr | None = Field(
         description="Dedicated API key for Tinyfish search.",
         default=None,
+        validation_alias=AliasChoices(
+            "AISUB_AI_SEARCH_TINYFISH_KEY",
+            "AISUB_SERVER_SEARCH_TINYFISH_KEY",
+            "AISUB_WORKER_SEARCH_TINYFISH_KEY",
+            "TINYFISH_API_KEY",
+        ),
     )
     langsearch_key: SecretStr | None = Field(
         description="Dedicated API key for Langsearch.",
         default=None,
+        validation_alias=AliasChoices(
+            "AISUB_AI_SEARCH_LANGSEARCH_KEY",
+            "AISUB_SERVER_SEARCH_LANGSEARCH_KEY",
+            "AISUB_WORKER_SEARCH_LANGSEARCH_KEY",
+            "LANGSEARCH_API_KEY",
+        ),
     )
     ollama_key: SecretStr | None = Field(
         description="Dedicated API key for Ollama search.",
         default=None,
+        validation_alias=AliasChoices(
+            "AISUB_AI_SEARCH_OLLAMA_KEY",
+            "AISUB_SERVER_SEARCH_OLLAMA_KEY",
+            "AISUB_WORKER_SEARCH_OLLAMA_KEY",
+            "OLLAMA_API_KEY",
+        ),
     )
     max_turns: PositiveInt = Field(
         description="Maximum function-calling search turns permitted per segment.",
@@ -372,56 +347,6 @@ class SearchSettings(BaseSettings):
             return self.ollama_key or self.key
         return self.key
 
-    @model_validator(mode="before")
-    @classmethod
-    def load_api_keys_from_env(cls, values: dict[str, Any]) -> dict[str, Any]:
-        """Normalizes tools list and loads provider-specific search keys from environment.
-
-        Args:
-            values: Raw input dictionary before validation.
-
-        Returns:
-            dict[str, Any]: Updated input dictionary.
-        """
-        raw_tools = values.get("tools")
-        if raw_tools is None:
-            if env_tools := os.getenv("AISUB_AI_SEARCH_TOOLS"):
-                raw_tools = env_tools
-            else:
-                raw_tools = ["duckduckgo"]
-
-        if isinstance(raw_tools, str):
-            raw_tools_str = raw_tools.strip()
-            if raw_tools_str.startswith("[") and raw_tools_str.endswith("]"):
-                try:
-                    parsed = json.loads(raw_tools_str)
-                    if isinstance(parsed, (list, tuple)):
-                        raw_tools = parsed
-                except Exception:
-                    pass
-
-        if isinstance(raw_tools, str):
-            values["tools"] = [t.strip() for t in raw_tools.split(",") if t.strip()]
-        elif isinstance(raw_tools, (list, tuple)):
-            flattened: list[str] = []
-            for item in raw_tools:
-                if isinstance(item, str) and "," in item:
-                    flattened.extend(t.strip() for t in item.split(",") if t.strip())
-                elif isinstance(item, str) and item.strip():
-                    flattened.append(item.strip())
-            values["tools"] = flattened
-
-        for key_field, env_var in (
-            ("tinyfish_key", "TINYFISH_API_KEY"),
-            ("langsearch_key", "LANGSEARCH_API_KEY"),
-            ("ollama_key", "OLLAMA_API_KEY"),
-            ("key", "AISUB_AI_SEARCH_KEY"),
-        ):
-            if values.get(key_field) is None and (env_val := os.getenv(env_var)):
-                values[key_field] = env_val.strip().strip('"').strip("'")
-
-        return values
-
     @model_validator(mode="after")
     def validate_tools_list(self) -> Self:
         """Validates that configured search tools are supported.
@@ -448,8 +373,9 @@ class AiSettings(BaseSettings):
     }
 
     key: SecretStr | None = Field(
-        description="Google Gemini API key. Falls back to GEMINI_API_KEY or GOOGLE_API_KEY.",
+        description="Google Gemini API key.",
         default=None,
+        validation_alias=AliasChoices("AISUB_AI_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"),
     )
     base_url: HttpUrl | None = Field(
         description="Optional custom base URL or proxy for Google Gemini API calls.",
@@ -523,22 +449,6 @@ class AiSettings(BaseSettings):
         description="Web search configuration for lyrics and metadata retrieval.",
         default_factory=SearchSettings,
     )
-
-    @model_validator(mode="before")
-    @classmethod
-    def load_api_key_from_env(cls, values: dict[str, Any]) -> dict[str, Any]:
-        """Loads Google Gemini key from ambient environment variables.
-
-        Args:
-            values: Raw input dictionary before validation.
-
-        Returns:
-            dict[str, Any]: Updated input dictionary.
-        """
-        if values.get("key") is None:
-            if env_key := (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")):
-                values["key"] = env_key.strip().strip('"').strip("'")
-        return values
 
     @model_validator(mode="after")
     def validate_models_and_tiers(self) -> Self:
@@ -737,7 +647,7 @@ class RetrySettings(BaseSettings):
         description="Maximum internal retries by the executor on transient network or schema failures.",
         default=5,
     )
-    max_runs: NonNegativeInt = Field(
+    max_runs: PositiveInt = Field(
         description="Maximum total attempt limit persisted across application executions per segment.",
         default=3,
     )
@@ -846,7 +756,6 @@ class Settings(BaseSettings):
         default=None,
         description="Path to a text file containing user background context.",
     )
-
     input_video_file: CliPositionalArg[FilePath] = Field(
         description="Path to the video file to transcribe and subtitle.",
     )
@@ -855,10 +764,10 @@ class Settings(BaseSettings):
         """Reads and merges context from context_file and inline context if provided.
 
         Returns:
-            str | None: Combined, non-empty user context string or None if neither provided.
+            str | None: Combined user context string or None.
 
         Raises:
-            ValueError: If context_file cannot be read due to file errors or encoding issues.
+            ValueError: If context_file cannot be read.
         """
         parts: list[str] = []
         if self.context_file is not None:

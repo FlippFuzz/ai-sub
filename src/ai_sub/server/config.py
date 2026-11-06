@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
     HttpUrl,
+    NonNegativeFloat,
+    NonNegativeInt,
+    PositiveInt,
     SecretStr,
     model_validator,
 )
@@ -61,7 +64,7 @@ class PipelineConfig(BaseModel):
     )
     search_tools: list[str] | None = Field(
         default=None,
-        description="Optional pipeline-specific search tools override. Inherits from global search.tools if null.",
+        description="Optional pipeline-specific search tools override.",
     )
 
 
@@ -76,6 +79,10 @@ class GitConfig(EnvPrioritySettings):
     repo_url: HttpUrl = Field(description="Remote git repository URL for pushing completed subtitles.")
     branch: str = Field(default="main", description="Git branch to checkout and push to.")
     pat: SecretStr = Field(description="GitHub Personal Access Token.")
+    player_base_url: HttpUrl = Field(
+        default=HttpUrl("https://flippfuzz.github.io/ai-sub-player"),
+        description="Base URL of the GitHub Pages subtitle player.",
+    )
 
     def get_pat_value(self) -> str:
         """Resolves the Personal Access Token string.
@@ -98,7 +105,7 @@ class FilesSourceConfig(EnvPrioritySettings):
         default_factory=list,
         description="Local filesystem directories scanned recursively for video media files.",
     )
-    rescan_interval_minutes: int = Field(
+    rescan_interval_minutes: PositiveInt = Field(
         default=2,
         description="Background polling interval in minutes to discover newly added local media files.",
     )
@@ -116,15 +123,15 @@ class YoutubeSourceConfig(EnvPrioritySettings):
         default_factory=list,
         description="YouTube playlist, channel, or video URLs to ingest.",
     )
-    rescan_interval_minutes: int = Field(
+    rescan_interval_minutes: PositiveInt = Field(
         default=60,
         description="Base interval in minutes between full YouTube channel and playlist intake scans.",
     )
-    rescan_jitter_minutes: int = Field(
+    rescan_jitter_minutes: NonNegativeInt = Field(
         default=15,
-        description="Maximum additive random delay in minutes added to the YouTube rescan interval (e.g. 60-75m).",
+        description="Symmetric random delay variation in minutes added or subtracted from rescan interval.",
     )
-    channel_delay_seconds: float = Field(
+    channel_delay_seconds: NonNegativeFloat = Field(
         default=5.0,
         description="Target delay in seconds between scraping individual YouTube channels or playlists.",
     )
@@ -138,36 +145,32 @@ class YoutubeSourceConfig(EnvPrioritySettings):
     )
     channels_file: Path = Field(
         default=Path("channels.json"),
-        description="Path to the YouTube channel ID to uploader handle mapping JSON cache.",
+        description="Path to the YouTube channel mapping JSON cache.",
     )
-    max_title_bytes: int = Field(
+    max_title_bytes: PositiveInt = Field(
         default=100,
         description="Maximum byte length of the video title prefix in downloaded filenames.",
     )
     enable_pot_provider: bool = Field(
         default=True,
-        description="Whether to automatically clone, update, and build bgutil-ytdlp-pot-provider.",
+        description="Whether to automatically build and run bgutil-ytdlp-pot-provider.",
     )
     pot_dir: Path = Field(
         default=Path("bgutil-ytdlp-pot-provider"),
         description="Directory path for bgutil-ytdlp-pot-provider repository.",
     )
-    pot_update_interval_hours: int = Field(
-        default=24,
-        description="Minimum interval in hours between bgutil-ytdlp-pot-provider git update checks.",
-    )
-    max_consecutive_failures: int = Field(
+    max_download_failures: PositiveInt = Field(
         default=3,
-        description="Maximum consecutive video download failures triggering a circuit-breaker pause.",
+        description="Maximum consecutive video download failures in a cycle before entering cooldown.",
     )
-    download_test_duration_s: int = Field(
-        default=10,
-        description="Length in seconds of the audio stream pre-flight availability download test.",
+    cooldown_minutes: PositiveInt = Field(
+        default=60,
+        description="Cooldown duration in minutes when bot detection or download failure limit is reached.",
     )
 
 
 class SourcesConfig(EnvPrioritySettings):
-    """Container for distinct intake source categories (local filesystem and YouTube)."""
+    """Container for distinct intake source categories."""
 
     model_config = SettingsConfigDict(
         env_prefix="AISUB_SERVER_SOURCES_",
@@ -187,15 +190,19 @@ class ServerOptions(EnvPrioritySettings):
     )
 
     host: str = Field(default="127.0.0.1", description="Bind IP address for the FastAPI server.")
-    port: int = Field(default=8000, description="Bind port for the FastAPI server.")
+    port: PositiveInt = Field(default=8000, description="Bind port for the FastAPI server.")
     work_dir: Path = Field(default=Path("./work"), description="Base working directory for pipeline state.")
-    heartbeat_timeout_seconds: int = Field(
+    heartbeat_timeout_seconds: PositiveInt = Field(
         default=300,
-        description="Seconds before an unresponsive worker lease expires (10 missed 30s heartbeats = 300s).",
+        description="Seconds before an unresponsive worker lease expires.",
     )
-    validation_buffer_ms: int = Field(
+    validation_buffer_ms: NonNegativeInt = Field(
         default=2000,
         description="Tolerance buffer in milliseconds for timestamp bounds checks.",
+    )
+    activity_log_maxlen: PositiveInt = Field(
+        default=50,
+        description="Maximum number of recent worker activity events preserved per combination pipeline.",
     )
 
 
@@ -236,7 +243,7 @@ class ServerRetrySettings(EnvPrioritySettings, RetrySettings):
 
 
 def _get_default_pipelines() -> list[PipelineConfig]:
-    """Generates the three standard combinations requested.
+    """Generates the three standard default combination pipelines.
 
     Returns:
         list[PipelineConfig]: Standard default pipelines.
@@ -272,7 +279,10 @@ class ServerSettings(YamlFileSettings):
     )
 
     server: ServerOptions = Field(default_factory=ServerOptions)
-    git: GitConfig | None = Field(default=None)
+    git: GitConfig | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AISUB_SERVER_GIT", "git"),
+    )
     sources: SourcesConfig = Field(default_factory=SourcesConfig)
     reencode: ServerReEncodeSettings = Field(default_factory=ServerReEncodeSettings)
     search: ServerSearchSettings = Field(default_factory=ServerSearchSettings)
@@ -291,7 +301,9 @@ class ServerSettings(YamlFileSettings):
         Returns:
             Any: Updated input data dictionary.
         """
-        if isinstance(values, dict):
-            if values.get("git") is None and os.getenv("AISUB_SERVER_GIT_REPO_URL"):
+        if isinstance(values, dict) and values.get("git") is None:
+            import os
+
+            if os.getenv("AISUB_SERVER_GIT_REPO_URL"):
                 values["git"] = {}
         return values

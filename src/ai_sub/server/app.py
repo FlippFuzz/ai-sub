@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+import urllib.parse
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, AsyncGenerator
 
 import logfire
 from fastapi import FastAPI, HTTPException, Response, status
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse
 
 from ai_sub.protocol import (
     TaskClaimRequest,
@@ -21,9 +23,11 @@ from ai_sub.protocol import (
 )
 from ai_sub.server.config import ServerSettings
 from ai_sub.server.coordinator import PipelineCoordinator
-from ai_sub.server.dashboard import DASHBOARD_HTML
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.ingestion import IngestionManager
+from ai_sub.telemetry import get_app_version
+
+DASHBOARD_HTML_PATH = Path(__file__).parent / "static" / "dashboard.html"
 
 
 def create_app(settings: ServerSettings) -> FastAPI:
@@ -68,19 +72,19 @@ def create_app(settings: ServerSettings) -> FastAPI:
     app = FastAPI(
         title="ai-sub-server",
         description="Central task coordinator, media distributor, and live observability dashboard for AI Sub",
-        version="4.0.0",
+        version=get_app_version(),
         lifespan=lifespan,
     )
 
-    @app.get("/", response_class=HTMLResponse)
-    @app.get("/dashboard", response_class=HTMLResponse)
-    async def get_dashboard() -> HTMLResponse:
-        """Serves the live WebUI dashboard.
+    @app.get("/", response_class=FileResponse)
+    @app.get("/dashboard", response_class=FileResponse)
+    async def get_dashboard() -> FileResponse:
+        """Serves the live WebUI dashboard HTML template.
 
         Returns:
-            HTMLResponse: Live WebUI HTML page.
+            FileResponse: Static WebUI HTML dashboard file response.
         """
-        return HTMLResponse(content=DASHBOARD_HTML)
+        return FileResponse(DASHBOARD_HTML_PATH, media_type="text/html")
 
     @app.get("/api/v1/dashboard/data")
     async def get_dashboard_data() -> dict[str, Any]:
@@ -90,7 +94,13 @@ def create_app(settings: ServerSettings) -> FastAPI:
             dict[str, Any]: Complete dashboard state dictionary.
         """
         pipeline_queues = ingestion.get_all_pipeline_queues()
-        return coordinator.get_dashboard_data(pipeline_queues)
+        cooldown_info = ingestion.get_youtube_cooldown_info()
+        total_tracked = len(ingestion.local_videos) + len(ingestion.youtube_videos)
+        return coordinator.get_dashboard_data(
+            pipeline_queues=pipeline_queues,
+            youtube_cooldown=cooldown_info,
+            total_tracked_videos=total_tracked,
+        )
 
     @app.post(
         "/api/v1/tasks/claim",
@@ -126,7 +136,11 @@ def create_app(settings: ServerSettings) -> FastAPI:
         Returns:
             TaskHeartbeatResponse: Acknowledgment status confirming whether lease was renewed.
         """
-        acknowledged = await coordinator.record_heartbeat(task_id, req.worker_id)
+        clean_task_id = urllib.parse.unquote(task_id)
+        acknowledged = await coordinator.record_heartbeat(
+            clean_task_id,
+            req.worker_id,
+        )
         return TaskHeartbeatResponse(acknowledged=acknowledged)
 
     @app.get("/api/v1/tasks/{task_id}/media")
@@ -144,7 +158,8 @@ def create_app(settings: ServerSettings) -> FastAPI:
         Raises:
             HTTPException: If the media chunk file is not found on disk.
         """
-        media_path = coordinator.get_task_media_path(task_id)
+        clean_task_id = urllib.parse.unquote(task_id)
+        media_path = coordinator.get_task_media_path(clean_task_id)
         if not media_path or not media_path.is_file():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media chunk file not found.")
 
@@ -170,14 +185,18 @@ def create_app(settings: ServerSettings) -> FastAPI:
         Raises:
             HTTPException: If the task was not claimed by this worker or has already completed.
         """
-        success = await coordinator.complete_task(task_id, req.worker_id, req.result)
+        clean_task_id = urllib.parse.unquote(task_id)
+        success = await coordinator.complete_task(
+            clean_task_id,
+            req.worker_id,
+            req.result,
+        )
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Task was not assigned to this worker or has already completed.",
             )
 
-        # Run finalization and feeding in background so worker response returns immediately
         async def _finalize_and_feed() -> None:
             try:
                 finalized = await coordinator.check_and_finalize_completed_pipelines()
@@ -198,7 +217,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
         Args:
             task_id: Unique task identifier.
-            req: Failure report request containing reason and optional error details.
+            req: Failure report request containing reason, optional error details, and transient flag.
 
         Returns:
             dict[str, str]: Operation status confirmation dictionary.
@@ -206,11 +225,13 @@ def create_app(settings: ServerSettings) -> FastAPI:
         Raises:
             HTTPException: If the task could not be found or was not held by this worker.
         """
+        clean_task_id = urllib.parse.unquote(task_id)
         success = await coordinator.fail_task(
-            task_id=task_id,
+            task_id=clean_task_id,
             worker_id=req.worker_id,
             reason=req.reason,
             error_message=req.error_message,
+            is_transient=req.is_transient,
         )
         if not success:
             raise HTTPException(

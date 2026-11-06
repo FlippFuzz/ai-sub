@@ -42,9 +42,9 @@ class TaskClaimResponse(BaseModel):
     prompt_system: str = Field(description="System instruction prompt for the Gemini model.")
     prompt_user: str = Field(description="User prompt instructions and input context.")
     response_schema_name: str = Field(
-        description="Target response schema ('SummaryAiResponse', 'SubtitlesAiResponse', or 'LyricsAiResponse')."
+        default="",
+        description="Target response schema ('SummaryAiResponse', 'SubtitlesAiResponse', or 'LyricsAiResponse').",
     )
-    traceparent: str | None = Field(default=None, description="W3C traceparent header for distributed Logfire tracing.")
     search_tools: list[str] = Field(default_factory=list, description="Search tools permitted for this task.")
     agentic_video: bool = Field(default=False, description="Whether to enable agentic video inspection.")
     service_tier: str | None = Field(default=None, description="Optional Google Gemini service tier.")
@@ -52,7 +52,6 @@ class TaskClaimResponse(BaseModel):
         default_factory=list,
         description="Serialized list of detected singing performances for lyrics refinement.",
     )
-    # Server-directed retry and backoff policy applied during worker execution
     retry: RetrySettings = Field(
         default_factory=RetrySettings,
         description="Task execution retry and backoff policy configured by the server.",
@@ -85,6 +84,14 @@ class TaskFailRequest(BaseModel):
 
     worker_id: str = Field(description="Unique identifier of the worker.")
     task_id: str = Field(description="Unique task identifier.")
-    reason: str = Field(description="Failure code (e.g. 'QUOTA_EXHAUSTED' or 'EXECUTION_ERROR').")
+    reason: str = Field(
+        description="Failure code (e.g. 'QUOTA_EXHAUSTED', 'TRANSIENT_API_ERROR', or 'EXECUTION_ERROR')."
+    )
     model: str | None = Field(default=None, description="Model identifier that failed, if applicable.")
     error_message: str | None = Field(default=None, description="Optional error description or traceback.")
+    is_transient: bool = Field(
+        default=False,
+        description=(
+            "Whether the failure is transient (e.g. upstream 5xx, timeout) and should not penalize attempt counts."
+        ),
+    )
