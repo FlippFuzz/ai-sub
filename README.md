@@ -3,9 +3,13 @@
 [![PyPI version](https://img.shields.io/pypi/v/ai-sub)](https://pypi.org/project/ai-sub)
 [![Downloads](https://img.shields.io/pypi/dw/ai-sub)](https://pypistats.org/packages/ai-sub)
 
-**AI Sub** uses Google's Gemini AI (via the Interactions API) to automatically transcribe and translate videos into audio-synchronized, bilingual English subtitles.
+**AI Sub** uses Google's Gemini AI to automatically transcribe and translate videos into audio-synchronized, bilingual English subtitles.
 
 It handles fast Japanese speech, livestream banter, video game terms, and live singing performances with high timing accuracy.
+
+---
+
+Showcase of sample subtitled YouTube videos can be found at [ai-sub-showcase](https://github.com/FlippFuzz/ai-sub-showcase).
 
 ---
 
@@ -18,7 +22,7 @@ It handles fast Japanese speech, livestream banter, video game terms, and live s
   - [Option 1: Recommended Setup (Gemini + Tinyfish)](#option-1-recommended-setup-gemini--tinyfish)
   - [Option 2: Free Search Setup (DuckDuckGo)](#option-2-free-search-setup-duckduckgo)
   - [Option 3: Providing Custom Notes & Lore](#option-3-providing-custom-notes--lore)
-- [Intermediate Files & Resuming](#intermediate-files--resuming)
+- [Intermediate Files & Forcing Regeneration](#intermediate-files--forcing-regeneration)
 - [Distributed Server & Worker Deployment](#distributed-server--worker-deployment)
 - [Configuration](#configuration)
 
@@ -26,7 +30,7 @@ It handles fast Japanese speech, livestream banter, video game terms, and live s
 
 ## How It Works (In Simple Terms)
 
-AI Sub breaks down video subtitling into a clean, human-like workflow:
+AI Sub breaks down video subtitling via the following workflow:
 
 ```text
 [Your Video File]
