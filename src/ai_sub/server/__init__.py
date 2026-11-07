@@ -1,7 +1,6 @@
 """Server coordinator module for distributed AI Sub execution."""
 
 from ai_sub.server.app import create_app
-from ai_sub.server.channel_mapping import ChannelInfo, ChannelMap, ChannelMapper
 from ai_sub.server.config import (
     FilesSourceConfig,
     GitConfig,
@@ -21,15 +20,21 @@ from ai_sub.server.models import (
     TaskStatus,
 )
 from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
-from ai_sub.server.pot_provider import ensure_pot_provider, is_node_runtime_available
+from ai_sub.server.youtube import (
+    DiscoveredVideo,
+    DownloadedVideo,
+    YouTubeBotDetectionError,
+    YouTubeClient,
+    YouTubeError,
+    YouTubeVideoUnavailableError,
+)
 
 __all__ = [
     "ActiveVideo",
     "ActivityEvent",
-    "ChannelInfo",
-    "ChannelMap",
-    "ChannelMapper",
     "ComboPipeline",
+    "DiscoveredVideo",
+    "DownloadedVideo",
     "FilesSourceConfig",
     "GitConfig",
     "GitSyncManager",
@@ -43,8 +48,10 @@ __all__ = [
     "ServerTask",
     "SourcesConfig",
     "TaskStatus",
+    "YouTubeBotDetectionError",
+    "YouTubeClient",
+    "YouTubeError",
+    "YouTubeVideoUnavailableError",
     "YoutubeSourceConfig",
     "create_app",
-    "ensure_pot_provider",
-    "is_node_runtime_available",
 ]

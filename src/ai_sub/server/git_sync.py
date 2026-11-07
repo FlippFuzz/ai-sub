@@ -43,7 +43,7 @@ class GitSyncManager:
     local_repo_dir: Path
     player_base_url: str
     _lock: asyncio.Lock
-    _completed_cache: set[tuple[str, str, str]]
+    _completed_videos: dict[tuple[str, str], str]
 
     def __init__(self, config: GitConfig | None, base_work_dir: Path) -> None:
         """Initializes the Git synchronization manager.
@@ -54,7 +54,7 @@ class GitSyncManager:
         """
         self.config = config
         self._lock = asyncio.Lock()
-        self._completed_cache = set()
+        self._completed_videos = {}
         repo_name = "subtitles-archive"
 
         if config:
@@ -95,9 +95,9 @@ class GitSyncManager:
 
     def _rebuild_completed_cache_sync(self) -> None:
         """Scans the local repository directory to rebuild the in-memory completed subtitles cache."""
-        cache: set[tuple[str, str, str]] = set()
+        completed: dict[tuple[str, str], str] = {}
         if not self.local_repo_dir.is_dir():
-            self._completed_cache = cache
+            self._completed_videos = completed
             return
 
         try:
@@ -117,12 +117,12 @@ class GitSyncManager:
                             if srt.stat().st_size > 0:
                                 track_info = parse_subtitle_track(srt)
                                 if track_info.shortcode:
-                                    cache.add((uploader, video_id, track_info.shortcode))
+                                    completed[(video_id, track_info.shortcode)] = uploader
         except Exception as e:
             logfire.warning(f"Error rebuilding completed subtitles cache: {e}")
 
-        self._completed_cache = cache
-        logfire.debug(f"Rebuilt completed subtitles cache: {len(self._completed_cache)} entry(s).")
+        self._completed_videos = completed
+        logfire.debug(f"Rebuilt completed subtitles cache: {len(self._completed_videos)} entry(s).")
 
     def _ensure_repo_sync(self) -> None:
         """Synchronous implementation of cloning or updating the local repository."""
@@ -164,18 +164,29 @@ class GitSyncManager:
         async with self._lock:
             await asyncio.to_thread(self._ensure_repo_sync)
 
-    def is_video_completed(self, uploader: str, video_id: str, full_shortcode: str) -> bool:
-        """Checks if completed subtitles for a video and shortcode exist in the in-memory repository cache.
+    def is_video_completed(self, video_id: str, full_shortcode: str) -> bool:
+        """Checks if completed subtitles for a video ID and shortcode exist in the repository cache.
 
         Args:
-            uploader: Channel or uploader identifier.
             video_id: Video identifier.
             full_shortcode: Model shortcode (e.g. 'g38f-011019').
 
         Returns:
             bool: True if completed subtitles exist; False otherwise.
         """
-        return (uploader, video_id, full_shortcode) in self._completed_cache
+        return (video_id, full_shortcode) in self._completed_videos
+
+    def get_completed_uploader(self, video_id: str, full_shortcode: str) -> str | None:
+        """Retrieves the uploader handle for a completed video ID if known in the repository cache.
+
+        Args:
+            video_id: Video identifier.
+            full_shortcode: Model shortcode.
+
+        Returns:
+            str | None: Uploader handle if present in repository, None otherwise.
+        """
+        return self._completed_videos.get((video_id, full_shortcode))
 
     def _discover_video_subtitles(self, video_dir: Path) -> list[dict[str, str]]:
         """Discovers and ranks all finalized and intermediate SRT files relative to the video directory.
@@ -268,7 +279,6 @@ class GitSyncManager:
                 except Exception:
                     date_str = "Unknown"
 
-            # Determine best model display from pre-sorted subtitles array
             best_model_label = "-"
             best_version_str = ""
             subtitles_list = meta_data.get("subtitles")
@@ -294,9 +304,14 @@ class GitSyncManager:
             )
 
         if not entries:
+            readme_path = uploader_dir / "README.md"
+            if readme_path.is_file():
+                try:
+                    readme_path.unlink()
+                except OSError:
+                    pass
             return
 
-        # Sort descending by JST timestamp, with video_id as tiebreaker
         entries.sort(key=lambda x: (x["timestamp"], x["video_id"]), reverse=True)
 
         lines: list[str] = [
@@ -372,10 +387,8 @@ class GitSyncManager:
         for yf in yaml_files:
             shutil.copy2(yf, int_dir / yf.name)
 
-        # Update in-memory completion cache immediately
-        self._completed_cache.add((uploader, video_id, full_shortcode))
+        self._completed_videos[(video_id, full_shortcode)] = uploader
 
-        # Sanitize metadata: extract safe public fields to prevent leaking local paths
         clean_meta: dict[str, Any] = {
             "video_id": video_id,
             "uploader": uploader,
@@ -397,7 +410,6 @@ class GitSyncManager:
             except Exception as e:
                 logfire.warning(f"Failed to read metadata from {meta_file}: {e}")
 
-        # Discover and rank all available finalized and raw subtitles in this folder
         clean_meta["subtitles"] = self._discover_video_subtitles(video_dir)
 
         target_meta = video_dir / "video_meta.json"
