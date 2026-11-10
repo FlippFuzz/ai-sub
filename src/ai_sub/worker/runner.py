@@ -14,20 +14,23 @@ from pydantic import BaseModel
 
 from ai_sub.config import AiSettings, ServiceTier
 from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError, is_retryable_error
-from ai_sub.jobs.base import Prompt
-from ai_sub.jobs.lyrics import LyricsAiResponse, prefetch_lyrics
-from ai_sub.jobs.subtitles import DetectedMusicalPerformance, SubtitlesAiResponse
-from ai_sub.jobs.summary import SummaryAiResponse
+from ai_sub.jobs.lyrics import (
+    LyricsAiResponse,
+    get_lyrics_prompt,
+    prefetch_lyrics,
+)
+from ai_sub.jobs.subtitles import (
+    SubtitlesAiResponse,
+    get_subtitles_prompt,
+)
+from ai_sub.jobs.summary import (
+    SummaryAiResponse,
+    get_summary_prompt,
+)
 from ai_sub.protocol import TaskClaimResponse, TaskType
 from ai_sub.search import BaseSearchProvider, create_search_providers
-from ai_sub.worker.client import WorkerClient
+from ai_sub.worker.client import VersionMismatchError, WorkerClient
 from ai_sub.worker.config import WorkerSettings
-
-TASK_RESPONSE_SCHEMAS: dict[TaskType, type[BaseModel]] = {
-    TaskType.SUMMARY: SummaryAiResponse,
-    TaskType.SUBTITLES: SubtitlesAiResponse,
-    TaskType.LYRICS: LyricsAiResponse,
-}
 
 
 class LeaseRevokedError(Exception):
@@ -49,6 +52,7 @@ class WorkerRunner:
     _tasks_completed_per_model: dict[str, int]
     _last_busy_timestamp: float
     _deadline: float | None
+    _version_mismatch: bool
 
     def __init__(self, settings: WorkerSettings) -> None:
         """Initializes the worker runner.
@@ -71,6 +75,7 @@ class WorkerRunner:
         self._tasks_completed_per_model = {model: 0 for model in dict.fromkeys(settings.models)}
         self._last_busy_timestamp = time()
         self._deadline = None
+        self._version_mismatch = False
 
     @property
     def _tasks_completed(self) -> int:
@@ -163,7 +168,7 @@ class WorkerRunner:
         chunk_path: Path,
         search_providers: list[BaseSearchProvider],
     ) -> dict[str, Any]:
-        """Runs the Gemini multimodal inference task and returns structured output.
+        """Runs Gemini multimodal inference using domain prompt builders and returns structured output.
 
         Args:
             task: Assigned task details from the server.
@@ -175,40 +180,50 @@ class WorkerRunner:
             dict[str, Any]: Validated output data dictionary.
 
         Raises:
-            ValueError: If target task type response schema is unknown.
+            ValueError: If target task type is unknown.
         """
-        response_cls = TASK_RESPONSE_SCHEMAS.get(task.task_type)
-        if response_cls is None:
-            raise ValueError(f"Unknown task type: '{task.task_type}'")
-
         active_tools = [p for p in search_providers if p.provider_name in task.search_tools]
 
-        prompt_user = task.prompt_user
-        if task.task_type == TaskType.LYRICS and task.detected_performances:
-            try:
-                performances = [DetectedMusicalPerformance.model_validate(p) for p in task.detected_performances]
-                prefetched = await prefetch_lyrics(performances, active_tools)
-                if prefetched and prefetched.strip():
-                    search_block = f"<initial_search_results>\n  {prefetched.strip()}\n</initial_search_results>\n"
-                    if "<draft_subtitles_to_refine>" in prompt_user:
-                        prompt_user = prompt_user.replace(
-                            "<draft_subtitles_to_refine>",
-                            f"{search_block}<draft_subtitles_to_refine>",
-                            1,
-                        )
-                    else:
-                        prompt_user += f"\n{search_block}"
-            except Exception as e:
-                logfire.warning(f"Worker lyrics pre-fetch error: {e}")
+        if task.task_type == TaskType.SUMMARY:
+            prompt = get_summary_prompt(user_context=task.user_context)
+            response_cls: type[BaseModel] = SummaryAiResponse
+        elif task.task_type == TaskType.SUBTITLES:
+            prompt = get_subtitles_prompt(
+                user_context=task.user_context,
+                global_summary=task.global_summary,
+                segment_offset_ms=task.segment_offset_ms,
+                segment_duration_ms=task.video_duration_ms,
+            )
+            response_cls = SubtitlesAiResponse
+        elif task.task_type == TaskType.LYRICS:
+            prefetched = ""
+            if task.detected_performances:
+                try:
+                    prefetched = await prefetch_lyrics(task.detected_performances, active_tools)
+                except Exception as e:
+                    logfire.warning(f"Worker lyrics pre-fetch error: {e}")
+
+            prompt = get_lyrics_prompt(
+                draft_subtitles=task.draft_subtitles,
+                detected_performances=task.detected_performances,
+                initial_search_results=prefetched,
+                user_context=task.user_context,
+                global_summary=task.global_summary,
+                segment_offset_ms=task.segment_offset_ms,
+                segment_duration_ms=task.video_duration_ms,
+            )
+            response_cls = LyricsAiResponse
+        else:
+            raise ValueError(f"Unknown task type: '{task.task_type}'")
 
         res = await executor.run_structured(
-            prompt=Prompt(system=task.prompt_system, user=prompt_user),
+            prompt=prompt,
             media_path=chunk_path,
             video_duration_ms=task.video_duration_ms,
             response_type=response_cls,
             model_name=task.model,
             service_tier=cast(ServiceTier | None, task.service_tier),
-            tools=active_tools if active_tools else None,
+            tools=active_tools if active_tools and task.task_type != TaskType.SUBTITLES else None,
             agentic_video=task.agentic_video,
             task_label=task.task_type.value,
             retry_settings=task.retry,
@@ -464,6 +479,14 @@ class WorkerRunner:
                     models=[model],
                     search_tools=self.settings.search.tools,
                 )
+            except VersionMismatchError as e:
+                logfire.error(
+                    f"[{slot_label}] ai-sub package version mismatch: {e}. "
+                    "Shutting down worker so worker.sh can update to latest version."
+                )
+                self._version_mismatch = True
+                self._trigger_shutdown()
+                break
             except Exception as e:
                 claim_failed = True
                 logfire.warning(f"[{slot_label}] Failed to claim task from server: {e}. Retrying in 5s...")
@@ -522,7 +545,7 @@ class WorkerRunner:
         """Executes concurrent per-model worker slots until queues are drained or quotas are exhausted.
 
         Returns:
-            int: Application exit code (0 for clean finish).
+            int: Application exit code (0 for clean finish, 1 for abnormal exit or update required).
         """
         if not self.settings.gemini_key:
             logfire.error("Gemini API key is missing in worker configuration. Specify gemini_key in worker YAML.")
@@ -569,6 +592,11 @@ class WorkerRunner:
             await asyncio.gather(*slots)
 
         await self.client.close()
+
+        if self._version_mismatch:
+            logfire.warning("Worker exited due to an ai-sub package version mismatch. Update required.")
+            return 1
+
         total_completed = self._tasks_completed
         details = ", ".join(f"{m}: {c}" for m, c in self._tasks_completed_per_model.items())
         logfire.info(f"Worker finished cleanly. Total tasks completed: {total_completed} ({details}).")

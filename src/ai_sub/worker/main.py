@@ -9,7 +9,7 @@ from pathlib import Path
 
 import logfire
 
-from ai_sub.config import LoggingSettings, find_config_file
+from ai_sub.config import find_config_file
 from ai_sub.telemetry import setup_logging
 from ai_sub.worker.config import WorkerSettings
 from ai_sub.worker.runner import WorkerRunner
@@ -44,7 +44,8 @@ def main() -> None:
 
     settings = WorkerSettings.from_yaml(config_path)
 
-    setup_logging(LoggingSettings(level="info"), service_name=settings.worker_id)
+    # Configure logging using worker configuration settings
+    setup_logging(settings.log, service_name=settings.worker_id)
     logfire.info(f"Loaded worker configuration from {config_path}")
 
     runner = WorkerRunner(settings)

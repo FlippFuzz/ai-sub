@@ -9,7 +9,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_sub.config import RetrySettings
-from ai_sub.jobs.base import Prompt
+from ai_sub.jobs.subtitles import DetectedMusicalPerformance, Subtitles
+from ai_sub.jobs.summary import SummaryAiResponse
+from ai_sub.pipeline_session import PipelineSession
 from ai_sub.protocol import TaskClaimResponse, TaskType
 
 
@@ -35,8 +37,9 @@ class ServerTask(BaseModel):
     model: str = Field(description="Target Gemini model identifier.")
     media_path: Path = Field(description="Local filesystem path to the compressed media file.")
     video_duration_ms: int = Field(description="Duration of the segment in milliseconds.")
-    prompt: Prompt = Field(description="System and user prompt pair.")
-    response_schema_name: str = Field(description="Expected response schema class name.")
+    segment_offset_ms: int = Field(default=0, description="Start offset from beginning of video in milliseconds.")
+    user_context: str | None = Field(default=None, description="Resolved background context.")
+    global_summary: SummaryAiResponse | None = Field(default=None, description="Summary context model.")
 
     status: TaskStatus = Field(default=TaskStatus.PENDING, description="Current task state.")
     worker_id: str | None = Field(default=None, description="Identifier of the worker holding the lease.")
@@ -48,18 +51,18 @@ class ServerTask(BaseModel):
     agentic_video: bool = Field(default=False, description="Whether agentic video inspection is enabled.")
     service_tier: str | None = Field(default=None, description="Optional Google Gemini service tier.")
 
-    detected_performances: list[dict[str, Any]] = Field(
+    detected_performances: list[DetectedMusicalPerformance] = Field(
         default_factory=list,
         description="Detected singing performances passed to lyrics refinement.",
     )
-    draft_subtitles: list[dict[str, Any]] = Field(
+    draft_subtitles: list[Subtitles] = Field(
         default_factory=list,
         description="Draft subtitles passed to lyrics refinement.",
     )
     result: dict[str, Any] | None = Field(default=None, description="Validated output received from worker.")
 
     def to_claim_response(self, media_url: str, retry: RetrySettings) -> TaskClaimResponse:
-        """Serializes this task into the wire claim response sent to workers.
+        """Serializes this task into the typed claim response sent to workers.
 
         Args:
             media_url: Relative URL endpoint where the worker downloads media.
@@ -76,19 +79,22 @@ class ServerTask(BaseModel):
             model=self.model,
             media_url=media_url,
             video_duration_ms=self.video_duration_ms,
-            prompt_system=self.prompt.system,
-            prompt_user=self.prompt.user,
-            response_schema_name=self.response_schema_name,
+            segment_offset_ms=self.segment_offset_ms,
+            user_context=self.user_context,
+            global_summary=self.global_summary,
+            draft_subtitles=self.draft_subtitles,
+            detected_performances=self.detected_performances,
             search_tools=self.search_tools,
             agentic_video=self.agentic_video,
             service_tier=self.service_tier,
-            detected_performances=self.detected_performances,
             retry=retry,
         )
 
 
 class ActiveVideo(BaseModel):
-    """Metadata and filesystem paths for the video currently active in a pipeline."""
+    """Metadata, filesystem paths, and session tracking for the video active in a pipeline."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     video_id: str = Field(description="Video identifier.")
     uploader: str = Field(description="Channel or uploader handle/identifier.")
@@ -108,6 +114,10 @@ class ActiveVideo(BaseModel):
         description="Mapping of segment indices to their compressed low-bitrate media files.",
     )
     segment_durations_ms: list[int] = Field(default_factory=list, description="Durations for each 5-minute chunk.")
+    session: PipelineSession | None = Field(
+        default=None,
+        description="Active pipeline state machine session managing this video.",
+    )
 
 
 class ActivityEvent(BaseModel):

@@ -869,7 +869,7 @@ class GeminiExecutor:
         remote_file = await self.ensure_file_uploaded(media_path)
 
         tokens = _calculate_tokens(prompt, video_duration_ms)
-        token_weight = min(tokens, self.ai_settings.tpm)
+        token_weight = max(1, min(tokens, self.ai_settings.tpm))
 
         media_input: dict[str, Any] = {"type": "video", "uri": remote_file.uri, "mime_type": remote_file.mime_type}
         if agentic_video:

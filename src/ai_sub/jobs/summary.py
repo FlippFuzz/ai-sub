@@ -173,15 +173,6 @@ class SummaryAiResponse(BaseModel):
         description="Model reasoning traces per turn, preserved on disk but omitted from LLM output schemas.",
     )
 
-    @property
-    def glossary_dict(self) -> dict[str, str]:
-        """The glossary is returned as a key-value dictionary mapping term to meaning.
-
-        Returns:
-            dict[str, str]: Mapping of terms to their contextual meanings.
-        """
-        return {item.term: item.meaning for item in self.domain_glossary}
-
 
 class SummaryJob(AiJob):
     """Job container holding global summary state for an entire video."""

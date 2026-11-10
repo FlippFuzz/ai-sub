@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.metadata
 import re
 import sys
@@ -10,8 +11,9 @@ from pathlib import Path
 
 import logfire
 
-from ai_sub.config import LoggingSettings, find_config_file
+from ai_sub.config import find_config_file
 from ai_sub.telemetry import setup_logging
+from ai_sub.video import init_ffmpeg_engine
 
 
 def _ensure_server_dependencies() -> None:
@@ -57,10 +59,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     """Starts the ai-sub-server coordinator with uvicorn using pure YAML configuration."""
-    # Ensure server dependencies are installed before importing web server modules
     _ensure_server_dependencies()
 
-    # Local imports prevent ModuleNotFoundError before the preflight check runs
     import uvicorn
 
     from ai_sub.server.app import create_app
@@ -68,17 +68,22 @@ def main() -> None:
 
     args = parse_args()
 
-    # Discover and validate the server YAML configuration path
     try:
         config_path = find_config_file("server", args.config)
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Initialize Logfire telemetry and application logging
-    setup_logging(LoggingSettings(level="info"))
-    logfire.info(f"Loading server configuration from {config_path}")
     settings = ServerSettings.from_yaml(config_path)
+
+    # Initialize Logfire telemetry and application logging using server configuration
+    setup_logging(settings.log)
+    logfire.info(f"Loading server configuration from {config_path}")
+
+    # Auto-detect hardware encoder if not explicitly configured
+    if settings.reencode.encoder is None:
+        _, _, detected_encoder = asyncio.run(init_ffmpeg_engine())
+        settings.reencode.encoder = detected_encoder
 
     # Instantiate the FastAPI coordinator application and launch via Uvicorn
     app = create_app(settings)

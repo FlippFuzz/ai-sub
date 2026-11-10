@@ -8,6 +8,7 @@ import os
 import random
 import shutil
 import stat
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -371,6 +372,10 @@ class GitSyncManager:
             srt_files: List of generated subtitle files to commit.
             yaml_files: List of intermediate YAML state files.
             meta_file: Optional video metadata JSON file. Defaults to None.
+
+        Raises:
+            GitCommandError: If git push fails after exhausting all retries.
+            RuntimeError: If git rebase encounters an unresolvable merge conflict.
         """
         uploader_dir = self.local_repo_dir / uploader
         video_dir = uploader_dir / "v" / video_id
@@ -446,43 +451,65 @@ class GitSyncManager:
             logfire.info("No Git changes to commit.")
             return
 
+        # Cross-platform no-op editor command that works on Windows, Linux, and macOS
+        editor_cmd = f'"{sys.executable}" -c "import sys; sys.exit(0)"'
+        rebase_merge_dir = Path(repo.git_dir) / "rebase-merge"
+        rebase_apply_dir = Path(repo.git_dir) / "rebase-apply"
+
         for attempt in range(5):
             try:
                 repo.git.push()
                 logfire.info("Git push succeeded.")
                 break
             except GitCommandError as e:
-                if attempt < 4:
-                    backoff = random.uniform(1.0, 10.0)
-                    logfire.warning(f"Git push failed ({e}). Retrying in {backoff:.1f}s with pull --rebase...")
-                    time.sleep(backoff)
-                    try:
-                        repo.git.pull("origin", self.config.branch, "--rebase")
-                        self._rebuild_completed_cache_sync()
-                    except GitCommandError:
-                        try:
-                            unmerged_output = repo.git.diff("-z", "--diff-filter=U", "--name-only")
-                            unmerged_files = [f for f in unmerged_output.split("\0") if f]
-                            readme_rel = f"{uploader}/README.md"
+                if attempt >= 4:
+                    logfire.error(f"Git push exhausted retries: {e}")
+                    raise
 
-                            if unmerged_files == [readme_rel]:
-                                self._update_channel_readme_sync(uploader)
-                                repo.git.add(readme_rel)
-                                repo.git.rebase("--continue", env={**os.environ, "GIT_EDITOR": "true"})
-                                self._rebuild_completed_cache_sync()
-                                logfire.info("Resolved channel README conflict and continued rebase.")
-                            else:
-                                logfire.warning(f"Non-README conflict encountered ({unmerged_files}). Aborting rebase.")
-                                repo.git.rebase("--abort")
-                        except Exception as rebase_err:
-                            logfire.warning(f"Could not automatically resolve rebase: {rebase_err}. Aborting.")
+                backoff = random.uniform(1.0, 10.0)
+                logfire.warning(f"Git push failed ({e}). Retrying in {backoff:.1f}s with pull --rebase...")
+                time.sleep(backoff)
+
+                try:
+                    repo.git.pull("origin", self.config.branch, "--rebase")
+                    self._rebuild_completed_cache_sync()
+                except GitCommandError as pull_err:
+                    rebase_in_progress = rebase_merge_dir.exists() or rebase_apply_dir.exists()
+
+                    if not rebase_in_progress:
+                        logfire.warning(
+                            f"Git pull --rebase failed without active rebase (transient network error): {pull_err}"
+                        )
+                        continue
+
+                    # A rebase conflict was created; inspect unmerged files
+                    try:
+                        unmerged_output = repo.git.diff("-z", "--diff-filter=U", "--name-only")
+                        unmerged_files = [f for f in unmerged_output.split("\0") if f]
+                        readme_rel = f"{uploader}/README.md"
+
+                        if unmerged_files == [readme_rel]:
+                            self._update_channel_readme_sync(uploader)
+                            repo.git.add(readme_rel)
+                            repo.git.rebase("--continue", env={**os.environ, "GIT_EDITOR": editor_cmd})
+                            self._rebuild_completed_cache_sync()
+                            logfire.info("Resolved channel README conflict and continued rebase.")
+                        else:
+                            logfire.warning(
+                                f"Unresolvable non-README conflict encountered ({unmerged_files}). Aborting rebase."
+                            )
+                            repo.git.rebase("--abort")
+                            raise RuntimeError(
+                                f"Git rebase aborted due to unresolvable conflict in files: {unmerged_files}"
+                            ) from pull_err
+                    except Exception as rebase_err:
+                        if rebase_merge_dir.exists() or rebase_apply_dir.exists():
                             try:
                                 repo.git.rebase("--abort")
                             except Exception:
                                 pass
-                else:
-                    logfire.error(f"Git push exhausted retries: {e}")
-                    raise
+                        logfire.error(f"Failed to resolve git rebase: {rebase_err}")
+                        raise
 
     async def finalize_and_push(
         self,

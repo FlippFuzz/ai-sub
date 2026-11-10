@@ -15,5 +15,6 @@
   },
 
   // Ignore bgutil-ytdlp-pot-provider in work directory
-  "python.analysis.ignore": ["work/"]
+  "python.analysis.ignore": ["work/"],
+  "python.analysis.autoImportCompletions": true
 }

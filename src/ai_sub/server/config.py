@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from pydantic import (
-    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -17,10 +16,10 @@ from pydantic import (
     SecretStr,
     model_validator,
 )
-from pydantic_settings import SettingsConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ai_sub.config import (
-    EnvPrioritySettings,
+    LoggingSettings,
     PathList,
     ReEncodeSettings,
     RetrySettings,
@@ -35,7 +34,7 @@ from ai_sub.config import (
 class PipelineConfig(BaseModel):
     """Configuration for an independent model processing pipeline."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     name: str = Field(description="Unique identifier for the pipeline (e.g. 'combo_38f').")
     summary_model: str = Field(
@@ -56,7 +55,7 @@ class PipelineConfig(BaseModel):
     )
     service_tier_subtitles: ServiceTier | None = Field(
         default=None,
-        description="Optional Google Gemini service tier for subtitle transcription.",
+        description="Optional Google Gemini service tier for subtitle generation.",
     )
     service_tier_lyrics: ServiceTier | None = Field(
         default=None,
@@ -68,21 +67,47 @@ class PipelineConfig(BaseModel):
     )
 
 
-class GitConfig(EnvPrioritySettings):
+class GitConfig(BaseSettings):
     """Git repository synchronization settings."""
 
     model_config = SettingsConfigDict(
         env_prefix="AISUB_SERVER_GIT_",
+        env_file=".env",
+        env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
-    repo_url: HttpUrl = Field(description="Remote git repository URL for pushing completed subtitles.")
-    branch: str = Field(default="main", description="Git branch to checkout and push to.")
-    pat: SecretStr = Field(description="GitHub Personal Access Token.")
+    repo_url: HttpUrl | None = Field(
+        default=None,
+        description="Remote git repository URL for pushing completed subtitles.",
+    )
+    branch: str = Field(
+        default="main",
+        description="Git branch to checkout and push to.",
+    )
+    pat: SecretStr | None = Field(
+        default=None,
+        description="GitHub Personal Access Token.",
+    )
     player_base_url: HttpUrl = Field(
         default=HttpUrl("https://flippfuzz.github.io/ai-sub-player"),
         description="Base URL of the GitHub Pages subtitle player.",
     )
+
+    @model_validator(mode="after")
+    def _validate_when_active(self) -> Self:
+        """Ensures PAT is provided when repo URL is configured.
+
+        Returns:
+            Self: Validated instance.
+
+        Raises:
+            ValueError: If repo_url is configured without pat.
+        """
+        if self.repo_url is not None and not self.pat:
+            raise ValueError("Git pat must be provided when repo_url is configured.")
+        return self
 
     def get_pat_value(self) -> str:
         """Resolves the Personal Access Token string.
@@ -90,15 +115,18 @@ class GitConfig(EnvPrioritySettings):
         Returns:
             str: Clean PAT string.
         """
-        return self.pat.get_secret_value()
+        return self.pat.get_secret_value() if self.pat else ""
 
 
-class FilesSourceConfig(EnvPrioritySettings):
+class FilesSourceConfig(BaseSettings):
     """Local filesystem intake configuration."""
 
     model_config = SettingsConfigDict(
         env_prefix="AISUB_SERVER_SOURCES_FILES_",
+        env_file=".env",
+        env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     folders: PathList = Field(
@@ -111,12 +139,15 @@ class FilesSourceConfig(EnvPrioritySettings):
     )
 
 
-class YoutubeSourceConfig(EnvPrioritySettings):
+class YoutubeSourceConfig(BaseSettings):
     """YouTube intake, anti-bot pacing, and download configuration."""
 
     model_config = SettingsConfigDict(
         env_prefix="AISUB_SERVER_SOURCES_YOUTUBE_",
+        env_file=".env",
+        env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     urls: StringList = Field(
@@ -169,29 +200,44 @@ class YoutubeSourceConfig(EnvPrioritySettings):
     )
 
 
-class SourcesConfig(EnvPrioritySettings):
+class SourcesConfig(BaseSettings):
     """Container for distinct intake source categories."""
 
     model_config = SettingsConfigDict(
         env_prefix="AISUB_SERVER_SOURCES_",
+        env_file=".env",
+        env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     files: FilesSourceConfig = Field(default_factory=FilesSourceConfig)
     youtube: YoutubeSourceConfig = Field(default_factory=YoutubeSourceConfig)
 
 
-class ServerOptions(EnvPrioritySettings):
+class ServerOptions(BaseSettings):
     """HTTP server and filesystem orchestration options."""
 
     model_config = SettingsConfigDict(
-        env_prefix="AISUB_SERVER_SERVER_",
+        env_prefix="AISUB_SERVER_",
+        env_file=".env",
+        env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
-    host: str = Field(default="127.0.0.1", description="Bind IP address for the FastAPI server.")
-    port: PositiveInt = Field(default=8000, description="Bind port for the FastAPI server.")
-    work_dir: Path = Field(default=Path("./work"), description="Base working directory for pipeline state.")
+    host: str = Field(
+        default="127.0.0.1",
+        description="Bind IP address for the FastAPI server.",
+    )
+    port: PositiveInt = Field(
+        default=8000,
+        description="Bind port for the FastAPI server.",
+    )
+    work_dir: Path = Field(
+        default=Path("./work"),
+        description="Base working directory for pipeline state.",
+    )
     heartbeat_timeout_seconds: PositiveInt = Field(
         default=300,
         description="Seconds before an unresponsive worker lease expires.",
@@ -203,42 +249,6 @@ class ServerOptions(EnvPrioritySettings):
     activity_log_maxlen: PositiveInt = Field(
         default=50,
         description="Maximum number of recent worker activity events preserved per combination pipeline.",
-    )
-
-
-class ServerReEncodeSettings(EnvPrioritySettings, ReEncodeSettings):
-    """Server video re-encoding configuration with AISUB_SERVER_REENCODE_ prefix."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_SERVER_REENCODE_",
-        extra="ignore",
-    )
-
-
-class ServerSearchSettings(EnvPrioritySettings, SearchSettings):
-    """Server search provider configuration with AISUB_SERVER_SEARCH_ prefix."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_SERVER_SEARCH_",
-        extra="ignore",
-    )
-
-
-class ServerSplittingSettings(EnvPrioritySettings, SplittingSettings):
-    """Server video splitting configuration with AISUB_SERVER_SPLIT_ prefix."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_SERVER_SPLIT_",
-        extra="ignore",
-    )
-
-
-class ServerRetrySettings(EnvPrioritySettings, RetrySettings):
-    """Server task retry policy configuration with AISUB_SERVER_RETRY_ prefix."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_SERVER_RETRY_",
-        extra="ignore",
     )
 
 
@@ -275,35 +285,51 @@ class ServerSettings(YamlFileSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="AISUB_SERVER_",
+        env_file=".env",
+        env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     server: ServerOptions = Field(default_factory=ServerOptions)
-    git: GitConfig | None = Field(
-        default=None,
-        validation_alias=AliasChoices("AISUB_SERVER_GIT", "git"),
-    )
+    git: GitConfig | None = Field(default=None)
     sources: SourcesConfig = Field(default_factory=SourcesConfig)
-    reencode: ServerReEncodeSettings = Field(default_factory=ServerReEncodeSettings)
-    search: ServerSearchSettings = Field(default_factory=ServerSearchSettings)
-    split: ServerSplittingSettings = Field(default_factory=ServerSplittingSettings)
-    retry: ServerRetrySettings = Field(default_factory=ServerRetrySettings)
+    reencode: ReEncodeSettings = Field(default_factory=ReEncodeSettings)
+    search: SearchSettings = Field(default_factory=SearchSettings)
+    split: SplittingSettings = Field(default_factory=SplittingSettings)
+    retry: RetrySettings = Field(default_factory=RetrySettings)
+    log: LoggingSettings = Field(default_factory=LoggingSettings)
     pipelines: list[PipelineConfig] = Field(default_factory=_get_default_pipelines)
 
     @model_validator(mode="before")
     @classmethod
     def _check_git_env(cls, values: Any) -> Any:
-        """Instantiates GitConfig if git environment variables are present but git is omitted in YAML.
+        """Instantiates git configuration if git environment variables are present but git is omitted in YAML.
 
         Args:
             values: Raw input data dictionary.
 
         Returns:
             Any: Updated input data dictionary.
+
+        Raises:
+            ValueError: If repo_url is configured in env or .env without pat.
         """
         if isinstance(values, dict) and values.get("git") is None:
-            import os
-
-            if os.getenv("AISUB_SERVER_GIT_REPO_URL"):
-                values["git"] = {}
+            git_cfg = GitConfig()
+            if git_cfg.repo_url is not None:
+                if not git_cfg.pat:
+                    raise ValueError("Git pat must be provided via AISUB_SERVER_GIT_PAT when repo_url is configured.")
+                values["git"] = git_cfg
         return values
+
+    @model_validator(mode="after")
+    def _normalize_git_config(self) -> Self:
+        """Normalizes an inactive GitConfig (missing repo_url) to None.
+
+        Returns:
+            Self: Validated instance.
+        """
+        if self.git is not None and self.git.repo_url is None:
+            self.git = None
+        return self

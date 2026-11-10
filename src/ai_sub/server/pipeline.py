@@ -18,23 +18,8 @@ from ai_sub.config import (
     SearchSettings,
     SplittingSettings,
 )
-from ai_sub.jobs.lyrics import (
-    LyricsAiResponse,
-    LyricsJob,
-    get_lyrics_prompt,
-)
-from ai_sub.jobs.subtitles import (
-    DetectedMusicalPerformance,
-    Subtitles,
-    SubtitlesAiResponse,
-    SubtitlesJob,
-    get_subtitles_prompt,
-)
-from ai_sub.jobs.summary import (
-    SummaryAiResponse,
-    SummaryJob,
-    get_summary_prompt,
-)
+from ai_sub.jobs.summary import SummaryJob
+from ai_sub.pipeline_session import PipelineSession
 from ai_sub.protocol import TaskType
 from ai_sub.server.config import PipelineConfig
 from ai_sub.server.models import ActiveVideo, ServerTask, TaskStatus
@@ -44,7 +29,6 @@ from ai_sub.shortcode import (
     generate_subtitles_shortcode,
     generate_summary_shortcode,
 )
-from ai_sub.stitching import stitch_subtitles
 from ai_sub.video import (
     get_video_duration_ms,
     reencode_video,
@@ -83,7 +67,6 @@ class ComboPipeline:
     active_video: ActiveVideo | None
     preparing_video_info: dict[str, Any] | None
     tasks: dict[str, ServerTask]
-    summary_response: SummaryAiResponse | None
     _reencode_task: asyncio.Task[None] | None
 
     def __init__(
@@ -133,8 +116,14 @@ class ComboPipeline:
         self.active_video = None
         self.preparing_video_info = None
         self.tasks = {}
-        self.summary_response = None
         self._reencode_task = None
+
+    @property
+    def summary_response(self) -> Any:
+        """Summary response from the active session if available."""
+        if self.active_video and self.active_video.session:
+            return self.active_video.session.summary_response
+        return None
 
     def is_idle(self) -> bool:
         """Checks if the pipeline is idle and ready to accept a new video.
@@ -190,18 +179,22 @@ class ComboPipeline:
                 return task.segment_index in self.active_video.reencoded_segment_paths
         return True
 
-    def _build_user_context(self) -> str | None:
+    def _build_user_context(self, active: ActiveVideo | None = None) -> str | None:
         """Constructs background user context from video metadata.
+
+        Args:
+            active: Optional active video model. Defaults to self.active_video.
 
         Returns:
             str | None: Formatted context string or None.
         """
-        if not self.active_video:
+        video = active or self.active_video
+        if not video:
             return None
-        if self.active_video.source_type == "youtube":
-            ch = self.active_video.channel_name or self.active_video.uploader
-            return f"This is a YouTube video from {ch} channel. The video title is '{self.active_video.title}'."
-        return f"The video title is '{self.active_video.title}'."
+        if video.source_type == "youtube":
+            ch = video.channel_name or video.uploader
+            return f"This is a YouTube video from {ch} channel. The video title is '{video.title}'."
+        return f"The video title is '{video.title}'."
 
     def _get_active_search_tools(self) -> list[str]:
         """Resolves active search tools from pipeline override or global search settings.
@@ -221,6 +214,12 @@ class ComboPipeline:
         reencode_dir.mkdir(parents=True, exist_ok=True)
         seg_cfg = self.reencode_settings.segment
 
+        # If segment re-encoding is disabled, mark all segments as ready immediately
+        if not seg_cfg.enabled:
+            for idx, seg_path in enumerate(active.segment_paths):
+                active.reencoded_segment_paths[idx] = seg_path
+            return
+
         with logfire.span(
             "Background Re-encoding Loop: {video_id}",
             combo=self.config.name,
@@ -234,13 +233,8 @@ class ComboPipeline:
             skipped_count = 0
 
             for idx, seg_path in enumerate(active.segment_paths):
-                file_size_mb = seg_path.stat().st_size / (1024 * 1024)
-                should_reencode = seg_cfg.enabled and (
-                    seg_cfg.threshold_mb == 0 or file_size_mb >= seg_cfg.threshold_mb
-                )
-
-                if not should_reencode:
-                    active.reencoded_segment_paths[idx] = seg_path
+                # Skip if already marked ready (e.g. below size threshold)
+                if idx in active.reencoded_segment_paths:
                     skipped_count += 1
                     continue
 
@@ -248,6 +242,14 @@ class ComboPipeline:
                 if out_file.is_file():
                     active.reencoded_segment_paths[idx] = out_file
                     reencoded_count += 1
+                    continue
+
+                file_size_mb = seg_path.stat().st_size / (1024 * 1024)
+                should_reencode = seg_cfg.threshold_mb == 0 or file_size_mb >= seg_cfg.threshold_mb
+
+                if not should_reencode:
+                    active.reencoded_segment_paths[idx] = seg_path
+                    skipped_count += 1
                     continue
 
                 with logfire.span(
@@ -286,6 +288,65 @@ class ComboPipeline:
 
             loop_span.set_attribute("reencoded_chunks", reencoded_count)
             loop_span.set_attribute("skipped_chunks", skipped_count)
+
+    def _sync_tasks_from_session(self) -> None:
+        """Synchronizes pending task specifications from PipelineSession into ServerTask instances."""
+        active = self.active_video
+        session = active.session if active else None
+        if not active or session is None:
+            return
+
+        pending_specs = session.get_pending_task_specs()
+        for spec in pending_specs:
+            full_task_id = f"{self.config.name}::{spec.task_id}"
+            if full_task_id in self.tasks:
+                if spec.segment_index is not None and spec.segment_index in active.reencoded_segment_paths:
+                    self.tasks[full_task_id].media_path = active.reencoded_segment_paths[spec.segment_index]
+                continue
+
+            if spec.task_type == TaskType.SUMMARY:
+                model = self.config.summary_model
+                tier = self.config.service_tier_summary
+                tools = [t for t in self._get_active_search_tools() if t != "lrclib"]
+                agentic = True
+                prior_attempts = session.summary_attempts
+            elif spec.task_type == TaskType.SUBTITLES:
+                model = self.config.subtitles_model
+                tier = self.config.service_tier_subtitles
+                tools = []
+                agentic = False
+                prior_attempts = (
+                    session.subtitles_attempts.get(spec.segment_index, 0) if spec.segment_index is not None else 0
+                )
+            else:  # TaskType.LYRICS
+                model = self.config.lyrics_model
+                tier = self.config.service_tier_lyrics
+                tools = self._get_active_search_tools()
+                agentic = True
+                prior_attempts = (
+                    session.lyrics_attempts.get(spec.segment_index, 0) if spec.segment_index is not None else 0
+                )
+
+            self.tasks[full_task_id] = ServerTask(
+                task_id=full_task_id,
+                task_type=spec.task_type,
+                pipeline_name=self.config.name,
+                video_id=active.video_id,
+                segment_index=spec.segment_index,
+                model=model,
+                service_tier=tier,
+                media_path=spec.media_path,
+                video_duration_ms=spec.video_duration_ms,
+                segment_offset_ms=spec.segment_offset_ms,
+                user_context=spec.user_context,
+                global_summary=spec.global_summary,
+                draft_subtitles=spec.draft_subtitles,
+                detected_performances=spec.detected_performances,
+                search_tools=tools,
+                agentic_video=agentic,
+                attempts=prior_attempts,
+                status=TaskStatus.PENDING,
+            )
 
     async def prepare_and_set_video(
         self,
@@ -396,7 +457,16 @@ class ComboPipeline:
                 durations = await asyncio.gather(*(get_video_duration_ms(p) for p in segment_paths))
                 split_span.set_attribute("chunks_created", len(segment_paths))
 
-            self.active_video = ActiveVideo(
+            # Pre-populate reencoded_segment_paths for chunks that do not require re-encoding
+            seg_cfg = self.reencode_settings.segment
+            initial_reencoded_paths: dict[int, Path] = {}
+            for idx, p in enumerate(segment_paths):
+                file_mb = p.stat().st_size / (1024 * 1024)
+                needs_reenc = seg_cfg.enabled and (seg_cfg.threshold_mb == 0 or file_mb >= seg_cfg.threshold_mb)
+                if not needs_reenc:
+                    initial_reencoded_paths[idx] = p
+
+            active = ActiveVideo(
                 video_id=video_id,
                 uploader=uploader,
                 channel_name=channel_name,
@@ -409,223 +479,100 @@ class ComboPipeline:
                 duration_ms=total_duration_ms,
                 summary_proxy_path=proxy_path,
                 segment_paths=segment_paths,
+                reencoded_segment_paths=initial_reencoded_paths,
                 segment_durations_ms=durations,
             )
-            self.active_video.user_context = self._build_user_context()
-            self.tasks.clear()
-            self.summary_response = None
-            self.preparing_video_info = None
+            active.user_context = self._build_user_context(active)
 
+            # Initialize session sharing the exact same dictionary in memory
+            session = PipelineSession(
+                job_dir=job_dir,
+                video_id=video_id,
+                title=title,
+                uploader=uploader,
+                channel_name=channel_name,
+                duration_ms=total_duration_ms,
+                segment_paths=segment_paths,
+                segment_durations_ms=durations,
+                summary_model=self.config.summary_model,
+                subtitles_model=self.config.subtitles_model,
+                lyrics_model=self.config.lyrics_model,
+                reencode_settings=self.reencode_settings,
+                search_settings=self.search_settings,
+                split_settings=self.split_settings,
+                retry_settings=self.retry_settings,
+                source_type=source_type,
+                timestamp=timestamp,
+                user_context=active.user_context,
+                validation_buffer_ms=self.validation_buffer_ms,
+                summary_proxy_path=proxy_path,
+                reencoded_segment_paths=active.reencoded_segment_paths,
+            )
+            active.session = session
+            self.active_video = active
+
+            self.tasks.clear()
+            self.preparing_video_info = None
             self.status = PipelineStatus.PROCESSING
-            self._queue_summary_task()
+
+            self._sync_tasks_from_session()
             self._reencode_task = asyncio.create_task(self._reencode_segments_background())
 
             prep_span.set_attribute("result", "ready")
             prep_span.set_attribute("chunk_count", len(segment_paths))
 
-    def _queue_summary_task(self) -> None:
-        """Generates and enqueues the Phase 1 whole-video summary task."""
-        if not self.active_video or not self.active_video.summary_proxy_path:
-            return
-
-        active = self.active_video
-        proxy_path = active.summary_proxy_path
-        assert proxy_path is not None
-
-        task_id = f"{self.config.name}::{active.video_id}::summary"
-        prompt = get_summary_prompt(user_context=active.user_context)
-        active_tools = [t for t in self._get_active_search_tools() if t != "lrclib"]
-
-        self.tasks[task_id] = ServerTask(
-            task_id=task_id,
-            task_type=TaskType.SUMMARY,
-            pipeline_name=self.config.name,
-            video_id=active.video_id,
-            model=self.config.summary_model,
-            service_tier=self.config.service_tier_summary,
-            media_path=proxy_path,
-            video_duration_ms=active.duration_ms,
-            prompt=prompt,
-            response_schema_name="SummaryAiResponse",
-            search_tools=active_tools,
-            agentic_video=True,
-        )
-
-    def _queue_subtitles_tasks(self) -> None:
-        """Generates and enqueues Phase 2 subtitle chunk tasks for all segments."""
-        if not self.active_video:
-            return
-
-        active = self.active_video
-        with logfire.span(
-            "Queue Subtitles Tasks: {video_id}",
-            combo=self.config.name,
-            video_id=active.video_id,
-            chunk_count=len(active.segment_paths),
-            _level="debug",
-        ):
-            current_offset_ms = 0
-            for idx, (seg_path, seg_dur_ms) in enumerate(
-                zip(active.segment_paths, active.segment_durations_ms, strict=True)
-            ):
-                task_id = f"{self.config.name}::{active.video_id}::subtitles::{idx:03d}"
-                prompt = get_subtitles_prompt(
-                    user_context=active.user_context,
-                    global_summary=self.summary_response,
-                    segment_offset_ms=current_offset_ms,
-                    segment_duration_ms=seg_dur_ms,
-                )
-                media_file = active.reencoded_segment_paths.get(idx) or seg_path
-
-                self.tasks[task_id] = ServerTask(
-                    task_id=task_id,
-                    task_type=TaskType.SUBTITLES,
-                    pipeline_name=self.config.name,
-                    video_id=active.video_id,
-                    segment_index=idx,
-                    model=self.config.subtitles_model,
-                    service_tier=self.config.service_tier_subtitles,
-                    media_path=media_file,
-                    video_duration_ms=seg_dur_ms,
-                    prompt=prompt,
-                    response_schema_name="SubtitlesAiResponse",
-                    search_tools=[],
-                    agentic_video=False,
-                )
-                current_offset_ms += seg_dur_ms
-
-    def _queue_lyrics_task(self, seg_idx: int, sub_resp: SubtitlesAiResponse) -> None:
-        """Generates and enqueues a Phase 3 lyrics task for a segment with detected singing.
-
-        Args:
-            seg_idx: Segment chunk index.
-            sub_resp: Subtitle response containing detected singing performances.
-        """
-        if not self.active_video:
-            return
-
-        active = self.active_video
-        seg_path = active.reencoded_segment_paths.get(seg_idx) or active.segment_paths[seg_idx]
-        seg_dur_ms = active.segment_durations_ms[seg_idx]
-        offset_ms = sum(active.segment_durations_ms[:seg_idx])
-
-        task_id = f"{self.config.name}::{active.video_id}::lyrics::{seg_idx:03d}"
-        prompt = get_lyrics_prompt(
-            draft_subtitles=sub_resp.subtitles,
-            detected_performances=sub_resp.detected_musical_performances,
-            user_context=active.user_context,
-            global_summary=self.summary_response,
-            segment_offset_ms=offset_ms,
-            segment_duration_ms=seg_dur_ms,
-        )
-
-        self.tasks[task_id] = ServerTask(
-            task_id=task_id,
-            task_type=TaskType.LYRICS,
-            pipeline_name=self.config.name,
-            video_id=active.video_id,
-            segment_index=seg_idx,
-            model=self.config.lyrics_model,
-            service_tier=self.config.service_tier_lyrics,
-            media_path=seg_path,
-            video_duration_ms=seg_dur_ms,
-            prompt=prompt,
-            response_schema_name="LyricsAiResponse",
-            search_tools=self._get_active_search_tools(),
-            agentic_video=True,
-            detected_performances=[p.model_dump(mode="json") for p in sub_resp.detected_musical_performances],
-            draft_subtitles=[s.model_dump(mode="json") for s in sub_resp.subtitles],
-        )
-
     def on_task_completed(self, task_id: str, result_data: dict[str, Any]) -> None:
-        """Handles task completion, saving YAML state files and triggering downstream stages.
+        """Handles task completion, validating output and updating session checkpoints.
 
         Args:
             task_id: Unique task identifier.
             result_data: Validated structured dictionary received from worker.
         """
         task = self.tasks.get(task_id)
-        if not task or not self.active_video:
-            return
-
         active = self.active_video
-        val_ctx = {"video_duration_ms": task.video_duration_ms, "validation_buffer_ms": self.validation_buffer_ms}
+        session = active.session if active else None
+        if not task or not active or session is None:
+            return
 
         with logfire.span(
             "Task Cascade Complete: {task_id}",
             combo=self.config.name,
             task_id=task_id,
             task_type=task.task_type.value,
-        ) as cascade_span:
-            if task.task_type == TaskType.SUMMARY:
-                resp = SummaryAiResponse.model_validate(result_data, context=val_ctx)
-                self.summary_response = resp
-                summary_job = SummaryJob(
-                    name="summary",
-                    video_duration_ms=active.duration_ms,
-                    user_context=active.user_context,
-                    response=resp,
-                )
-                summary_job.save(active.job_dir / f"summary.{self.summary_shortcode}.yaml")
-                task.status = TaskStatus.COMPLETED
-                task.result = result_data
+        ):
+            session.complete_task(
+                task_type=task.task_type,
+                result_data=result_data,
+                segment_index=task.segment_index,
+            )
+            task.status = TaskStatus.COMPLETED
+            task.result = result_data
+            self._sync_tasks_from_session()
 
-                cascade_span.set_attribute("chapters_count", len(resp.chapters))
-                cascade_span.set_attribute("entities_count", len(resp.entities))
-                cascade_span.set_attribute("glossary_count", len(resp.domain_glossary))
-                self._queue_subtitles_tasks()
+    def on_task_failed(self, task_id: str, attempts: int) -> None:
+        """Handles task failure, updating session state and persisting attempt counts to disk.
 
-            elif task.task_type == TaskType.SUBTITLES:
-                assert task.segment_index is not None
-                idx = task.segment_index
-                resp = SubtitlesAiResponse.model_validate(result_data, context=val_ctx)
-                seg_path = active.segment_paths[idx]
-                sub_job = SubtitlesJob(
-                    name=seg_path.stem,
-                    video_duration_ms=task.video_duration_ms,
-                    segment_offset_ms=sum(active.segment_durations_ms[:idx]),
-                    global_summary=self.summary_response,
-                    user_context=active.user_context,
-                    response=resp,
-                )
-                sub_job.save(active.job_dir / f"{seg_path.stem}.subtitles.{self.subtitles_shortcode}.yaml")
-                task.status = TaskStatus.COMPLETED
-                task.result = result_data
+        Args:
+            task_id: Unique task identifier.
+            attempts: Total attempts recorded so far for this task.
+        """
+        task = self.tasks.get(task_id)
+        active = self.active_video
+        session = active.session if active else None
+        if not task or not active or session is None:
+            return
 
-                cascade_span.set_attribute("subtitles_count", len(resp.subtitles))
-                cascade_span.set_attribute("music_count", len(resp.detected_musical_performances))
-
-                if resp.detected_musical_performances:
-                    self._queue_lyrics_task(idx, resp)
-
-            elif task.task_type == TaskType.LYRICS:
-                assert task.segment_index is not None
-                idx = task.segment_index
-                resp = LyricsAiResponse.model_validate(result_data, context=val_ctx)
-                seg_path = active.segment_paths[idx]
-                lyrics_job = LyricsJob(
-                    name=seg_path.stem,
-                    video_duration_ms=task.video_duration_ms,
-                    segment_offset_ms=sum(active.segment_durations_ms[:idx]),
-                    draft_subtitles=[Subtitles.model_validate(s) for s in task.draft_subtitles],
-                    detected_performances=[
-                        DetectedMusicalPerformance.model_validate(p) for p in task.detected_performances
-                    ],
-                    global_summary=self.summary_response,
-                    user_context=active.user_context,
-                    response=resp,
-                )
-                lyrics_job.save(active.job_dir / f"{seg_path.stem}.lyrics.{self.lyrics_shortcode}.yaml")
-                task.status = TaskStatus.COMPLETED
-                task.result = result_data
-
-                cascade_span.set_attribute("refined_subtitles_count", len(resp.subtitles))
+        session.record_task_failure(
+            task_type=task.task_type,
+            segment_index=task.segment_index,
+            attempts=attempts,
+        )
 
     def is_video_complete(self) -> bool:
-        """Checks if all segments for the active video have finished processing.
+        """Checks if all segments for the active video have finished processing (succeeded or failed).
 
         Returns:
-            bool: True if video processing is finished, False otherwise.
+            bool: True if video processing has concluded across all stages, False otherwise.
         """
         if not self.active_video or self.status == PipelineStatus.PREPARING:
             return False
@@ -633,49 +580,29 @@ class ComboPipeline:
         if self.status in (PipelineStatus.FINALIZING, PipelineStatus.PUSH_FAILED):
             return True
 
-        summary_task = next((t for t in self.tasks.values() if t.task_type == TaskType.SUMMARY), None)
+        summary_task_id = f"{self.config.name}::{self.active_video.video_id}::summary"
+        summary_task = self.tasks.get(summary_task_id)
         if summary_task and summary_task.status == TaskStatus.FAILED:
             return True
 
+        # If any generated task is still actively being processed, the video is not complete
         if any(t.status in (TaskStatus.PENDING, TaskStatus.CLAIMED) for t in self.tasks.values()):
             return False
 
-        if self.summary_response is None:
+        session = self.active_video.session
+        if session is None:
             return False
 
+        # Summary must either be completed or aborted
+        if not session.is_summary_complete() and not session.summary_failed:
+            return False
+
+        # All subtitle chunks must have tasks generated and concluded
         sub_tasks = [t for t in self.tasks.values() if t.task_type == TaskType.SUBTITLES]
-        return len(sub_tasks) >= len(self.active_video.segment_paths)
+        if len(sub_tasks) < len(self.active_video.segment_paths):
+            return False
 
-    def _build_settings_metadata(self) -> dict[str, Any]:
-        """Constructs metadata dictionary capturing active pipeline settings for Event 0.
-
-        Returns:
-            dict[str, Any]: Settings dictionary embedded in finalized subtitles.
-        """
-        assert self.active_video is not None
-        search_dump = self.search_settings.model_dump(
-            mode="json",
-            exclude={"key": True, "tinyfish_key": True, "langsearch_key": True, "ollama_key": True},
-        )
-        if self.config.search_tools is not None:
-            search_dump["tools"] = self.config.search_tools
-
-        return {
-            "ai": {
-                "model_summary": self.config.summary_model,
-                "model_subtitles": self.config.subtitles_model,
-                "model_lyrics": self.config.lyrics_model,
-                "search": search_dump,
-                "agentic_video_summary": True,
-                "agentic_video_subtitles": False,
-                "agentic_video_lyrics": True,
-                "validation_buffer_ms": self.validation_buffer_ms,
-            },
-            "reencode": self.reencode_settings.model_dump(mode="json"),
-            "split": self.split_settings.model_dump(mode="json"),
-            "retry": self.retry_settings.model_dump(mode="json"),
-            "context": self.active_video.user_context,
-        }
+        return True
 
     def stitch_final_subtitles(self, output_path: Path) -> list[Path]:
         """Stitches completed segment subtitles into unified SRT files.
@@ -687,12 +614,13 @@ class ComboPipeline:
             list[Path]: List of generated subtitle file paths.
 
         Raises:
-            RuntimeError: If video processing is incomplete or segments are missing.
+            RuntimeError: If video processing is incomplete or active video is missing.
         """
-        if not self.active_video or not self.is_video_complete():
+        active = self.active_video
+        session = active.session if active else None
+        if active is None or session is None or not self.is_video_complete():
             raise RuntimeError(f"Cannot stitch subtitles: {self.config.name} video processing is incomplete.")
 
-        active = self.active_video
         raw_output_path = output_path.parent / f"{active.filename_stem}.raw-{self.full_shortcode}.srt"
         has_failures = any(t.status == TaskStatus.FAILED for t in self.tasks.values())
         status_str = "RetriesExceeded" if has_failures else "Completed"
@@ -702,29 +630,13 @@ class ComboPipeline:
             combo=self.config.name,
             video_id=active.video_id,
             output_file=output_path.name,
-        ) as stitch_span:
-            segments = [
-                (seg_path.stem, seg_dur_ms)
-                for seg_path, seg_dur_ms in zip(active.segment_paths, active.segment_durations_ms, strict=True)
-            ]
-
-            result = stitch_subtitles(
-                segments=segments,
-                state_dir=active.job_dir,
+        ):
+            return session.stitch(
                 output_primary_path=output_path,
                 output_raw_path=raw_output_path,
-                subtitles_shortcode=self.subtitles_shortcode,
-                lyrics_shortcode=self.lyrics_shortcode,
-                validation_buffer_ms=self.validation_buffer_ms,
-                settings_dump=self._build_settings_metadata(),
-                max_runs=self.retry_settings.max_runs,
                 status_override=status_str,
-                summary_available=self.summary_response is not None,
+                allow_partial=True,
             )
-
-            stitch_span.set_attribute("total_events", result.total_events)
-            stitch_span.set_attribute("duration_ms", result.duration_ms)
-            return result.generated_files
 
     async def resume_from_disk(self) -> bool:
         """Inspects work/<combo>/ to restore in-progress video subdirectories upon server boot.
@@ -759,9 +671,6 @@ class ComboPipeline:
                 channel_name = meta.get("channel_name")
                 title = str(meta.get("title", job_dir.name))
                 filename_stem = str(meta.get("filename_stem", ""))
-                raw_filename = meta.get("raw_filename")
-                raw_path_meta = meta.get("raw_path")
-                meta_size_mb = meta.get("raw_size_mb")
                 meta_duration_ms = int(meta.get("duration_ms", 0))
                 source_type = meta.get("source_type", "youtube")
                 timestamp = int(meta.get("timestamp", 0))
@@ -774,120 +683,120 @@ class ComboPipeline:
             segment_files = sorted(
                 [p for p in job_dir.glob("part_*") if p.is_file() and p.suffix.lower() in valid_extensions]
             )
+            raw_meta_str = str(meta.get("raw_path", ""))
+            raw_meta = Path(raw_meta_str) if raw_meta_str else None
+            raw_video_path = raw_meta if raw_meta and raw_meta.is_file() else None
 
-            proxy_path = job_dir / "summary_proxy.mp4"
-            raw_video_path: Path | None = None
+            # Validate whether existing segment files cover the full original video duration
+            durations: list[int] = []
+            if segment_files:
+                durations = await asyncio.gather(*(get_video_duration_ms(p) for p in segment_files))
+                total_seg_duration = sum(durations)
+                tolerance = self.split_settings.duration_tolerance_ms * len(segment_files)
 
-            # Verify saved raw file exists and matches size (and mtime for local files) before reuse
-            if raw_path_meta:
-                candidate = Path(str(raw_path_meta))
-                if candidate.is_file():
-                    actual_mb = candidate.stat().st_size / (1024 * 1024)
-                    actual_mtime = int(candidate.stat().st_mtime)
-                    size_match = meta_size_mb is None or abs(actual_mb - float(meta_size_mb)) < 0.1
-                    mtime_match = source_type != "local" or timestamp <= 0 or actual_mtime == timestamp
-                    if size_match and mtime_match:
-                        raw_video_path = candidate
+                if meta_duration_ms > 0 and abs(total_seg_duration - meta_duration_ms) > tolerance:
+                    if raw_video_path:
+                        logfire.warning(f"Incomplete split detected for {video_id} on resume. Re-splitting...")
+                        for p in segment_files:
+                            try:
+                                p.unlink()
+                            except OSError:
+                                pass
+                        # Clear stale re-encoded media and outdated segment checkpoints
+                        shutil.rmtree(job_dir / "reencoded", ignore_errors=True)
+                        for stale_yaml in job_dir.glob("part_*.yaml"):
+                            try:
+                                stale_yaml.unlink()
+                            except OSError:
+                                pass
+                        for stale_srt in job_dir.glob("part_*.srt"):
+                            try:
+                                stale_srt.unlink()
+                            except OSError:
+                                pass
 
-            # If a local source file was modified, replaced, or removed after segmentation,
-            # discard the stale job directory completely so it can be re-ingested freshly.
-            if source_type == "local" and not raw_video_path:
-                logfire.warning(
-                    f"Local source file for '{video_id}' at '{raw_path_meta}' is missing or has changed "
-                    f"(mtime/size mismatch). Discarding stale job directory {job_dir.name}."
+                        segment_files = await split_video(
+                            input_video=raw_video_path,
+                            output_dir=job_dir,
+                            split_duration_s=self.split_settings.max_seconds,
+                            output_pattern="part_%03d",
+                            duration_tolerance_ms=self.split_settings.duration_tolerance_ms,
+                        )
+                        durations = await asyncio.gather(*(get_video_duration_ms(p) for p in segment_files))
+                    else:
+                        logfire.warning(f"Incomplete split detected for {video_id} but raw video missing. Purging job.")
+                        shutil.rmtree(job_dir, ignore_errors=True)
+                        self.status = PipelineStatus.IDLE
+                        self.preparing_video_info = None
+                        return False
+            elif raw_video_path:
+                shutil.rmtree(job_dir / "reencoded", ignore_errors=True)
+                for stale_yaml in job_dir.glob("part_*.yaml"):
+                    try:
+                        stale_yaml.unlink()
+                    except OSError:
+                        pass
+                for stale_srt in job_dir.glob("part_*.srt"):
+                    try:
+                        stale_srt.unlink()
+                    except OSError:
+                        pass
+
+                segment_files = await split_video(
+                    input_video=raw_video_path,
+                    output_dir=job_dir,
+                    split_duration_s=self.split_settings.max_seconds,
+                    output_pattern="part_%03d",
+                    duration_tolerance_ms=self.split_settings.duration_tolerance_ms,
                 )
+                durations = await asyncio.gather(*(get_video_duration_ms(p) for p in segment_files))
+            else:
                 shutil.rmtree(job_dir, ignore_errors=True)
                 self.status = PipelineStatus.IDLE
                 self.preparing_video_info = None
-                resume_span.set_attribute("result", "purged_stale_local_job")
+                resume_span.set_attribute("result", "no_chunks_or_raw")
                 return False
 
-            if not raw_video_path and raw_filename:
-                candidate = job_dir / str(raw_filename)
-                if candidate.is_file():
-                    actual_mb = candidate.stat().st_size / (1024 * 1024)
-                    if meta_size_mb is None or abs(actual_mb - float(meta_size_mb)) < 0.1:
-                        raw_video_path = candidate
+            summary_checkpoint = SummaryJob.load(
+                job_dir / f"summary.{self.summary_shortcode}.yaml", self.validation_buffer_ms
+            )
+            summary_concluded = bool(
+                summary_checkpoint
+                and (summary_checkpoint.response or summary_checkpoint.total_attempts >= self.retry_settings.max_runs)
+            )
 
-            if not raw_video_path:
-                raw_candidates = [
-                    p
-                    for p in job_dir.glob(f"*{video_id}*.*")
-                    if p.is_file() and not p.name.startswith("part_") and p.suffix.lower() in valid_extensions
-                ]
-                raw_video_path = raw_candidates[0] if raw_candidates else None
-
-            if not segment_files:
-                if raw_video_path and raw_video_path.is_file():
-                    logfire.info(f"Re-splitting segments for {video_id} during resume...")
-                    shutil.rmtree(job_dir / "reencoded", ignore_errors=True)
-                    segment_files = await split_video(
-                        input_video=raw_video_path,
-                        output_dir=job_dir,
-                        split_duration_s=self.split_settings.max_seconds,
-                        output_pattern="part_%03d",
-                        duration_tolerance_ms=self.split_settings.duration_tolerance_ms,
-                    )
-                else:
-                    shutil.rmtree(job_dir, ignore_errors=True)
-                    self.status = PipelineStatus.IDLE
-                    self.preparing_video_info = None
-                    resume_span.set_attribute("result", "no_chunks_or_raw")
-                    return False
-
-            durations = await asyncio.gather(*(get_video_duration_ms(p) for p in segment_files))
-            total_seg_duration = sum(durations)
-            tolerance = self.split_settings.duration_tolerance_ms * len(segment_files)
-
-            # Validate whether existing segment files cover the full original video duration
-            if meta_duration_ms > 0 and abs(total_seg_duration - meta_duration_ms) > tolerance:
-                if raw_video_path and raw_video_path.is_file():
-                    logfire.warning(
-                        f"Segment duration sum ({total_seg_duration}ms) differs from metadata duration "
-                        f"({meta_duration_ms}ms) for {video_id}. Re-splitting video from raw..."
-                    )
-                    for seg in segment_files:
-                        try:
-                            seg.unlink()
-                        except OSError:
-                            pass
-                    # Wipe stale re-encoded files and old intermediate state files whose stems will be reused
-                    shutil.rmtree(job_dir / "reencoded", ignore_errors=True)
-                    for stale_yaml in job_dir.glob("part_*.yaml"):
-                        try:
-                            stale_yaml.unlink()
-                        except OSError:
-                            pass
-
-                    segment_files = await split_video(
-                        input_video=raw_video_path,
-                        output_dir=job_dir,
-                        split_duration_s=self.split_settings.max_seconds,
-                        output_pattern="part_%03d",
-                        duration_tolerance_ms=self.split_settings.duration_tolerance_ms,
-                    )
-                    durations = await asyncio.gather(*(get_video_duration_ms(p) for p in segment_files))
-                else:
-                    logfire.warning(
-                        f"Duration mismatch for {video_id} on resume, but raw media is unavailable. "
-                        "Proceeding with existing chunks."
-                    )
-
+            proxy_path = job_dir / "summary_proxy.mp4"
             if not proxy_path.is_file():
-                proxy_path = raw_video_path or segment_files[0]
+                if raw_video_path:
+                    proxy_path = raw_video_path
+                else:
+                    if not summary_concluded:
+                        logfire.warning(
+                            f"Summary pending for {video_id} but raw media and proxy are missing. Purging stale job."
+                        )
+                        shutil.rmtree(job_dir, ignore_errors=True)
+                        self.status = PipelineStatus.IDLE
+                        self.preparing_video_info = None
+                        return False
+                    proxy_path = segment_files[0]
 
             if not filename_stem:
-                stem_source = raw_video_path if raw_video_path else segment_files[0]
-                filename_stem = sanitize_filename(stem_source.stem)
+                filename_stem = sanitize_filename(segment_files[0].stem)
 
             reencode_dir = job_dir / "reencoded"
-            reencoded_paths = {
-                idx: reencode_dir / f"{p.stem}.mp4"
-                for idx, p in enumerate(segment_files)
-                if (reencode_dir / f"{p.stem}.mp4").is_file()
-            }
+            seg_cfg = self.reencode_settings.segment
+            reencoded_paths: dict[int, Path] = {}
+            for idx, p in enumerate(segment_files):
+                out_p = reencode_dir / f"{p.stem}.mp4"
+                if out_p.is_file():
+                    reencoded_paths[idx] = out_p
+                else:
+                    file_mb = p.stat().st_size / (1024 * 1024)
+                    needs_reenc = seg_cfg.enabled and (seg_cfg.threshold_mb == 0 or file_mb >= seg_cfg.threshold_mb)
+                    if not needs_reenc:
+                        reencoded_paths[idx] = p
 
-            self.active_video = ActiveVideo(
+            active = ActiveVideo(
                 video_id=video_id,
                 uploader=uploader,
                 channel_name=channel_name,
@@ -903,134 +812,151 @@ class ComboPipeline:
                 reencoded_segment_paths=reencoded_paths,
                 segment_durations_ms=durations,
             )
-            self.active_video.user_context = self._build_user_context()
-            active = self.active_video
+            active.user_context = self._build_user_context(active)
+
+            session = PipelineSession(
+                job_dir=job_dir,
+                video_id=video_id,
+                title=title,
+                uploader=uploader,
+                channel_name=channel_name,
+                duration_ms=sum(durations),
+                segment_paths=segment_files,
+                segment_durations_ms=durations,
+                summary_model=self.config.summary_model,
+                subtitles_model=self.config.subtitles_model,
+                lyrics_model=self.config.lyrics_model,
+                reencode_settings=self.reencode_settings,
+                search_settings=self.search_settings,
+                split_settings=self.split_settings,
+                retry_settings=self.retry_settings,
+                source_type=source_type,
+                timestamp=timestamp,
+                user_context=active.user_context,
+                validation_buffer_ms=self.validation_buffer_ms,
+                summary_proxy_path=proxy_path,
+                reencoded_segment_paths=active.reencoded_segment_paths,
+            )
+            session.discover_on_disk_state()
+            active.session = session
+            self.active_video = active
+
             self.tasks.clear()
             self.preparing_video_info = None
-            self._reencode_task = asyncio.create_task(self._reencode_segments_background())
 
-            summary_file = job_dir / f"summary.{self.summary_shortcode}.yaml"
-            loaded_summary_job = SummaryJob.load(summary_file, self.validation_buffer_ms)
-
-            if not loaded_summary_job or not loaded_summary_job.response:
-                self.status = PipelineStatus.PROCESSING
-                self._queue_summary_task()
-                resume_span.set_attribute("result", "resumed_summary_pending")
-                return True
-
-            self.summary_response = loaded_summary_job.response
-            sum_task_id = f"{self.config.name}::{video_id}::summary"
-            self.tasks[sum_task_id] = ServerTask(
-                task_id=sum_task_id,
-                task_type=TaskType.SUMMARY,
-                pipeline_name=self.config.name,
-                video_id=video_id,
-                model=self.config.summary_model,
-                service_tier=self.config.service_tier_summary,
-                media_path=proxy_path,
-                video_duration_ms=active.duration_ms,
-                prompt=get_summary_prompt(user_context=active.user_context),
-                response_schema_name="SummaryAiResponse",
-                status=TaskStatus.COMPLETED,
-                result=loaded_summary_job.response.model_dump(mode="json"),
-            )
-
-            current_offset_ms = 0
-            for idx, (seg_path, seg_dur_ms) in enumerate(zip(segment_files, durations, strict=True)):
-                sub_file = job_dir / f"{seg_path.stem}.subtitles.{self.subtitles_shortcode}.yaml"
-                lyrics_file = job_dir / f"{seg_path.stem}.lyrics.{self.lyrics_shortcode}.yaml"
-                loaded_sub_job = SubtitlesJob.load(sub_file, self.validation_buffer_ms)
-                loaded_lyrics_job = LyricsJob.load(lyrics_file, self.validation_buffer_ms)
-
-                media_file = reencoded_paths.get(idx) or seg_path
-                sub_task_id = f"{self.config.name}::{video_id}::subtitles::{idx:03d}"
-                sub_prompt = get_subtitles_prompt(
-                    user_context=active.user_context,
-                    global_summary=self.summary_response,
-                    segment_offset_ms=current_offset_ms,
-                    segment_duration_ms=seg_dur_ms,
+            # Seed completed or permanently failed tasks from existing on-disk responses
+            sum_id = f"{self.config.name}::{video_id}::summary"
+            if session.summary_response:
+                self.tasks[sum_id] = ServerTask(
+                    task_id=sum_id,
+                    task_type=TaskType.SUMMARY,
+                    pipeline_name=self.config.name,
+                    video_id=video_id,
+                    model=self.config.summary_model,
+                    media_path=proxy_path,
+                    video_duration_ms=active.duration_ms,
+                    status=TaskStatus.COMPLETED,
+                    attempts=session.summary_attempts,
+                    result=session.summary_response.model_dump(mode="json"),
+                )
+            elif session.summary_failed:
+                self.tasks[sum_id] = ServerTask(
+                    task_id=sum_id,
+                    task_type=TaskType.SUMMARY,
+                    pipeline_name=self.config.name,
+                    video_id=video_id,
+                    model=self.config.summary_model,
+                    media_path=proxy_path,
+                    video_duration_ms=active.duration_ms,
+                    status=TaskStatus.FAILED,
+                    attempts=max(session.summary_attempts, self.retry_settings.max_runs),
                 )
 
-                if loaded_sub_job and loaded_sub_job.response:
-                    self.tasks[sub_task_id] = ServerTask(
-                        task_id=sub_task_id,
-                        task_type=TaskType.SUBTITLES,
-                        pipeline_name=self.config.name,
-                        video_id=video_id,
-                        segment_index=idx,
-                        model=self.config.subtitles_model,
-                        service_tier=self.config.service_tier_subtitles,
-                        media_path=media_file,
-                        video_duration_ms=seg_dur_ms,
-                        prompt=sub_prompt,
-                        response_schema_name="SubtitlesAiResponse",
-                        status=TaskStatus.COMPLETED,
-                        result=loaded_sub_job.response.model_dump(mode="json"),
-                    )
-                else:
-                    self.tasks[sub_task_id] = ServerTask(
-                        task_id=sub_task_id,
-                        task_type=TaskType.SUBTITLES,
-                        pipeline_name=self.config.name,
-                        video_id=video_id,
-                        segment_index=idx,
-                        model=self.config.subtitles_model,
-                        service_tier=self.config.service_tier_subtitles,
-                        media_path=media_file,
-                        video_duration_ms=seg_dur_ms,
-                        prompt=sub_prompt,
-                        response_schema_name="SubtitlesAiResponse",
-                        status=TaskStatus.PENDING,
-                    )
+            for idx, sub_resp in session.subtitles_responses.items():
+                sub_id = f"{self.config.name}::{video_id}::subtitles::{idx:03d}"
+                self.tasks[sub_id] = ServerTask(
+                    task_id=sub_id,
+                    task_type=TaskType.SUBTITLES,
+                    pipeline_name=self.config.name,
+                    video_id=video_id,
+                    segment_index=idx,
+                    model=self.config.subtitles_model,
+                    media_path=reencoded_paths.get(idx) or segment_files[idx],
+                    video_duration_ms=durations[idx],
+                    status=TaskStatus.COMPLETED,
+                    attempts=session.subtitles_attempts.get(idx, 1),
+                    result=sub_resp.model_dump(mode="json"),
+                )
 
-                if loaded_sub_job and loaded_sub_job.response and loaded_sub_job.response.detected_musical_performances:
-                    lyr_task_id = f"{self.config.name}::{video_id}::lyrics::{idx:03d}"
-                    lyr_prompt = get_lyrics_prompt(
-                        draft_subtitles=loaded_sub_job.response.subtitles,
-                        detected_performances=loaded_sub_job.response.detected_musical_performances,
-                        user_context=active.user_context,
-                        global_summary=self.summary_response,
-                        segment_offset_ms=current_offset_ms,
-                        segment_duration_ms=seg_dur_ms,
-                    )
-                    if loaded_lyrics_job and loaded_lyrics_job.response:
-                        self.tasks[lyr_task_id] = ServerTask(
-                            task_id=lyr_task_id,
-                            task_type=TaskType.LYRICS,
-                            pipeline_name=self.config.name,
-                            video_id=video_id,
-                            segment_index=idx,
-                            model=self.config.lyrics_model,
-                            service_tier=self.config.service_tier_lyrics,
-                            media_path=media_file,
-                            video_duration_ms=seg_dur_ms,
-                            prompt=lyr_prompt,
-                            response_schema_name="LyricsAiResponse",
-                            status=TaskStatus.COMPLETED,
-                            result=loaded_lyrics_job.response.model_dump(mode="json"),
-                        )
-                    else:
-                        self._queue_lyrics_task(idx, loaded_sub_job.response)
+            for idx in session.failed_subtitles:
+                sub_id = f"{self.config.name}::{video_id}::subtitles::{idx:03d}"
+                self.tasks[sub_id] = ServerTask(
+                    task_id=sub_id,
+                    task_type=TaskType.SUBTITLES,
+                    pipeline_name=self.config.name,
+                    video_id=video_id,
+                    segment_index=idx,
+                    model=self.config.subtitles_model,
+                    media_path=reencoded_paths.get(idx) or segment_files[idx],
+                    video_duration_ms=durations[idx],
+                    status=TaskStatus.FAILED,
+                    attempts=max(session.subtitles_attempts.get(idx, 0), self.retry_settings.max_runs),
+                )
 
-                current_offset_ms += seg_dur_ms
+            for idx, lyr_resp in session.lyrics_responses.items():
+                lyr_id = f"{self.config.name}::{video_id}::lyrics::{idx:03d}"
+                self.tasks[lyr_id] = ServerTask(
+                    task_id=lyr_id,
+                    task_type=TaskType.LYRICS,
+                    pipeline_name=self.config.name,
+                    video_id=video_id,
+                    segment_index=idx,
+                    model=self.config.lyrics_model,
+                    media_path=reencoded_paths.get(idx) or segment_files[idx],
+                    video_duration_ms=durations[idx],
+                    status=TaskStatus.COMPLETED,
+                    attempts=session.lyrics_attempts.get(idx, 1),
+                    result=lyr_resp.model_dump(mode="json"),
+                )
 
-            has_pending = any(t.status in (TaskStatus.PENDING, TaskStatus.CLAIMED) for t in self.tasks.values())
-            if has_pending:
+            for idx in session.failed_lyrics:
+                lyr_id = f"{self.config.name}::{video_id}::lyrics::{idx:03d}"
+                self.tasks[lyr_id] = ServerTask(
+                    task_id=lyr_id,
+                    task_type=TaskType.LYRICS,
+                    pipeline_name=self.config.name,
+                    video_id=video_id,
+                    segment_index=idx,
+                    model=self.config.lyrics_model,
+                    media_path=reencoded_paths.get(idx) or segment_files[idx],
+                    video_duration_ms=durations[idx],
+                    status=TaskStatus.FAILED,
+                    attempts=max(session.lyrics_attempts.get(idx, 0), self.retry_settings.max_runs),
+                )
+
+            self._sync_tasks_from_session()
+            self._reencode_task = asyncio.create_task(self._reencode_segments_background())
+
+            if self.is_video_complete():
+                self.status = PipelineStatus.FINALIZING
+                resume_span.set_attribute("result", "resumed_complete")
+            else:
                 self.status = PipelineStatus.PROCESSING
                 pending_count = sum(1 for t in self.tasks.values() if t.status == TaskStatus.PENDING)
-                resume_span.set_attribute("result", "resumed_subtitles_pending")
+                resume_span.set_attribute("result", "resumed_processing")
                 resume_span.set_attribute("pending_tasks", pending_count)
-            else:
-                self.status = PipelineStatus.FINALIZING
-                resume_span.set_attribute("result", "resumed_all_chunks_complete")
 
             return True
 
-    def clear_active_video(self) -> None:
+    async def clear_active_video(self) -> None:
         """Purges working directory files and clears the active video state for this pipeline."""
         with logfire.span("Clear Active Video: {combo}", combo=self.config.name) as clear_span:
             if self._reencode_task and not self._reencode_task.done():
                 self._reencode_task.cancel()
+                try:
+                    await self._reencode_task
+                except asyncio.CancelledError:
+                    pass
                 self._reencode_task = None
 
             purged_path = None
@@ -1045,5 +971,4 @@ class ComboPipeline:
             self.active_video = None
             self.preparing_video_info = None
             self.tasks.clear()
-            self.summary_response = None
             self.status = PipelineStatus.IDLE

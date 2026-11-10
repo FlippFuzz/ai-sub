@@ -29,17 +29,10 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-_BASE_CONFIG: SettingsConfigDict = {
-    "env_file": ".env",
-    "env_file_encoding": "utf-8",
-    "extra": "ignore",
-    "populate_by_name": True,
-}
-
 ServiceTier = Literal["auto", "default", "flex", "priority"]
 
 
-def parse_string_list(val: Any) -> list[str] | Any:
+def _parse_string_list(val: Any) -> list[str] | Any:
     """Parses a list of strings from a Python list, JSON array, or comma-separated string.
 
     Args:
@@ -71,7 +64,7 @@ def parse_string_list(val: Any) -> list[str] | Any:
     return val
 
 
-def parse_path_list(val: Any) -> list[Path] | Any:
+def _parse_path_list(val: Any) -> list[Path] | Any:
     """Parses a list of Paths from a Python list, JSON array, or comma-separated string.
 
     Args:
@@ -80,41 +73,14 @@ def parse_path_list(val: Any) -> list[Path] | Any:
     Returns:
         list[Path] | Any: Normalized list of Path objects or unparsed raw input.
     """
-    raw_list = parse_string_list(val)
+    raw_list = _parse_string_list(val)
     if not isinstance(raw_list, list):
         return raw_list
     return [Path(p) for p in raw_list]
 
 
-StringList = Annotated[list[str], NoDecode, BeforeValidator(parse_string_list)]
-PathList = Annotated[list[Path], NoDecode, BeforeValidator(parse_path_list)]
-
-
-class EnvPrioritySettings(BaseSettings):
-    """Base settings model where environment variables take precedence over init kwargs."""
-
-    @classmethod
-    def settings_customise_sources(
-        cls,
-        settings_cls: type[BaseSettings],
-        init_settings: PydanticBaseSettingsSource,
-        env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,
-        file_secret_settings: PydanticBaseSettingsSource,
-    ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Ensures environment variables override values supplied in init kwargs.
-
-        Args:
-            settings_cls: Target settings class.
-            init_settings: Injected initial settings kwargs.
-            env_settings: Environment variable settings source.
-            dotenv_settings: Dotenv settings source.
-            file_secret_settings: File secret settings source.
-
-        Returns:
-            tuple[PydanticBaseSettingsSource, ...]: Source priority sequence.
-        """
-        return (env_settings, init_settings)
+StringList = Annotated[list[str], NoDecode, BeforeValidator(_parse_string_list)]
+PathList = Annotated[list[Path], NoDecode, BeforeValidator(_parse_path_list)]
 
 
 class YamlFileSettings(BaseSettings):
@@ -129,7 +95,7 @@ class YamlFileSettings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Ensures environment variables override values loaded from YAML.
+        """Ensures environment variables and .env files override values loaded from YAML.
 
         Args:
             settings_cls: Target settings class.
@@ -141,7 +107,7 @@ class YamlFileSettings(BaseSettings):
         Returns:
             tuple[PydanticBaseSettingsSource, ...]: Source priority sequence.
         """
-        return (env_settings, init_settings)
+        return (env_settings, dotenv_settings, init_settings)
 
     @classmethod
     def from_yaml(cls, yaml_path: Path | str) -> Self:
@@ -204,10 +170,13 @@ def find_config_file(kind: Literal["server", "worker"], cli_arg: str | Path | No
 class StorageSettings(BaseSettings):
     """Configuration for Gemini Files API storage lifecycle and cleanup."""
 
-    model_config = {
-        "env_prefix": "AISUB_AI_STORAGE_",
-        **_BASE_CONFIG,
-    }
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_AI_STORAGE_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
 
     max_gb: PositiveFloat = Field(
         description="High-water mark in Gigabytes (GB) triggering managed file cleanup.",
@@ -227,7 +196,7 @@ class StorageSettings(BaseSettings):
     )
 
     @model_validator(mode="after")
-    def validate_thresholds(self) -> Self:
+    def _validate_thresholds(self) -> Self:
         """Validates that low-water mark target_gb is strictly less than max_gb.
 
         Returns:
@@ -247,11 +216,13 @@ class StorageSettings(BaseSettings):
 class SearchSettings(BaseSettings):
     """Configuration for auxiliary web search tools used by the AI model."""
 
-    model_config = {
-        "env_prefix": "AISUB_AI_SEARCH_",
-        "enable_decoding": False,
-        **_BASE_CONFIG,
-    }
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_AI_SEARCH_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
 
     tools: StringList = Field(
         description="List of search providers to enable.",
@@ -348,7 +319,7 @@ class SearchSettings(BaseSettings):
         return self.key
 
     @model_validator(mode="after")
-    def validate_tools_list(self) -> Self:
+    def _validate_tools_list(self) -> Self:
         """Validates that configured search tools are supported.
 
         Returns:
@@ -364,13 +335,260 @@ class SearchSettings(BaseSettings):
         return self
 
 
+class SummaryReEncodeSettings(BaseSettings):
+    """Re-encoding configuration for the whole-video summary proxy."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_REENCODE_SUMMARY_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    enabled: bool = Field(
+        default=True,
+        description="Whether whole-video proxy re-encoding is enabled.",
+    )
+    threshold_mb: NonNegativeInt = Field(
+        default=300,
+        description="File size threshold in MB above which the full video is compressed. 0 compresses unconditionally.",
+    )
+    keyframe_only: bool = Field(
+        default=True,
+        description="Whether to decode only keyframes from the input video for faster summary proxy re-encoding.",
+    )
+    fps: PositiveFloat = Field(
+        default=1.0,
+        description="Target framerate (FPS) for the summary proxy video.",
+    )
+    height: PositiveInt = Field(
+        default=360,
+        description="Target resolution height in pixels (aspect ratio is preserved).",
+    )
+    bitrate_kb: PositiveInt = Field(
+        default=35,
+        description="Target video bitrate in Kilobytes per second (KB/s).",
+    )
+    duration_tolerance_ms: NonNegativeInt = Field(
+        default=100,
+        description="Allowed duration divergence in milliseconds for summary proxy output.",
+    )
+
+
+class SegmentReEncodeSettings(BaseSettings):
+    """Re-encoding configuration for individual video chunk segments."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_REENCODE_SEGMENT_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether segment re-encoding is enabled.",
+    )
+    threshold_mb: NonNegativeInt = Field(
+        default=20,
+        description="File size threshold in MB above which chunks are compressed. 0 compresses unconditionally.",
+    )
+    keyframe_only: bool = Field(
+        default=False,
+        description="Whether to decode only keyframes from the input video for segment chunk re-encoding.",
+    )
+    fps: PositiveFloat = Field(
+        default=1.0,
+        description="Target framerate (FPS) for compressed segment chunks.",
+    )
+    height: PositiveInt = Field(
+        default=360,
+        description="Target resolution height in pixels (aspect ratio is preserved).",
+    )
+    bitrate_kb: PositiveInt = Field(
+        default=35,
+        description="Target video bitrate in Kilobytes per second (KB/s).",
+    )
+    duration_tolerance_ms: NonNegativeInt = Field(
+        default=100,
+        description="Allowed duration divergence in milliseconds for re-encoded chunk output.",
+    )
+
+
+class ReEncodeSettings(BaseSettings):
+    """Configuration for FFmpeg video re-encoding across pipeline stages."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_REENCODE_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    encoder: str | None = Field(
+        default=None,
+        description="Specific H.264 encoder to use (e.g., 'h264_nvenc', 'libx264'). Auto-detected if null.",
+    )
+    summary: SummaryReEncodeSettings = Field(
+        description="Re-encoding rules for the whole-video summary proxy.",
+        default_factory=SummaryReEncodeSettings,
+    )
+    segment: SegmentReEncodeSettings = Field(
+        description="Re-encoding rules for individual video chunk segments.",
+        default_factory=SegmentReEncodeSettings,
+    )
+
+
+class SplittingSettings(BaseSettings):
+    """Configuration for splitting input videos into uniform segments."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_SPLIT_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    max_seconds: PositiveInt = Field(
+        description="Maximum duration in seconds for each video chunk.",
+        default=300,
+    )
+    start_offset_min: NonNegativeInt = Field(
+        description="Duration in minutes to skip from the beginning of the video.",
+        default=0,
+    )
+    duration_tolerance_ms: NonNegativeInt = Field(
+        description="Maximum allowed duration variance in milliseconds per segment during split validation.",
+        default=100,
+    )
+
+
+class ConcurrencySettings(BaseSettings):
+    """Concurrency settings controlling parallel worker tasks in standalone mode."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_CONCURRENCY_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    re_encode: PositiveInt = Field(
+        description="Number of concurrent FFmpeg compression processes.",
+        default=2,
+    )
+    summary: NonNegativeInt = Field(
+        description="Number of concurrent summary tasks. Set to 0 to skip whole-video summary.",
+        default=1,
+    )
+    subtitles: PositiveInt = Field(
+        description="Number of concurrent subtitle generation tasks.",
+        default=4,
+    )
+    lyrics: NonNegativeInt = Field(
+        description="Number of concurrent lyrics refinement tasks. Set to 0 to skip lyrics lookup.",
+        default=4,
+    )
+
+
+class RetrySettings(BaseSettings):
+    """Retry parameters for transient API failures and cross-run persistence."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_RETRY_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    per_run: NonNegativeInt = Field(
+        description="Maximum internal retries by the executor on transient network or schema failures.",
+        default=5,
+    )
+    max_runs: PositiveInt = Field(
+        description="Maximum total attempt limit persisted across application executions per segment.",
+        default=3,
+    )
+    multiplier: PositiveFloat = Field(
+        description="Exponential backoff multiplier between retry attempts.",
+        default=2.0,
+    )
+    min_wait_seconds: PositiveFloat = Field(
+        description="Minimum backoff wait time in seconds.",
+        default=30.0,
+    )
+    max_wait_seconds: PositiveInt = Field(
+        description="Maximum backoff wait time in seconds.",
+        default=300,
+    )
+
+
+class DirectorySettings(BaseSettings):
+    """Configuration for working directories."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_DIR_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    tmp: Path = Field(
+        description="Temporary directory for intermediate segments and state files.",
+        default=Path("tmp_input_video_file"),
+    )
+    out: Path = Field(
+        description="Output directory for generated subtitle files.",
+        default=Path("directory_of_input_file"),
+    )
+
+
+class LoggingSettings(BaseSettings):
+    """Telemetry and console logging configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_LOG_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+    level: LevelName = Field(
+        description="Minimum log level to output.",
+        default="info",
+    )
+    timestamps: bool = Field(
+        description="Whether to prefix console log lines with timestamps.",
+        default=False,
+    )
+    scrub: bool = Field(
+        description="Whether to scrub sensitive API keys and secrets from logs.",
+        default=True,
+    )
+    progress: bool = Field(
+        description="Whether to display live Rich progress bars.",
+        default=True,
+    )
+
+
 class AiSettings(BaseSettings):
     """Configuration for Google Gemini models and rate limiting."""
 
-    model_config = {
-        "env_prefix": "AISUB_AI_",
-        **_BASE_CONFIG,
-    }
+    model_config = SettingsConfigDict(
+        env_prefix="AISUB_AI_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
 
     key: SecretStr | None = Field(
         description="Google Gemini API key.",
@@ -380,10 +598,6 @@ class AiSettings(BaseSettings):
     base_url: HttpUrl | None = Field(
         description="Optional custom base URL or proxy for Google Gemini API calls.",
         default=None,
-    )
-    model: str | None = Field(
-        default=None,
-        description="Shorthand setting model_subtitles, model_lyrics, and model_summary to the same identifier.",
     )
     model_summary: str = Field(
         description="AI model for whole-video summary, entity extraction, and chapter indexing.",
@@ -397,10 +611,6 @@ class AiSettings(BaseSettings):
         description="AI model for musical lyrics search and refinement with agentic video inspection.",
         default="google-gla:gemini-3.5-flash-lite",
     )
-    service_tier: ServiceTier | None = Field(
-        default=None,
-        description="Shorthand setting service tiers across all pipeline phases.",
-    )
     service_tier_summary: ServiceTier | None = Field(
         default=None,
         description="Google Gemini service tier for whole-video summary.",
@@ -412,10 +622,6 @@ class AiSettings(BaseSettings):
     service_tier_lyrics: ServiceTier | None = Field(
         default=None,
         description="Google Gemini service tier for lyrics refinement.",
-    )
-    agentic_video: bool | None = Field(
-        default=None,
-        description="Shorthand setting agentic video understanding across all pipeline phases.",
     )
     agentic_video_summary: bool = Field(
         default=True,
@@ -451,8 +657,8 @@ class AiSettings(BaseSettings):
     )
 
     @model_validator(mode="after")
-    def validate_models_and_tiers(self) -> Self:
-        """Synchronizes shorthands and validates required provider prefixes.
+    def _validate_models(self) -> Self:
+        """Validates required provider prefixes for models.
 
         Returns:
             Self: The validated instance.
@@ -460,11 +666,6 @@ class AiSettings(BaseSettings):
         Raises:
             ValueError: If a model identifier does not start with 'google-gla:'.
         """
-        if self.model:
-            self.model_summary = self.model
-            self.model_lyrics = self.model
-            self.model_subtitles = self.model
-
         for field_name, model_val in (
             ("model_summary", self.model_summary),
             ("model_lyrics", self.model_lyrics),
@@ -475,250 +676,22 @@ class AiSettings(BaseSettings):
                     f"Invalid model '{model_val}' for '{field_name}'. "
                     "Model identifier must start with 'google-gla:' (e.g., 'google-gla:gemini-3.8-flash')."
                 )
-
-        if self.service_tier is not None:
-            self.service_tier_summary = self.service_tier
-            self.service_tier_lyrics = self.service_tier
-            self.service_tier_subtitles = self.service_tier
-
-        if self.agentic_video is not None:
-            self.agentic_video_summary = self.agentic_video
-            self.agentic_video_subtitles = self.agentic_video
-            self.agentic_video_lyrics = self.agentic_video
-
         return self
 
 
-class SummaryReEncodeSettings(BaseSettings):
-    """Re-encoding configuration for the whole-video summary proxy."""
+class Settings(YamlFileSettings):
+    """Root standalone application configuration model."""
 
-    model_config = {
-        "env_prefix": "AISUB_REENCODE_SUMMARY_",
-        **_BASE_CONFIG,
-    }
-
-    enabled: bool = Field(
-        default=True,
-        description="Whether whole-video proxy re-encoding is enabled.",
+    model_config = SettingsConfigDict(
+        nested_model_default_partial_update=True,
+        cli_avoid_json=True,
+        cli_kebab_case=True,
+        env_prefix="AISUB_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
     )
-    threshold_mb: NonNegativeInt = Field(
-        default=300,
-        description="File size threshold in MB above which the full video is compressed. 0 compresses unconditionally.",
-    )
-    keyframe_only: bool = Field(
-        default=True,
-        description="Whether to decode only keyframes from the input video for faster summary proxy re-encoding.",
-    )
-    fps: PositiveFloat = Field(
-        default=1.0,
-        description="Target framerate (FPS) for the summary proxy video.",
-    )
-    height: PositiveInt = Field(
-        default=360,
-        description="Target resolution height in pixels (aspect ratio is preserved).",
-    )
-    bitrate_kb: PositiveInt = Field(
-        default=35,
-        description="Target video bitrate in Kilobytes per second (KB/s).",
-    )
-    duration_tolerance_ms: NonNegativeInt = Field(
-        default=100,
-        description="Allowed duration divergence in milliseconds for summary proxy output.",
-    )
-
-
-class SegmentReEncodeSettings(BaseSettings):
-    """Re-encoding configuration for individual video chunk segments."""
-
-    model_config = {
-        "env_prefix": "AISUB_REENCODE_SEGMENT_",
-        **_BASE_CONFIG,
-    }
-
-    enabled: bool = Field(
-        default=False,
-        description="Whether segment re-encoding is enabled.",
-    )
-    threshold_mb: NonNegativeInt = Field(
-        default=20,
-        description="File size threshold in MB above which chunks are compressed. 0 compresses unconditionally.",
-    )
-    keyframe_only: bool = Field(
-        default=False,
-        description="Whether to decode only keyframes from the input video for segment chunk re-encoding.",
-    )
-    fps: PositiveFloat = Field(
-        default=1.0,
-        description="Target framerate (FPS) for compressed segment chunks.",
-    )
-    height: PositiveInt = Field(
-        default=360,
-        description="Target resolution height in pixels (aspect ratio is preserved).",
-    )
-    bitrate_kb: PositiveInt = Field(
-        default=35,
-        description="Target video bitrate in Kilobytes per second (KB/s).",
-    )
-    duration_tolerance_ms: NonNegativeInt = Field(
-        default=100,
-        description="Allowed duration divergence in milliseconds for re-encoded chunk output.",
-    )
-
-
-class ReEncodeSettings(BaseSettings):
-    """Configuration for FFmpeg video re-encoding across pipeline stages."""
-
-    model_config = {
-        "env_prefix": "AISUB_REENCODE_",
-        **_BASE_CONFIG,
-    }
-
-    encoder: str | None = Field(
-        default=None,
-        description="Specific H.264 encoder to use (e.g., 'h264_nvenc', 'libx264'). Auto-detected if null.",
-    )
-    summary: SummaryReEncodeSettings = Field(
-        description="Re-encoding rules for the whole-video summary proxy.",
-        default_factory=SummaryReEncodeSettings,
-    )
-    segment: SegmentReEncodeSettings = Field(
-        description="Re-encoding rules for individual video chunk segments.",
-        default_factory=SegmentReEncodeSettings,
-    )
-
-
-class SplittingSettings(BaseSettings):
-    """Configuration for splitting input videos into uniform segments."""
-
-    model_config = {
-        "env_prefix": "AISUB_SPLIT_",
-        **_BASE_CONFIG,
-    }
-
-    max_seconds: PositiveInt = Field(
-        description="Maximum duration in seconds for each video chunk.",
-        default=300,
-    )
-    start_offset_min: NonNegativeInt = Field(
-        description="Duration in minutes to skip from the beginning of the video.",
-        default=0,
-    )
-    duration_tolerance_ms: NonNegativeInt = Field(
-        description="Maximum allowed duration variance in milliseconds per segment during split validation.",
-        default=100,
-    )
-
-
-class ConcurrencySettings(BaseSettings):
-    """Concurrency settings controlling parallel worker tasks in standalone mode."""
-
-    model_config = {
-        "env_prefix": "AISUB_CONCURRENCY_",
-        **_BASE_CONFIG,
-    }
-
-    re_encode: PositiveInt = Field(
-        description="Number of concurrent FFmpeg compression processes.",
-        default=2,
-    )
-    summary: NonNegativeInt = Field(
-        description="Number of concurrent summary tasks. Set to 0 to skip whole-video summary.",
-        default=1,
-    )
-    subtitles: PositiveInt = Field(
-        description="Number of concurrent subtitle generation tasks.",
-        default=4,
-    )
-    lyrics: NonNegativeInt = Field(
-        description="Number of concurrent lyrics refinement tasks. Set to 0 to skip lyrics lookup.",
-        default=4,
-    )
-
-
-class RetrySettings(BaseSettings):
-    """Retry parameters for transient API failures and cross-run persistence."""
-
-    model_config = {
-        "env_prefix": "AISUB_RETRY_",
-        **_BASE_CONFIG,
-    }
-
-    per_run: NonNegativeInt = Field(
-        description="Maximum internal retries by the executor on transient network or schema failures.",
-        default=5,
-    )
-    max_runs: PositiveInt = Field(
-        description="Maximum total attempt limit persisted across application executions per segment.",
-        default=3,
-    )
-    multiplier: PositiveFloat = Field(
-        description="Exponential backoff multiplier between retry attempts.",
-        default=2.0,
-    )
-    min_wait_seconds: PositiveFloat = Field(
-        description="Minimum backoff wait time in seconds.",
-        default=30.0,
-    )
-    max_wait_seconds: PositiveInt = Field(
-        description="Maximum backoff wait time in seconds.",
-        default=300,
-    )
-
-
-class DirectorySettings(BaseSettings):
-    """Configuration for working directories."""
-
-    model_config = {
-        "env_prefix": "AISUB_DIR_",
-        **_BASE_CONFIG,
-    }
-
-    tmp: Path = Field(
-        description="Temporary directory for intermediate segments and state files.",
-        default=Path("tmp_input_video_file"),
-    )
-    out: Path = Field(
-        description="Output directory for generated subtitle files.",
-        default=Path("directory_of_input_file"),
-    )
-
-
-class LoggingSettings(BaseSettings):
-    """Telemetry and console logging configuration."""
-
-    model_config = {
-        "env_prefix": "AISUB_LOG_",
-        **_BASE_CONFIG,
-    }
-
-    level: LevelName = Field(
-        description="Minimum log level to output.",
-        default="info",
-    )
-    timestamps: bool = Field(
-        description="Whether to prefix console log lines with timestamps.",
-        default=False,
-    )
-    scrub: bool = Field(
-        description="Whether to scrub sensitive API keys and secrets from logs.",
-        default=True,
-    )
-    progress: bool = Field(
-        description="Whether to display live Rich progress bars.",
-        default=True,
-    )
-
-
-class Settings(BaseSettings):
-    """Root application configuration model."""
-
-    model_config = {
-        "nested_model_default_partial_update": True,
-        "cli_avoid_json": True,
-        "cli_kebab_case": True,
-        "env_prefix": "AISUB_",
-        **_BASE_CONFIG,
-    }
 
     ai: AiSettings = Field(
         description="AI models, quotas, storage, and search settings.",
@@ -784,7 +757,7 @@ class Settings(BaseSettings):
         return "\n\n".join(parts) if parts else None
 
     @model_validator(mode="after")
-    def validate_api_keys(self) -> Self:
+    def _validate_api_keys(self) -> Self:
         """Ensures required API keys are configured before pipeline initialization.
 
         Returns:
@@ -812,7 +785,7 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def setup_file_locations(self) -> Self:
+    def _setup_file_locations(self) -> Self:
         """Resolves input, output, and temporary paths to absolute directory locations.
 
         Returns:

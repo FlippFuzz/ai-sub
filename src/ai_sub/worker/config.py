@@ -18,20 +18,11 @@ from pydantic import (
 from pydantic_settings import SettingsConfigDict
 
 from ai_sub.config import (
-    EnvPrioritySettings,
+    LoggingSettings,
     SearchSettings,
     StringList,
     YamlFileSettings,
 )
-
-
-class WorkerSearchSettings(EnvPrioritySettings, SearchSettings):
-    """Worker web search configuration with AISUB_WORKER_SEARCH_ prefix."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_WORKER_SEARCH_",
-        extra="ignore",
-    )
 
 
 class WorkerSettings(YamlFileSettings):
@@ -39,7 +30,10 @@ class WorkerSettings(YamlFileSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="AISUB_WORKER_",
+        env_file=".env",
+        env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     server_url: HttpUrl = Field(
@@ -69,11 +63,19 @@ class WorkerSettings(YamlFileSettings):
     gemini_key: SecretStr | None = Field(
         default=None,
         description="Google Gemini API key.",
-        validation_alias=AliasChoices("AISUB_WORKER_GEMINI_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_key"),
+        validation_alias=AliasChoices(
+            "AISUB_WORKER_GEMINI_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ),
     )
-    search: WorkerSearchSettings = Field(
-        default_factory=WorkerSearchSettings,
+    search: SearchSettings = Field(
+        default_factory=SearchSettings,
         description="Web search configuration and provider API keys.",
+    )
+    log: LoggingSettings = Field(
+        default_factory=LoggingSettings,
+        description="Telemetry and logging controls.",
     )
     heartbeat_interval_seconds: PositiveFloat = Field(
         default=30.0,

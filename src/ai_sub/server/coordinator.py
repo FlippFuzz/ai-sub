@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import urllib.parse
 from collections import deque
 from collections.abc import Callable
 from datetime import datetime
@@ -167,9 +168,10 @@ class PipelineCoordinator:
 
                     for pipe in self.pipelines.values():
                         for task in pipe.tasks.values():
-                            if task.status == TaskStatus.CLAIMED and task.last_heartbeat is not None:
+                            if task.status == TaskStatus.CLAIMED:
                                 active_leases += 1
-                                elapsed = now - task.last_heartbeat
+                                reference_time = task.last_heartbeat or task.claimed_at or 0.0
+                                elapsed = now - reference_time
                                 if elapsed > timeout:
                                     expired_count += 1
                                     worker_id = task.worker_id or "unknown"
@@ -184,6 +186,11 @@ class PipelineCoordinator:
                                     task.claimed_at = None
                                     task.last_heartbeat = None
                                     task.attempts += 1
+
+                                    try:
+                                        pipe.on_task_failed(task.task_id, task.attempts)
+                                    except Exception as e:
+                                        logfire.exception(f"Failed to persist failure for '{task.task_id}': {e}")
 
                                     if task.attempts >= max_runs:
                                         task.status = TaskStatus.FAILED
@@ -253,7 +260,8 @@ class PipelineCoordinator:
                             continue
 
                         if task.task_type in (TaskType.SUMMARY, TaskType.LYRICS):
-                            if task.search_tools and not any(t.lower() in worker_tools for t in task.search_tools):
+                            # The worker must provide all search tools requested by the task
+                            if task.search_tools and not all(t.lower() in worker_tools for t in task.search_tools):
                                 continue
 
                         now = time()
@@ -280,7 +288,9 @@ class PipelineCoordinator:
                                 f"(model: {task.model}, type: {task.task_type.value})."
                             )
 
-                        media_url = f"/api/v1/tasks/{task.task_id}/media/{task.media_path.name}"
+                        safe_task_id = urllib.parse.quote(task.task_id, safe=":")
+                        safe_filename = urllib.parse.quote(task.media_path.name)
+                        media_url = f"/api/v1/tasks/{safe_task_id}/media/{safe_filename}"
                         return task.to_claim_response(media_url=media_url, retry=self.settings.retry)
 
                 claim_span.set_attribute("result", "none_available")
@@ -307,13 +317,6 @@ class PipelineCoordinator:
                     task = pipe.tasks[task_id]
                     if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
                         task.last_heartbeat = now
-                        with logfire.span(
-                            "Server Heartbeat Received: {task_id}",
-                            task_id=task_id,
-                            worker_id=worker_id,
-                            _level="debug",
-                        ):
-                            pass
                         return True
                     else:
                         logfire.warning(
@@ -358,6 +361,14 @@ class PipelineCoordinator:
         if not is_transient:
             task.attempts += 1
             max_runs = self.settings.retry.max_runs
+
+            pipe = self.pipelines.get(task.pipeline_name)
+            if pipe:
+                try:
+                    pipe.on_task_failed(task.task_id, task.attempts)
+                except Exception as e:
+                    logfire.exception(f"Failed to persist failure for '{task.task_id}': {e}")
+
             if task.attempts >= max_runs:
                 task.status = TaskStatus.FAILED
                 logfire.error(f"Task '{task.task_id}' marked FAILED after {task.attempts}/{max_runs} runs.")
@@ -556,7 +567,7 @@ class PipelineCoordinator:
                     return False
 
             async with self._lock:
-                pipe.clear_active_video()
+                await pipe.clear_active_video()
                 logfire.info(f"Pipeline '{pipe.config.name}' cleared and ready for next video.")
                 return True
         except Exception as e:
@@ -655,6 +666,7 @@ class PipelineCoordinator:
 
                 sub_done = sum(1 for t in sub_tasks if t.status == TaskStatus.COMPLETED)
                 sub_prog = sum(1 for t in sub_tasks if t.status == TaskStatus.CLAIMED)
+                sub_concluded = sum(1 for t in sub_tasks if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED))
 
                 lyr_done = sum(1 for t in lyr_tasks if t.status == TaskStatus.COMPLETED)
                 lyr_prog = sum(1 for t in lyr_tasks if t.status == TaskStatus.CLAIMED)
@@ -670,7 +682,7 @@ class PipelineCoordinator:
                 ]
 
                 has_singing = bool(lyr_tasks)
-                if sub_done < total_chunks:
+                if sub_concluded < total_chunks:
                     lyr_status = "in_progress" if lyr_prog > 0 else "pending"
                 else:
                     if lyr_tasks:

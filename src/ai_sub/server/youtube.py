@@ -669,25 +669,3 @@ class YouTubeClient:
             if _is_bot_detection_error(err_msg):
                 raise YouTubeBotDetectionError(f"Bot detection downloading video {video_id}") from e
             raise
-
-    def resolve_video_uploader(self, video_id: str) -> tuple[str, str]:
-        """Queries YouTube for an individual video to resolve its true uploader handle and display name.
-
-        Args:
-            video_id: 11-character video ID.
-
-        Returns:
-            tuple[str, str]: (uploader_id, channel_name).
-
-        Raises:
-            YouTubeError: If metadata cannot be extracted.
-        """
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        with YoutubeDL(cast(Any, self._base_ydl_opts)) as ydl:
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                raise YouTubeError(f"Could not extract info for video {video_id}")
-
-            uploader = self.get_uploader_id(info)
-            channel_name = str(info.get("channel") or info.get("uploader") or uploader)
-            return uploader, channel_name

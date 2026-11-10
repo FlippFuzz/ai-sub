@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from time import time
 from typing import Any, Literal
@@ -17,10 +18,25 @@ from ai_sub.server.coordinator import PipelineCoordinator
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.pipeline import ComboPipeline
 from ai_sub.server.youtube import (
+    DiscoveredVideo,
+    DownloadedVideo,
     YouTubeBotDetectionError,
     YouTubeClient,
     YouTubeVideoUnavailableError,
 )
+
+
+@dataclass
+class _DiscoveredLocalFile:
+    """Internal lightweight container for local video file metadata discovered during disk scans."""
+
+    video_id: str
+    uploader: str
+    channel_name: str
+    title: str
+    source_ref: str
+    timestamp: int
+    local_path: Path
 
 
 class QueuedVideo(BaseModel):
@@ -169,14 +185,14 @@ class IngestionManager:
         if self._loop is not None and self._loop.is_running():
             self._loop.call_soon_threadsafe(_schedule)
 
-    def _scan_watch_folders(self) -> list[QueuedVideo]:
-        """Scans watched directories recursively for video media files.
+    def _scan_watch_folders(self) -> dict[str, _DiscoveredLocalFile]:
+        """Scans watched directories recursively for video media files off-thread without mutating shared state.
 
         Returns:
-            list[QueuedVideo]: Newly discovered or updated local video items.
+            dict[str, _DiscoveredLocalFile]: Map of video ID to discovered file metadata.
         """
         valid_extensions = {".mp4", ".mkv", ".mov", ".webm", ".flv", ".ts"}
-        discovered_ids: set[str] = set()
+        discovered: dict[str, _DiscoveredLocalFile] = {}
 
         for folder in self.config.files.folders:
             if not folder.is_dir():
@@ -184,37 +200,76 @@ class IngestionManager:
             for file_path in folder.rglob("*"):
                 if file_path.is_file() and file_path.suffix.lower() in valid_extensions:
                     vid = file_path.stem
-                    discovered_ids.add(vid)
                     mtime = int(file_path.stat().st_mtime)
                     uploader = file_path.parent.name or "local"
                     uploader = uploader.strip("@")[:20]
+                    resolved_path = file_path.resolve()
 
-                    if vid not in self.local_videos:
-                        self.local_videos[vid] = QueuedVideo(
-                            video_id=vid,
-                            uploader=uploader,
-                            channel_name=uploader,
-                            title=vid,
-                            source_type="local",
-                            source_ref=str(file_path.resolve()),
-                            timestamp=mtime,
-                            local_path=file_path.resolve(),
-                        )
-                    else:
-                        existing = self.local_videos[vid]
-                        existing.local_path = file_path.resolve()
-                        existing.timestamp = mtime
+                    discovered[vid] = _DiscoveredLocalFile(
+                        video_id=vid,
+                        uploader=uploader,
+                        channel_name=uploader,
+                        title=vid,
+                        source_ref=str(resolved_path),
+                        timestamp=mtime,
+                        local_path=resolved_path,
+                    )
 
-        for vid in set(self.local_videos.keys()) - discovered_ids:
-            self.local_videos.pop(vid, None)
+        return discovered
 
-        if self.local_videos:
-            logfire.debug(f"Watch folders scan complete: {len(self.local_videos)} local file(s) tracked.")
+    def _scan_youtube_sources(self, deep_scan: bool = False) -> list[DiscoveredVideo]:
+        """Fetches metadata for YouTube sources off-thread without mutating shared state.
 
-        return list(self.local_videos.values())
+        Args:
+            deep_scan: If True, crawls full channel history; if False, applies lookback window cutoff.
 
-    def _scan_youtube_sources(self, deep_scan: bool = False) -> list[QueuedVideo]:
-        """Fetches metadata for YouTube sources using flat single-request extraction.
+        Returns:
+            list[DiscoveredVideo]: Discovered YouTube video metadata items.
+        """
+        if not self.config.youtube.urls or self._is_youtube_in_cooldown():
+            return []
+        return self.youtube_client.scan_sources(deep_scan=deep_scan)
+
+    async def _scan_watch_folders_async(self) -> list[QueuedVideo]:
+        """Scans local watch directories off-thread and updates in-memory cache safely on the event loop.
+
+        Returns:
+            list[QueuedVideo]: Discovered local video items.
+        """
+        async with self._scan_lock:
+            discovered = await asyncio.to_thread(self._scan_watch_folders)
+
+            # Update self.local_videos synchronously on the main event loop
+            for vid, item in discovered.items():
+                if vid not in self.local_videos:
+                    self.local_videos[vid] = QueuedVideo(
+                        video_id=item.video_id,
+                        uploader=item.uploader,
+                        channel_name=item.channel_name,
+                        title=item.title,
+                        source_type="local",
+                        source_ref=item.source_ref,
+                        timestamp=item.timestamp,
+                        local_path=item.local_path,
+                    )
+                else:
+                    existing = self.local_videos[vid]
+                    existing.local_path = item.local_path
+                    existing.timestamp = item.timestamp
+                    existing.uploader = item.uploader
+                    existing.channel_name = item.channel_name
+
+            # Remove deleted local files
+            for vid in set(self.local_videos.keys()) - set(discovered.keys()):
+                self.local_videos.pop(vid, None)
+
+            if self.local_videos:
+                logfire.debug(f"Watch folders scan complete: {len(self.local_videos)} local file(s) tracked.")
+
+            return list(self.local_videos.values())
+
+    async def _scan_youtube_sources_async(self, deep_scan: bool = False) -> list[QueuedVideo]:
+        """Scans YouTube sources off-thread and updates in-memory cache safely on the event loop.
 
         Args:
             deep_scan: If True, crawls full channel history; if False, applies lookback window cutoff.
@@ -222,13 +277,20 @@ class IngestionManager:
         Returns:
             list[QueuedVideo]: Discovered YouTube video items.
         """
-        if not self.config.youtube.urls or self._is_youtube_in_cooldown():
+        if self._is_youtube_in_cooldown():
+            remaining_m = (self._youtube_cooldown_until - time()) / 60.0
+            logfire.info(f"Skipping YouTube scan: bot cooldown active ({remaining_m:.1f}m remaining).")
             return list(self.youtube_videos.values())
 
-        try:
-            discovered = self.youtube_client.scan_sources(deep_scan=deep_scan)
-            discovered_new = 0
+        async with self._scan_lock:
+            try:
+                discovered = await asyncio.to_thread(self._scan_youtube_sources, deep_scan)
+            except YouTubeBotDetectionError as e:
+                self._trigger_youtube_cooldown(reason=str(e))
+                return list(self.youtube_videos.values())
 
+            # Update self.youtube_videos synchronously on the main event loop
+            discovered_new = 0
             for item in discovered:
                 if item.video_id not in self.youtube_videos:
                     self.youtube_videos[item.video_id] = QueuedVideo(
@@ -256,36 +318,7 @@ class IngestionManager:
                 f"YouTube scan complete: {len(self.youtube_videos)} metadata entry(s) tracked in memory "
                 f"({discovered_new} newly discovered)."
             )
-        except YouTubeBotDetectionError as e:
-            self._trigger_youtube_cooldown(reason=str(e))
-
-        return list(self.youtube_videos.values())
-
-    async def _scan_watch_folders_async(self) -> list[QueuedVideo]:
-        """Scans local watch directories off-thread and updates in-memory cache.
-
-        Returns:
-            list[QueuedVideo]: Discovered local video items.
-        """
-        async with self._scan_lock:
-            return await asyncio.to_thread(self._scan_watch_folders)
-
-    async def _scan_youtube_sources_async(self, deep_scan: bool = False) -> list[QueuedVideo]:
-        """Scans YouTube sources off-thread and updates in-memory cache.
-
-        Args:
-            deep_scan: If True, crawls full channel history; if False, applies lookback window cutoff.
-
-        Returns:
-            list[QueuedVideo]: Discovered YouTube video items.
-        """
-        if self._is_youtube_in_cooldown():
-            remaining_m = (self._youtube_cooldown_until - time()) / 60.0
-            logfire.info(f"Skipping YouTube scan: bot cooldown active ({remaining_m:.1f}m remaining).")
             return list(self.youtube_videos.values())
-
-        async with self._scan_lock:
-            return await asyncio.to_thread(self._scan_youtube_sources, deep_scan)
 
     async def _scan_all_sources(self, deep_scan: bool = False) -> list[QueuedVideo]:
         """Executes rescan of both local watch folders and YouTube sources off-thread.
@@ -315,20 +348,21 @@ class IngestionManager:
         job_dir = combo_work_dir / video.video_id
         job_dir.mkdir(parents=True, exist_ok=True)
 
-        def _do_download() -> Path:
-            downloaded = self.youtube_client.download_video(
+        def _do_download() -> DownloadedVideo:
+            return self.youtube_client.download_video(
                 video_id=video.video_id,
                 source_ref=video.source_ref,
                 destination_dir=job_dir,
             )
+
+        with logfire.span("Downloading YouTube Video to {job_dir}: {title}", job_dir=job_dir.name, title=video.title):
+            downloaded = await asyncio.to_thread(_do_download)
+            # Update uploader and channel name safely on the main event loop
             if downloaded.uploader and downloaded.uploader.lower() != "youtube":
                 video.uploader = downloaded.uploader
             if downloaded.channel_name:
                 video.channel_name = downloaded.channel_name
             return downloaded.file_path
-
-        with logfire.span("Downloading YouTube Video to {job_dir}: {title}", job_dir=job_dir.name, title=video.title):
-            return await asyncio.to_thread(_do_download)
 
     def _get_pipeline_queue(self, pipeline: ComboPipeline) -> dict[str, Any]:
         """Gathers outstanding queued videos for a given pipeline with total count and top 50 items.

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from textwrap import dedent
-from typing import Any, ClassVar
+from typing import ClassVar
 
 import logfire
 from pydantic import Field
@@ -20,6 +20,7 @@ from ai_sub.jobs.subtitles import (
     DetectedMusicalPerformance,
     Subtitles,
 )
+from ai_sub.jobs.summary import SummaryAiResponse
 from ai_sub.search.base import BaseSearchProvider
 from ai_sub.search.lrclib import LrclibSearchProvider
 
@@ -82,7 +83,7 @@ async def prefetch_lyrics(
     """Pre-fetches lyrics from LRCLIB and web search providers before the first LLM turn.
 
     Args:
-        performances: List of detected musical performances.
+        performances: List of detected musical performance models.
         search_providers: Available search providers on the worker.
 
     Returns:
@@ -139,23 +140,23 @@ async def prefetch_lyrics(
 
 def get_lyrics_prompt(
     draft_subtitles: list[Subtitles],
-    detected_performances: list[Any],
+    detected_performances: list[DetectedMusicalPerformance],
     initial_search_results: str | None = None,
     user_context: str | None = None,
-    global_summary: Any | None = None,
+    global_summary: SummaryAiResponse | None = None,
     segment_offset_ms: int = 0,
     segment_duration_ms: int = 0,
 ) -> Prompt:
     """Generates the prompt for musical subtitle refinement.
 
     Args:
-        draft_subtitles: List of initial subtitles.
-        detected_performances: List of detected musical performances.
-        initial_search_results: Optional pre-fetched lyrics and search text from Python.
-        user_context: Optional background text or directives supplied by the user.
-        global_summary: Optional global summary schema or dictionary.
-        segment_offset_ms: Absolute start time offset of this segment in milliseconds.
-        segment_duration_ms: Duration of this segment in milliseconds.
+        draft_subtitles: List of initial subtitle models.
+        detected_performances: List of detected musical performance models.
+        initial_search_results: Optional pre-fetched lyrics and search text. Defaults to None.
+        user_context: Optional background text or directives supplied by the user. Defaults to None.
+        global_summary: Optional global summary model. Defaults to None.
+        segment_offset_ms: Absolute start time offset in milliseconds. Defaults to 0.
+        segment_duration_ms: Duration of this segment in milliseconds. Defaults to 0.
 
     Returns:
         Prompt: Configured system and user prompt pair.
