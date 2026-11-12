@@ -14,6 +14,7 @@ from ai_sub.config import (
     ReEncodeSettings,
     RetrySettings,
     SearchSettings,
+    ServiceTier,
     SplittingSettings,
 )
 from ai_sub.jobs.base import BaseJob
@@ -40,6 +41,7 @@ from ai_sub.shortcode import (
 from ai_sub.stitching import stitch_subtitles
 from ai_sub.video import (
     get_video_duration_ms,
+    is_valid_reencoded_file,
     split_video,
 )
 
@@ -67,6 +69,25 @@ class Pipeline(BaseModel):
     summary_model: str = Field(description="Gemini model identifier for summary.")
     subtitles_model: str = Field(description="Gemini model identifier for subtitles.")
     lyrics_model: str = Field(description="Gemini model identifier for lyrics.")
+    service_tier_summary: ServiceTier | None = Field(
+        default=None, description="Optional Google Gemini service tier override for summary."
+    )
+    service_tier_subtitles: ServiceTier | None = Field(
+        default=None, description="Optional Google Gemini service tier override for subtitles."
+    )
+    service_tier_lyrics: ServiceTier | None = Field(
+        default=None, description="Optional Google Gemini service tier override for lyrics."
+    )
+    agentic_video_summary: bool = Field(
+        default=True, description="Whether agentic video understanding is enabled for summary."
+    )
+    agentic_video_subtitles: bool = Field(
+        default=False, description="Whether agentic video understanding is enabled for subtitles."
+    )
+    agentic_video_lyrics: bool = Field(
+        default=True, description="Whether agentic video understanding is enabled for lyrics."
+    )
+
     summary_shortcode: str = Field(description="Model shortcode for summary.")
     subtitles_shortcode: str = Field(description="Model shortcode for subtitles.")
     lyrics_shortcode: str = Field(description="Model shortcode for lyrics.")
@@ -125,6 +146,12 @@ class Pipeline(BaseModel):
         validation_buffer_ms: int = 2000,
         summary_enabled: bool = True,
         lyrics_enabled: bool = True,
+        service_tier_summary: ServiceTier | None = None,
+        service_tier_subtitles: ServiceTier | None = None,
+        service_tier_lyrics: ServiceTier | None = None,
+        agentic_video_summary: bool = True,
+        agentic_video_subtitles: bool = False,
+        agentic_video_lyrics: bool = True,
     ) -> Self:
         """Asynchronously initializes the pipeline, probes media, splits segments, and discovers on-disk state.
 
@@ -148,6 +175,12 @@ class Pipeline(BaseModel):
             validation_buffer_ms: Timestamp validation tolerance in milliseconds. Defaults to 2000.
             summary_enabled: Whether the whole-video summary stage is enabled. Defaults to True.
             lyrics_enabled: Whether musical lyrics refinement is enabled. Defaults to True.
+            service_tier_summary: Optional Google Gemini service tier override for summary. Defaults to None.
+            service_tier_subtitles: Optional Google Gemini service tier override for subtitles. Defaults to None.
+            service_tier_lyrics: Optional Google Gemini service tier override for lyrics. Defaults to None.
+            agentic_video_summary: Whether agentic video is enabled for summary. Defaults to True.
+            agentic_video_subtitles: Whether agentic video is enabled for subtitles. Defaults to False.
+            agentic_video_lyrics: Whether agentic video is enabled for lyrics. Defaults to True.
 
         Returns:
             Pipeline: Initialized pipeline instance with media prepared and state discovered.
@@ -178,7 +211,7 @@ class Pipeline(BaseModel):
 
         all_durations = await asyncio.gather(*(get_video_duration_ms(p) for p in all_segments))
 
-        # 3. Apply start_offset_min (rounded down to nearest segment duration)
+        # 3. Apply start_offset_min using actual durations of skipped segments
         if split_settings.start_offset_min > 0:
             start_offset_s = split_settings.start_offset_min * 60
             skip_count = start_offset_s // split_settings.max_seconds
@@ -187,7 +220,7 @@ class Pipeline(BaseModel):
                     f"start_offset_min ({split_settings.start_offset_min}m) exceeds or equals total "
                     f"video duration ({total_duration_ms / 60000:.1f}m)."
                 )
-            initial_offset_ms = skip_count * split_settings.max_seconds * 1000
+            initial_offset_ms = sum(all_durations[:skip_count])
             segment_paths = all_segments[skip_count:]
             segment_durations_ms = all_durations[skip_count:]
             logfire.info(
@@ -199,7 +232,7 @@ class Pipeline(BaseModel):
             segment_paths = all_segments
             segment_durations_ms = all_durations
 
-        # 4. Evaluate summary proxy re-encoding
+        # 4. Evaluate summary proxy re-encoding with full file validation
         sum_cfg = reencode_settings.summary
         raw_size_mb = raw_resolved.stat().st_size / (1024 * 1024)
         summary_proxy_needed = (
@@ -208,12 +241,22 @@ class Pipeline(BaseModel):
         proxy_path = job_dir / "summary_proxy.mp4"
         if not summary_proxy_needed:
             actual_proxy_path: Path | None = raw_resolved
-        elif proxy_path.is_file():
+        elif await is_valid_reencoded_file(
+            input_path=raw_resolved,
+            output_path=proxy_path,
+            fps=sum_cfg.fps,
+            duration_tolerance_ms=sum_cfg.duration_tolerance_ms,
+        ):
             actual_proxy_path = proxy_path
         else:
+            if proxy_path.exists():
+                try:
+                    proxy_path.unlink()
+                except OSError:
+                    pass
             actual_proxy_path = None
 
-        # 5. Evaluate segment re-encoding requirements
+        # 5. Evaluate segment re-encoding requirements with full file validation
         seg_cfg = reencode_settings.segment
         reencode_dir = job_dir / "reencoded"
         reencode_dir.mkdir(parents=True, exist_ok=True)
@@ -225,8 +268,18 @@ class Pipeline(BaseModel):
                 reencoded_segment_paths[idx] = seg_p
             else:
                 out_p = reencode_dir / f"{seg_p.stem}.mp4"
-                if out_p.is_file():
+                if await is_valid_reencoded_file(
+                    input_path=seg_p,
+                    output_path=out_p,
+                    fps=seg_cfg.fps,
+                    duration_tolerance_ms=seg_cfg.duration_tolerance_ms,
+                ):
                     reencoded_segment_paths[idx] = out_p
+                elif out_p.exists():
+                    try:
+                        out_p.unlink()
+                    except OSError:
+                        pass
 
         # 6. Generate shortcodes
         summary_shortcode = generate_summary_shortcode(summary_model) if summary_enabled else ""
@@ -258,6 +311,12 @@ class Pipeline(BaseModel):
             summary_model=summary_model,
             subtitles_model=subtitles_model,
             lyrics_model=lyrics_model,
+            service_tier_summary=service_tier_summary,
+            service_tier_subtitles=service_tier_subtitles,
+            service_tier_lyrics=service_tier_lyrics,
+            agentic_video_summary=agentic_video_summary,
+            agentic_video_subtitles=agentic_video_subtitles,
+            agentic_video_lyrics=agentic_video_lyrics,
             summary_shortcode=summary_shortcode,
             subtitles_shortcode=subtitles_shortcode,
             lyrics_shortcode=lyrics_shortcode,
@@ -432,6 +491,8 @@ class Pipeline(BaseModel):
                         user_context=self.user_context,
                         media_path=self.summary_proxy_path,
                         model_name=self.summary_model,
+                        service_tier=self.service_tier_summary,
+                        agentic_video=self.agentic_video_summary,
                         retry_settings=self.retry_settings,
                         total_attempts=self.summary_attempts,
                     )
@@ -459,6 +520,8 @@ class Pipeline(BaseModel):
                         user_context=self.user_context,
                         media_path=media_file,
                         model_name=self.subtitles_model,
+                        service_tier=self.service_tier_subtitles,
+                        agentic_video=self.agentic_video_subtitles,
                         retry_settings=self.retry_settings,
                         segment_index=idx,
                         total_attempts=self.subtitles_attempts.get(idx, 0),
@@ -482,6 +545,8 @@ class Pipeline(BaseModel):
                             user_context=self.user_context,
                             media_path=media_file,
                             model_name=self.lyrics_model,
+                            service_tier=self.service_tier_lyrics,
+                            agentic_video=self.agentic_video_lyrics,
                             retry_settings=self.retry_settings,
                             segment_index=idx,
                             total_attempts=self.lyrics_attempts.get(idx, 0),
@@ -497,6 +562,7 @@ class Pipeline(BaseModel):
         job_or_name: BaseJob | str,
         result_data: Any = None,
         segment_index: int | None = None,
+        task_type: TaskType | str | None = None,
     ) -> None:
         """Validates job output, persists checkpoints to disk, and updates session state.
 
@@ -504,12 +570,20 @@ class Pipeline(BaseModel):
             job_or_name: The completed Job instance or string name identifier.
             result_data: Output data returned by the executor (model response, dictionary, or Path).
             segment_index: Chunk index if applicable. Defaults to None.
+            task_type: Optional explicit task type (summary, subtitles, lyrics, reencode).
         """
         job_name = job_or_name.name if isinstance(job_or_name, BaseJob) else str(job_or_name)
+        explicit_type = (
+            task_type.value
+            if isinstance(task_type, TaskType)
+            else (str(task_type).lower() if task_type is not None else None)
+        )
 
         # Handle ReencodeJob (by instance or string name)
-        is_reencode = isinstance(job_or_name, ReencodeJob) or (
-            isinstance(job_or_name, str) and ("reencode" in job_name or "proxy" in job_name)
+        is_reencode = (
+            explicit_type in ("reencode", "proxy")
+            or isinstance(job_or_name, ReencodeJob)
+            or (isinstance(job_or_name, str) and ("reencode" in job_name or "proxy" in job_name))
         )
         if is_reencode:
             out_path = result_data if isinstance(result_data, Path) else getattr(job_or_name, "output_file", None)
@@ -524,13 +598,24 @@ class Pipeline(BaseModel):
 
         val_ctx: dict[str, Any] = {"validation_buffer_ms": self.validation_buffer_ms}
 
-        is_summary = isinstance(job_or_name, SummaryJob) or job_name == "summary"
-        is_lyrics = isinstance(job_or_name, LyricsJob) or "lyrics" in job_name
+        is_summary = (
+            explicit_type == "summary"
+            or isinstance(job_or_name, SummaryJob)
+            or (explicit_type is None and job_name == "summary")
+        )
+        is_lyrics = (
+            explicit_type == "lyrics"
+            or isinstance(job_or_name, LyricsJob)
+            or (explicit_type is None and "lyrics" in job_name)
+        )
         is_subtitles = (
-            isinstance(job_or_name, SubtitlesJob)
-            or "subtitles" in job_name
-            or job_name.startswith("part_")
-            or not (is_summary or is_lyrics)
+            explicit_type == "subtitles"
+            or isinstance(job_or_name, SubtitlesJob)
+            or (
+                explicit_type is None
+                and not (is_summary or is_lyrics)
+                and ("subtitles" in job_name or job_name.startswith("part_"))
+            )
         )
 
         if is_summary:
@@ -539,22 +624,25 @@ class Pipeline(BaseModel):
                 resp = result_data
             else:
                 resp = SummaryAiResponse.model_validate(result_data, context=val_ctx)
-            self.summary_response = resp
-            self.summary_failed = False
 
             summary_file = self.job_dir / f"summary.{self.summary_shortcode}.yaml"
             existing = SummaryJob.load(summary_file, self.validation_buffer_ms)
             attempts = max(existing.total_attempts if existing else 0, self.summary_attempts, 1)
-            self.summary_attempts = attempts
 
             summary_job = SummaryJob(
                 name="summary",
                 video_duration_ms=self.duration_ms,
                 user_context=self.user_context,
+                service_tier=self.service_tier_summary,
+                agentic_video=self.agentic_video_summary,
                 total_attempts=attempts,
                 response=resp,
             )
+            # Save to disk first; update in-memory state only upon successful persistence
             summary_job.save(summary_file)
+            self.summary_response = resp
+            self.summary_failed = False
+            self.summary_attempts = attempts
 
         elif is_lyrics:
             idx = segment_index if segment_index is not None else getattr(job_or_name, "segment_index", None)
@@ -567,14 +655,10 @@ class Pipeline(BaseModel):
             )
             resp_lyr = LyricsAiResponse.model_validate(payload_lyr, context=val_ctx)
 
-            self.lyrics_responses[idx] = resp_lyr
-            self.failed_lyrics.discard(idx)
-
             seg_path = self.segment_paths[idx]
             lyr_file = self.job_dir / f"{seg_path.stem}.lyrics.{self.lyrics_shortcode}.yaml"
             existing = LyricsJob.load(lyr_file, self.validation_buffer_ms)
             attempts = max(existing.total_attempts if existing else 0, self.lyrics_attempts.get(idx, 0), 1)
-            self.lyrics_attempts[idx] = attempts
 
             offset_ms = self.initial_offset_ms + sum(self.segment_durations_ms[:idx])
             sub_resp = self.subtitles_responses.get(idx)
@@ -586,10 +670,16 @@ class Pipeline(BaseModel):
                 detected_performances=sub_resp.detected_musical_performances if sub_resp else [],
                 global_summary=self.summary_response,
                 user_context=self.user_context,
+                service_tier=self.service_tier_lyrics,
+                agentic_video=self.agentic_video_lyrics,
                 total_attempts=attempts,
                 response=resp_lyr,
             )
+            # Save to disk first; update in-memory state only upon successful persistence
             lyrics_job.save(lyr_file)
+            self.lyrics_responses[idx] = resp_lyr
+            self.failed_lyrics.discard(idx)
+            self.lyrics_attempts[idx] = attempts
 
         elif is_subtitles:
             idx = segment_index if segment_index is not None else getattr(job_or_name, "segment_index", None)
@@ -602,14 +692,10 @@ class Pipeline(BaseModel):
             )
             resp_sub = SubtitlesAiResponse.model_validate(payload_sub, context=val_ctx)
 
-            self.subtitles_responses[idx] = resp_sub
-            self.failed_subtitles.discard(idx)
-
             seg_path = self.segment_paths[idx]
             sub_file = self.job_dir / f"{seg_path.stem}.subtitles.{self.subtitles_shortcode}.yaml"
             existing = SubtitlesJob.load(sub_file, self.validation_buffer_ms)
             attempts = max(existing.total_attempts if existing else 0, self.subtitles_attempts.get(idx, 0), 1)
-            self.subtitles_attempts[idx] = attempts
 
             offset_ms = self.initial_offset_ms + sum(self.segment_durations_ms[:idx])
             sub_job = SubtitlesJob(
@@ -618,10 +704,16 @@ class Pipeline(BaseModel):
                 segment_offset_ms=offset_ms,
                 global_summary=self.summary_response,
                 user_context=self.user_context,
+                service_tier=self.service_tier_subtitles,
+                agentic_video=self.agentic_video_subtitles,
                 total_attempts=attempts,
                 response=resp_sub,
             )
+            # Save to disk first; update in-memory state only upon successful persistence
             sub_job.save(sub_file)
+            self.subtitles_responses[idx] = resp_sub
+            self.failed_subtitles.discard(idx)
+            self.subtitles_attempts[idx] = attempts
 
     def record_failure(
         self,
@@ -654,6 +746,8 @@ class Pipeline(BaseModel):
                 name="summary",
                 video_duration_ms=self.duration_ms,
                 user_context=self.user_context,
+                service_tier=self.service_tier_summary,
+                agentic_video=self.agentic_video_summary,
                 total_attempts=effective_attempts,
                 response=None,
             )
@@ -684,6 +778,8 @@ class Pipeline(BaseModel):
                 segment_offset_ms=offset_ms,
                 global_summary=self.summary_response,
                 user_context=self.user_context,
+                service_tier=self.service_tier_subtitles,
+                agentic_video=self.agentic_video_subtitles,
                 total_attempts=effective_attempts,
                 response=None,
             )
@@ -717,6 +813,8 @@ class Pipeline(BaseModel):
                 detected_performances=sub_resp.detected_musical_performances if sub_resp else [],
                 global_summary=self.summary_response,
                 user_context=self.user_context,
+                service_tier=self.service_tier_lyrics,
+                agentic_video=self.agentic_video_lyrics,
                 total_attempts=effective_attempts,
                 response=None,
             )
@@ -747,10 +845,13 @@ class Pipeline(BaseModel):
                 "model_summary": self.summary_model,
                 "model_subtitles": self.subtitles_model,
                 "model_lyrics": self.lyrics_model,
+                "service_tier_summary": self.service_tier_summary,
+                "service_tier_subtitles": self.service_tier_subtitles,
+                "service_tier_lyrics": self.service_tier_lyrics,
                 "search": search_dump,
-                "agentic_video_summary": True,
-                "agentic_video_subtitles": False,
-                "agentic_video_lyrics": True,
+                "agentic_video_summary": self.agentic_video_summary,
+                "agentic_video_subtitles": self.agentic_video_subtitles,
+                "agentic_video_lyrics": self.agentic_video_lyrics,
                 "validation_buffer_ms": self.validation_buffer_ms,
             },
             "reencode": self.reencode_settings.model_dump(mode="json"),

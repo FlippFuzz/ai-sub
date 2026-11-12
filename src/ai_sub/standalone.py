@@ -159,6 +159,12 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
             summary_model=settings.ai.model_summary,
             subtitles_model=settings.ai.model_subtitles,
             lyrics_model=settings.ai.model_lyrics,
+            service_tier_summary=settings.ai.service_tier_summary,
+            service_tier_subtitles=settings.ai.service_tier_subtitles,
+            service_tier_lyrics=settings.ai.service_tier_lyrics,
+            agentic_video_summary=settings.ai.agentic_video_summary,
+            agentic_video_subtitles=settings.ai.agentic_video_subtitles,
+            agentic_video_lyrics=settings.ai.agentic_video_lyrics,
             reencode_settings=settings.reencode,
             search_settings=settings.ai.search,
             split_settings=settings.split,
@@ -232,6 +238,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                 progress.update(lyrics_tid, advance=1)
 
                 in_flight: dict[str, asyncio.Task[tuple[BaseJob, Any, Exception | None]]] = {}
+                quota_exhausted = False
 
                 # Consumer loop pulling ready DAG jobs directly from the pipeline
                 while not pipeline.is_done():
@@ -270,9 +277,14 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
 
                         if exc is not None:
                             if isinstance(exc, QuotaExceededError):
-                                logfire.warning(f"Quota exceeded during job '{job.name}': {exc}")
-                            else:
-                                logfire.error(f"Job '{job.name}' failed: {exc}")
+                                logfire.warning(
+                                    f"Daily quota limit reached during '{job.name}': {exc}. "
+                                    "Suspending remaining jobs without consuming retry limits."
+                                )
+                                quota_exhausted = True
+                                continue
+
+                            logfire.error(f"Job '{job.name}' failed: {exc}")
 
                             if isinstance(job, SummaryJob):
                                 pipeline.record_failure(TaskType.SUMMARY, attempts=job.total_attempts + 1)
@@ -315,7 +327,14 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                             elif isinstance(job, LyricsJob) and lyrics_tid is not None:
                                 progress.update(lyrics_tid, advance=1)
 
-                # Await any remaining in-flight tasks if loop ended early
+                    if quota_exhausted:
+                        for pending_task in in_flight.values():
+                            pending_task.cancel()
+                        await asyncio.gather(*in_flight.values(), return_exceptions=True)
+                        in_flight.clear()
+                        break
+
+                # Await any remaining in-flight tasks if loop ended early without quota exhaustion
                 if in_flight:
                     drain_results = await asyncio.gather(*in_flight.values(), return_exceptions=True)
                     for res in drain_results:

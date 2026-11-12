@@ -16,14 +16,13 @@ from pydantic import (
     SecretStr,
     model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
 
 from ai_sub.config import (
     LoggingSettings,
     PathList,
     ReEncodeSettings,
     RetrySettings,
-    SearchSettings,
     ServiceTier,
     SplittingSettings,
     StringList,
@@ -67,10 +66,11 @@ class PipelineConfig(BaseModel):
     )
 
 
-class GitConfig(BaseSettings):
+class GitConfig(YamlFileSettings):
     """Git repository synchronization settings."""
 
     model_config = SettingsConfigDict(
+        nested_model_default_partial_update=True,
         env_prefix="AISUB_SERVER_GIT_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -118,10 +118,11 @@ class GitConfig(BaseSettings):
         return self.pat.get_secret_value() if self.pat else ""
 
 
-class FilesSourceConfig(BaseSettings):
+class FilesSourceConfig(YamlFileSettings):
     """Local filesystem intake configuration."""
 
     model_config = SettingsConfigDict(
+        nested_model_default_partial_update=True,
         env_prefix="AISUB_SERVER_SOURCES_FILES_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -139,10 +140,11 @@ class FilesSourceConfig(BaseSettings):
     )
 
 
-class YoutubeSourceConfig(BaseSettings):
+class YoutubeSourceConfig(YamlFileSettings):
     """YouTube intake, anti-bot pacing, and download configuration."""
 
     model_config = SettingsConfigDict(
+        nested_model_default_partial_update=True,
         env_prefix="AISUB_SERVER_SOURCES_YOUTUBE_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -200,10 +202,11 @@ class YoutubeSourceConfig(BaseSettings):
     )
 
 
-class SourcesConfig(BaseSettings):
+class SourcesConfig(YamlFileSettings):
     """Container for distinct intake source categories."""
 
     model_config = SettingsConfigDict(
+        nested_model_default_partial_update=True,
         env_prefix="AISUB_SERVER_SOURCES_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -215,10 +218,11 @@ class SourcesConfig(BaseSettings):
     youtube: YoutubeSourceConfig = Field(default_factory=YoutubeSourceConfig)
 
 
-class ServerOptions(BaseSettings):
+class ServerOptions(YamlFileSettings):
     """HTTP server and filesystem orchestration options."""
 
     model_config = SettingsConfigDict(
+        nested_model_default_partial_update=True,
         env_prefix="AISUB_SERVER_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -288,6 +292,7 @@ class ServerSettings(YamlFileSettings):
     """Central configuration settings model for ai-sub-server loaded from YAML with ENV overrides."""
 
     model_config = SettingsConfigDict(
+        nested_model_default_partial_update=True,
         env_prefix="AISUB_SERVER_",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -299,7 +304,10 @@ class ServerSettings(YamlFileSettings):
     git: GitConfig | None = Field(default=None)
     sources: SourcesConfig = Field(default_factory=SourcesConfig)
     reencode: ReEncodeSettings = Field(default_factory=ReEncodeSettings)
-    search: SearchSettings = Field(default_factory=SearchSettings)
+    default_search_tools: StringList = Field(
+        default_factory=lambda: ["tinyfish", "lrclib"],
+        description="Default search tools required for pipelines unless overridden per pipeline.",
+    )
     split: SplittingSettings = Field(default_factory=SplittingSettings)
     retry: RetrySettings = Field(default_factory=RetrySettings)
     log: LoggingSettings = Field(default_factory=LoggingSettings)

@@ -11,7 +11,7 @@ from typing import Any, Callable, cast
 
 import logfire
 
-from ai_sub.config import AiSettings, ServiceTier
+from ai_sub.config import ServiceTier
 from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError, is_retryable_error
 from ai_sub.jobs import (
     LyricsJob,
@@ -171,14 +171,14 @@ class WorkerRunner:
         Raises:
             asyncio.CancelledError: If task execution is cancelled while waiting for download or inference.
             LeaseRevokedError: If the server rejects task lease during download or inference.
-            ValueError: If task type is unknown.
+            ValueError: If task type is unknown or structured input is invalid.
         """
         raw_name = Path(task.media_url).name
         if not Path(raw_name).suffix:
             raw_name = f"{raw_name}.mp4"
 
         safe_task_id = re.sub(r"[^a-zA-Z0-9_\-]+", "_", task.task_id)
-        chunk_path = self.settings.temp_dir / f"{safe_task_id}_{raw_name}"
+        chunk_path = self.settings.work_dir / f"{safe_task_id}_{raw_name}"
 
         stop_heartbeat = asyncio.Event()
         lease_revoked = asyncio.Event()
@@ -248,6 +248,10 @@ class WorkerRunner:
                     retry_settings=task.retry,
                 )
             elif task.task_type == TaskType.LYRICS:
+                if not task.draft_subtitles:
+                    raise ValueError(
+                        f"Lyrics task '{task.task_id}' rejected: missing draft_subtitles required for refinement."
+                    )
                 job = LyricsJob(
                     name=task.task_id,
                     video_duration_ms=task.video_duration_ms,
@@ -449,7 +453,7 @@ class WorkerRunner:
                 claim = await self.client.claim_task(
                     worker_id=self.settings.worker_id,
                     models=[model],
-                    search_tools=self.settings.search.tools,
+                    search_tools=self.settings.ai.search.tools,
                 )
             except VersionMismatchError as e:
                 logfire.error(
@@ -519,8 +523,11 @@ class WorkerRunner:
         Returns:
             int: Application exit code (0 for clean finish, 1 for abnormal exit or update required).
         """
-        if not self.settings.gemini_key:
-            logfire.error("Gemini API key is missing in worker configuration. Specify gemini_key in worker YAML.")
+        if not self.settings.ai.key:
+            logfire.error(
+                "Gemini API key is missing in worker configuration. "
+                "Specify ai.key in worker YAML or GEMINI_API_KEY environment variable."
+            )
             return 1
 
         models = list(dict.fromkeys(self.settings.models))
@@ -528,9 +535,8 @@ class WorkerRunner:
             logfire.info("No configured models available. Exiting cleanly.")
             return 0
 
-        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
-        ai_settings = AiSettings(key=self.settings.gemini_key, search=self.settings.search)
-        executor = GeminiExecutor(ai_settings)
+        self.settings.work_dir.mkdir(parents=True, exist_ok=True)
+        executor = GeminiExecutor(self.settings.ai)
 
         concurrency = self.settings.concurrency
         total_slots = len(models) * concurrency
@@ -552,7 +558,7 @@ class WorkerRunner:
             )
 
         async with AsyncExitStack() as stack:
-            search_providers = create_search_providers(self.settings.search)
+            search_providers = create_search_providers(self.settings.ai.search)
             for sp in search_providers:
                 await stack.enter_async_context(sp)
 

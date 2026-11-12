@@ -54,7 +54,7 @@ class ComboRunner:
     coordinator_lock: asyncio.Lock | None
     validation_buffer_ms: int
     reencode_settings: ReEncodeSettings
-    search_settings: SearchSettings
+    default_search_tools: list[str]
     split_settings: SplittingSettings
     retry_settings: RetrySettings
 
@@ -75,7 +75,7 @@ class ComboRunner:
         base_work_dir: Path,
         reencode_semaphore: asyncio.Semaphore,
         reencode_settings: ReEncodeSettings,
-        search_settings: SearchSettings,
+        default_search_tools: list[str],
         split_settings: SplittingSettings,
         retry_settings: RetrySettings,
         coordinator_lock: asyncio.Lock | None = None,
@@ -88,7 +88,7 @@ class ComboRunner:
             base_work_dir: Root working directory containing per-pipeline folders.
             reencode_semaphore: Server-wide concurrency semaphore for FFmpeg compression.
             reencode_settings: Video compression and proxy rules.
-            search_settings: Search tool configuration.
+            default_search_tools: Default search tools list when not overridden per pipeline.
             split_settings: Video chunk duration and tolerance rules.
             retry_settings: Task attempt limits and backoff rules.
             coordinator_lock: Optional coordinator lock to synchronize task mutations. Defaults to None.
@@ -103,7 +103,7 @@ class ComboRunner:
         self.validation_buffer_ms = validation_buffer_ms
 
         self.reencode_settings = reencode_settings
-        self.search_settings = search_settings
+        self.default_search_tools = default_search_tools
         self.split_settings = split_settings
         self.retry_settings = retry_settings
 
@@ -210,12 +210,12 @@ class ComboRunner:
         return f"The video title is '{title}'."
 
     def _get_active_search_tools(self) -> list[str]:
-        """Resolves active search tools from pipeline override or global search settings.
+        """Resolves active search tools from pipeline override or server default search tools.
 
         Returns:
             list[str]: Active search tools list.
         """
-        return self.config.search_tools if self.config.search_tools is not None else self.search_settings.tools
+        return self.config.search_tools if self.config.search_tools is not None else self.default_search_tools
 
     async def _process_local_reencode_jobs(self) -> None:
         """Background loop executing ReencodeJobs locally under the shared server semaphore."""
@@ -254,6 +254,13 @@ class ComboRunner:
                     logfire.warning(
                         f"Local re-encoding job '{job.name}' failed: {e}. Falling back to uncompressed input."
                     )
+                    # Clean up partial or corrupt output file to prevent lingering artifacts
+                    if job.output_file.exists():
+                        try:
+                            job.output_file.unlink()
+                        except OSError:
+                            pass
+
                     if self.coordinator_lock:
                         async with self.coordinator_lock:
                             pipeline.complete_job(job, job.input_file)
@@ -404,8 +411,11 @@ class ComboRunner:
                 summary_model=self.config.summary_model,
                 subtitles_model=self.config.subtitles_model,
                 lyrics_model=self.config.lyrics_model,
+                service_tier_summary=self.config.service_tier_summary,
+                service_tier_subtitles=self.config.service_tier_subtitles,
+                service_tier_lyrics=self.config.service_tier_lyrics,
                 reencode_settings=self.reencode_settings,
-                search_settings=self.search_settings,
+                search_settings=SearchSettings(tools=self._get_active_search_tools()),
                 split_settings=self.split_settings,
                 retry_settings=self.retry_settings,
                 source_type=source_type,
@@ -488,6 +498,7 @@ class ComboRunner:
                 job_or_name=task.task_type.value,
                 result_data=result_data,
                 segment_index=task.segment_index,
+                task_type=task.task_type,
             )
             task.status = TaskStatus.COMPLETED
             task.result = result_data
@@ -511,6 +522,7 @@ class ComboRunner:
             segment_index=task.segment_index,
             attempts=attempts,
         )
+        self.sync_tasks_from_pipeline()
 
     def is_video_complete(self) -> bool:
         """Checks if all segments for the active video have concluded.
@@ -563,6 +575,10 @@ class ComboRunner:
     async def resume_from_disk(self) -> bool:
         """Inspects work/<combo>/ to restore in-progress video directories upon server boot.
 
+        Selects the newest valid job directory with ground-truth metadata and existing media,
+        while purging invalid folders and deferring removal of older directories until
+        the candidate pipeline successfully initializes.
+
         Returns:
             bool: True if an active video was successfully restored, False otherwise.
         """
@@ -574,59 +590,121 @@ class ComboRunner:
                 resume_span.set_attribute("result", "idle")
                 return False
 
-            job_dir = job_dirs[0]
-            meta_file = job_dir / "video_meta.json"
-            if not meta_file.is_file():
-                shutil.rmtree(job_dir, ignore_errors=True)
-                self.status = RunnerStatus.IDLE
-                self.preparing_video_info = None
-                resume_span.set_attribute("result", "purged_invalid_folder")
-                return False
+            # Sort candidate job directories newest-first based on video_meta.json or directory mtime
+            def _get_mtime(d: Path) -> float:
+                meta = d / "video_meta.json"
+                if meta.is_file():
+                    try:
+                        return meta.stat().st_mtime
+                    except OSError:
+                        pass
+                try:
+                    return d.stat().st_mtime
+                except OSError:
+                    return 0.0
 
-            try:
-                with open(meta_file, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
+            valid_candidates: list[tuple[Path, dict[str, Any], Path]] = []
+            for d in job_dirs:
+                meta_file = d / "video_meta.json"
+                if not meta_file.is_file():
+                    logfire.info(f"Purging stale folder without metadata: {d.name} in {self.config.name}")
+                    shutil.rmtree(d, ignore_errors=True)
+                    continue
+
+                try:
+                    with open(meta_file, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    raw_path_str = str(meta.get("raw_path", ""))
+                    raw_path = Path(raw_path_str) if raw_path_str else None
+                    if not raw_path or not raw_path.is_file():
+                        logfire.warning(f"Purging job folder with missing raw video: {d.name} in {self.config.name}")
+                        shutil.rmtree(d, ignore_errors=True)
+                        continue
+
+                    valid_candidates.append((d, meta, raw_path))
+                except Exception as e:
+                    logfire.warning(f"Purging job folder with corrupt metadata: {d.name} ({e})")
+                    shutil.rmtree(d, ignore_errors=True)
+                    continue
+
+            valid_candidates.sort(key=lambda item: _get_mtime(item[0]), reverse=True)
+
+            resumed_pipeline: Pipeline | None = None
+            resumed_dir: Path | None = None
+            resumed_meta: dict[str, Any] | None = None
+            resumed_raw: Path | None = None
+            failed_resume_dirs: set[Path] = set()
+
+            for job_dir, meta, raw_path in valid_candidates:
                 video_id = str(meta.get("video_id", job_dir.name))
                 uploader = str(meta.get("uploader", "unknown"))
                 channel_name = meta.get("channel_name")
                 title = str(meta.get("title", job_dir.name))
                 source_type = meta.get("source_type", "youtube")
                 timestamp = int(meta.get("timestamp", 0))
-                raw_path_str = str(meta.get("raw_path", ""))
-                raw_path = Path(raw_path_str) if raw_path_str else None
-            except Exception:
+
+                user_context = self._build_user_context(title, uploader, channel_name, source_type)
+
+                try:
+                    pipeline = await Pipeline.create(
+                        raw_video_path=raw_path,
+                        job_dir=job_dir,
+                        title=title,
+                        uploader=uploader,
+                        channel_name=channel_name,
+                        video_id=video_id,
+                        summary_model=self.config.summary_model,
+                        subtitles_model=self.config.subtitles_model,
+                        lyrics_model=self.config.lyrics_model,
+                        service_tier_summary=self.config.service_tier_summary,
+                        service_tier_subtitles=self.config.service_tier_subtitles,
+                        service_tier_lyrics=self.config.service_tier_lyrics,
+                        reencode_settings=self.reencode_settings,
+                        search_settings=SearchSettings(tools=self._get_active_search_tools()),
+                        split_settings=self.split_settings,
+                        retry_settings=self.retry_settings,
+                        source_type=source_type,
+                        timestamp=timestamp,
+                        user_context=user_context,
+                        validation_buffer_ms=self.validation_buffer_ms,
+                    )
+                    resumed_pipeline = pipeline
+                    resumed_dir = job_dir
+                    resumed_meta = meta
+                    resumed_raw = raw_path
+                    break
+                except Exception as e:
+                    # Do not delete directory on initialization errors; keep it intact and check next candidate
+                    logfire.warning(
+                        f"Failed to initialize pipeline during resume for {job_dir.name}: {e}. Preserving job folder."
+                    )
+                    failed_resume_dirs.add(job_dir)
+                    continue
+
+            if resumed_pipeline is None or resumed_dir is None or resumed_meta is None or resumed_raw is None:
                 self.status = RunnerStatus.IDLE
                 self.preparing_video_info = None
-                resume_span.set_attribute("result", "corrupt_metadata")
+                resume_span.set_attribute("result", "no_valid_video_found")
                 return False
 
-            if not raw_path or not raw_path.is_file():
-                shutil.rmtree(job_dir, ignore_errors=True)
-                self.status = RunnerStatus.IDLE
-                self.preparing_video_info = None
-                resume_span.set_attribute("result", "missing_raw_video")
-                return False
+            # Purge older job directories now that resumed pipeline has succeeded,
+            # excluding candidates that failed initialization to preserve their checkpoints
+            for job_dir, _, _ in valid_candidates:
+                if job_dir != resumed_dir and job_dir not in failed_resume_dirs:
+                    logfire.info(f"Purging older job folder: {job_dir.name} in {self.config.name}")
+                    shutil.rmtree(job_dir, ignore_errors=True)
 
+            job_dir = resumed_dir
+            meta = resumed_meta
+            raw_path = resumed_raw
+            pipeline = resumed_pipeline
+            video_id = str(meta.get("video_id", job_dir.name))
+            uploader = str(meta.get("uploader", "unknown"))
+            channel_name = meta.get("channel_name")
+            title = str(meta.get("title", job_dir.name))
+            source_type = meta.get("source_type", "youtube")
+            timestamp = int(meta.get("timestamp", 0))
             user_context = self._build_user_context(title, uploader, channel_name, source_type)
-            pipeline = await Pipeline.create(
-                raw_video_path=raw_path,
-                job_dir=job_dir,
-                title=title,
-                uploader=uploader,
-                channel_name=channel_name,
-                video_id=video_id,
-                summary_model=self.config.summary_model,
-                subtitles_model=self.config.subtitles_model,
-                lyrics_model=self.config.lyrics_model,
-                reencode_settings=self.reencode_settings,
-                search_settings=self.search_settings,
-                split_settings=self.split_settings,
-                retry_settings=self.retry_settings,
-                source_type=source_type,
-                timestamp=timestamp,
-                user_context=user_context,
-                validation_buffer_ms=self.validation_buffer_ms,
-            )
 
             active = ActiveVideo(
                 video_id=video_id,
@@ -655,6 +733,7 @@ class ComboRunner:
                     pipeline_name=self.config.name,
                     video_id=video_id,
                     model=self.config.summary_model,
+                    service_tier=self.config.service_tier_summary,
                     media_path=pipeline.summary_proxy_path or raw_path,
                     video_duration_ms=pipeline.duration_ms,
                     status=TaskStatus.COMPLETED,
@@ -668,6 +747,7 @@ class ComboRunner:
                     pipeline_name=self.config.name,
                     video_id=video_id,
                     model=self.config.summary_model,
+                    service_tier=self.config.service_tier_summary,
                     media_path=pipeline.summary_proxy_path or raw_path,
                     video_duration_ms=pipeline.duration_ms,
                     status=TaskStatus.FAILED,
@@ -683,6 +763,7 @@ class ComboRunner:
                     video_id=video_id,
                     segment_index=idx,
                     model=self.config.subtitles_model,
+                    service_tier=self.config.service_tier_subtitles,
                     media_path=pipeline.reencoded_segment_paths.get(idx) or pipeline.segment_paths[idx],
                     video_duration_ms=pipeline.segment_durations_ms[idx],
                     status=TaskStatus.COMPLETED,
@@ -699,6 +780,7 @@ class ComboRunner:
                     video_id=video_id,
                     segment_index=idx,
                     model=self.config.subtitles_model,
+                    service_tier=self.config.service_tier_subtitles,
                     media_path=pipeline.reencoded_segment_paths.get(idx) or pipeline.segment_paths[idx],
                     video_duration_ms=pipeline.segment_durations_ms[idx],
                     status=TaskStatus.FAILED,
@@ -714,6 +796,7 @@ class ComboRunner:
                     video_id=video_id,
                     segment_index=idx,
                     model=self.config.lyrics_model,
+                    service_tier=self.config.service_tier_lyrics,
                     media_path=pipeline.reencoded_segment_paths.get(idx) or pipeline.segment_paths[idx],
                     video_duration_ms=pipeline.segment_durations_ms[idx],
                     status=TaskStatus.COMPLETED,
@@ -730,6 +813,7 @@ class ComboRunner:
                     video_id=video_id,
                     segment_index=idx,
                     model=self.config.lyrics_model,
+                    service_tier=self.config.service_tier_lyrics,
                     media_path=pipeline.reencoded_segment_paths.get(idx) or pipeline.segment_paths[idx],
                     video_duration_ms=pipeline.segment_durations_ms[idx],
                     status=TaskStatus.FAILED,

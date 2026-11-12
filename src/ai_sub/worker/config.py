@@ -6,20 +6,18 @@ import socket
 from pathlib import Path
 
 from pydantic import (
-    AliasChoices,
     Field,
     HttpUrl,
     NonNegativeFloat,
     NonNegativeInt,
     PositiveFloat,
     PositiveInt,
-    SecretStr,
 )
 from pydantic_settings import SettingsConfigDict
 
 from ai_sub.config import (
+    AiSettings,
     LoggingSettings,
-    SearchSettings,
     StringList,
     YamlFileSettings,
 )
@@ -60,18 +58,9 @@ class WorkerSettings(YamlFileSettings):
         ],
         description="List of Gemini models offered by this worker.",
     )
-    gemini_key: SecretStr | None = Field(
-        default=None,
-        description="Google Gemini API key.",
-        validation_alias=AliasChoices(
-            "AISUB_WORKER_GEMINI_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY",
-        ),
-    )
-    search: SearchSettings = Field(
-        default_factory=SearchSettings,
-        description="Web search configuration and provider API keys.",
+    ai: AiSettings = Field(
+        default_factory=AiSettings,
+        description="AI models, quotas, storage, and search settings.",
     )
     log: LoggingSettings = Field(
         default_factory=LoggingSettings,
@@ -97,9 +86,9 @@ class WorkerSettings(YamlFileSettings):
         default=0,
         description="Maximum tasks to execute per configured model before exiting (0 runs until idle timeout).",
     )
-    temp_dir: Path = Field(
+    work_dir: Path = Field(
         default=Path("/tmp/ai_sub_worker"),
-        description="Local directory for temporary media chunk downloads.",
+        description="Local working directory for temporary media chunk downloads and processing.",
     )
 
     @property

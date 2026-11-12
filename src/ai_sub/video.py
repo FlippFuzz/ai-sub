@@ -303,6 +303,37 @@ async def get_working_encoder() -> str:
     return "libx264"
 
 
+async def is_valid_reencoded_file(
+    input_path: Path,
+    output_path: Path,
+    fps: float,
+    duration_tolerance_ms: int = 100,
+) -> bool:
+    """Verifies whether an existing re-encoded file matches input duration and expected framerate.
+
+    Args:
+        input_path: Source input media file path.
+        output_path: Candidate re-encoded media file path.
+        fps: Target framerate.
+        duration_tolerance_ms: Allowed duration variance in milliseconds. Defaults to 100.
+
+    Returns:
+        bool: True if output file exists, is non-empty, and matches duration and FPS criteria; False otherwise.
+    """
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        return False
+    try:
+        input_duration, output_duration, output_fps = await asyncio.gather(
+            get_video_duration_ms(input_path),
+            get_video_duration_ms(output_path),
+            get_video_fps(output_path),
+        )
+        effective_tolerance = duration_tolerance_ms + (int(1000 / fps) if fps < 1.0 else 0)
+        return abs(input_duration - output_duration) < effective_tolerance and abs(fps - output_fps) < 0.01
+    except Exception:
+        return False
+
+
 @logfire.instrument("Splitting video into segments")
 async def split_video(
     input_video: Path,
@@ -416,19 +447,14 @@ async def reencode_video(
     Raises:
         subprocess.CalledProcessError: If FFmpeg re-encoding fails.
     """
-    if output_path.exists():
-        try:
-            input_duration, output_duration, output_fps = await asyncio.gather(
-                get_video_duration_ms(input_path),
-                get_video_duration_ms(output_path),
-                get_video_fps(output_path),
-            )
-            effective_tolerance = duration_tolerance_ms + (int(1000 / fps) if fps < 1.0 else 0)
-            if abs(input_duration - output_duration) < effective_tolerance and abs(fps - output_fps) < 0.01:
-                logfire.info(f"Reusing existing valid compressed media: {output_path.name}")
-                return
-        except Exception:
-            pass
+    if await is_valid_reencoded_file(
+        input_path=input_path,
+        output_path=output_path,
+        fps=fps,
+        duration_tolerance_ms=duration_tolerance_ms,
+    ):
+        logfire.info(f"Reusing existing valid compressed media: {output_path.name}")
+        return
 
     ffmpeg_bin, _ = ensure_ffmpeg()
     video_bytes_per_sec = bitrate_kb * 1024

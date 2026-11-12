@@ -10,6 +10,7 @@ server:
   heartbeat_timeout_seconds: 300
   validation_buffer_ms: 2000
   activity_log_maxlen: 50      # Maximum worker activity events preserved per combination pipeline
+  reencode_concurrency: 1      # Maximum concurrent FFmpeg re-encoding processes across runners
 
 # Task Execution and Distributed Retry Controls
 retry:
@@ -72,11 +73,10 @@ reencode:
     height: 360
     bitrate_kb: 35
 
-# Auxiliary Web Search and Lyric Provider Settings
-search:
-  tools:
-    - "tinyfish"
-    - "lrclib"
+# Default Search Tools Required by Pipelines
+default_search_tools:
+  - "tinyfish"
+  - "lrclib"
 
 # Segmentation / Splitting Settings
 split:

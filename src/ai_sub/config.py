@@ -121,13 +121,16 @@ class YamlFileSettings(BaseSettings):
 
         Raises:
             FileNotFoundError: If the configuration file does not exist.
+            ValueError: If YAML content is not a mapping.
         """
         path = Path(yaml_path)
         if not path.is_file():
             raise FileNotFoundError(f"Configuration file not found: {path}")
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        return cls.model_validate(data)
+        if not isinstance(data, dict):
+            raise ValueError(f"Invalid YAML content in {path}, expected dictionary mapping.")
+        return cls(**data)
 
 
 def find_config_file(kind: Literal["server", "worker"], cli_arg: str | Path | None = None) -> Path:
@@ -233,8 +236,7 @@ class SearchSettings(BaseSettings):
         default=None,
         validation_alias=AliasChoices(
             "AISUB_AI_SEARCH_KEY",
-            "AISUB_SERVER_SEARCH_KEY",
-            "AISUB_WORKER_SEARCH_KEY",
+            "SEARCH_API_KEY",
         ),
     )
     tinyfish_key: SecretStr | None = Field(
@@ -242,8 +244,6 @@ class SearchSettings(BaseSettings):
         default=None,
         validation_alias=AliasChoices(
             "AISUB_AI_SEARCH_TINYFISH_KEY",
-            "AISUB_SERVER_SEARCH_TINYFISH_KEY",
-            "AISUB_WORKER_SEARCH_TINYFISH_KEY",
             "TINYFISH_API_KEY",
         ),
     )
@@ -252,8 +252,6 @@ class SearchSettings(BaseSettings):
         default=None,
         validation_alias=AliasChoices(
             "AISUB_AI_SEARCH_LANGSEARCH_KEY",
-            "AISUB_SERVER_SEARCH_LANGSEARCH_KEY",
-            "AISUB_WORKER_SEARCH_LANGSEARCH_KEY",
             "LANGSEARCH_API_KEY",
         ),
     )
@@ -262,8 +260,6 @@ class SearchSettings(BaseSettings):
         default=None,
         validation_alias=AliasChoices(
             "AISUB_AI_SEARCH_OLLAMA_KEY",
-            "AISUB_SERVER_SEARCH_OLLAMA_KEY",
-            "AISUB_WORKER_SEARCH_OLLAMA_KEY",
             "OLLAMA_API_KEY",
         ),
     )
@@ -598,6 +594,7 @@ class AiSettings(BaseSettings):
     base_url: HttpUrl | None = Field(
         description="Optional custom base URL or proxy for Google Gemini API calls.",
         default=None,
+        validation_alias=AliasChoices("AISUB_AI_BASE_URL", "GEMINI_BASE_URL"),
     )
     model_summary: str = Field(
         description="AI model for whole-video summary, entity extraction, and chapter indexing.",

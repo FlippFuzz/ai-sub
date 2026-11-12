@@ -44,7 +44,8 @@ class GitSyncManager:
     local_repo_dir: Path
     player_base_url: str
     _lock: asyncio.Lock
-    _completed_videos: dict[tuple[str, str], str]
+    _completed_videos: set[tuple[str, str, str]]
+    _yt_completed_uploaders: dict[tuple[str, str], str]
 
     def __init__(self, config: GitConfig | None, base_work_dir: Path) -> None:
         """Initializes the Git synchronization manager.
@@ -55,7 +56,8 @@ class GitSyncManager:
         """
         self.config = config
         self._lock = asyncio.Lock()
-        self._completed_videos = {}
+        self._completed_videos = set()
+        self._yt_completed_uploaders = {}
         repo_name = "subtitles-archive"
 
         if config:
@@ -96,33 +98,53 @@ class GitSyncManager:
 
     def _rebuild_completed_cache_sync(self) -> None:
         """Scans the local repository directory to rebuild the in-memory completed subtitles cache."""
-        completed: dict[tuple[str, str], str] = {}
+        completed: set[tuple[str, str, str]] = set()
+        yt_uploaders: dict[tuple[str, str], str] = {}
         if not self.local_repo_dir.is_dir():
             self._completed_videos = completed
+            self._yt_completed_uploaders = yt_uploaders
             return
 
         try:
-            for uploader_dir in self.local_repo_dir.iterdir():
+            for uploader_dir in sorted(self.local_repo_dir.iterdir(), key=lambda p: p.name):
                 if not uploader_dir.is_dir() or uploader_dir.name.startswith("."):
                     continue
                 v_dir = uploader_dir / "v"
                 if not v_dir.is_dir():
                     continue
-                for video_dir in v_dir.iterdir():
+                for video_dir in sorted(v_dir.iterdir(), key=lambda p: p.name):
                     if not video_dir.is_dir() or video_dir.name.startswith("."):
                         continue
                     uploader = uploader_dir.name
                     video_id = video_dir.name
-                    for srt in video_dir.glob("*.srt"):
+
+                    meta_file = video_dir / "video_meta.json"
+                    is_yt = True
+                    if meta_file.is_file():
+                        try:
+                            with open(meta_file, "r", encoding="utf-8") as f:
+                                meta_data = json.load(f)
+                            if isinstance(meta_data, dict) and "source_type" in meta_data:
+                                is_yt = meta_data.get("source_type") == "youtube"
+                        except Exception:
+                            pass
+
+                    for srt in sorted(video_dir.glob("*.srt"), key=lambda p: p.name):
                         if srt.is_file() and not srt.name.startswith("part_") and ".raw-" not in srt.name:
                             if srt.stat().st_size > 0:
                                 track_info = parse_subtitle_track(srt)
                                 if track_info.shortcode:
-                                    completed[(video_id, track_info.shortcode)] = uploader
+                                    completed.add((uploader, video_id, track_info.shortcode))
+                                    if is_yt:
+                                        key = (video_id, track_info.shortcode)
+                                        # Deterministic selection: keep the first alphabetically sorted uploader
+                                        if key not in yt_uploaders:
+                                            yt_uploaders[key] = uploader
         except Exception as e:
             logfire.warning(f"Error rebuilding completed subtitles cache: {e}")
 
         self._completed_videos = completed
+        self._yt_completed_uploaders = yt_uploaders
         logfire.debug(f"Rebuilt completed subtitles cache: {len(self._completed_videos)} entry(s).")
 
     def _ensure_repo_sync(self) -> None:
@@ -165,17 +187,20 @@ class GitSyncManager:
         async with self._lock:
             await asyncio.to_thread(self._ensure_repo_sync)
 
-    def is_video_completed(self, video_id: str, full_shortcode: str) -> bool:
-        """Checks if completed subtitles for a video ID and shortcode exist in the repository cache.
+    def is_video_completed(self, video_id: str, full_shortcode: str, uploader: str | None = None) -> bool:
+        """Checks if completed subtitles for a video exist in the repository cache.
 
         Args:
             video_id: Video identifier.
             full_shortcode: Model shortcode (e.g. 'g38f-011019').
+            uploader: Optional channel or folder uploader handle. Defaults to None.
 
         Returns:
             bool: True if completed subtitles exist; False otherwise.
         """
-        return (video_id, full_shortcode) in self._completed_videos
+        if uploader and uploader.lower() != "youtube":
+            return (uploader, video_id, full_shortcode) in self._completed_videos
+        return (video_id, full_shortcode) in self._yt_completed_uploaders
 
     def get_completed_uploader(self, video_id: str, full_shortcode: str) -> str | None:
         """Retrieves the uploader handle for a completed video ID if known in the repository cache.
@@ -187,7 +212,7 @@ class GitSyncManager:
         Returns:
             str | None: Uploader handle if present in repository, None otherwise.
         """
-        return self._completed_videos.get((video_id, full_shortcode))
+        return self._yt_completed_uploaders.get((video_id, full_shortcode))
 
     def _discover_video_subtitles(self, video_dir: Path) -> list[dict[str, str]]:
         """Discovers and ranks all finalized and intermediate SRT files relative to the video directory.
@@ -243,7 +268,7 @@ class GitSyncManager:
         entries: list[dict[str, Any]] = []
         channel_display_name = uploader
 
-        for v_dir in sorted(v_base_dir.iterdir()):
+        for v_dir in sorted(v_base_dir.iterdir(), key=lambda p: p.name):
             if not v_dir.is_dir() or v_dir.name.startswith("."):
                 continue
 
@@ -392,7 +417,7 @@ class GitSyncManager:
         for yf in yaml_files:
             shutil.copy2(yf, int_dir / yf.name)
 
-        self._completed_videos[(video_id, full_shortcode)] = uploader
+        self._completed_videos.add((uploader, video_id, full_shortcode))
 
         clean_meta: dict[str, Any] = {
             "video_id": video_id,
@@ -414,6 +439,13 @@ class GitSyncManager:
                     clean_meta["timestamp"] = int(raw.get("timestamp") or 0)
             except Exception as e:
                 logfire.warning(f"Failed to read metadata from {meta_file}: {e}")
+
+        # Record to YouTube uploader reverse-lookup only for genuine YouTube source videos,
+        # retaining the lexicographically smallest uploader to match cache rebuilding order
+        if clean_meta.get("source_type") == "youtube":
+            yt_key = (video_id, full_shortcode)
+            if yt_key not in self._yt_completed_uploaders or uploader < self._yt_completed_uploaders[yt_key]:
+                self._yt_completed_uploaders[yt_key] = uploader
 
         clean_meta["subtitles"] = self._discover_video_subtitles(video_dir)
 
@@ -502,17 +534,23 @@ class GitSyncManager:
 
                     # A rebase conflict was created; inspect unmerged files and resolve sequentially
                     try:
-                        readme_rel = f"{uploader}/README.md"
                         while rebase_merge_dir.exists() or rebase_apply_dir.exists():
                             unmerged_output = repo.git.diff("-z", "--diff-filter=U", "--name-only")
                             unmerged_files = [f for f in unmerged_output.split("\0") if f]
 
-                            if unmerged_files == [readme_rel]:
-                                self._update_channel_readme_sync(uploader)
-                                repo.git.add(readme_rel)
+                            # Resolve conflicts dynamically if the single conflicted file is an uploader README.md
+                            if (
+                                len(unmerged_files) == 1
+                                and unmerged_files[0].endswith("/README.md")
+                                and unmerged_files[0].count("/") == 1
+                            ):
+                                conflicted_readme = unmerged_files[0]
+                                conflicted_uploader = conflicted_readme.split("/")[0]
+                                self._update_channel_readme_sync(conflicted_uploader)
+                                repo.git.add(conflicted_readme)
                                 try:
                                     repo.git.rebase("--continue", env={**os.environ, "GIT_EDITOR": editor_cmd})
-                                    logfire.info("Continued rebase after resolving channel README conflict.")
+                                    logfire.info(f"Continued rebase after resolving {conflicted_readme} conflict.")
                                 except GitCommandError:
                                     # If the next rebase step encounters another conflict, stay in the loop
                                     if rebase_merge_dir.exists() or rebase_apply_dir.exists():

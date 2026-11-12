@@ -9,6 +9,7 @@ import random
 import re
 import shutil
 import subprocess
+import threading
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -195,8 +196,10 @@ class YouTubeClient:
     base_work_dir: Path
     mapping_file: Path
     _channel_map: ChannelMap
+    _channel_lock: threading.Lock
     _pot_server_dir: Path | None
     _base_ydl_opts: dict[str, Any]
+    _source_last_scan_ts: dict[str, int]
 
     def __init__(self, config: YoutubeSourceConfig, base_work_dir: Path) -> None:
         """Initializes the YouTube client, compiling PO tokens and loading channel mappings.
@@ -207,6 +210,8 @@ class YouTubeClient:
         """
         self.config = config
         self.base_work_dir = base_work_dir
+        self._channel_lock = threading.Lock()
+        self._source_last_scan_ts = {}
 
         channels_path = config.channels_file
         if not channels_path.is_absolute():
@@ -349,7 +354,8 @@ class YouTubeClient:
         cookie_exists = bool(cookie_resolved and cookie_resolved.is_file())
 
         proxy_str = str(self.config.proxy) if self.config.proxy else "None"
-        masked_proxy = re.sub(r"://([^:]+):([^@]+)@", "://***:***@", proxy_str)
+        # Mask all userinfo variants (user:pass, user, user:) from telemetry logs
+        masked_proxy = re.sub(r"://[^@]+@", "://***:***@", proxy_str)
 
         try:
             pot_plugin_ver = importlib.metadata.version("bgutil-ytdlp-pot-provider")
@@ -382,18 +388,20 @@ class YouTubeClient:
             with open(self.mapping_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                self._channel_map = ChannelMap.model_validate(data)
+                with self._channel_lock:
+                    self._channel_map = ChannelMap.model_validate(data)
             logfire.debug(f"Loaded {len(self._channel_map.root)} channel mappings from {self.mapping_file.name}")
         except Exception as e:
             logfire.warning(f"Could not load channel mapping file {self.mapping_file.name}: {e}")
 
-    def _save_channel_map(self) -> None:
-        """Saves current channel mappings atomically to disk in UTF-8 JSON format."""
-        temp_file = self.mapping_file.with_name(f"{self.mapping_file.name}.tmp.{os.getpid()}")
+    def _save_channel_map_locked(self) -> None:
+        """Saves current channel mappings atomically to disk while holding _channel_lock."""
+        temp_file = self.mapping_file.with_name(f"{self.mapping_file.name}.tmp.{os.getpid()}.{threading.get_ident()}")
         try:
             self.mapping_file.parent.mkdir(parents=True, exist_ok=True)
+            data = self._channel_map.model_dump()
             with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(self._channel_map.model_dump(), f, indent=2, sort_keys=True, ensure_ascii=False)
+                json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
             os.replace(temp_file, self.mapping_file)
         except Exception as e:
             if temp_file.exists():
@@ -410,7 +418,7 @@ class YouTubeClient:
         channel_name: str | None,
         timestamp: int = 0,
     ) -> None:
-        """Records a new or updated channel mapping and saves to disk if changed.
+        """Records a new or updated channel mapping and saves to disk under lock if changed.
 
         Args:
             channel_id: Unique YouTube channel ID (e.g. 'UC...').
@@ -423,15 +431,16 @@ class YouTubeClient:
 
         c_str = str(channel_id)
         u_str = str(uploader_id).strip("@")[:20]
-        existing = self._channel_map.root.get(c_str)
 
-        if not existing or timestamp > existing.timestamp or u_str != existing.uploader_id:
-            self._channel_map.root[c_str] = ChannelInfo(
-                uploader_id=u_str,
-                channel_name=str(channel_name) if channel_name else (existing.channel_name if existing else None),
-                timestamp=timestamp,
-            )
-            self._save_channel_map()
+        with self._channel_lock:
+            existing = self._channel_map.root.get(c_str)
+            if not existing or timestamp > existing.timestamp or u_str != existing.uploader_id:
+                self._channel_map.root[c_str] = ChannelInfo(
+                    uploader_id=u_str,
+                    channel_name=str(channel_name) if channel_name else (existing.channel_name if existing else None),
+                    timestamp=timestamp,
+                )
+                self._save_channel_map_locked()
 
     def _lookup_youtube_handle(self, video_id: str | None, channel_id: str | None = None) -> str | None:
         """Performs targeted yt-dlp metadata extraction to resolve an unknown channel handle.
@@ -511,10 +520,11 @@ class YouTubeClient:
                 )
             return clean_handle
 
-        # 2. Check channels.json cache by channel_id
+        # 2. Check channels.json cache by channel_id under lock
         if channel_id and isinstance(channel_id, str):
             c_str = str(channel_id)
-            info = self._channel_map.root.get(c_str)
+            with self._channel_lock:
+                info = self._channel_map.root.get(c_str)
             if info and info.uploader_id and info.uploader_id.lower() != "youtube":
                 return info.uploader_id
 
@@ -559,9 +569,10 @@ class YouTubeClient:
 
         ydl_opts = dict(self._base_ydl_opts)
         ydl_opts["extract_flat"] = True
+        ydl_opts["lazy_playlist"] = True
 
-        lookback_seconds = int((2 * self.config.rescan_interval_minutes + self.config.rescan_jitter_minutes) * 60)
-        cutoff_ts = int(datetime.now(timezone.utc).timestamp()) - lookback_seconds if not deep_scan else 0
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        base_lookback = int((2 * self.config.rescan_interval_minutes + self.config.rescan_jitter_minutes) * 60)
 
         target_items: list[tuple[str, str | None]] = []
         for raw_url in self.config.urls:
@@ -572,8 +583,6 @@ class YouTubeClient:
             url_handle: str | None = None
             if match := re.search(r"/(@[\w.-]+)", clean_url):
                 url_handle = match.group(1)
-            elif match := re.search(r"/(channel/UC[\w-]+)", clean_url):
-                url_handle = match.group(1).split("/")[-1]
 
             if re.match(r"^https?://(www\.)?youtube\.com/(@[\w.-]+|channel/UC[\w-]+)$", clean_url):
                 target_items.extend([(f"{clean_url}/videos", url_handle), (f"{clean_url}/streams", url_handle)])
@@ -592,11 +601,21 @@ class YouTubeClient:
                         )
                         time_sleep(delay)
 
+                    source_last_scan = self._source_last_scan_ts.get(url, 0)
+                    if not deep_scan and source_last_scan > 0:
+                        elapsed = (now_ts - source_last_scan) + int(self.config.rescan_jitter_minutes * 60)
+                        lookback_seconds = max(base_lookback, elapsed)
+                    else:
+                        lookback_seconds = base_lookback
+
+                    cutoff_ts = now_ts - lookback_seconds if not deep_scan else 0
+
                     with logfire.span("Scanning {url}", url=url, _level="debug") as url_span:
                         try:
                             result = ydl.extract_info(url, download=False)
                             if not result:
                                 url_span.set_attribute("result", "empty")
+                                self._source_last_scan_ts[url] = now_ts
                                 continue
 
                             entries_raw = result.get("entries")
@@ -625,13 +644,21 @@ class YouTubeClient:
 
                                 if not ts and (ud := entry.get("upload_date")):
                                     try:
-                                        dt = datetime.strptime(str(ud), "%Y%m%d").replace(tzinfo=timezone.utc)
+                                        # Use end of the upload day (23:59:59 UTC) so date-only entries are not
+                                        # prematurely cut off during midday scans
+                                        dt = datetime.strptime(str(ud), "%Y%m%d").replace(
+                                            hour=23, minute=59, second=59, tzinfo=timezone.utc
+                                        )
                                         ts = int(dt.timestamp())
                                     except ValueError:
                                         ts = 0
 
                                 if not deep_scan and ts > 0 and ts < cutoff_ts:
-                                    break
+                                    # Break only for chronologically ordered channel tabs (/videos, /streams)
+                                    if url.endswith(("/videos", "/streams")):
+                                        break
+                                    # For playlists or custom collections, skip older entries and continue
+                                    continue
 
                                 uploader = self.get_uploader_id(entry=entry, url_context=url_context_handle)
                                 ch_name = str(entry.get("channel") or entry.get("uploader") or uploader)
@@ -649,6 +676,7 @@ class YouTubeClient:
                                 url_discovered_count += 1
 
                             url_span.set_attribute("discovered_count", url_discovered_count)
+                            self._source_last_scan_ts[url] = now_ts
                         except YouTubeBotDetectionError:
                             url_span.set_attribute("error", "bot_detection")
                             raise

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import shutil
 import urllib.parse
 from collections import deque
 from collections.abc import Callable
@@ -77,7 +78,7 @@ class ComboRunnersCoordinator:
                 base_work_dir=work_base,
                 reencode_semaphore=self.reencode_semaphore,
                 reencode_settings=settings.reencode,
-                search_settings=settings.search,
+                default_search_tools=settings.default_search_tools,
                 split_settings=settings.split,
                 retry_settings=settings.retry,
                 coordinator_lock=self._lock,
@@ -151,6 +152,11 @@ class ComboRunnersCoordinator:
         Returns:
             bool: True if the runner was idle and acquired; False otherwise.
         """
+        # Reject invalid or path-traversal video IDs that could corrupt filesystem cleanup
+        if video_id in (".", "..") or not video_id.strip() or "/" in video_id or "\\" in video_id:
+            logfire.warning(f"Rejected invalid or dangerous video ID for acquisition: {video_id!r}")
+            return False
+
         async with self._lock:
             runner = self.runners.get(runner_name)
             if not runner or not runner.is_idle():
@@ -201,6 +207,11 @@ class ComboRunnersCoordinator:
         Returns:
             bool: True if video was prepared and assigned; False otherwise.
         """
+        # Reject invalid or path-traversal video IDs
+        if video_id in (".", "..") or not video_id.strip() or "/" in video_id or "\\" in video_id:
+            logfire.warning(f"Rejected invalid or dangerous video ID for assignment: {video_id!r}")
+            return False
+
         runner = self.runners.get(runner_name)
         if not runner:
             return False
@@ -271,7 +282,8 @@ class ComboRunnersCoordinator:
                     active_leases = 0
 
                     for runner in self.runners.values():
-                        for task in runner.tasks.values():
+                        # Iterate over a snapshot list to avoid RuntimeError if failure handling modifies tasks
+                        for task in list(runner.tasks.values()):
                             if task.status == TaskStatus.CLAIMED:
                                 active_leases += 1
                                 reference_time = task.last_heartbeat or task.claimed_at or 0.0
@@ -668,6 +680,14 @@ class ComboRunnersCoordinator:
                     async with self._lock:
                         runner.status = RunnerStatus.PUSH_FAILED
                     return False
+            else:
+                # When Git sync is disabled, copy generated subtitles to durable local output directory
+                output_dir = self.settings.server.work_dir / "output" / vid.uploader
+                output_dir.mkdir(parents=True, exist_ok=True)
+                for srt_path in generated_srts:
+                    dest = output_dir / srt_path.name
+                    shutil.copy2(srt_path, dest)
+                    logfire.info(f"Saved durable subtitle output to {dest}")
 
             async with self._lock:
                 await runner.clear_active_video()

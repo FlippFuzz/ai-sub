@@ -21,25 +21,24 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 
 ## AI Settings (`--ai.*`)
 
-| Argument                              | Environment Variable                                 | Description                                                                                | Default                            |
-| :------------------------------------ | :--------------------------------------------------- | :----------------------------------------------------------------------------------------- | :--------------------------------- |
-| `--ai.key <key>`                      | `AISUB_AI_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Google Gemini API key.                                                                     | _None_                             |
-| `--ai.base-url <url>`                 | `AISUB_AI_BASE_URL`                                  | Optional custom base URL or proxy for Google Gemini API calls.                             | _None_                             |
-| `--ai.model <model>`                  | `AISUB_AI_MODEL`                                     | Shorthand setting model_subtitles, model_lyrics, and model_summary to the same identifier. | _None_                             |
-| `--ai.model-summary <model>`          | `AISUB_AI_MODEL_SUMMARY`                             | AI model for whole-video summary, entity extraction, and chapter indexing.                 | `google-gla:gemini-3.5-flash-lite` |
-| `--ai.model-subtitles <model>`        | `AISUB_AI_MODEL_SUBTITLES`                           | AI model for audio-visual subtitle transcription and alignment.                            | `google-gla:gemini-3.8-flash`      |
-| `--ai.model-lyrics <model>`           | `AISUB_AI_MODEL_LYRICS`                              | AI model for musical lyrics search and refinement with agentic video inspection.           | `google-gla:gemini-3.5-flash-lite` |
-| `--ai.service-tier <tier>`            | `AISUB_AI_SERVICE_TIER`                              | Shorthand setting service tiers across all pipeline phases.                                | _None_                             |
-| `--ai.service-tier-summary <tier>`    | `AISUB_AI_SERVICE_TIER_SUMMARY`                      | Google Gemini service tier for whole-video summary.                                        | _None_                             |
-| `--ai.service-tier-subtitles <tier>`  | `AISUB_AI_SERVICE_TIER_SUBTITLES`                    | Google Gemini service tier for subtitle generation.                                        | _None_                             |
-| `--ai.service-tier-lyrics <tier>`     | `AISUB_AI_SERVICE_TIER_LYRICS`                       | Google Gemini service tier for lyrics refinement.                                          | _None_                             |
-| `--ai.agentic-video <bool>`           | `AISUB_AI_AGENTIC_VIDEO`                             | Shorthand setting agentic video understanding across all pipeline phases.                  | _None_                             |
-| `--ai.agentic-video-summary <bool>`   | `AISUB_AI_AGENTIC_VIDEO_SUMMARY`                     | Whether to use agentic video understanding for whole-video summary.                        | `True`                             |
-| `--ai.agentic-video-subtitles <bool>` | `AISUB_AI_AGENTIC_VIDEO_SUBTITLES`                   | Whether to use agentic video understanding for subtitle generation.                        | `False`                            |
-| `--ai.agentic-video-lyrics <bool>`    | `AISUB_AI_AGENTIC_VIDEO_LYRICS`                      | Whether to use agentic video understanding for lyrics refinement.                          | `True`                             |
-| `--ai.rpm <int>`                      | `AISUB_AI_RPM`                                       | Maximum Requests Per Minute (RPM) allowed for the model.                                   | `4`                                |
-| `--ai.tpm <int>`                      | `AISUB_AI_TPM`                                       | Maximum Tokens Per Minute (TPM) allowed for the model.                                     | `250000`                           |
-| `--ai.validation-buffer-ms <int>`     | `AISUB_AI_VALIDATION_BUFFER_MS`                      | Allowed tolerance buffer in milliseconds for timestamps exceeding segment duration.        | `2000`                             |
+Unified across both standalone execution (`ai-sub`) and distributed workers (`ai-sub-worker` via `ai:` block):
+
+| Argument                              | Environment Variable                                 | Description                                                                         | Default                            |
+| :------------------------------------ | :--------------------------------------------------- | :---------------------------------------------------------------------------------- | :--------------------------------- |
+| `--ai.key <key>`                      | `AISUB_AI_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Google Gemini API key.                                                              | _None_                             |
+| `--ai.base-url <url>`                 | `AISUB_AI_BASE_URL` / `GEMINI_BASE_URL`              | Optional custom base URL or proxy for Google Gemini API calls.                      | _None_                             |
+| `--ai.model-summary <model>`          | `AISUB_AI_MODEL_SUMMARY`                             | AI model for whole-video summary, entity extraction, and chapter indexing.          | `google-gla:gemini-3.5-flash-lite` |
+| `--ai.model-subtitles <model>`        | `AISUB_AI_MODEL_SUBTITLES`                           | AI model for audio-visual subtitle transcription and alignment.                     | `google-gla:gemini-3.8-flash`      |
+| `--ai.model-lyrics <model>`           | `AISUB_AI_MODEL_LYRICS`                              | AI model for musical lyrics search and refinement with agentic video inspection.    | `google-gla:gemini-3.5-flash-lite` |
+| `--ai.service-tier-summary <tier>`    | `AISUB_AI_SERVICE_TIER_SUMMARY`                      | Google Gemini service tier for whole-video summary.                                 | _None_                             |
+| `--ai.service-tier-subtitles <tier>`  | `AISUB_AI_SERVICE_TIER_SUBTITLES`                    | Google Gemini service tier for subtitle generation.                                 | _None_                             |
+| `--ai.service-tier-lyrics <tier>`     | `AISUB_AI_SERVICE_TIER_LYRICS`                       | Google Gemini service tier for lyrics refinement.                                   | _None_                             |
+| `--ai.agentic-video-summary <bool>`   | `AISUB_AI_AGENTIC_VIDEO_SUMMARY`                     | Whether to use agentic video understanding for whole-video summary.                 | `True`                             |
+| `--ai.agentic-video-subtitles <bool>` | `AISUB_AI_AGENTIC_VIDEO_SUBTITLES`                   | Whether to use agentic video understanding for subtitle generation.                 | `False`                            |
+| `--ai.agentic-video-lyrics <bool>`    | `AISUB_AI_AGENTIC_VIDEO_LYRICS`                      | Whether to use agentic video understanding for lyrics refinement.                   | `True`                             |
+| `--ai.rpm <int>`                      | `AISUB_AI_RPM`                                       | Maximum Requests Per Minute (RPM) allowed for the model.                            | `4`                                |
+| `--ai.tpm <int>`                      | `AISUB_AI_TPM`                                       | Maximum Tokens Per Minute (TPM) allowed for the model.                              | `250000`                           |
+| `--ai.validation-buffer-ms <int>`     | `AISUB_AI_VALIDATION_BUFFER_MS`                      | Allowed tolerance buffer in milliseconds for timestamps exceeding segment duration. | `2000`                             |
 
 ### Files API Storage Settings (`--ai.storage.*`)
 
@@ -55,7 +54,7 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | Argument                               | Environment Variable                                    | Description                                                                                                                                                                         | Default          |
 | :------------------------------------- | :------------------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------- |
 | `--ai.search.tools <list>`             | `AISUB_AI_SEARCH_TOOLS`                                 | List of search providers to enable (e.g. `['duckduckgo']`, `['tinyfish', 'lrclib']`). Supported: `'builtin'`, `'duckduckgo'`, `'ollama'`, `'langsearch'`, `'tinyfish'`, `'lrclib'`. | `["duckduckgo"]` |
-| `--ai.search.key <key>`                | `AISUB_AI_SEARCH_KEY`                                   | Fallback API key for search services (Ollama, Langsearch, or Tinyfish).                                                                                                             | _None_           |
+| `--ai.search.key <key>`                | `AISUB_AI_SEARCH_KEY` / `SEARCH_API_KEY`                | Fallback API key for search services (Ollama, Langsearch, or Tinyfish).                                                                                                             | _None_           |
 | `--ai.search.tinyfish-key <key>`       | `AISUB_AI_SEARCH_TINYFISH_KEY` / `TINYFISH_API_KEY`     | Dedicated API key for Tinyfish search.                                                                                                                                              | _None_           |
 | `--ai.search.langsearch-key <key>`     | `AISUB_AI_SEARCH_LANGSEARCH_KEY` / `LANGSEARCH_API_KEY` | Dedicated API key for Langsearch.                                                                                                                                                   | _None_           |
 | `--ai.search.ollama-key <key>`         | `AISUB_AI_SEARCH_OLLAMA_KEY` / `OLLAMA_API_KEY`         | Dedicated API key for Ollama search.                                                                                                                                                | _None_           |
@@ -141,16 +140,6 @@ All settings can be configured via command-line arguments (e.g., `--ai.rpm 10`) 
 | `--retry.multiplier <float>`       | `AISUB_RETRY_MULTIPLIER`       | Exponential backoff multiplier between retry attempts.                            | `2.0`   |
 | `--retry.min-wait-seconds <float>` | `AISUB_RETRY_MIN_WAIT_SECONDS` | Minimum backoff wait time in seconds.                                             | `30.0`  |
 | `--retry.max-wait-seconds <int>`   | `AISUB_RETRY_MAX_WAIT_SECONDS` | Maximum backoff wait time in seconds.                                             | `300`   |
-
----
-
-## Stage Failure & Pipeline Behavior
-
-To prevent wasted API calls and ensure subtitle integrity, stages adhere to the following execution contracts:
-
-1. **Summary Failure**: If the whole-video summary stage is enabled and exhausts its retries without producing a valid response, pipeline execution **halts immediately**.
-2. **Subtitles Failure**: If subtitle generation fails for a particular 5-minute chunk, that chunk **will not continue** to lyrics refinement.
-3. **Lyrics Failure**: If a singing performance is detected but lyrics refinement completely fails to execute (e.g. crashes or exhausts retries without producing a response), the stitcher **will not fall back** to the draft subtitles. Instead, it marks that specific segment with an explicit error line (`Error processing subtitles for this segment.`) in the final `.srt` so omissions can be clearly identified. _(Note: If the model completes its execution successfully but verifies that official song lyrics are mismatched or unavailable, it gracefully preserves the draft subtitles without producing an error line)._
 
 ---
 

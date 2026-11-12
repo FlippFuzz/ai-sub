@@ -2,7 +2,7 @@
 # AI Sub Worker Configuration (worker.yaml or <hostname>.worker.yaml)
 # ==============================================================================
 
-# Server Connection
+# Server Connection & Worker Identity
 server_url: "https://sub.yourdomain.com"
 server_auth: "worker_user:your_secure_password"
 worker_id: "test-worker-1" # Defaults to machine hostname if omitted
@@ -15,24 +15,43 @@ max_duration_minutes: 0 # Exit after N minutes, draining active tasks (0 runs wi
 max_tasks: 0 # Exit after N tasks per model (0 runs until idle timeout or quotas exhausted)
 heartbeat_interval_seconds: 30.0
 
-# Gemini API Configuration
-gemini_key: "AIzaSyYourGeminiApiKeyHere"
-
 # Gemini Models Supported by This Worker
 models:
   - "google-gla:gemini-3.8-flash"
   - "google-gla:gemini-3.6-flash"
   - "google-gla:gemini-3.5-flash-lite"
 
-# Auxiliary Search & Lyrics Providers
-search:
-  tools:
-    - "tinyfish"
-    - "lrclib"
-    - "duckduckgo"
-  tinyfish_key: "sk-tinyfish-your-tinyfish-api-key"
-  # langsearch_key: "your-langsearch-key"
-  # ollama_key: "your-ollama-key"
+# Local Working Directory for Media Downloads
+work_dir: "./ai_sub_worker"
 
-# Local Storage
-temp_dir: "./ai_sub_worker"
+# Logging & Telemetry
+log:
+  level: "info"
+  timestamps: false
+  scrub: true
+  progress: true
+
+# AI Execution Engine & Auxiliary Providers (Unified AiSettings)
+ai:
+  key: "AIzaSyYourGeminiApiKeyHere"
+  # base_url: "https://your-custom-gemini-proxy.com"
+  rpm: 4
+  tpm: 250000
+  validation_buffer_ms: 2000
+
+  storage:
+    max_gb: 15.0
+    target_gb: 10.0
+    cleanup_interval_minutes: 30
+    polling_interval_seconds: 10.0
+
+  search:
+    tools:
+      - "tinyfish"
+      - "lrclib"
+      - "duckduckgo"
+    tinyfish_key: "sk-tinyfish-your-tinyfish-api-key"
+    # langsearch_key: "your-langsearch-key"
+    # ollama_key: "your-ollama-key"
+    max_turns: 3
+    timeout: 60.0

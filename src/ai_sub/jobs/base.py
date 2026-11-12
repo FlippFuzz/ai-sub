@@ -279,6 +279,7 @@ class AiJob(BaseJob):
     media_path: Path | None = Field(
         default=None,
         description="Local media path bound to this AI job.",
+        exclude=True,
     )
     segment_index: int | None = Field(
         default=None,
