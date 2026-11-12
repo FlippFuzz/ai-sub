@@ -19,6 +19,7 @@ from pydantic import (
 from pydantic.json_schema import SkipJsonSchema
 from pysubs2 import SSAEvent, SSAFile
 
+from ai_sub.config import RetrySettings, ServiceTier
 from ai_sub.jobs.base import (
     AiJob,
     CleanTimestamp,
@@ -275,6 +276,22 @@ class BaseSubtitleJob(AiJob):
         default=None,
         description="Optional global summary context from phase 1.",
     )
+    model_name: str | None = Field(
+        default=None,
+        description="Optional Gemini model identifier override.",
+    )
+    service_tier: ServiceTier | None = Field(
+        default=None,
+        description="Optional Google Gemini service tier override.",
+    )
+    agentic_video: bool = Field(
+        default=False,
+        description="Whether to enable agentic video exploration.",
+    )
+    retry_settings: RetrySettings | None = Field(
+        default=None,
+        description="Optional task-specific retry settings.",
+    )
     response: BaseSubtitleAiResponse | None = Field(
         default=None,
         description="Structured subtitle response once generated.",
@@ -320,16 +337,21 @@ class SubtitlesJob(BaseSubtitleJob):
             segment_offset_ms=self.segment_offset_ms,
             segment_duration_ms=self.video_duration_ms,
         )
+        media = self.media_path or ctx.media_path
+        model = self.model_name or ctx.executor.ai_settings.model_subtitles
+        tier = self.service_tier if self.service_tier is not None else ctx.executor.ai_settings.service_tier_subtitles
+
         res = await ctx.executor.run_structured(
             prompt=prompt,
-            media_path=ctx.media_path,
+            media_path=media,
             video_duration_ms=self.video_duration_ms,
             response_type=SubtitlesAiResponse,
-            model_name=ctx.executor.ai_settings.model_subtitles,
-            service_tier=ctx.executor.ai_settings.service_tier_subtitles,
+            model_name=model,
+            service_tier=tier,
             tools=None,
-            agentic_video=ctx.executor.ai_settings.agentic_video_subtitles,
+            agentic_video=self.agentic_video,
             task_label="subtitles",
+            retry_settings=self.retry_settings,
         )
         self.response = res
         self.total_attempts += 1

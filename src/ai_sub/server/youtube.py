@@ -17,11 +17,14 @@ from typing import Any, cast
 
 import logfire
 from git import Repo
+from git.exc import InvalidGitRepositoryError, NoSuchPathError
 from pydantic import BaseModel, RootModel
 from yt_dlp import YoutubeDL
 
 from ai_sub.server.config import YoutubeSourceConfig
 from ai_sub.video import ensure_ffmpeg
+
+_VALID_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".flv", ".ts"}
 
 
 class YouTubeError(Exception):
@@ -164,6 +167,27 @@ def _check_permanent_video_error(err_msg: str) -> str | None:
     return None
 
 
+def _has_pot_provider_artifacts(server_dir: Path) -> bool:
+    """Verifies that bgutil-ytdlp-pot-provider has compiled scripts and installed dependencies.
+
+    Args:
+        server_dir: Path to the provider's server directory.
+
+    Returns:
+        bool: True if required node_modules and compiled output scripts exist, False otherwise.
+    """
+    has_node_modules = (server_dir / "node_modules").is_dir()
+    b_dir = server_dir / "build"
+    d_dir = server_dir / "dist"
+    has_script = (
+        (b_dir / "generate_once.js").is_file()
+        or (d_dir / "generate_once.js").is_file()
+        or (b_dir / "main.js").is_file()
+        or (d_dir / "main.js").is_file()
+    )
+    return has_node_modules and has_script
+
+
 class YouTubeClient:
     """Encapsulates all YouTube operations: yt-dlp configuration, PO tokens, channel caching, and downloads."""
 
@@ -232,16 +256,24 @@ class YouTubeClient:
         needs_build = False
 
         try:
-            if not pot_dir.exists():
+            repo: Repo | None = None
+            if pot_dir.exists():
+                try:
+                    repo = Repo(pot_dir)
+                except (InvalidGitRepositoryError, NoSuchPathError):
+                    logfire.warning(f"Existing directory at {pot_dir} is not a valid git repository. Re-cloning...")
+                    shutil.rmtree(pot_dir, ignore_errors=True)
+                    repo = None
+
+            if repo is None:
                 logfire.info(f"Cloning bgutil-ytdlp-pot-provider ({target_version or 'default'}) into {pot_dir}")
                 pot_dir.parent.mkdir(parents=True, exist_ok=True)
                 if target_version:
-                    Repo.clone_from(repo_url, pot_dir, branch=target_version)
+                    repo = Repo.clone_from(repo_url, pot_dir, branch=target_version)
                 else:
-                    Repo.clone_from(repo_url, pot_dir)
+                    repo = Repo.clone_from(repo_url, pot_dir)
                 needs_build = True
             else:
-                repo = Repo(pot_dir)
                 try:
                     current_tag = repo.git.describe("--tags", "--exact-match").strip()
                 except Exception:
@@ -255,7 +287,7 @@ class YouTubeClient:
 
             build_dir = server_dir / "build"
             dist_dir = server_dir / "dist"
-            if not (build_dir.exists() or dist_dir.exists()):
+            if not _has_pot_provider_artifacts(server_dir):
                 needs_build = True
 
             if needs_build:
@@ -267,8 +299,10 @@ class YouTubeClient:
                 subprocess.run([npx_bin, "tsc"], cwd=server_dir, check=True, capture_output=True, shell=is_win)
                 logfire.info("bgutil-ytdlp-pot-provider built successfully.")
 
-            if server_dir.exists():
+            if _has_pot_provider_artifacts(server_dir):
                 return server_dir
+
+            logfire.warning(f"bgutil-ytdlp-pot-provider build artifacts missing in {server_dir}.")
         except Exception as e:
             logfire.warning(f"Failed to setup bgutil-ytdlp-pot-provider: {e}")
 
@@ -448,9 +482,10 @@ class YouTubeClient:
         Follows a strict hierarchy:
         1. Explicit handle on the entry (e.g. '@handle' in URLs or uploader_id).
         2. Cached handle in channels.json mapped to the entry's channel_id.
-        3. Targeted YouTube lookup for the video.
-        4. Context handle extracted from the intake URL (for channel tabs).
-        5. Fallback string 'youtube'.
+        3. Source handle from url_context when channel_id is present (recorded to channels.json).
+        4. Targeted YouTube lookup for the video when url_context is unavailable.
+        5. Context handle fallback without channel_id.
+        6. Generic fallback string 'youtube'.
 
         Args:
             entry: Video or channel metadata dictionary from yt-dlp.
@@ -483,21 +518,32 @@ class YouTubeClient:
             if info and info.uploader_id and info.uploader_id.lower() != "youtube":
                 return info.uploader_id
 
-            # 3. Targeted YouTube lookup if missing from cache
+            # 3. Associate channel_id with source URL handle when available
+            if url_context and str(url_context).lower() != "youtube":
+                clean_handle = str(url_context).strip("@")[:20]
+                self._record_channel_mapping(
+                    channel_id=c_str,
+                    uploader_id=clean_handle,
+                    channel_name=str(channel_name) if channel_name else None,
+                    timestamp=ts_int,
+                )
+                return clean_handle
+
+            # 4. Targeted YouTube lookup only when source handle is unavailable
             video_id = str(entry.get("id")) if entry.get("id") else None
             looked_up = self._lookup_youtube_handle(video_id=video_id, channel_id=c_str)
             if looked_up:
                 return looked_up
 
-        # 4. Fallback to URL context (for channel tabs) without polluting channels.json
+        # 5. Fallback to URL context (for channel tabs without channel_id)
         if url_context:
             return str(url_context).strip("@")[:20]
 
-        # 5. Generic fallback
+        # 6. Generic fallback
         return "youtube"
 
     def scan_sources(self, deep_scan: bool = False) -> list[DiscoveredVideo]:
-        """Fetches metadata for configured YouTube sources using flat single-request extraction.
+        """Fetches metadata for configured YouTube sources using flat extraction with early date cutoff.
 
         Args:
             deep_scan: If True, crawls full channel history; if False, applies lookback window cutoff.
@@ -554,9 +600,10 @@ class YouTubeClient:
                                 continue
 
                             entries_raw = result.get("entries")
-                            entries_list: list[Any] = [result] if entries_raw is None else list(cast(Any, entries_raw))
+                            entries_iterable = [result] if entries_raw is None else cast(Any, entries_raw)
+                            url_discovered_count = 0
 
-                            for entry in entries_list:
+                            for entry in entries_iterable:
                                 if not entry:
                                     continue
                                 vid = entry.get("id")
@@ -584,7 +631,7 @@ class YouTubeClient:
                                         ts = 0
 
                                 if not deep_scan and ts > 0 and ts < cutoff_ts:
-                                    continue
+                                    break
 
                                 uploader = self.get_uploader_id(entry=entry, url_context=url_context_handle)
                                 ch_name = str(entry.get("channel") or entry.get("uploader") or uploader)
@@ -599,8 +646,9 @@ class YouTubeClient:
                                         timestamp=ts,
                                     )
                                 )
+                                url_discovered_count += 1
 
-                            url_span.set_attribute("discovered_count", len(entries_list))
+                            url_span.set_attribute("discovered_count", url_discovered_count)
                         except YouTubeBotDetectionError:
                             url_span.set_attribute("error", "bot_detection")
                             raise
@@ -631,7 +679,7 @@ class YouTubeClient:
         """
         destination_dir.mkdir(parents=True, exist_ok=True)
         ydl_opts = dict(self._base_ydl_opts)
-        ydl_opts["format"] = "bestvideo[height<=360]+bestaudio/best[height<=360]/best"
+        ydl_opts["format"] = "bestvideo[height<=360]+bestaudio/best[height<=360]"
         ydl_opts["outtmpl"] = str(destination_dir / f"%(title).{self.config.max_title_bytes}B [%(id)s].%(ext)s")
 
         try:
@@ -648,9 +696,13 @@ class YouTubeClient:
                     matches = [
                         p
                         for p in destination_dir.glob(f"*{video_id}*.*")
-                        if p.is_file() and not p.name.startswith("part_") and not p.name.endswith(".json")
+                        if p.is_file()
+                        and not p.name.startswith("part_")
+                        and p.suffix.lower() in _VALID_VIDEO_EXTENSIONS
                     ]
                     if matches:
+                        # Prioritize the largest file (e.g. merged stream over unmerged track)
+                        matches.sort(key=lambda p: p.stat().st_size, reverse=True)
                         downloaded_path = matches[0]
                     else:
                         raise RuntimeError(f"Downloaded file not found for {video_id}")

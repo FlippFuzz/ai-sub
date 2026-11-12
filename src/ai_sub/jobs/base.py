@@ -239,7 +239,7 @@ class Prompt(BaseModel):
 
 @dataclass
 class WorkerContext:
-    """Runtime execution dependencies provided by the worker node."""
+    """Runtime execution dependencies provided by the worker node or local runner."""
 
     executor: GeminiExecutor
     media_path: Path
@@ -247,12 +247,12 @@ class WorkerContext:
 
 
 class BaseJob(BaseModel):
-    """Base class for all segment execution tasks."""
+    """Base class for all pipeline execution tasks."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     name: str = Field(
-        description="Unique name identifier for this segment job (e.g., 'part_001').",
+        description="Unique name identifier for this job (e.g., 'part_001' or 'summary').",
     )
     total_attempts: NonNegativeInt = Field(
         default=0,
@@ -275,6 +275,14 @@ class AiJob(BaseJob):
     user_context: str | None = Field(
         default=None,
         description="Resolved user-supplied context string applied during execution.",
+    )
+    media_path: Path | None = Field(
+        default=None,
+        description="Local media path bound to this AI job.",
+    )
+    segment_index: int | None = Field(
+        default=None,
+        description="Segment index if applicable.",
     )
 
     prompt_version_field: ClassVar[str] = ""

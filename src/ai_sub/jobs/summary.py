@@ -12,6 +12,7 @@ from pydantic import (
 )
 from pydantic.json_schema import SkipJsonSchema
 
+from ai_sub.config import RetrySettings, ServiceTier
 from ai_sub.jobs.base import AiJob, CleanTimestamp, Prompt, WorkerContext
 
 SUMMARY_PROMPT_VERSION = 1
@@ -185,6 +186,22 @@ class SummaryJob(AiJob):
         default=SUMMARY_PROMPT_VERSION,
         description="Prompt version employed for this summary response.",
     )
+    model_name: str | None = Field(
+        default=None,
+        description="Optional Gemini model identifier override.",
+    )
+    service_tier: ServiceTier | None = Field(
+        default=None,
+        description="Optional Google Gemini service tier override.",
+    )
+    agentic_video: bool = Field(
+        default=True,
+        description="Whether to enable agentic video exploration.",
+    )
+    retry_settings: RetrySettings | None = Field(
+        default=None,
+        description="Optional task-specific retry settings.",
+    )
     response: SummaryAiResponse | None = Field(
         default=None,
         description="Structured AI output once processed.",
@@ -200,16 +217,21 @@ class SummaryJob(AiJob):
             SummaryAiResponse: Parsed AI summary response.
         """
         prompt = get_summary_prompt(user_context=self.user_context)
+        media = self.media_path or ctx.media_path
+        model = self.model_name or ctx.executor.ai_settings.model_summary
+        tier = self.service_tier if self.service_tier is not None else ctx.executor.ai_settings.service_tier_summary
+
         res = await ctx.executor.run_structured(
             prompt=prompt,
-            media_path=ctx.media_path,
+            media_path=media,
             video_duration_ms=self.video_duration_ms,
             response_type=SummaryAiResponse,
-            model_name=ctx.executor.ai_settings.model_summary,
-            service_tier=ctx.executor.ai_settings.service_tier_summary,
+            model_name=model,
+            service_tier=tier,
             tools=ctx.search_providers,
-            agentic_video=ctx.executor.ai_settings.agentic_video_summary,
+            agentic_video=self.agentic_video,
             task_label="summary",
+            retry_settings=self.retry_settings,
         )
         self.response = res
         self.total_attempts += 1

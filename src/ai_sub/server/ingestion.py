@@ -13,10 +13,10 @@ from typing import Any, Literal
 import logfire
 from pydantic import BaseModel, Field
 
+from ai_sub.server.combo_runner import ComboRunner
 from ai_sub.server.config import SourcesConfig
-from ai_sub.server.coordinator import PipelineCoordinator
+from ai_sub.server.coordinator import ComboRunnersCoordinator
 from ai_sub.server.git_sync import GitSyncManager
-from ai_sub.server.pipeline import ComboPipeline
 from ai_sub.server.youtube import (
     DiscoveredVideo,
     DownloadedVideo,
@@ -73,7 +73,7 @@ class IngestionManager:
     """Orchestrates video intake from watched directories and YouTube feeds."""
 
     config: SourcesConfig
-    coordinator: PipelineCoordinator
+    coordinator: ComboRunnersCoordinator
     git_sync: GitSyncManager
     base_work_dir: Path
     youtube_client: YouTubeClient
@@ -93,7 +93,7 @@ class IngestionManager:
     def __init__(
         self,
         config: SourcesConfig,
-        coordinator: PipelineCoordinator,
+        coordinator: ComboRunnersCoordinator,
         git_sync: GitSyncManager,
         base_work_dir: Path,
     ) -> None:
@@ -101,15 +101,15 @@ class IngestionManager:
 
         Args:
             config: Intake sources configuration containing files and youtube options.
-            coordinator: Pipeline coordinator managing active combinations.
+            coordinator: Combination runners coordinator managing active runners.
             git_sync: Git synchronization manager.
-            base_work_dir: Root working directory for downloads and pipelines.
+            base_work_dir: Root working directory for downloads and runners.
         """
         self.config = config
         self.coordinator = coordinator
         self.git_sync = git_sync
         self.base_work_dir = base_work_dir
-        self.coordinator.on_pipelines_finalized = self.feed_idle_pipelines
+        self.coordinator.on_runners_finalized = self.feed_idle_runners
 
         self.youtube_client = YouTubeClient(config.youtube, base_work_dir)
         self.local_videos = {}
@@ -171,7 +171,7 @@ class IngestionManager:
                 if self._stopped:
                     return
                 logfire.info("YouTube intake cooldown expired. Resuming YouTube job feeding...")
-                await self.feed_idle_pipelines()
+                await self.feed_idle_runners()
             except asyncio.CancelledError:
                 pass
 
@@ -239,7 +239,6 @@ class IngestionManager:
         async with self._scan_lock:
             discovered = await asyncio.to_thread(self._scan_watch_folders)
 
-            # Update self.local_videos synchronously on the main event loop
             for vid, item in discovered.items():
                 if vid not in self.local_videos:
                     self.local_videos[vid] = QueuedVideo(
@@ -259,7 +258,6 @@ class IngestionManager:
                     existing.uploader = item.uploader
                     existing.channel_name = item.channel_name
 
-            # Remove deleted local files
             for vid in set(self.local_videos.keys()) - set(discovered.keys()):
                 self.local_videos.pop(vid, None)
 
@@ -289,7 +287,6 @@ class IngestionManager:
                 self._trigger_youtube_cooldown(reason=str(e))
                 return list(self.youtube_videos.values())
 
-            # Update self.youtube_videos synchronously on the main event loop
             discovered_new = 0
             for item in discovered:
                 if item.video_id not in self.youtube_videos:
@@ -340,7 +337,7 @@ class IngestionManager:
 
         Args:
             video: Discovered video metadata.
-            combo_work_dir: Working directory of the target pipeline.
+            combo_work_dir: Working directory of the target combination runner.
 
         Returns:
             Path: Filesystem path to the downloaded media file.
@@ -357,18 +354,17 @@ class IngestionManager:
 
         with logfire.span("Downloading YouTube Video to {job_dir}: {title}", job_dir=job_dir.name, title=video.title):
             downloaded = await asyncio.to_thread(_do_download)
-            # Update uploader and channel name safely on the main event loop
             if downloaded.uploader and downloaded.uploader.lower() != "youtube":
                 video.uploader = downloaded.uploader
             if downloaded.channel_name:
                 video.channel_name = downloaded.channel_name
             return downloaded.file_path
 
-    def _get_pipeline_queue(self, pipeline: ComboPipeline) -> dict[str, Any]:
-        """Gathers outstanding queued videos for a given pipeline with total count and top 50 items.
+    def _get_runner_queue(self, runner: ComboRunner) -> dict[str, Any]:
+        """Gathers outstanding queued videos for a given runner with total count and top 50 items.
 
         Args:
-            pipeline: Combination pipeline instance.
+            runner: Combination runner instance.
 
         Returns:
             dict[str, Any]: Dictionary containing 'total_count' and top 50 'items'.
@@ -378,17 +374,17 @@ class IngestionManager:
         now = time()
 
         for v in candidates:
-            if pipeline.active_video and pipeline.active_video.video_id == v.video_id:
+            if runner.active_video and runner.active_video.video_id == v.video_id:
                 continue
 
-            if pipeline.preparing_video_info and pipeline.preparing_video_info.get("video_id") == v.video_id:
+            if runner.preparing_video_info and runner.preparing_video_info.get("video_id") == v.video_id:
                 continue
 
             if v.uploader.lower() == "youtube":
-                if known := self.git_sync.get_completed_uploader(v.video_id, pipeline.full_shortcode):
+                if known := self.git_sync.get_completed_uploader(v.video_id, runner.full_shortcode):
                     v.uploader = known
 
-            if not self.git_sync.is_video_completed(v.video_id, pipeline.full_shortcode):
+            if not self.git_sync.is_video_completed(v.video_id, runner.full_shortcode):
                 retry_in_s = max(0, int(v.retry_after - now)) if v.retry_after and v.retry_after > now else None
                 outstanding.append(
                     {
@@ -412,22 +408,22 @@ class IngestionManager:
             "items": outstanding[:50],
         }
 
-    def get_all_pipeline_queues(self) -> dict[str, dict[str, Any]]:
-        """Computes outstanding queues for all active pipelines without network calls.
+    def get_all_runner_queues(self) -> dict[str, dict[str, Any]]:
+        """Computes outstanding queues for all active runners without network calls.
 
         Returns:
-            dict[str, dict[str, Any]]: Mapping of pipeline names to their queue dictionaries.
+            dict[str, dict[str, Any]]: Mapping of runner names to their queue dictionaries.
         """
-        return {name: self._get_pipeline_queue(pipe) for name, pipe in self.coordinator.pipelines.items()}
+        return {name: self._get_runner_queue(runner) for name, runner in self.coordinator.runners.items()}
 
-    async def feed_idle_pipelines(self) -> None:
-        """Assigns the newest available video to each idle pipeline."""
+    async def feed_idle_runners(self) -> None:
+        """Assigns the newest available video to each idle runner."""
         if self._stopped:
             return
 
         async with self._feed_lock:
-            idle_pipelines = [p for p in self.coordinator.pipelines.values() if p.is_idle()]
-            if not idle_pipelines:
+            idle_runners = [r for r in self.coordinator.runners.values() if r.is_idle()]
+            if not idle_runners:
                 return
 
             if not self.local_videos and not self.youtube_videos:
@@ -435,7 +431,7 @@ class IngestionManager:
 
             now = time()
 
-            for pipe in idle_pipelines:
+            for runner in idle_runners:
                 candidates: list[QueuedVideo] = list(self.local_videos.values())
                 if not self._is_youtube_in_cooldown():
                     candidates.extend(self.youtube_videos.values())
@@ -446,10 +442,10 @@ class IngestionManager:
 
                 for v in candidates:
                     if v.uploader.lower() == "youtube":
-                        if known := self.git_sync.get_completed_uploader(v.video_id, pipe.full_shortcode):
+                        if known := self.git_sync.get_completed_uploader(v.video_id, runner.full_shortcode):
                             v.uploader = known
 
-                    if self.git_sync.is_video_completed(v.video_id, pipe.full_shortcode):
+                    if self.git_sync.is_video_completed(v.video_id, runner.full_shortcode):
                         completed_in_git += 1
                     elif v.retry_after is not None and now < v.retry_after:
                         in_cooldown += 1
@@ -469,17 +465,17 @@ class IngestionManager:
                         summary_key = f"{len(candidates)}:{reason_str}"
 
                         msg = (
-                            f"Pipeline '{pipe.config.name}' is idle: 0 pending videos "
+                            f"Runner '{runner.config.name}' is idle: 0 pending videos "
                             f"({len(candidates)} tracked: {reason_str})."
                         )
-                        if self._last_idle_summary.get(pipe.config.name) != summary_key:
-                            self._last_idle_summary[pipe.config.name] = summary_key
+                        if self._last_idle_summary.get(runner.config.name) != summary_key:
+                            self._last_idle_summary[runner.config.name] = summary_key
                             logfire.info(msg)
                         else:
                             logfire.debug(msg)
                     continue
 
-                self._last_idle_summary.pop(pipe.config.name, None)
+                self._last_idle_summary.pop(runner.config.name, None)
 
                 consecutive_download_failures = 0
                 max_failures = self.config.youtube.max_download_failures
@@ -496,18 +492,24 @@ class IngestionManager:
                             video.retry_after = now + 120
                             continue
 
-                        pipe.set_preparing(
+                        acquired = await self.coordinator.acquire_idle_runner(
+                            runner_name=runner.config.name,
                             video_id=video.video_id,
                             title=video.title,
                             uploader=video.uploader,
                             channel_name=video.channel_name,
                             source_type="local",
                         )
+                        if not acquired:
+                            # Runner is no longer idle; move to next runner
+                            break
+
                         try:
                             logfire.info(
-                                f"Feeding '{pipe.config.name}' with local file '{video.title}' ({video.video_id})."
+                                f"Feeding '{runner.config.name}' with local file '{video.title}' ({video.video_id})."
                             )
-                            await pipe.prepare_and_set_video(
+                            await self.coordinator.assign_prepared_video(
+                                runner_name=runner.config.name,
                                 video_id=video.video_id,
                                 uploader=video.uploader,
                                 title=video.title,
@@ -519,81 +521,97 @@ class IngestionManager:
                             fed = True
                             break
                         except Exception as e:
-                            pipe.clear_preparing()
-                            shutil.rmtree(pipe.work_dir / video.video_id, ignore_errors=True)
+                            await self.coordinator.release_preparing_runner(runner.config.name)
+                            shutil.rmtree(runner.work_dir / video.video_id, ignore_errors=True)
                             logfire.warning(
-                                f"Failed to prepare local video '{video.title}' for '{pipe.config.name}': {e}"
+                                f"Failed to prepare local video '{video.title}' for '{runner.config.name}': {e}"
                             )
                             video.status = "failed"
                             video.error_reason = f"Preparation error: {e}"
                             video.retry_after = now + 120
                             continue
 
-                    pipe.set_preparing(
-                        video_id=video.video_id,
-                        title=video.title,
-                        uploader=video.uploader,
-                        channel_name=video.channel_name,
-                        source_type="youtube",
-                    )
-
-                    try:
-                        media_path = await self._download_youtube_to_combo_dir(video, pipe.work_dir)
-                        video.status = "ready"
-                        video.error_reason = None
-                        video.retry_after = None
-
-                        logfire.info(f"Feeding '{pipe.config.name}' with '{video.title}' ({video.video_id}).")
-                        await pipe.prepare_and_set_video(
+                    elif video.source_type == "youtube":
+                        acquired = await self.coordinator.acquire_idle_runner(
+                            runner_name=runner.config.name,
                             video_id=video.video_id,
-                            uploader=video.uploader,
                             title=video.title,
-                            raw_video_path=media_path,
+                            uploader=video.uploader,
                             channel_name=video.channel_name,
                             source_type="youtube",
-                            timestamp=video.timestamp,
                         )
-                        fed = True
-                        break
-
-                    except YouTubeVideoUnavailableError as e:
-                        pipe.clear_preparing()
-                        shutil.rmtree(pipe.work_dir / video.video_id, ignore_errors=True)
-                        video.status = "unplayable"
-                        video.error_reason = e.reason
-                        video.retry_after = now + (24 * 3600)
-                        video.failure_count += 1
-                        logfire.warning(f"Video '{video.title}' is unplayable ({e.reason}). Retrying in 24h.")
-                        continue
-
-                    except YouTubeBotDetectionError as e:
-                        pipe.clear_preparing()
-                        shutil.rmtree(pipe.work_dir / video.video_id, ignore_errors=True)
-                        self._trigger_youtube_cooldown(reason=str(e))
-                        break
-
-                    except Exception as e:
-                        pipe.clear_preparing()
-                        err_msg = str(e)
-                        shutil.rmtree(pipe.work_dir / video.video_id, ignore_errors=True)
-                        video.status = "failed"
-                        video.error_reason = "Download failed"
-                        video.retry_after = now + (30 * 60)
-                        video.failure_count += 1
-                        consecutive_download_failures += 1
-                        logfire.warning(
-                            f"Download failed for '{video.title}' "
-                            f"({consecutive_download_failures}/{max_failures}): {err_msg}"
-                        )
-
-                        if consecutive_download_failures >= max_failures:
-                            self._trigger_youtube_cooldown(
-                                reason=f"{consecutive_download_failures} consecutive download failures"
-                            )
+                        if not acquired:
+                            # Runner is no longer idle; move to next runner
                             break
 
+                        # 1. Download YouTube video
+                        try:
+                            media_path = await self._download_youtube_to_combo_dir(video, runner.work_dir)
+                            video.status = "ready"
+                            video.error_reason = None
+                            video.retry_after = None
+                        except YouTubeVideoUnavailableError as e:
+                            await self.coordinator.release_preparing_runner(runner.config.name)
+                            shutil.rmtree(runner.work_dir / video.video_id, ignore_errors=True)
+                            video.status = "unplayable"
+                            video.error_reason = e.reason
+                            video.retry_after = now + (24 * 3600)
+                            video.failure_count += 1
+                            logfire.warning(f"Video '{video.title}' is unplayable ({e.reason}). Retrying in 24h.")
+                            continue
+                        except YouTubeBotDetectionError as e:
+                            await self.coordinator.release_preparing_runner(runner.config.name)
+                            shutil.rmtree(runner.work_dir / video.video_id, ignore_errors=True)
+                            self._trigger_youtube_cooldown(reason=str(e))
+                            break
+                        except Exception as e:
+                            await self.coordinator.release_preparing_runner(runner.config.name)
+                            err_msg = str(e)
+                            shutil.rmtree(runner.work_dir / video.video_id, ignore_errors=True)
+                            video.status = "failed"
+                            video.error_reason = "Download failed"
+                            video.retry_after = now + (30 * 60)
+                            video.failure_count += 1
+                            consecutive_download_failures += 1
+                            logfire.warning(
+                                f"Download failed for '{video.title}' "
+                                f"({consecutive_download_failures}/{max_failures}): {err_msg}"
+                            )
+                            if consecutive_download_failures >= max_failures:
+                                self._trigger_youtube_cooldown(
+                                    reason=f"{consecutive_download_failures} consecutive download failures"
+                                )
+                                break
+                            continue
+
+                        # 2. Prepare media and assign video to runner
+                        try:
+                            logfire.info(f"Feeding '{runner.config.name}' with '{video.title}' ({video.video_id}).")
+                            await self.coordinator.assign_prepared_video(
+                                runner_name=runner.config.name,
+                                video_id=video.video_id,
+                                uploader=video.uploader,
+                                title=video.title,
+                                raw_video_path=media_path,
+                                channel_name=video.channel_name,
+                                source_type="youtube",
+                                timestamp=video.timestamp,
+                            )
+                            fed = True
+                            break
+                        except Exception as e:
+                            await self.coordinator.release_preparing_runner(runner.config.name)
+                            shutil.rmtree(runner.work_dir / video.video_id, ignore_errors=True)
+                            logfire.warning(
+                                f"Failed to prepare YouTube video '{video.title}' for '{runner.config.name}': {e}"
+                            )
+                            video.status = "failed"
+                            video.error_reason = f"Preparation error: {e}"
+                            video.retry_after = now + 120
+                            continue
+
                 if not fed:
-                    pipe.clear_preparing()
+                    await self.coordinator.release_preparing_runner(runner.config.name)
 
     async def start(self) -> None:
         """Starts the ingestion manager with an initial scan, followed by periodic delta intake loops."""
@@ -601,7 +619,7 @@ class IngestionManager:
         self._loop = asyncio.get_running_loop()
         await self._scan_watch_folders_async()
         await self._scan_youtube_sources_async(deep_scan=True)
-        await self.feed_idle_pipelines()
+        await self.feed_idle_runners()
 
         self._files_rescan_task = asyncio.create_task(self._periodic_files_loop())
         self._youtube_rescan_task = asyncio.create_task(self._periodic_youtube_loop())
@@ -638,8 +656,8 @@ class IngestionManager:
             try:
                 logfire.debug("Running periodic watch folder scan...")
                 await self._scan_watch_folders_async()
-                await self.coordinator.check_and_finalize_completed_pipelines()
-                await self.feed_idle_pipelines()
+                await self.coordinator.check_and_finalize_completed_runners()
+                await self.feed_idle_runners()
             except Exception as e:
                 logfire.warning(f"Error during periodic watch folder scan: {e}")
 
@@ -650,7 +668,7 @@ class IngestionManager:
             jitter_sec = max(0.0, self.config.youtube.rescan_jitter_minutes * 60.0)
             delay_sec = max(5.0, base_sec + random.uniform(-jitter_sec, jitter_sec))
 
-            logfire.debug(f"Next YouTube delta rescan scheduled in {delay_sec / 60:.1f} minutes ")
+            logfire.debug(f"Next YouTube delta rescan scheduled in {delay_sec / 60:.1f} minutes")
             await asyncio.sleep(delay_sec)
             if self._stopped:
                 break
@@ -658,7 +676,7 @@ class IngestionManager:
             try:
                 logfire.debug("Running periodic YouTube delta scan...")
                 await self._scan_youtube_sources_async(deep_scan=False)
-                await self.coordinator.check_and_finalize_completed_pipelines()
-                await self.feed_idle_pipelines()
+                await self.coordinator.check_and_finalize_completed_runners()
+                await self.feed_idle_runners()
             except Exception as e:
                 logfire.warning(f"Error during periodic YouTube rescan: {e}")

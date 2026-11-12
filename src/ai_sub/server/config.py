@@ -106,7 +106,7 @@ class GitConfig(BaseSettings):
             ValueError: If repo_url is configured without pat.
         """
         if self.repo_url is not None and not self.pat:
-            raise ValueError("Git pat must be provided when repo_url is configured.")
+            raise ValueError("Git pat must be provided via AISUB_SERVER_GIT_PAT when repo_url is configured.")
         return self
 
     def get_pat_value(self) -> str:
@@ -250,6 +250,10 @@ class ServerOptions(BaseSettings):
         default=50,
         description="Maximum number of recent worker activity events preserved per combination pipeline.",
     )
+    reencode_concurrency: PositiveInt = Field(
+        default=1,
+        description="Maximum concurrent FFmpeg re-encoding processes across all combination runners.",
+    )
 
 
 def _get_default_pipelines() -> list[PipelineConfig]:
@@ -311,15 +315,10 @@ class ServerSettings(YamlFileSettings):
 
         Returns:
             Any: Updated input data dictionary.
-
-        Raises:
-            ValueError: If repo_url is configured in env or .env without pat.
         """
         if isinstance(values, dict) and values.get("git") is None:
             git_cfg = GitConfig()
             if git_cfg.repo_url is not None:
-                if not git_cfg.pat:
-                    raise ValueError("Git pat must be provided via AISUB_SERVER_GIT_PAT when repo_url is configured.")
                 values["git"] = git_cfg
         return values
 

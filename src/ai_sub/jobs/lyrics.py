@@ -8,6 +8,7 @@ from typing import ClassVar
 import logfire
 from pydantic import Field
 
+from ai_sub.config import RetrySettings, ServiceTier
 from ai_sub.jobs.base import (
     Prompt,
     WorkerContext,
@@ -250,6 +251,22 @@ class LyricsJob(BaseSubtitleJob):
         default_factory=list,
         description="Detected singing performances in this segment.",
     )
+    model_name: str | None = Field(
+        default=None,
+        description="Optional Gemini model identifier override.",
+    )
+    service_tier: ServiceTier | None = Field(
+        default=None,
+        description="Optional Google Gemini service tier override.",
+    )
+    agentic_video: bool = Field(
+        default=True,
+        description="Whether to enable agentic video exploration.",
+    )
+    retry_settings: RetrySettings | None = Field(
+        default=None,
+        description="Optional task-specific retry settings.",
+    )
     response: LyricsAiResponse | None = Field(
         default=None,
         description="Structured AI output once refined.",
@@ -279,16 +296,21 @@ class LyricsJob(BaseSubtitleJob):
             segment_duration_ms=self.video_duration_ms,
         )
 
+        media = self.media_path or ctx.media_path
+        model = self.model_name or ctx.executor.ai_settings.model_lyrics
+        tier = self.service_tier if self.service_tier is not None else ctx.executor.ai_settings.service_tier_lyrics
+
         res = await ctx.executor.run_structured(
             prompt=prompt,
-            media_path=ctx.media_path,
+            media_path=media,
             video_duration_ms=self.video_duration_ms,
             response_type=LyricsAiResponse,
-            model_name=ctx.executor.ai_settings.model_lyrics,
-            service_tier=ctx.executor.ai_settings.service_tier_lyrics,
+            model_name=model,
+            service_tier=tier,
             tools=ctx.search_providers,
-            agentic_video=ctx.executor.ai_settings.agentic_video_lyrics,
+            agentic_video=self.agentic_video,
             task_label="lyrics",
+            retry_settings=self.retry_settings,
         )
         self.response = res
         self.total_attempts += 1

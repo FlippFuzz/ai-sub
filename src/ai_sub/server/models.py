@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from ai_sub.config import RetrySettings
 from ai_sub.jobs.subtitles import DetectedMusicalPerformance, Subtitles
 from ai_sub.jobs.summary import SummaryAiResponse
-from ai_sub.pipeline_session import PipelineSession
+from ai_sub.pipeline import Pipeline
 from ai_sub.protocol import TaskClaimResponse, TaskType
 
 
@@ -107,16 +107,9 @@ class ActiveVideo(BaseModel):
     job_dir: Path = Field(description="Subdirectory containing all files for this video job.")
     raw_path: Path = Field(description="Filesystem path to the original raw video.")
     duration_ms: int = Field(description="Total video duration in milliseconds.")
-    summary_proxy_path: Path | None = Field(default=None, description="Path to the whole-video summary proxy.")
-    segment_paths: list[Path] = Field(default_factory=list, description="Ordered paths to 5-minute chunk files.")
-    reencoded_segment_paths: dict[int, Path] = Field(
-        default_factory=dict,
-        description="Mapping of segment indices to their compressed low-bitrate media files.",
-    )
-    segment_durations_ms: list[int] = Field(default_factory=list, description="Durations for each 5-minute chunk.")
-    session: PipelineSession | None = Field(
+    pipeline: Pipeline | None = Field(
         default=None,
-        description="Active pipeline state machine session managing this video.",
+        description="Active pipeline state machine managing this video.",
     )
 
 

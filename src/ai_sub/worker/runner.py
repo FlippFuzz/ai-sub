@@ -10,22 +10,14 @@ from time import time
 from typing import Any, Callable, cast
 
 import logfire
-from pydantic import BaseModel
 
 from ai_sub.config import AiSettings, ServiceTier
 from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError, is_retryable_error
-from ai_sub.jobs.lyrics import (
-    LyricsAiResponse,
-    get_lyrics_prompt,
-    prefetch_lyrics,
-)
-from ai_sub.jobs.subtitles import (
-    SubtitlesAiResponse,
-    get_subtitles_prompt,
-)
-from ai_sub.jobs.summary import (
-    SummaryAiResponse,
-    get_summary_prompt,
+from ai_sub.jobs import (
+    LyricsJob,
+    SubtitlesJob,
+    SummaryJob,
+    WorkerContext,
 )
 from ai_sub.protocol import TaskClaimResponse, TaskType
 from ai_sub.search import BaseSearchProvider, create_search_providers
@@ -134,7 +126,6 @@ class WorkerRunner:
         interval = self.settings.heartbeat_interval_seconds
         hb_num = 0
 
-        # Wrap all heartbeats under a single collapsible debug span
         with logfire.span("Heartbeats", task_id=task_id, _level="debug"):
             while not stop_event.is_set():
                 try:
@@ -161,82 +152,13 @@ class WorkerRunner:
                                 on_lease_rejected()
                                 break
 
-    async def _run_inference(
-        self,
-        task: TaskClaimResponse,
-        executor: GeminiExecutor,
-        chunk_path: Path,
-        search_providers: list[BaseSearchProvider],
-    ) -> dict[str, Any]:
-        """Runs Gemini multimodal inference using domain prompt builders and returns structured output.
-
-        Args:
-            task: Assigned task details from the server.
-            executor: Configured Gemini executor.
-            chunk_path: Local path to the media chunk file.
-            search_providers: Active search provider instances.
-
-        Returns:
-            dict[str, Any]: Validated output data dictionary.
-
-        Raises:
-            ValueError: If target task type is unknown.
-        """
-        active_tools = [p for p in search_providers if p.provider_name in task.search_tools]
-
-        if task.task_type == TaskType.SUMMARY:
-            prompt = get_summary_prompt(user_context=task.user_context)
-            response_cls: type[BaseModel] = SummaryAiResponse
-        elif task.task_type == TaskType.SUBTITLES:
-            prompt = get_subtitles_prompt(
-                user_context=task.user_context,
-                global_summary=task.global_summary,
-                segment_offset_ms=task.segment_offset_ms,
-                segment_duration_ms=task.video_duration_ms,
-            )
-            response_cls = SubtitlesAiResponse
-        elif task.task_type == TaskType.LYRICS:
-            prefetched = ""
-            if task.detected_performances:
-                try:
-                    prefetched = await prefetch_lyrics(task.detected_performances, active_tools)
-                except Exception as e:
-                    logfire.warning(f"Worker lyrics pre-fetch error: {e}")
-
-            prompt = get_lyrics_prompt(
-                draft_subtitles=task.draft_subtitles,
-                detected_performances=task.detected_performances,
-                initial_search_results=prefetched,
-                user_context=task.user_context,
-                global_summary=task.global_summary,
-                segment_offset_ms=task.segment_offset_ms,
-                segment_duration_ms=task.video_duration_ms,
-            )
-            response_cls = LyricsAiResponse
-        else:
-            raise ValueError(f"Unknown task type: '{task.task_type}'")
-
-        res = await executor.run_structured(
-            prompt=prompt,
-            media_path=chunk_path,
-            video_duration_ms=task.video_duration_ms,
-            response_type=response_cls,
-            model_name=task.model,
-            service_tier=cast(ServiceTier | None, task.service_tier),
-            tools=active_tools if active_tools and task.task_type != TaskType.SUBTITLES else None,
-            agentic_video=task.agentic_video,
-            task_label=task.task_type.value,
-            retry_settings=task.retry,
-        )
-        return res.model_dump(mode="json")
-
     async def _execute_task(
         self,
         task: TaskClaimResponse,
         executor: GeminiExecutor,
         search_providers: list[BaseSearchProvider],
     ) -> dict[str, Any]:
-        """Downloads media, runs GeminiExecutor with lease-revocation monitoring, and returns validated output.
+        """Downloads media, runs the canonical Job instance, and returns validated output.
 
         Args:
             task: Assigned task details from the server including retry policy.
@@ -249,6 +171,7 @@ class WorkerRunner:
         Raises:
             asyncio.CancelledError: If task execution is cancelled while waiting for download or inference.
             LeaseRevokedError: If the server rejects task lease during download or inference.
+            ValueError: If task type is unknown.
         """
         raw_name = Path(task.media_url).name
         if not Path(raw_name).suffix:
@@ -292,16 +215,66 @@ class WorkerRunner:
             if lease_revoked.is_set():
                 raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected before inference started.")
 
-            # 2. Run inference under lease-revocation monitoring
-            current_coro = self._run_inference(task, executor, chunk_path, search_providers)
-            inference_task = asyncio.create_task(current_coro)
+            # 2. Construct canonical Job and execute under lease-revocation monitoring
+            active_tools = [p for p in search_providers if p.provider_name in task.search_tools]
+            ctx = WorkerContext(
+                executor=executor,
+                media_path=chunk_path,
+                search_providers=active_tools,
+            )
+
+            if task.task_type == TaskType.SUMMARY:
+                job = SummaryJob(
+                    name="summary",
+                    video_duration_ms=task.video_duration_ms,
+                    user_context=task.user_context,
+                    media_path=chunk_path,
+                    model_name=task.model,
+                    service_tier=cast(ServiceTier | None, task.service_tier),
+                    agentic_video=task.agentic_video,
+                    retry_settings=task.retry,
+                )
+            elif task.task_type == TaskType.SUBTITLES:
+                job = SubtitlesJob(
+                    name=task.task_id,
+                    video_duration_ms=task.video_duration_ms,
+                    segment_offset_ms=task.segment_offset_ms,
+                    global_summary=task.global_summary,
+                    user_context=task.user_context,
+                    media_path=chunk_path,
+                    model_name=task.model,
+                    service_tier=cast(ServiceTier | None, task.service_tier),
+                    agentic_video=task.agentic_video,
+                    retry_settings=task.retry,
+                )
+            elif task.task_type == TaskType.LYRICS:
+                job = LyricsJob(
+                    name=task.task_id,
+                    video_duration_ms=task.video_duration_ms,
+                    segment_offset_ms=task.segment_offset_ms,
+                    draft_subtitles=task.draft_subtitles,
+                    detected_performances=task.detected_performances,
+                    global_summary=task.global_summary,
+                    user_context=task.user_context,
+                    media_path=chunk_path,
+                    model_name=task.model,
+                    service_tier=cast(ServiceTier | None, task.service_tier),
+                    agentic_video=task.agentic_video,
+                    retry_settings=task.retry,
+                )
+            else:
+                raise ValueError(f"Unknown task type: '{task.task_type}'")
+
+            inference_task = asyncio.create_task(job.execute(ctx))
             active_subtask = inference_task
             try:
-                return await inference_task
+                res = await inference_task
+                return res.model_dump(mode="json")
             except asyncio.CancelledError:
                 if lease_revoked.is_set():
                     raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected during inference.")
                 raise
+
         finally:
             stop_heartbeat.set()
             try:
@@ -384,7 +357,6 @@ class WorkerRunner:
                 logfire.warning(f"[{slot_label}] {e}")
 
             except asyncio.CancelledError:
-                # Distinguish slot task cancellation (Ctrl-C/shutdown) from inference subtask lease revocation
                 current = asyncio.current_task()
                 if current is not None and current.cancelling():
                     raise

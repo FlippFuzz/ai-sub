@@ -1,6 +1,7 @@
 """Server coordinator module for distributed AI Sub execution."""
 
 from ai_sub.server.app import create_app
+from ai_sub.server.combo_runner import ComboRunner, RunnerStatus
 from ai_sub.server.config import (
     FilesSourceConfig,
     GitConfig,
@@ -10,7 +11,7 @@ from ai_sub.server.config import (
     SourcesConfig,
     YoutubeSourceConfig,
 )
-from ai_sub.server.coordinator import PipelineCoordinator
+from ai_sub.server.coordinator import ComboRunnersCoordinator
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.ingestion import IngestionManager, QueuedVideo
 from ai_sub.server.models import (
@@ -19,7 +20,6 @@ from ai_sub.server.models import (
     ServerTask,
     TaskStatus,
 )
-from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
 from ai_sub.server.youtube import (
     DiscoveredVideo,
     DownloadedVideo,
@@ -32,7 +32,8 @@ from ai_sub.server.youtube import (
 __all__ = [
     "ActiveVideo",
     "ActivityEvent",
-    "ComboPipeline",
+    "ComboRunner",
+    "ComboRunnersCoordinator",
     "DiscoveredVideo",
     "DownloadedVideo",
     "FilesSourceConfig",
@@ -40,9 +41,8 @@ __all__ = [
     "GitSyncManager",
     "IngestionManager",
     "PipelineConfig",
-    "PipelineCoordinator",
-    "PipelineStatus",
     "QueuedVideo",
+    "RunnerStatus",
     "ServerOptions",
     "ServerSettings",
     "ServerTask",

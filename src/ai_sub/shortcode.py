@@ -14,11 +14,11 @@ from ai_sub.jobs.summary import SUMMARY_PROMPT_VERSION
 def generate_model_shortcode(model_name: str) -> str:
     """Generates an ultra-compact filename shortcode for a model identifier.
 
-    Transforms Gemini models into 'g<version><tier>[variant]' (e.g., 'g38f', 'g37f', 'g35l').
+    Transforms Gemini models into 'g<version><tier>[variant]' (e.g., 'g4c', 'g4a', 'g38f', 'g37f', 'g35l').
     Non-Gemini models are sanitized to safe kebab-case strings.
 
     Args:
-        model_name: Model identifier (e.g., 'google-gla:gemini-3.8-flash').
+        model_name: Model identifier (e.g., 'google-gla:gemini-4-carbon', 'google-gla:gemini-3.8-flash').
 
     Returns:
         str: Sanitized shortcode string.
@@ -33,7 +33,14 @@ def generate_model_shortcode(model_name: str) -> str:
     rem = rem[v_match.end() :].lstrip("-_") if v_match else rem
 
     tier = "g"
-    for name, code in (("flash-lite", "l"), ("lite", "l"), ("flash", "f"), ("pro", "p")):
+    for name, code in (
+        ("carbon", "c"),
+        ("argon", "a"),
+        ("flash-lite", "l"),
+        ("lite", "l"),
+        ("flash", "f"),
+        ("pro", "p"),
+    ):
         if rem.startswith(name):
             tier = code
             rem = rem[len(name) :].lstrip("-_")
@@ -55,7 +62,7 @@ def generate_summary_shortcode(
         summary_prompt_version: Prompt version number. Defaults to SUMMARY_PROMPT_VERSION.
 
     Returns:
-        str: Tag formatted as '<model_code>-<summary_v>' (e.g., 'g35l-01').
+        str: Tag formatted as '<model_code>-<summary_v>' (e.g., 'g4a-01', 'g35l-01').
     """
     return f"{generate_model_shortcode(model_name)}-{summary_prompt_version:02d}"
 
@@ -112,7 +119,7 @@ def generate_full_shortcode(
         subtitles_prompt_version: Subtitle prompt version number. Defaults to SUBTITLES_PROMPT_VERSION.
 
     Returns:
-        str: Tag formatted as '<model_code>-<summary_v><lyrics_v><sub_v>' (e.g., 'g38f-011019').
+        str: Tag formatted as '<model_code>-<summary_v><lyrics_v><sub_v>' (e.g., 'g4c-011019', 'g38f-011019').
     """
     code = generate_model_shortcode(model_name)
     return f"{code}-{summary_prompt_version:02d}{lyrics_prompt_version:02d}{subtitles_prompt_version:02d}"
@@ -140,8 +147,8 @@ class SubtitleTrackInfo:
 
         Hierarchy:
         1. is_refined (1 for refined/primary, 0 for raw .int/)
-        2. tier_rank (Pro=3 > Flash=2 > Flash-Lite=1 > Other=0)
-        3. version_tuple (e.g., (3, 10) > (3, 9) > (3, 8) > (3, 7))
+        2. tier_rank (Carbon=5 > Argon=4 > Pro=3 > Flash=2 > Flash-Lite=1 > Other=0)
+        3. version_tuple (e.g., (4, 0) > (3, 10) > (3, 9) > (3, 8) > (3, 7))
         4. subtitles_version (higher prompt version)
         5. lyrics_version (higher prompt version)
         6. summary_version (higher prompt version)
@@ -162,8 +169,8 @@ class SubtitleTrackInfo:
 def parse_subtitle_track(path_or_name: str | Path) -> SubtitleTrackInfo:
     """Parses model, prompt lineage, refinement status, and ranking metadata from a subtitle filename or path.
 
-    Handles standard full shortcodes (e.g., 'g38f-011019'), legacy shortcodes without summary stages
-    (e.g., 'g35f-0918'), raw dialogue-only tracks (e.g., 'raw-g38f-011019' or '.int/...'), and multi-stage
+    Handles standard full shortcodes (e.g., 'g4c-011019', 'g38f-011019'), legacy shortcodes without summary stages
+    (e.g., 'g35f-0918'), raw dialogue-only tracks (e.g., 'raw-g4c-011019' or '.int/...'), and multi-stage
     lineage strings by taking the final model stage.
 
     Args:
@@ -185,7 +192,7 @@ def parse_subtitle_track(path_or_name: str | Path) -> SubtitleTrackInfo:
     if leaf.endswith(".srt"):
         leaf = leaf[:-4]
 
-    # Extract shortcode suffix from filename (e.g. 'Title [id].g38f-011019' or 'Title.raw-g38f-011019')
+    # Extract shortcode suffix from filename (e.g. 'Title [id].g4c-011019' or 'Title.raw-g4c-011019')
     if ".raw-" in leaf:
         leaf = leaf.split(".raw-")[-1]
     elif leaf.startswith("raw-"):
@@ -193,7 +200,7 @@ def parse_subtitle_track(path_or_name: str | Path) -> SubtitleTrackInfo:
     elif "." in leaf:
         leaf = leaf.split(".")[-1]
 
-    # If an intermediate lineage shortcode is encountered (e.g. 'g35l-01_g38f-19'), evaluate the final stage
+    # If an intermediate lineage shortcode is encountered (e.g. 'g4a-01_g4c-19'), evaluate the final stage
     if "_" in leaf:
         leaf = leaf.split("_")[-1]
 
@@ -222,9 +229,15 @@ def parse_subtitle_track(path_or_name: str | Path) -> SubtitleTrackInfo:
     elif len(prompt_digits) == 2:
         subtitles_v = int(prompt_digits[-2:])
 
-    # Decompose model code (e.g. 'g38f', 'g37f', 'g36f', 'g35l', 'g310f', 'g30p', 'g3p')
-    tier_map = {"p": ("pro", 3), "f": ("flash", 2), "l": ("flash-lite", 1)}
-    match = re.match(r"^g(\d+)([lfp])(.*)$", model_code.lower())
+    # Decompose model code (e.g. 'g4c', 'g4a', 'g38f', 'g37f', 'g36f', 'g35l', 'g310f', 'g30p', 'g3p')
+    tier_map = {
+        "c": ("carbon", 5),
+        "a": ("argon", 4),
+        "p": ("pro", 3),
+        "f": ("flash", 2),
+        "l": ("flash-lite", 1),
+    }
+    match = re.match(r"^g(\d+)([lfpca])(.*)$", model_code.lower())
 
     if match:
         v_code = match.group(1)

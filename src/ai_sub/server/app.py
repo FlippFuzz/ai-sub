@@ -21,7 +21,7 @@ from ai_sub.protocol import (
     TaskHeartbeatResponse,
 )
 from ai_sub.server.config import ServerSettings
-from ai_sub.server.coordinator import PipelineCoordinator
+from ai_sub.server.coordinator import ComboRunnersCoordinator
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.ingestion import IngestionManager
 from ai_sub.telemetry import get_app_version
@@ -39,7 +39,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
         FastAPI: Configured FastAPI application instance.
     """
     git_sync = GitSyncManager(settings.git, settings.server.work_dir)
-    coordinator = PipelineCoordinator(settings, git_sync=git_sync)
+    coordinator = ComboRunnersCoordinator(settings, git_sync=git_sync)
     ingestion = IngestionManager(settings.sources, coordinator, git_sync, settings.server.work_dir)
     background_tasks: set[asyncio.Task[Any]] = set()
 
@@ -87,16 +87,16 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
     @app.get("/api/v1/dashboard/data")
     async def get_dashboard_data() -> dict[str, Any]:
-        """Returns live dashboard telemetry, active pipelines, queue, and recent event logs.
+        """Returns live dashboard telemetry, active runners, queue, and recent event logs.
 
         Returns:
             dict[str, Any]: Complete dashboard state dictionary.
         """
-        pipeline_queues = ingestion.get_all_pipeline_queues()
+        runner_queues = ingestion.get_all_runner_queues()
         cooldown_info = ingestion.get_youtube_cooldown_info()
         total_tracked = len(ingestion.local_videos) + len(ingestion.youtube_videos)
         return coordinator.get_dashboard_data(
-            pipeline_queues=pipeline_queues,
+            pipeline_queues=runner_queues,
             youtube_cooldown=cooldown_info,
             total_tracked_videos=total_tracked,
         )
@@ -213,9 +213,9 @@ def create_app(settings: ServerSettings) -> FastAPI:
             )
 
         async def _finalize_and_feed() -> None:
-            """Background finalization and pipeline coordination task."""
+            """Background finalization and runner coordination task."""
             try:
-                await coordinator.check_and_finalize_completed_pipelines()
+                await coordinator.check_and_finalize_completed_runners()
             except Exception as e:
                 logfire.exception(f"Background finalization error: {e}")
 
@@ -253,9 +253,9 @@ def create_app(settings: ServerSettings) -> FastAPI:
             )
 
         async def _finalize_on_failure() -> None:
-            """Background check to finalize pipelines if this failure concluded all tasks."""
+            """Background check to finalize runners if this failure concluded all tasks."""
             try:
-                await coordinator.check_and_finalize_completed_pipelines()
+                await coordinator.check_and_finalize_completed_runners()
             except Exception as e:
                 logfire.exception(f"Background finalization check on failure error: {e}")
 
@@ -267,26 +267,27 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
     @app.get("/api/v1/status")
     async def get_server_status() -> dict[str, Any]:
-        """Returns macroscopic pipeline and in-memory queue status.
+        """Returns macroscopic runner and in-memory queue status.
 
         Returns:
-            dict[str, Any]: Mapping of server status and pipeline queue metrics.
+            dict[str, Any]: Mapping of server status and runner queue metrics.
         """
-        pipeline_status = {}
-        for name, pipe in coordinator.pipelines.items():
-            pipeline_status[name] = {
-                "status": pipe.status.value,
-                "idle": pipe.is_idle(),
-                "active_video": pipe.active_video.video_id if pipe.active_video else None,
-                "total_tasks": len(pipe.tasks),
-                "pending_tasks": sum(1 for t in pipe.tasks.values() if t.status.value == "pending"),
-                "claimed_tasks": sum(1 for t in pipe.tasks.values() if t.status.value == "claimed"),
-                "completed_tasks": sum(1 for t in pipe.tasks.values() if t.status.value == "completed"),
+        runner_status = {}
+        for name, runner in coordinator.runners.items():
+            runner_status[name] = {
+                "status": runner.status.value,
+                "idle": runner.is_idle(),
+                "active_video": runner.active_video.video_id if runner.active_video else None,
+                "total_tasks": len(runner.tasks),
+                "pending_tasks": sum(1 for t in runner.tasks.values() if t.status.value == "pending"),
+                "claimed_tasks": sum(1 for t in runner.tasks.values() if t.status.value == "claimed"),
+                "completed_tasks": sum(1 for t in runner.tasks.values() if t.status.value == "completed"),
             }
 
         return {
             "status": "online",
-            "pipelines": pipeline_status,
+            "runners": runner_status,
+            "pipelines": runner_status,
         }
 
     return app

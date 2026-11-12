@@ -1,4 +1,4 @@
-"""Central server coordinator managing dynamic pipelines, task dispatch, worker leases, and activity logs."""
+"""Central server coordinator managing combination runners, worker task leases, and telemetry."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from time import time
-from typing import Any
+from typing import Any, Literal
 
 import logfire
 
@@ -18,10 +18,10 @@ from ai_sub.protocol import (
     TaskClaimResponse,
     TaskType,
 )
+from ai_sub.server.combo_runner import ComboRunner, RunnerStatus
 from ai_sub.server.config import ServerSettings
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.models import ActivityEvent, ServerTask, TaskStatus
-from ai_sub.server.pipeline import ComboPipeline, PipelineStatus
 
 
 def _format_logfire_query(task: ServerTask) -> str:
@@ -36,21 +36,22 @@ def _format_logfire_query(task: ServerTask) -> str:
     return f"attributes->>'task_id' = '{task.task_id}'"
 
 
-class PipelineCoordinator:
-    """Orchestrates in-memory pipeline runners, worker task leases, and dashboard telemetry."""
+class ComboRunnersCoordinator:
+    """Orchestrates in-memory combination runners, worker task leases, and dashboard telemetry."""
 
     settings: ServerSettings
     git_sync: GitSyncManager | None
-    pipelines: dict[str, ComboPipeline]
-    pipeline_activity_logs: dict[str, deque[ActivityEvent]]
+    runners: dict[str, ComboRunner]
+    runner_activity_logs: dict[str, deque[ActivityEvent]]
+    reencode_semaphore: asyncio.Semaphore
     _lock: asyncio.Lock
-    _finalizing_pipes: set[str]
+    _finalizing_runners: set[str]
     _sweep_task: asyncio.Task[None] | None
     _background_tasks: set[asyncio.Task[Any]]
-    on_pipelines_finalized: Callable[[], Any] | None
+    on_runners_finalized: Callable[[], Any] | None
 
     def __init__(self, settings: ServerSettings, git_sync: GitSyncManager | None = None) -> None:
-        """Initializes the central pipeline coordinator.
+        """Initializes the central combination runners coordinator.
 
         Args:
             settings: Server settings model.
@@ -58,27 +59,35 @@ class PipelineCoordinator:
         """
         self.settings = settings
         self.git_sync = git_sync
-        self.pipelines = {}
-        self.pipeline_activity_logs = {
+        self.runners = {}
+        self.runner_activity_logs = {
             p_cfg.name: deque(maxlen=settings.server.activity_log_maxlen) for p_cfg in settings.pipelines
         }
+        self.reencode_semaphore = asyncio.Semaphore(settings.server.reencode_concurrency)
         self._lock = asyncio.Lock()
-        self._finalizing_pipes = set()
+        self._finalizing_runners = set()
         self._sweep_task = None
         self._background_tasks = set()
-        self.on_pipelines_finalized = None
+        self.on_runners_finalized = None
 
         work_base = settings.server.work_dir
         for p_cfg in settings.pipelines:
-            self.pipelines[p_cfg.name] = ComboPipeline(
+            self.runners[p_cfg.name] = ComboRunner(
                 config=p_cfg,
                 base_work_dir=work_base,
+                reencode_semaphore=self.reencode_semaphore,
                 reencode_settings=settings.reencode,
                 search_settings=settings.search,
                 split_settings=settings.split,
                 retry_settings=settings.retry,
+                coordinator_lock=self._lock,
                 validation_buffer_ms=settings.server.validation_buffer_ms,
             )
+
+    @property
+    def pipelines(self) -> dict[str, ComboRunner]:
+        """Provides backwards-compatible dictionary property mapping to active runners."""
+        return self.runners
 
     def _log_activity(
         self,
@@ -88,7 +97,7 @@ class PipelineCoordinator:
         duration_s: float | None = None,
         detail: str | None = None,
     ) -> None:
-        """Appends an event to the per-pipeline circular activity buffer with Logfire query string on errors.
+        """Appends an event to the per-runner circular activity buffer with Logfire query string on errors.
 
         Args:
             event_type: Event classification ('claim', 'complete', 'fail', 'timeout').
@@ -115,27 +124,122 @@ class PipelineCoordinator:
             logfire_query=query_str,
         )
 
-        pipe_log = self.pipeline_activity_logs.setdefault(
+        runner_log = self.runner_activity_logs.setdefault(
             task.pipeline_name, deque(maxlen=self.settings.server.activity_log_maxlen)
         )
-        pipe_log.appendleft(event)
+        runner_log.appendleft(event)
+
+    async def acquire_idle_runner(
+        self,
+        runner_name: str,
+        video_id: str,
+        title: str,
+        uploader: str,
+        channel_name: str | None = None,
+        source_type: Literal["local", "youtube"] = "youtube",
+    ) -> bool:
+        """Atomically transitions an idle runner to PREPARING status under lock.
+
+        Args:
+            runner_name: Name of the target combination runner.
+            video_id: Unique video identifier.
+            title: Title of the video.
+            uploader: Channel or uploader handle identifier.
+            channel_name: Human-readable channel display name. Defaults to None.
+            source_type: Ingestion source type ('local' or 'youtube'). Defaults to 'youtube'.
+
+        Returns:
+            bool: True if the runner was idle and acquired; False otherwise.
+        """
+        async with self._lock:
+            runner = self.runners.get(runner_name)
+            if not runner or not runner.is_idle():
+                return False
+            runner.set_preparing(
+                video_id=video_id,
+                title=title,
+                uploader=uploader,
+                channel_name=channel_name,
+                source_type=source_type,
+            )
+            return True
+
+    async def release_preparing_runner(self, runner_name: str) -> None:
+        """Atomically resets a preparing runner back to IDLE status if preparation fails.
+
+        Args:
+            runner_name: Name of the combination runner to reset.
+        """
+        async with self._lock:
+            runner = self.runners.get(runner_name)
+            if runner:
+                runner.clear_preparing()
+
+    async def assign_prepared_video(
+        self,
+        runner_name: str,
+        video_id: str,
+        uploader: str,
+        title: str,
+        raw_video_path: Path,
+        channel_name: str | None = None,
+        source_type: Literal["local", "youtube"] = "local",
+        timestamp: int = 0,
+    ) -> bool:
+        """Prepares media and sets video into the runner, synchronizing state safely under lock.
+
+        Args:
+            runner_name: Target runner name.
+            video_id: Video identifier string.
+            uploader: Channel or uploader handle.
+            title: Video title.
+            raw_video_path: Local media file path.
+            channel_name: Channel display name. Defaults to None.
+            source_type: Ingestion category ('local' or 'youtube'). Defaults to 'local'.
+            timestamp: Video publication Unix timestamp. Defaults to 0.
+
+        Returns:
+            bool: True if video was prepared and assigned; False otherwise.
+        """
+        runner = self.runners.get(runner_name)
+        if not runner:
+            return False
+
+        await runner.prepare_and_set_video(
+            video_id=video_id,
+            uploader=uploader,
+            title=title,
+            raw_video_path=raw_video_path,
+            channel_name=channel_name,
+            source_type=source_type,
+            timestamp=timestamp,
+            coordinator_lock=self._lock,
+        )
+        return True
 
     async def start(self) -> None:
-        """Starts background lease monitoring and attempts disk resumption on all pipelines."""
-        with logfire.span("Coordinator Startup", pipeline_count=len(self.pipelines)) as start_span:
+        """Starts background lease monitoring and attempts disk resumption on all runners."""
+        with logfire.span("Coordinator Startup", runner_count=len(self.runners)) as start_span:
             resumed_count = 0
-            for name, pipe in self.pipelines.items():
-                resumed = await pipe.resume_from_disk()
-                if resumed:
-                    resumed_count += 1
-                    logfire.info(f"Pipeline '{name}' resumed active video from disk.")
+            for name, runner in self.runners.items():
+                try:
+                    resumed = await runner.resume_from_disk()
+                    if resumed:
+                        resumed_count += 1
+                        logfire.info(f"Runner '{name}' resumed active video from disk.")
+                except Exception as e:
+                    logfire.exception(f"Error resuming runner '{name}' from disk: {e}")
+                    try:
+                        await runner.clear_active_video()
+                    except Exception as clear_err:
+                        logfire.warning(f"Error clearing active video for failed runner '{name}': {clear_err}")
 
-            start_span.set_attribute("resumed_pipelines", resumed_count)
+            start_span.set_attribute("resumed_runners", resumed_count)
 
             try:
-                await self.check_and_finalize_completed_pipelines()
+                await self.check_and_finalize_completed_runners()
             except Exception as e:
-                logfire.exception(f"Error checking and finalizing completed pipelines on startup: {e}")
+                logfire.exception(f"Error checking and finalizing completed runners on startup: {e}")
 
             self._sweep_task = asyncio.create_task(self._lease_sweeper_loop())
 
@@ -166,8 +270,8 @@ class PipelineCoordinator:
                     expired_count = 0
                     active_leases = 0
 
-                    for pipe in self.pipelines.values():
-                        for task in pipe.tasks.values():
+                    for runner in self.runners.values():
+                        for task in runner.tasks.values():
                             if task.status == TaskStatus.CLAIMED:
                                 active_leases += 1
                                 reference_time = task.last_heartbeat or task.claimed_at or 0.0
@@ -188,7 +292,7 @@ class PipelineCoordinator:
                                     task.attempts += 1
 
                                     try:
-                                        pipe.on_task_failed(task.task_id, task.attempts)
+                                        runner.on_task_failed(task.task_id, task.attempts)
                                     except Exception as e:
                                         logfire.exception(f"Failed to persist failure for '{task.task_id}': {e}")
 
@@ -220,9 +324,9 @@ class PipelineCoordinator:
                     sweep_span.set_attribute("expired_leases", expired_count)
 
             try:
-                await self.check_and_finalize_completed_pipelines()
+                await self.check_and_finalize_completed_runners()
             except Exception as e:
-                logfire.exception(f"Error checking and finalizing completed pipelines in lease sweeper: {e}")
+                logfire.exception(f"Error checking and finalizing completed runners in lease sweeper: {e}")
 
     async def claim_task(
         self,
@@ -251,16 +355,15 @@ class PipelineCoordinator:
                 available_models = {m.strip().lower() for m in models}
                 worker_tools = {t.strip().lower() for t in search_tools}
 
-                for pipe in self.pipelines.values():
-                    for task in pipe.tasks.values():
-                        if task.status != TaskStatus.PENDING or not pipe.is_task_ready_for_claim(task):
+                for runner in self.runners.values():
+                    for task in runner.tasks.values():
+                        if task.status != TaskStatus.PENDING or not runner.is_task_ready_for_claim(task):
                             continue
 
                         if task.model.lower() not in available_models:
                             continue
 
                         if task.task_type in (TaskType.SUMMARY, TaskType.LYRICS):
-                            # The worker must provide all search tools requested by the task
                             if task.search_tools and not all(t.lower() in worker_tools for t in task.search_tools):
                                 continue
 
@@ -312,9 +415,9 @@ class PipelineCoordinator:
         """
         now = time()
         async with self._lock:
-            for pipe in self.pipelines.values():
-                if task_id in pipe.tasks:
-                    task = pipe.tasks[task_id]
+            for runner in self.runners.values():
+                if task_id in runner.tasks:
+                    task = runner.tasks[task_id]
                     if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
                         task.last_heartbeat = now
                         return True
@@ -362,10 +465,10 @@ class PipelineCoordinator:
             task.attempts += 1
             max_runs = self.settings.retry.max_runs
 
-            pipe = self.pipelines.get(task.pipeline_name)
-            if pipe:
+            runner = self.runners.get(task.pipeline_name)
+            if runner:
                 try:
-                    pipe.on_task_failed(task.task_id, task.attempts)
+                    runner.on_task_failed(task.task_id, task.attempts)
                 except Exception as e:
                     logfire.exception(f"Failed to persist failure for '{task.task_id}': {e}")
 
@@ -387,7 +490,7 @@ class PipelineCoordinator:
         worker_id: str,
         result: dict[str, Any],
     ) -> bool:
-        """Records task completion and hands the result to the pipeline runner.
+        """Records task completion and hands the result to the runner.
 
         Args:
             task_id: Unique task identifier.
@@ -398,16 +501,16 @@ class PipelineCoordinator:
             bool: True if completion was accepted, False otherwise.
         """
         async with self._lock:
-            for pipe in self.pipelines.values():
-                if task_id in pipe.tasks:
-                    task = pipe.tasks[task_id]
+            for runner in self.runners.values():
+                if task_id in runner.tasks:
+                    task = runner.tasks[task_id]
                     if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
                         with logfire.span(
                             "Process Complete Task: {task_id}", task_id=task_id, worker_id=worker_id
                         ) as comp_span:
                             duration = time() - (task.claimed_at or time())
                             try:
-                                pipe.on_task_completed(task_id, result)
+                                runner.on_task_completed(task_id, result)
                             except Exception as val_err:
                                 logfire.warning(f"Task '{task_id}' validation failed: {val_err}. Routing to fail.")
                                 comp_span.set_attribute("result", "validation_failed")
@@ -471,9 +574,9 @@ class PipelineCoordinator:
             bool: True if failure was recorded, False otherwise.
         """
         async with self._lock:
-            for pipe in self.pipelines.values():
-                if task_id in pipe.tasks:
-                    task = pipe.tasks[task_id]
+            for runner in self.runners.values():
+                if task_id in runner.tasks:
+                    task = runner.tasks[task_id]
                     if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
                         with logfire.span(
                             "Process Task Failure: {task_id}",
@@ -505,47 +608,47 @@ class PipelineCoordinator:
         Returns:
             Path | None: File path if task exists and file is present, None otherwise.
         """
-        for pipe in self.pipelines.values():
-            if task_id in pipe.tasks:
-                task = pipe.tasks[task_id]
+        for runner in self.runners.values():
+            if task_id in runner.tasks:
+                task = runner.tasks[task_id]
                 if task.media_path.is_file():
                     return task.media_path
         return None
 
-    async def finalize_pipeline_if_complete(self, pipe: ComboPipeline) -> bool:
-        """Checks if a pipeline has finished all segments, stitches subtitles, and pushes to Git.
+    async def finalize_runner_if_complete(self, runner: ComboRunner) -> bool:
+        """Checks if a runner has finished all segments, stitches subtitles, and pushes to Git.
 
         Args:
-            pipe: Pipeline instance to check and finalize.
+            runner: Combination runner instance to check and finalize.
 
         Returns:
-            bool: True if pipeline was completed and finalized, False otherwise.
+            bool: True if runner was completed and finalized, False otherwise.
         """
         async with self._lock:
-            if pipe.config.name in self._finalizing_pipes:
+            if runner.config.name in self._finalizing_runners:
                 return False
-            if pipe.is_idle() or not pipe.active_video:
+            if runner.is_idle() or not runner.active_video:
                 return False
-            if pipe.status != PipelineStatus.PUSH_FAILED and not pipe.is_video_complete():
+            if runner.status != RunnerStatus.PUSH_FAILED and not runner.is_video_complete():
                 return False
 
-            self._finalizing_pipes.add(pipe.config.name)
-            pipe.status = PipelineStatus.FINALIZING
+            self._finalizing_runners.add(runner.config.name)
+            runner.status = RunnerStatus.FINALIZING
 
         try:
-            vid = pipe.active_video
+            vid = runner.active_video
             assert vid is not None
-            logfire.info(f"Pipeline '{pipe.config.name}' finalizing for '{vid.title}'...")
+            logfire.info(f"Runner '{runner.config.name}' finalizing for '{vid.title}'...")
 
-            srt_filename = f"{vid.filename_stem}.{pipe.full_shortcode}.srt"
+            srt_filename = f"{vid.filename_stem}.{runner.full_shortcode}.srt"
             temp_srt = vid.job_dir / srt_filename
 
             try:
-                generated_srts = await asyncio.to_thread(pipe.stitch_final_subtitles, temp_srt)
+                generated_srts = await asyncio.to_thread(runner.stitch_final_subtitles, temp_srt)
             except Exception as e:
-                logfire.error(f"Subtitle stitching failed for '{pipe.config.name}': {e}")
+                logfire.error(f"Subtitle stitching failed for '{runner.config.name}': {e}")
                 async with self._lock:
-                    pipe.status = PipelineStatus.PUSH_FAILED
+                    runner.status = RunnerStatus.PUSH_FAILED
                 return False
 
             yaml_files = list(vid.job_dir.glob("*.yaml"))
@@ -555,29 +658,29 @@ class PipelineCoordinator:
                     await self.git_sync.finalize_and_push(
                         uploader=vid.uploader,
                         video_id=vid.video_id,
-                        full_shortcode=pipe.full_shortcode,
+                        full_shortcode=runner.full_shortcode,
                         srt_files=generated_srts,
                         yaml_files=yaml_files,
                         meta_file=meta_file if meta_file.is_file() else None,
                     )
                 except Exception as e:
-                    logfire.error(f"Git push failed for '{pipe.config.name}': {e}. Setting PUSH_FAILED.")
+                    logfire.error(f"Git push failed for '{runner.config.name}': {e}. Setting PUSH_FAILED.")
                     async with self._lock:
-                        pipe.status = PipelineStatus.PUSH_FAILED
+                        runner.status = RunnerStatus.PUSH_FAILED
                     return False
 
             async with self._lock:
-                await pipe.clear_active_video()
-                logfire.info(f"Pipeline '{pipe.config.name}' cleared and ready for next video.")
+                await runner.clear_active_video()
+                logfire.info(f"Runner '{runner.config.name}' cleared and ready for next video.")
                 return True
         except Exception as e:
-            logfire.exception(f"Unexpected error finalizing pipeline '{pipe.config.name}': {e}")
+            logfire.exception(f"Unexpected error finalizing runner '{runner.config.name}': {e}")
             async with self._lock:
-                pipe.status = PipelineStatus.PUSH_FAILED
+                runner.status = RunnerStatus.PUSH_FAILED
             return False
         finally:
             async with self._lock:
-                self._finalizing_pipes.discard(pipe.config.name)
+                self._finalizing_runners.discard(runner.config.name)
 
     @staticmethod
     async def _run_intake_callback(coro: Any) -> None:
@@ -593,28 +696,26 @@ class PipelineCoordinator:
         except Exception as e:
             logfire.exception(f"Background intake callback failed: {e}")
 
-    async def check_and_finalize_completed_pipelines(self) -> list[ComboPipeline]:
-        """Inspects all pipelines, finalizing any that have reached completion.
+    async def check_and_finalize_completed_runners(self) -> list[ComboRunner]:
+        """Inspects all runners, finalizing any that have reached completion.
 
         Returns:
-            list[ComboPipeline]: List of pipelines that completed and were reset.
+            list[ComboRunner]: List of runners that completed and were reset.
         """
-        finalized: list[ComboPipeline] = []
-        for pipe in list(self.pipelines.values()):
-            if await self.finalize_pipeline_if_complete(pipe):
-                finalized.append(pipe)
+        finalized: list[ComboRunner] = []
+        for runner in list(self.runners.values()):
+            if await self.finalize_runner_if_complete(runner):
+                finalized.append(runner)
 
-        # Notify registered intake callback in the background so callers (such as the
-        # lease sweeper) are never blocked while long video downloads are in progress.
-        if finalized and self.on_pipelines_finalized is not None:
+        if finalized and self.on_runners_finalized is not None:
             try:
-                res = self.on_pipelines_finalized()
+                res = self.on_runners_finalized()
                 if inspect.isawaitable(res):
                     bg_task = asyncio.create_task(self._run_intake_callback(res))
                     self._background_tasks.add(bg_task)
                     bg_task.add_done_callback(self._background_tasks.discard)
             except Exception as e:
-                logfire.exception(f"Error scheduling on_pipelines_finalized callback: {e}")
+                logfire.exception(f"Error scheduling on_runners_finalized callback: {e}")
 
         return finalized
 
@@ -627,7 +728,7 @@ class PipelineCoordinator:
         """Gathers macroscopic metrics and active states for the live WebUI dashboard.
 
         Args:
-            pipeline_queues: Mapping of pipeline names to their outstanding queue dictionaries.
+            pipeline_queues: Mapping of runner names to their outstanding queue dictionaries.
             youtube_cooldown: Optional YouTube intake cooldown status dictionary.
             total_tracked_videos: Count of all media files and streams tracked in memory. Defaults to 0.
 
@@ -637,30 +738,33 @@ class PipelineCoordinator:
         now = time()
         pipeline_data = []
 
-        for name, pipe in self.pipelines.items():
+        for name, runner in self.runners.items():
             active_info = None
             stages_info = None
 
-            if pipe.active_video:
-                total_chunks = len(pipe.active_video.segment_paths)
-                reenc_count = len(pipe.active_video.reencoded_segment_paths)
+            if runner.active_video and runner.active_video.pipeline:
+                pipe = runner.active_video.pipeline
+                total_chunks = len(pipe.segment_paths)
+                reenc_count = len(pipe.reencoded_segment_paths)
                 pending_reenc = max(0, total_chunks - reenc_count)
 
                 active_info = {
-                    "video_id": pipe.active_video.video_id,
-                    "title": pipe.active_video.title,
-                    "uploader": pipe.active_video.uploader,
-                    "channel_name": pipe.active_video.channel_name,
-                    "duration_ms": pipe.active_video.duration_ms,
-                    "source_type": pipe.active_video.source_type,
+                    "video_id": runner.active_video.video_id,
+                    "title": runner.active_video.title,
+                    "uploader": runner.active_video.uploader,
+                    "channel_name": runner.active_video.channel_name,
+                    "duration_ms": runner.active_video.duration_ms,
+                    "source_type": runner.active_video.source_type,
                 }
 
-                summary_task = next((t for t in pipe.tasks.values() if t.task_type == TaskType.SUMMARY), None)
-                sub_tasks = [t for t in pipe.tasks.values() if t.task_type == TaskType.SUBTITLES]
-                lyr_tasks = [t for t in pipe.tasks.values() if t.task_type == TaskType.LYRICS]
+                summary_task = next((t for t in runner.tasks.values() if t.task_type == TaskType.SUMMARY), None)
+                sub_tasks = [t for t in runner.tasks.values() if t.task_type == TaskType.SUBTITLES]
+                lyr_tasks = [t for t in runner.tasks.values() if t.task_type == TaskType.LYRICS]
 
                 sum_done = (
-                    1 if pipe.summary_response or (summary_task and summary_task.status == TaskStatus.COMPLETED) else 0
+                    1
+                    if runner.summary_response or (summary_task and summary_task.status == TaskStatus.COMPLETED)
+                    else 0
                 )
                 sum_prog = 1 if summary_task and summary_task.status == TaskStatus.CLAIMED else 0
 
@@ -736,7 +840,7 @@ class PipelineCoordinator:
                     "elapsed_s": int(now - t.claimed_at) if t.claimed_at else None,
                     "logfire_query": _format_logfire_query(t),
                 }
-                for t in pipe.tasks.values()
+                for t in runner.tasks.values()
             ]
 
             q_info = pipeline_queues.get(name, {"total_count": 0, "items": []})
@@ -746,20 +850,20 @@ class PipelineCoordinator:
             pipeline_data.append(
                 {
                     "name": name,
-                    "status": pipe.status.value,
+                    "status": runner.status.value,
                     "models": {
-                        "summary": pipe.config.summary_model,
-                        "subtitles": pipe.config.subtitles_model,
-                        "lyrics": pipe.config.lyrics_model,
+                        "summary": runner.config.summary_model,
+                        "subtitles": runner.config.subtitles_model,
+                        "lyrics": runner.config.lyrics_model,
                     },
-                    "idle": pipe.is_idle(),
+                    "idle": runner.is_idle(),
                     "active_video": active_info,
-                    "preparing_video": pipe.preparing_video_info,
+                    "preparing_video": runner.preparing_video_info,
                     "stages": stages_info,
                     "tasks": tasks_list,
                     "queue_total": queue_total,
                     "next_in_queue": next_in_queue,
-                    "recent_activity": [event.model_dump() for event in self.pipeline_activity_logs.get(name, [])],
+                    "recent_activity": [event.model_dump() for event in self.runner_activity_logs.get(name, [])],
                 }
             )
 

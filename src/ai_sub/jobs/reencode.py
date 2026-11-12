@@ -1,4 +1,4 @@
-"""Job definition for video segment compression and re-encoding."""
+"""Job definition for video segment and summary proxy compression."""
 
 from __future__ import annotations
 
@@ -11,12 +11,12 @@ from ai_sub.video import reencode_video
 
 
 class ReencodeJob(MediaJob):
-    """Represents a video segment compression task using FFmpeg."""
+    """Represents a video segment or proxy compression task using FFmpeg."""
 
-    input_file: Path = Field(description="Source video segment path.")
-    output_file: Path = Field(description="Destination path for the compressed segment.")
+    input_file: Path = Field(description="Source video segment or raw video path.")
+    output_file: Path = Field(description="Destination path for the compressed output.")
     fps: PositiveFloat = Field(description="Target framerate for the re-encoded video.")
-    height: PositiveInt = Field(description="Target resolution height.")
+    height: PositiveInt = Field(description="Target resolution height in pixels.")
     bitrate_kb: PositiveInt = Field(description="Target video bitrate in Kilobytes per second.")
     duration_tolerance_ms: NonNegativeInt = Field(
         description="Allowed duration difference in milliseconds to consider an existing re-encoded file valid.",
@@ -29,9 +29,17 @@ class ReencodeJob(MediaJob):
         default=False,
         description="Whether to decode only keyframes from the input video.",
     )
+    segment_index: int | None = Field(
+        default=None,
+        description="Segment chunk index if this job compresses a segment, or None for summary proxy.",
+    )
+    is_summary_proxy: bool = Field(
+        default=False,
+        description="Whether this job compresses the whole-video summary proxy.",
+    )
 
     async def execute(self) -> Path:
-        """Executes FFmpeg re-encoding for this segment.
+        """Executes FFmpeg re-encoding for this segment or proxy.
 
         Returns:
             Path: Path to the validated compressed video file.

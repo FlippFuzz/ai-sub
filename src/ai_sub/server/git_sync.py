@@ -448,8 +448,26 @@ class GitSyncManager:
             repo.index.commit(commit_msg)
             logfire.info(f"Committed changes: '{commit_msg}'")
         else:
-            logfire.info("No Git changes to commit.")
-            return
+            # Check if there are unpublished local commits ahead of remote tracking branch
+            has_unpushed = False
+            unpushed_count = 0
+            if has_head:
+                try:
+                    unpushed_str = repo.git.rev_list(f"origin/{self.config.branch}..HEAD", count=True).strip()
+                    unpushed_count = int(unpushed_str)
+                    has_unpushed = unpushed_count > 0
+                except Exception:
+                    # If origin/branch cannot be resolved or rev-list fails, assume unpublished commit exists
+                    has_unpushed = True
+                    unpushed_count = 1
+
+            if has_unpushed:
+                logfire.info(
+                    f"No new changes to commit, but found {unpushed_count} unpublished commit(s). Proceeding to push."
+                )
+            else:
+                logfire.info("No Git changes to commit.")
+                return
 
         # Cross-platform no-op editor command that works on Windows, Linux, and macOS
         editor_cmd = f'"{sys.executable}" -c "import sys; sys.exit(0)"'
@@ -482,26 +500,35 @@ class GitSyncManager:
                         )
                         continue
 
-                    # A rebase conflict was created; inspect unmerged files
+                    # A rebase conflict was created; inspect unmerged files and resolve sequentially
                     try:
-                        unmerged_output = repo.git.diff("-z", "--diff-filter=U", "--name-only")
-                        unmerged_files = [f for f in unmerged_output.split("\0") if f]
                         readme_rel = f"{uploader}/README.md"
+                        while rebase_merge_dir.exists() or rebase_apply_dir.exists():
+                            unmerged_output = repo.git.diff("-z", "--diff-filter=U", "--name-only")
+                            unmerged_files = [f for f in unmerged_output.split("\0") if f]
 
-                        if unmerged_files == [readme_rel]:
-                            self._update_channel_readme_sync(uploader)
-                            repo.git.add(readme_rel)
-                            repo.git.rebase("--continue", env={**os.environ, "GIT_EDITOR": editor_cmd})
-                            self._rebuild_completed_cache_sync()
-                            logfire.info("Resolved channel README conflict and continued rebase.")
-                        else:
-                            logfire.warning(
-                                f"Unresolvable non-README conflict encountered ({unmerged_files}). Aborting rebase."
-                            )
-                            repo.git.rebase("--abort")
-                            raise RuntimeError(
-                                f"Git rebase aborted due to unresolvable conflict in files: {unmerged_files}"
-                            ) from pull_err
+                            if unmerged_files == [readme_rel]:
+                                self._update_channel_readme_sync(uploader)
+                                repo.git.add(readme_rel)
+                                try:
+                                    repo.git.rebase("--continue", env={**os.environ, "GIT_EDITOR": editor_cmd})
+                                    logfire.info("Continued rebase after resolving channel README conflict.")
+                                except GitCommandError:
+                                    # If the next rebase step encounters another conflict, stay in the loop
+                                    if rebase_merge_dir.exists() or rebase_apply_dir.exists():
+                                        continue
+                                    raise
+                            else:
+                                logfire.warning(
+                                    f"Unresolvable non-README conflict encountered ({unmerged_files}). Aborting rebase."
+                                )
+                                repo.git.rebase("--abort")
+                                raise RuntimeError(
+                                    f"Git rebase aborted due to unresolvable conflict in files: {unmerged_files}"
+                                ) from pull_err
+
+                        self._rebuild_completed_cache_sync()
+                        logfire.info("Resolved all channel README conflicts and completed rebase.")
                     except Exception as rebase_err:
                         if rebase_merge_dir.exists() or rebase_apply_dir.exists():
                             try:
