@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import re
+import urllib.parse
 from contextlib import AsyncExitStack
 from pathlib import Path
 from time import time
@@ -173,12 +173,14 @@ class WorkerRunner:
             LeaseRevokedError: If the server rejects task lease during download or inference.
             ValueError: If task type is unknown or structured input is invalid.
         """
-        raw_name = Path(task.media_url).name
+        raw_name = Path(urllib.parse.unquote(task.media_url)).name
         if not Path(raw_name).suffix:
             raw_name = f"{raw_name}.mp4"
 
-        safe_task_id = re.sub(r"[^a-zA-Z0-9_\-]+", "_", task.task_id)
-        chunk_path = self.settings.work_dir / f"{safe_task_id}_{raw_name}"
+        # Organize by pipeline_name and video_id to avoid long filenames and prevent collisions:
+        # e.g. ai_sub_worker/combo_35l/AhCOzPaFyh4/summary_proxy.webm
+        chunk_dir = self.settings.work_dir / task.pipeline_name / task.video_id
+        chunk_path = chunk_dir / raw_name
 
         stop_heartbeat = asyncio.Event()
         lease_revoked = asyncio.Event()
@@ -288,6 +290,14 @@ class WorkerRunner:
             if chunk_path.is_file():
                 try:
                     chunk_path.unlink()
+                    # Clean up empty parent directories up to work_dir
+                    parent = chunk_path.parent
+                    while parent != self.settings.work_dir and parent.exists():
+                        try:
+                            parent.rmdir()
+                            parent = parent.parent
+                        except OSError:
+                            break
                 except OSError:
                     pass
 

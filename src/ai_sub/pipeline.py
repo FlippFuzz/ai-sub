@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -238,23 +240,39 @@ class Pipeline(BaseModel):
         summary_proxy_needed = (
             summary_enabled and sum_cfg.enabled and (sum_cfg.threshold_mb == 0 or raw_size_mb >= sum_cfg.threshold_mb)
         )
-        proxy_path = job_dir / "summary_proxy.mp4"
         if not summary_proxy_needed:
-            actual_proxy_path: Path | None = raw_resolved
-        elif await is_valid_reencoded_file(
-            input_path=raw_resolved,
-            output_path=proxy_path,
-            fps=sum_cfg.fps,
-            duration_tolerance_ms=sum_cfg.duration_tolerance_ms,
-        ):
-            actual_proxy_path = proxy_path
-        else:
-            if proxy_path.exists():
+            # Reference raw media via short summary_proxy filename to prevent long URL/path issues
+            proxy_path = job_dir / f"summary_proxy{raw_resolved.suffix}"
+            if proxy_path.is_file() and proxy_path.stat().st_size != raw_resolved.stat().st_size:
                 try:
                     proxy_path.unlink()
                 except OSError:
                     pass
-            actual_proxy_path = None
+            if not proxy_path.is_file():
+                try:
+                    os.link(raw_resolved, proxy_path)
+                except OSError:
+                    try:
+                        os.symlink(raw_resolved, proxy_path)
+                    except OSError:
+                        shutil.copyfile(raw_resolved, proxy_path)
+            actual_proxy_path: Path | None = proxy_path
+        else:
+            proxy_path = job_dir / "summary_proxy.mp4"
+            if await is_valid_reencoded_file(
+                input_path=raw_resolved,
+                output_path=proxy_path,
+                fps=sum_cfg.fps,
+                duration_tolerance_ms=sum_cfg.duration_tolerance_ms,
+            ):
+                actual_proxy_path = proxy_path
+            else:
+                if proxy_path.exists():
+                    try:
+                        proxy_path.unlink()
+                    except OSError:
+                        pass
+                actual_proxy_path = None
 
         # 5. Evaluate segment re-encoding requirements with full file validation
         seg_cfg = reencode_settings.segment
