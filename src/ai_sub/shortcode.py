@@ -10,15 +10,38 @@ from ai_sub.jobs.lyrics import LYRICS_PROMPT_VERSION
 from ai_sub.jobs.subtitles import SUBTITLES_PROMPT_VERSION
 from ai_sub.jobs.summary import SUMMARY_PROMPT_VERSION
 
+# Single ranking & shortcode definition (ordered highest -> lowest).
+# Format: {shortcode_char: tier_name}. Unlisted tiers ("Others") receive rank 0.
+_TIERS: dict[str, str] = {
+    "c": "carbon",
+    "a": "argon",
+    "h": "hydrogen",
+    "p": "pro",
+    "f": "flash",
+    "l": "flash-lite",
+}
+
+_TIER_RANKS: dict[str, int] = {name: len(_TIERS) - idx for idx, name in enumerate(_TIERS.values())}
+
+# Longest prefix first so e.g. "flash-lite" matches before "flash" regardless of rank order.
+_TIER_ENCODE_PREFIXES: tuple[tuple[str, str], ...] = tuple(
+    sorted(
+        ((name, code) for code, name in _TIERS.items()),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
+
 
 def generate_model_shortcode(model_name: str) -> str:
     """Generates an ultra-compact filename shortcode for a model identifier.
 
-    Transforms Gemini models into 'g<version><tier>[variant]' (e.g., 'g4c', 'g4a', 'g38f', 'g37f', 'g35l').
+    Transforms Gemini models into 'g<version><tier>[variant]' (e.g., 'g4c', 'g4a', 'g4h', 'g38f', 'g35l'),
+    or 'g<version>-<name>' for unrecognized tiers (e.g., 'g4-neon').
     Non-Gemini models are sanitized to safe kebab-case strings.
 
     Args:
-        model_name: Model identifier (e.g., 'google-gla:gemini-4-carbon', 'google-gla:gemini-3.8-flash').
+        model_name: Model identifier (e.g., 'google-gla:gemini-4-hydrogen', 'google-gla:gemini-3.8-flash').
 
     Returns:
         str: Sanitized shortcode string.
@@ -32,23 +55,16 @@ def generate_model_shortcode(model_name: str) -> str:
     v_code = v_match.group(1).replace(".", "") if v_match else ""
     rem = rem[v_match.end() :].lstrip("-_") if v_match else rem
 
-    tier = "g"
-    for name, code in (
-        ("carbon", "c"),
-        ("argon", "a"),
-        ("flash-lite", "l"),
-        ("lite", "l"),
-        ("flash", "f"),
-        ("pro", "p"),
-    ):
+    tier = ""
+    for name, code in _TIER_ENCODE_PREFIXES:
         if rem.startswith(name):
             tier = code
             rem = rem[len(name) :].lstrip("-_")
             break
 
-    variant = {"preview": "p"}.get(rem, re.sub(r"[^a-zA-Z0-9]+", "-", rem.replace(".", "")).strip("-"))
+    variant = re.sub(r"[^a-zA-Z0-9]+", "-", rem.replace(".", "")).strip("-")
     base = f"g{v_code}{tier}"
-    return f"{base}{variant}" if variant == "p" else (f"{base}-{variant}" if variant else base)
+    return f"{base}-{variant}" if variant else base
 
 
 def generate_summary_shortcode(
@@ -119,7 +135,7 @@ def generate_full_shortcode(
         subtitles_prompt_version: Subtitle prompt version number. Defaults to SUBTITLES_PROMPT_VERSION.
 
     Returns:
-        str: Tag formatted as '<model_code>-<summary_v><lyrics_v><sub_v>' (e.g., 'g4c-011019', 'g38f-011019').
+        str: Tag formatted as '<model_code>-<summary_v><lyrics_v><sub_v>' (e.g., 'g4c-011019', 'g4h-011019').
     """
     code = generate_model_shortcode(model_name)
     return f"{code}-{summary_prompt_version:02d}{lyrics_prompt_version:02d}{subtitles_prompt_version:02d}"
@@ -142,36 +158,103 @@ class SubtitleTrackInfo:
     subtitles_version: int
 
     @property
-    def sort_key(self) -> tuple[int, int, tuple[int, ...], int, int, int]:
+    def sort_key(self) -> tuple[int, tuple[int, ...], int, str, int, int, int]:
         """Sort key tuple for ordering tracks from best to worst.
 
         Hierarchy:
         1. is_refined (1 for refined/primary, 0 for raw .int/)
-        2. tier_rank (Carbon=5 > Argon=4 > Pro=3 > Flash=2 > Flash-Lite=1 > Other=0)
-        3. version_tuple (e.g., (4, 0) > (3, 10) > (3, 9) > (3, 8) > (3, 7))
-        4. subtitles_version (higher prompt version)
-        5. lyrics_version (higher prompt version)
-        6. summary_version (higher prompt version)
+        2. version_tuple (e.g., (4, 0) > (3, 10) > (3, 8) > (3, 5))
+        3. tier_rank (derived from _TIERS; 0 for Others)
+        4. model (alphabetical text tie-breaker)
+        5. subtitles_version (higher prompt version)
+        6. lyrics_version (higher prompt version)
+        7. summary_version (higher prompt version)
 
         Returns:
-            tuple[int, int, tuple[int, ...], int, int, int]: Comparable sort key.
+            tuple[int, tuple[int, ...], int, str, int, int, int]: Comparable sort key.
         """
         return (
             1 if self.is_refined else 0,
-            self.tier_rank,
             self.version_tuple,
+            self.tier_rank,
+            self.model,
             self.subtitles_version,
             self.lyrics_version,
             self.summary_version,
         )
 
 
+def _parse_version_code(v_code: str) -> str:
+    """Converts a compact numeric version code into a dotted version string.
+
+    Args:
+        v_code: Compact numeric version string (e.g., '4', '38', '310').
+
+    Returns:
+        str: Dotted version string (e.g., '4', '3.8', '3.10').
+    """
+    if len(v_code) == 1:
+        return v_code
+    if len(v_code) == 2:
+        return f"{v_code[0]}.{v_code[1]}"
+    return f"{v_code[0]}.{v_code[1:]}"
+
+
+def _decode_model_code(model_code: str) -> str:
+    """Expands a compact model shortcode back into its canonical model name.
+
+    Args:
+        model_code: Compact model code (e.g., 'g4h', 'g38f', 'g4-neon').
+
+    Returns:
+        str: Reconstructed model name (e.g., 'gemini-4-hydrogen', 'gemini-3.8-flash').
+    """
+    match = re.match(r"^g(\d+)(.*)$", model_code.lower())
+    if not match:
+        return model_code
+
+    v_str = _parse_version_code(match.group(1))
+    rest = match.group(2)
+
+    if rest and rest[0] in _TIERS:
+        tier_name = _TIERS[rest[0]]
+        variant = rest[1:].lstrip("-_")
+        return f"gemini-{v_str}-{tier_name}-{variant}" if variant else f"gemini-{v_str}-{tier_name}"
+
+    variant = rest.lstrip("-_")
+    return f"gemini-{v_str}-{variant}" if variant else f"gemini-{v_str}"
+
+
+def _rank_model(model_name: str) -> tuple[tuple[int, ...], int]:
+    """Extracts version tuple and tier rank by splitting 'gemini-<version>-<text>'.
+
+    Args:
+        model_name: Canonical model name (e.g., 'gemini-4-hydrogen', 'gemini-3.8-flash').
+
+    Returns:
+        tuple[tuple[int, ...], int]: (version_tuple, tier_rank) where tier_rank is 0 for unlisted tiers.
+    """
+    match = re.match(r"^gemini-(\d+(?:\.\d+)*)(?:-(.*))?$", model_name.lower())
+    if not match:
+        return (0, 0), 0
+
+    parts = [int(p) for p in match.group(1).split(".")]
+    v_tuple = (parts[0], 0) if len(parts) == 1 else tuple(parts)
+    text = match.group(2) or ""
+
+    for prefix, _ in _TIER_ENCODE_PREFIXES:
+        if text == prefix or text.startswith(f"{prefix}-"):
+            return v_tuple, _TIER_RANKS[prefix]
+
+    return v_tuple, 0
+
+
 def parse_subtitle_track(path_or_name: str | Path) -> SubtitleTrackInfo:
     """Parses model, prompt lineage, refinement status, and ranking metadata from a subtitle filename or path.
 
-    Handles standard full shortcodes (e.g., 'g4c-011019', 'g38f-011019'), legacy shortcodes without summary stages
-    (e.g., 'g35f-0918'), raw dialogue-only tracks (e.g., 'raw-g4c-011019' or '.int/...'), and multi-stage
-    lineage strings by taking the final model stage.
+    Handles standard full shortcodes (e.g., 'g4c-011019', 'g4h-011019', 'g38f-011019'), legacy shortcodes
+    without summary stages (e.g., 'g35f-0918'), undefined tiers (e.g., 'g4-neon-011019'), raw dialogue-only
+    tracks (e.g., 'raw-g4c-011019' or '.int/...'), and multi-stage lineage strings by taking the final stage.
 
     Args:
         path_or_name: Subtitle file path, filename, or shortcode string.
@@ -192,7 +275,6 @@ def parse_subtitle_track(path_or_name: str | Path) -> SubtitleTrackInfo:
     if leaf.endswith(".srt"):
         leaf = leaf[:-4]
 
-    # Extract shortcode suffix from filename (e.g. 'Title [id].g4c-011019' or 'Title.raw-g4c-011019')
     if ".raw-" in leaf:
         leaf = leaf.split(".raw-")[-1]
     elif leaf.startswith("raw-"):
@@ -200,22 +282,19 @@ def parse_subtitle_track(path_or_name: str | Path) -> SubtitleTrackInfo:
     elif "." in leaf:
         leaf = leaf.split(".")[-1]
 
-    # If an intermediate lineage shortcode is encountered (e.g. 'g4a-01_g4c-19'), evaluate the final stage
     if "_" in leaf:
         leaf = leaf.split("_")[-1]
 
     shortcode = leaf.strip()
 
-    # Split into model shortcode and prompt version suffix
     parts = shortcode.split("-")
     prompt_digits = ""
-    if len(parts) > 1 and parts[-1].isdigit():
+    if len(parts) > 1 and parts[-1].isdigit() and len(parts[-1]) in (2, 4, 6):
         prompt_digits = parts[-1]
         model_code = "-".join(parts[:-1])
     else:
         model_code = shortcode
 
-    # Decompose prompt version suffix
     summary_v = 0
     lyrics_v = 0
     subtitles_v = 0
@@ -229,51 +308,12 @@ def parse_subtitle_track(path_or_name: str | Path) -> SubtitleTrackInfo:
     elif len(prompt_digits) == 2:
         subtitles_v = int(prompt_digits[-2:])
 
-    # Decompose model code (e.g. 'g4c', 'g4a', 'g38f', 'g37f', 'g36f', 'g35l', 'g310f', 'g30p', 'g3p')
-    tier_map = {
-        "c": ("carbon", 5),
-        "a": ("argon", 4),
-        "p": ("pro", 3),
-        "f": ("flash", 2),
-        "l": ("flash-lite", 1),
-    }
-    match = re.match(r"^g(\d+)([lfpca])(.*)$", model_code.lower())
+    model_name = _decode_model_code(model_code)
+    v_tuple, tier_rank = _rank_model(model_name)
 
-    if match:
-        v_code = match.group(1)
-        tier_char = match.group(2)
-        variant = match.group(3).lstrip("-_")
-
-        if len(v_code) == 1:
-            v_str = v_code
-            v_tuple = (int(v_code), 0)
-        elif len(v_code) == 2:
-            v_str = f"{v_code[0]}.{v_code[1]}"
-            v_tuple = (int(v_code[0]), int(v_code[1]))
-        else:
-            # Handles multi-digit minor versions (e.g. '310' -> 3.10)
-            v_str = f"{v_code[0]}.{v_code[1:]}"
-            v_tuple = (int(v_code[0]), int(v_code[1:]))
-
-        tier_name, tier_rank = tier_map[tier_char]
-        model_name = f"gemini-{v_str}-{tier_name}"
-        if variant:
-            model_name = f"{model_name}-{variant}"
-
-        tier_label = "lite" if tier_char == "l" else tier_name
-        base_label = f"{v_str}-{tier_label}"
-
-        # Track name for video players (includes prompt version and Draft indicator)
-        base_track_name = f"{model_name} ({prompt_digits})" if prompt_digits else model_name
-        track_name = base_track_name if is_refined else f"{base_track_name} (Draft)"
-        display_label = base_label if is_refined else f"{base_label} (Draft)"
-    else:
-        model_name = model_code
-        tier_rank = 0
-        v_tuple = (0, 0)
-        base_track_name = f"{model_code} ({prompt_digits})" if prompt_digits else model_code
-        track_name = base_track_name if is_refined else f"{base_track_name} (Draft)"
-        display_label = model_code if is_refined else f"{model_code} (Draft)"
+    base_track_name = f"{model_name} ({prompt_digits})" if prompt_digits else model_name
+    track_name = base_track_name if is_refined else f"{base_track_name} (Draft)"
+    display_label = model_name if is_refined else f"{model_name} (Draft)"
 
     return SubtitleTrackInfo(
         model=model_name,
@@ -292,14 +332,14 @@ def parse_subtitle_track(path_or_name: str | Path) -> SubtitleTrackInfo:
 
 def subtitle_track_sort_key(
     path_or_name: str | Path,
-) -> tuple[int, int, tuple[int, ...], int, int, int]:
+) -> tuple[int, tuple[int, ...], int, str, int, int, int]:
     """Generates a comparable sort tuple for ordering subtitle files from best to worst.
 
     Args:
         path_or_name: Subtitle file path, filename, or shortcode string.
 
     Returns:
-        tuple[int, int, tuple[int, ...], int, int, int]: Sort tuple
-        (is_refined, tier, version_tuple, sub_v, lyrics_v, summary_v).
+        tuple[int, tuple[int, ...], int, str, int, int, int]: Sort tuple
+        (is_refined, version_tuple, tier_rank, model, sub_v, lyrics_v, summary_v).
     """
     return parse_subtitle_track(path_or_name).sort_key
