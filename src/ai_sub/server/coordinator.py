@@ -92,16 +92,16 @@ class ComboRunnersCoordinator:
 
     def _log_activity(
         self,
-        event_type: Any,
+        event_type: Literal["complete", "fail", "timeout"],
         task: ServerTask,
         worker_id: str,
         duration_s: float | None = None,
         detail: str | None = None,
     ) -> None:
-        """Appends an event to the per-runner circular activity buffer with Logfire query string on errors.
+        """Appends an event to the per-runner circular activity buffer with Logfire query string.
 
         Args:
-            event_type: Event classification ('claim', 'complete', 'fail', 'timeout').
+            event_type: Event classification ('complete', 'fail', 'timeout').
             task: Affected server task.
             worker_id: Worker identifier involved.
             duration_s: Execution duration in seconds if complete. Defaults to None.
@@ -109,7 +109,7 @@ class ComboRunnersCoordinator:
         """
         now = time()
         time_str = datetime.fromtimestamp(now).strftime("%H:%M:%S")
-        query_str = _format_logfire_query(task) if event_type in ("fail", "timeout") else None
+        query_str = _format_logfire_query(task)
 
         event = ActivityEvent(
             timestamp=now,
@@ -392,7 +392,6 @@ class ComboRunnersCoordinator:
                             model=task.model,
                             task_type=task.task_type.value,
                         ):
-                            self._log_activity(event_type="claim", task=task, worker_id=worker_id)
                             claim_span.set_attribute("result", "claimed")
                             claim_span.set_attribute("task_id", task.task_id)
                             claim_span.set_attribute("task_type", task.task_type.value)

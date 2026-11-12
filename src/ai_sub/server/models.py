@@ -118,7 +118,7 @@ class ActivityEvent(BaseModel):
 
     timestamp: float = Field(description="Unix timestamp of the event.")
     time_str: str = Field(description="Human-readable event time string (HH:MM:SS).")
-    event_type: Literal["claim", "complete", "fail", "timeout"] = Field(description="Event classification.")
+    event_type: Literal["complete", "fail", "timeout"] = Field(description="Event classification.")
     task_id: str = Field(description="Task identifier.")
     pipeline: str = Field(description="Pipeline name.")
     worker_id: str = Field(description="Worker identifier.")
