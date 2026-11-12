@@ -1,29 +1,38 @@
-"""AI Sub: AI-Powered Subtitle Generation with Translation."""
+"""Job definitions, data schemas, and runtime execution contexts."""
 
-from __future__ import annotations
+from ai_sub.jobs.base import AiJob, BaseJob, MediaJob, Prompt, WorkerContext
+from ai_sub.jobs.lyrics import LyricsAiResponse, LyricsJob
+from ai_sub.jobs.reencode import ReencodeJob
+from ai_sub.jobs.subtitles import (
+    DetectedMusicalPerformance,
+    Subtitles,
+    SubtitlesAiResponse,
+    SubtitlesJob,
+)
+from ai_sub.jobs.summary import (
+    ChapterItem,
+    EntityItem,
+    GlossaryItem,
+    SummaryAiResponse,
+    SummaryJob,
+)
 
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from ai_sub.pipeline import Pipeline
-
-__all__ = ["Pipeline"]
-
-
-def __getattr__(name: str) -> Any:
-    """Lazy import for public attributes to prevent importing heavy dependencies at module init.
-
-    Args:
-        name: Name of the attribute to look up.
-
-    Returns:
-        Any: The resolved module attribute.
-
-    Raises:
-        AttributeError: If attribute name is not recognized.
-    """
-    if name == "Pipeline":
-        from ai_sub.pipeline import Pipeline
-
-        return Pipeline
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+__all__ = [
+    "AiJob",
+    "BaseJob",
+    "ChapterItem",
+    "DetectedMusicalPerformance",
+    "EntityItem",
+    "GlossaryItem",
+    "LyricsAiResponse",
+    "LyricsJob",
+    "MediaJob",
+    "Prompt",
+    "ReencodeJob",
+    "Subtitles",
+    "SubtitlesAiResponse",
+    "SubtitlesJob",
+    "SummaryAiResponse",
+    "SummaryJob",
+    "WorkerContext",
+]

@@ -8,7 +8,6 @@ from typing import Any, Literal, Self
 
 import logfire
 from pydantic import BaseModel, ConfigDict, Field
-from yt_dlp.utils import sanitize_filename
 
 from ai_sub.config import (
     ReEncodeSettings,
@@ -42,6 +41,7 @@ from ai_sub.stitching import stitch_subtitles
 from ai_sub.video import (
     get_video_duration_ms,
     is_valid_reencoded_file,
+    sanitize_filename,
     split_video,
 )
 
@@ -539,8 +539,8 @@ class Pipeline(BaseModel):
                             name=seg_path.stem,
                             video_duration_ms=seg_dur_ms,
                             segment_offset_ms=current_offset_ms,
-                            draft_subtitles=sub_resp.subtitles,
-                            detected_performances=sub_resp.detected_musical_performances,
+                            draft_subtitles=sub_resp.subtitles if sub_resp else [],
+                            detected_performances=sub_resp.detected_musical_performances if sub_resp else [],
                             global_summary=self.summary_response,
                             user_context=self.user_context,
                             media_path=media_file,

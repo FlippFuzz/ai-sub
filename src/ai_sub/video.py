@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -15,6 +16,22 @@ _FFMPEG_INITIALIZED: bool = False
 _FFMPEG_PATH: str = "ffmpeg"
 _FFPROBE_PATH: str = "ffprobe"
 _FFMPEG_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def sanitize_filename(name: str) -> str:
+    """Sanitizes a string to produce a safe filesystem filename stem.
+
+    Replaces reserved characters, control characters, and normalizes spacing.
+
+    Args:
+        name: Raw filename or stem string.
+
+    Returns:
+        str: Filesystem-safe sanitized filename string.
+    """
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    cleaned = cleaned.strip(" .")
+    return cleaned or "video"
 
 
 def set_ffmpeg_concurrency(max_concurrent: int) -> None:
