@@ -50,7 +50,7 @@ def is_retryable_error(e: Exception) -> bool:
     Returns:
         bool: True if error can be retried, False otherwise.
     """
-    # Deterministic validation or client programming errors are never transient
+    # Deterministic validation or client programming errors are never retryable
     if isinstance(e, (ValidationError, ValueError, TypeError, KeyError)):
         return False
 
@@ -60,7 +60,11 @@ def is_retryable_error(e: Exception) -> bool:
     if isinstance(e, (TransportError, TimeoutException, ConnectionError, asyncio.TimeoutError, TimeoutError)):
         return True
 
-    status_code = getattr(e, "code", None) or getattr(e, "status_code", None)
+    status_code = (
+        getattr(e, "code", None)
+        or getattr(e, "status_code", None)
+        or getattr(getattr(e, "response", None), "status_code", None)
+    )
     if isinstance(status_code, int):
         return status_code in (408, 429, 500, 502, 503, 504)
 
@@ -555,7 +559,7 @@ class GeminiExecutor:
         search_turns: int,
         retry: RetrySettings,
     ) -> Any:
-        """Executes a single search turn with exponential backoff on transient network or 5xx errors.
+        """Executes a single search turn with exponential backoff on retryable network or 5xx errors.
 
         Args:
             model_id: Target Gemini model identifier.
@@ -607,7 +611,7 @@ class GeminiExecutor:
                     ) + random.uniform(0, 1)
 
                     logfire.warning(
-                        f"Transient error on {model_id} search turn {search_turns} "
+                        f"Retryable error on {model_id} search turn {search_turns} "
                         f"(attempt {search_turn_attempt + 1}/{turn_max_attempts}): {err}. Retrying in {backoff:.2f}s..."
                     )
                     await asyncio.sleep(backoff)
@@ -865,7 +869,7 @@ class GeminiExecutor:
         if self._quota_exhausted.get(model_id, False):
             raise QuotaExceededError(f"Daily quota previously exhausted for model '{model_id}'.")
 
-        effective_retry = retry_settings or getattr(self, "default_retry_settings", None) or RetrySettings()
+        effective_retry = retry_settings or self.default_retry_settings
         remote_file = await self.ensure_file_uploaded(media_path)
 
         tokens = _calculate_tokens(prompt, video_duration_ms)

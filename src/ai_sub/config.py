@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import socket
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self, cast
 
@@ -30,6 +31,8 @@ from pydantic_settings import (
 )
 
 ServiceTier = Literal["auto", "default", "flex", "priority"]
+
+_LOADING_FROM_YAML: ContextVar[bool] = ContextVar("_loading_from_yaml", default=False)
 
 
 def _parse_string_list(val: Any) -> list[str] | Any:
@@ -64,6 +67,21 @@ def _parse_string_list(val: Any) -> list[str] | Any:
     return val
 
 
+def _parse_float_list(val: Any) -> list[float] | Any:
+    """Parses a list of floats from a Python list, JSON array, or comma-separated string.
+
+    Args:
+        val: Raw input value from environment variable, CLI, or YAML.
+
+    Returns:
+        list[float] | Any: Normalized list of floats or unparsed raw input.
+    """
+    raw_list = _parse_string_list(val)
+    if not isinstance(raw_list, list):
+        return raw_list
+    return [float(item) for item in raw_list]
+
+
 def _parse_path_list(val: Any) -> list[Path] | Any:
     """Parses a list of Paths from a Python list, JSON array, or comma-separated string.
 
@@ -80,11 +98,12 @@ def _parse_path_list(val: Any) -> list[Path] | Any:
 
 
 StringList = Annotated[list[str], NoDecode, BeforeValidator(_parse_string_list)]
+FloatList = Annotated[list[PositiveFloat], NoDecode, BeforeValidator(_parse_float_list)]
 PathList = Annotated[list[Path], NoDecode, BeforeValidator(_parse_path_list)]
 
 
 class YamlFileSettings(BaseSettings):
-    """Base settings model loaded from a YAML configuration file with ENV overrides."""
+    """Base settings model supporting YAML loading where ENV and .env override YAML values."""
 
     @classmethod
     def settings_customise_sources(
@@ -95,7 +114,10 @@ class YamlFileSettings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Ensures environment variables and .env files override values loaded from YAML.
+        """Prioritizes ENV and .env over YAML init kwargs when invoked via from_yaml().
+
+        When not loading from YAML (e.g. CLI invocation or explicit instantiation), keeps
+        init_settings ahead of ENV and .env so CLI flags override environment variables.
 
         Args:
             settings_cls: Target settings class.
@@ -107,7 +129,9 @@ class YamlFileSettings(BaseSettings):
         Returns:
             tuple[PydanticBaseSettingsSource, ...]: Source priority sequence.
         """
-        return (env_settings, dotenv_settings, init_settings)
+        if _LOADING_FROM_YAML.get():
+            return (env_settings, dotenv_settings, init_settings)
+        return (init_settings, env_settings, dotenv_settings)
 
     @classmethod
     def from_yaml(cls, yaml_path: Path | str) -> Self:
@@ -130,7 +154,12 @@ class YamlFileSettings(BaseSettings):
             data = yaml.safe_load(f) or {}
         if not isinstance(data, dict):
             raise ValueError(f"Invalid YAML content in {path}, expected dictionary mapping.")
-        return cls(**data)
+
+        token = _LOADING_FROM_YAML.set(True)
+        try:
+            return cls(**data)
+        finally:
+            _LOADING_FROM_YAML.reset(token)
 
 
 def find_config_file(kind: Literal["server", "worker"], cli_arg: str | Path | None = None) -> Path:
@@ -170,7 +199,7 @@ def find_config_file(kind: Literal["server", "worker"], cli_arg: str | Path | No
     raise FileNotFoundError(f"No {kind} configuration file found. Checked: {checked_str}.")
 
 
-class StorageSettings(BaseSettings):
+class StorageSettings(YamlFileSettings):
     """Configuration for Gemini Files API storage lifecycle and cleanup."""
 
     model_config = SettingsConfigDict(
@@ -216,7 +245,7 @@ class StorageSettings(BaseSettings):
         return self
 
 
-class SearchSettings(BaseSettings):
+class SearchSettings(YamlFileSettings):
     """Configuration for auxiliary web search tools used by the AI model."""
 
     model_config = SettingsConfigDict(
@@ -331,7 +360,7 @@ class SearchSettings(BaseSettings):
         return self
 
 
-class SummaryReEncodeSettings(BaseSettings):
+class SummaryReEncodeSettings(YamlFileSettings):
     """Re-encoding configuration for the whole-video summary proxy."""
 
     model_config = SettingsConfigDict(
@@ -358,6 +387,12 @@ class SummaryReEncodeSettings(BaseSettings):
         default=1.0,
         description="Target framerate (FPS) for the summary proxy video.",
     )
+    fallback_fps: FloatList = Field(
+        default_factory=list,
+        description=(
+            "Ordered fallback FPS tiers used to re-encode summary media after repeated non-retryable failures."
+        ),
+    )
     height: PositiveInt = Field(
         default=360,
         description="Target resolution height in pixels (aspect ratio is preserved).",
@@ -372,7 +407,7 @@ class SummaryReEncodeSettings(BaseSettings):
     )
 
 
-class SegmentReEncodeSettings(BaseSettings):
+class SegmentReEncodeSettings(YamlFileSettings):
     """Re-encoding configuration for individual video chunk segments."""
 
     model_config = SettingsConfigDict(
@@ -399,6 +434,12 @@ class SegmentReEncodeSettings(BaseSettings):
         default=1.0,
         description="Target framerate (FPS) for compressed segment chunks.",
     )
+    fallback_fps: FloatList = Field(
+        default_factory=list,
+        description=(
+            "Ordered fallback FPS tiers used to re-encode video segments after repeated non-retryable failures."
+        ),
+    )
     height: PositiveInt = Field(
         default=360,
         description="Target resolution height in pixels (aspect ratio is preserved).",
@@ -413,7 +454,7 @@ class SegmentReEncodeSettings(BaseSettings):
     )
 
 
-class ReEncodeSettings(BaseSettings):
+class ReEncodeSettings(YamlFileSettings):
     """Configuration for FFmpeg video re-encoding across pipeline stages."""
 
     model_config = SettingsConfigDict(
@@ -438,7 +479,7 @@ class ReEncodeSettings(BaseSettings):
     )
 
 
-class SplittingSettings(BaseSettings):
+class SplittingSettings(YamlFileSettings):
     """Configuration for splitting input videos into uniform segments."""
 
     model_config = SettingsConfigDict(
@@ -463,7 +504,7 @@ class SplittingSettings(BaseSettings):
     )
 
 
-class ConcurrencySettings(BaseSettings):
+class ConcurrencySettings(YamlFileSettings):
     """Concurrency settings controlling parallel worker tasks in standalone mode."""
 
     model_config = SettingsConfigDict(
@@ -492,8 +533,8 @@ class ConcurrencySettings(BaseSettings):
     )
 
 
-class RetrySettings(BaseSettings):
-    """Retry parameters for transient API failures and cross-run persistence."""
+class RetrySettings(YamlFileSettings):
+    """Retry parameters for transient API failures and server worker attempt limits."""
 
     model_config = SettingsConfigDict(
         env_prefix="AISUB_RETRY_",
@@ -504,11 +545,13 @@ class RetrySettings(BaseSettings):
     )
 
     per_run: NonNegativeInt = Field(
-        description="Maximum internal retries by the executor on transient network or schema failures.",
+        description="Maximum internal retries by the executor on retryable or schema failures.",
         default=5,
     )
     max_runs: PositiveInt = Field(
-        description="Maximum total attempt limit persisted across application executions per segment.",
+        description=(
+            "Maximum non-retryable worker failure attempts per FPS tier before fallback or exhaustion (server mode)."
+        ),
         default=3,
     )
     multiplier: PositiveFloat = Field(
@@ -525,7 +568,7 @@ class RetrySettings(BaseSettings):
     )
 
 
-class DirectorySettings(BaseSettings):
+class DirectorySettings(YamlFileSettings):
     """Configuration for working directories."""
 
     model_config = SettingsConfigDict(
@@ -546,7 +589,7 @@ class DirectorySettings(BaseSettings):
     )
 
 
-class LoggingSettings(BaseSettings):
+class LoggingSettings(YamlFileSettings):
     """Telemetry and console logging configuration."""
 
     model_config = SettingsConfigDict(
@@ -575,7 +618,7 @@ class LoggingSettings(BaseSettings):
     )
 
 
-class AiSettings(BaseSettings):
+class AiSettings(YamlFileSettings):
     """Configuration for Google Gemini models and rate limiting."""
 
     model_config = SettingsConfigDict(

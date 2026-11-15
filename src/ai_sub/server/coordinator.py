@@ -15,14 +15,16 @@ from typing import Any, Literal
 
 import logfire
 
+from ai_sub.pipeline import Pipeline
 from ai_sub.protocol import (
     TaskClaimResponse,
     TaskType,
 )
 from ai_sub.server.combo_runner import ComboRunner, RunnerStatus
-from ai_sub.server.config import ServerSettings
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.models import ActivityEvent, ServerTask, TaskStatus
+from ai_sub.server.server_config import ServerSettings
+from ai_sub.video import sanitize_filename
 
 
 def _format_logfire_query(task: ServerTask) -> str:
@@ -35,6 +37,125 @@ def _format_logfire_query(task: ServerTask) -> str:
         str: Formatted Logfire search query string.
     """
     return f"attributes->>'task_id' = '{task.task_id}'"
+
+
+def _is_valid_video_id(video_id: str) -> bool:
+    """Checks that a video ID is non-empty and free of path traversal characters.
+
+    Args:
+        video_id: Candidate video identifier string.
+
+    Returns:
+        bool: True if safe for directory path construction, False otherwise.
+    """
+    return video_id not in (".", "..") and bool(video_id.strip()) and "/" not in video_id and "\\" not in video_id
+
+
+def _release_task_lease(task: ServerTask) -> None:
+    """Clears active worker lease metadata from a server task.
+
+    Args:
+        task: Target server task to release.
+    """
+    task.worker_id = None
+    task.claimed_at = None
+    task.last_heartbeat = None
+
+
+def _build_stages_info(name: str, runner: ComboRunner, pipe: Pipeline, now: float) -> dict[str, Any]:
+    """Computes per-stage progress counters and active lease summaries for a dashboard card.
+
+    Args:
+        name: Runner pipeline name.
+        runner: Active ComboRunner instance.
+        pipe: Active Pipeline state machine.
+        now: Current Unix epoch timestamp.
+
+    Returns:
+        dict[str, Any]: Stage progress mapping for summary, reencoding, subtitles, and lyrics.
+    """
+    assert runner.active_video is not None
+    total_chunks = len(pipe.segments)
+    reenc_count = sum(1 for seg in pipe.segments if seg.media_ready)
+    pending_reenc = max(0, total_chunks - reenc_count)
+
+    summary_task = runner.tasks.get(f"{name}::{runner.active_video.video_id}::summary")
+    sub_tasks = [t for t in runner.tasks.values() if t.task_type == TaskType.SUBTITLES]
+    lyr_tasks = [t for t in runner.tasks.values() if t.task_type == TaskType.LYRICS]
+
+    sum_done = 1 if pipe.summary.response is not None else 0
+    sum_prog = 1 if summary_task and summary_task.status == TaskStatus.CLAIMED else 0
+
+    sub_done = sum(1 for seg in pipe.segments if seg.subtitles_response is not None)
+    sub_prog = sum(1 for t in sub_tasks if t.status == TaskStatus.CLAIMED)
+    sub_concluded = sum(1 for seg in pipe.segments if seg.subtitles_response is not None or seg.subtitles_exhausted)
+
+    lyr_total = (
+        sum(
+            1
+            for seg in pipe.segments
+            if seg.subtitles_response is not None and seg.subtitles_response.detected_musical_performances
+        )
+        if pipe.lyrics_enabled
+        else 0
+    )
+    lyr_done = sum(1 for seg in pipe.segments if seg.lyrics_response is not None)
+    lyr_prog = sum(1 for t in lyr_tasks if t.status == TaskStatus.CLAIMED)
+
+    active_lyr_tasks = [
+        {
+            "task_id": t.task_id,
+            "worker_id": t.worker_id,
+            "elapsed_s": int(now - t.claimed_at) if t.claimed_at else None,
+        }
+        for t in lyr_tasks
+        if t.status == TaskStatus.CLAIMED
+    ]
+
+    has_singing = lyr_total > 0
+    if sub_concluded < total_chunks:
+        lyr_status = "in_progress" if lyr_prog > 0 else "pending"
+    elif has_singing:
+        lyr_concluded = sum(
+            1
+            for seg in pipe.segments
+            if seg.subtitles_response is not None
+            and seg.subtitles_response.detected_musical_performances
+            and (seg.lyrics_response is not None or seg.lyrics_exhausted)
+        )
+        lyr_status = "completed" if lyr_concluded == lyr_total else ("in_progress" if lyr_prog > 0 else "pending")
+    else:
+        lyr_status = "skipped"
+
+    return {
+        "summary": {
+            "total": 1,
+            "done": sum_done,
+            "in_progress": sum_prog,
+            "status": "completed" if sum_done else ("claimed" if sum_prog else "pending"),
+            "worker_id": summary_task.worker_id if summary_task else None,
+            "elapsed_s": int(now - summary_task.claimed_at) if summary_task and summary_task.claimed_at else None,
+        },
+        "reencoding": {
+            "total": total_chunks,
+            "done": reenc_count,
+            "in_progress": min(pending_reenc, runner.max_reencode_concurrency),
+            "pending": pending_reenc,
+        },
+        "subtitles": {
+            "total": total_chunks,
+            "done": sub_done,
+            "in_progress": sub_prog,
+        },
+        "lyrics": {
+            "total": lyr_total,
+            "done": lyr_done,
+            "in_progress": lyr_prog,
+            "has_singing": has_singing,
+            "status": lyr_status,
+            "active_leases": active_lyr_tasks,
+        },
+    }
 
 
 class ComboRunnersCoordinator:
@@ -50,6 +171,7 @@ class ComboRunnersCoordinator:
     _sweep_task: asyncio.Task[None] | None
     _background_tasks: set[asyncio.Task[Any]]
     on_runners_finalized: Callable[[], Any] | None
+    on_video_aborted: Callable[[str, str, str], None] | None
 
     def __init__(self, settings: ServerSettings, git_sync: GitSyncManager | None = None) -> None:
         """Initializes the central combination runners coordinator.
@@ -70,6 +192,7 @@ class ComboRunnersCoordinator:
         self._sweep_task = None
         self._background_tasks = set()
         self.on_runners_finalized = None
+        self.on_video_aborted = None
 
         work_base = settings.server.work_dir
         for p_cfg in settings.pipelines:
@@ -81,14 +204,38 @@ class ComboRunnersCoordinator:
                 default_search_tools=settings.default_search_tools,
                 split_settings=settings.split,
                 retry_settings=settings.retry,
+                max_reencode_concurrency=settings.server.reencode_concurrency,
                 coordinator_lock=self._lock,
+                on_pipeline_done=self._schedule_finalize_check,
                 validation_buffer_ms=settings.server.validation_buffer_ms,
             )
 
-    @property
-    def pipelines(self) -> dict[str, ComboRunner]:
-        """Provides backwards-compatible dictionary property mapping to active runners."""
-        return self.runners
+    def _find_task(self, task_id: str) -> tuple[ComboRunner, ServerTask] | None:
+        """Locates a ServerTask and its owning ComboRunner by task ID.
+
+        Args:
+            task_id: Unique task identifier.
+
+        Returns:
+            tuple[ComboRunner, ServerTask] | None: (runner, task) if found, else None.
+        """
+        for runner in self.runners.values():
+            if task := runner.tasks.get(task_id):
+                return runner, task
+        return None
+
+    def _schedule_finalize_check(self) -> None:
+        """Schedules an asynchronous completion check after background re-encoding concludes."""
+
+        async def _run() -> None:
+            try:
+                await self.check_and_finalize_completed_runners()
+            except Exception as e:
+                logfire.exception(f"Background finalization check error: {e}")
+
+        bg_task = asyncio.create_task(_run())
+        self._background_tasks.add(bg_task)
+        bg_task.add_done_callback(self._background_tasks.discard)
 
     def _log_activity(
         self,
@@ -108,12 +255,9 @@ class ComboRunnersCoordinator:
             detail: Optional extra details or error traceback. Defaults to None.
         """
         now = time()
-        time_str = datetime.fromtimestamp(now).strftime("%H:%M:%S")
-        query_str = _format_logfire_query(task)
-
         event = ActivityEvent(
             timestamp=now,
-            time_str=time_str,
+            time_str=datetime.fromtimestamp(now).strftime("%H:%M:%S"),
             event_type=event_type,
             task_id=task.task_id,
             pipeline=task.pipeline_name,
@@ -122,7 +266,7 @@ class ComboRunnersCoordinator:
             video_id=task.video_id,
             duration_s=round(duration_s, 1) if duration_s is not None else None,
             detail=detail,
-            logfire_query=query_str,
+            logfire_query=_format_logfire_query(task),
         )
 
         runner_log = self.runner_activity_logs.setdefault(
@@ -152,8 +296,7 @@ class ComboRunnersCoordinator:
         Returns:
             bool: True if the runner was idle and acquired; False otherwise.
         """
-        # Reject invalid or path-traversal video IDs that could corrupt filesystem cleanup
-        if video_id in (".", "..") or not video_id.strip() or "/" in video_id or "\\" in video_id:
+        if not _is_valid_video_id(video_id):
             logfire.warning(f"Rejected invalid or dangerous video ID for acquisition: {video_id!r}")
             return False
 
@@ -177,8 +320,7 @@ class ComboRunnersCoordinator:
             runner_name: Name of the combination runner to reset.
         """
         async with self._lock:
-            runner = self.runners.get(runner_name)
-            if runner:
+            if runner := self.runners.get(runner_name):
                 runner.clear_preparing()
 
     async def assign_prepared_video(
@@ -207,8 +349,7 @@ class ComboRunnersCoordinator:
         Returns:
             bool: True if video was prepared and assigned; False otherwise.
         """
-        # Reject invalid or path-traversal video IDs
-        if video_id in (".", "..") or not video_id.strip() or "/" in video_id or "\\" in video_id:
+        if not _is_valid_video_id(video_id):
             logfire.warning(f"Rejected invalid or dangerous video ID for assignment: {video_id!r}")
             return False
 
@@ -234,16 +375,16 @@ class ComboRunnersCoordinator:
             resumed_count = 0
             for name, runner in self.runners.items():
                 try:
-                    resumed = await runner.resume_from_disk()
-                    if resumed:
+                    if await runner.resume_from_disk():
                         resumed_count += 1
                         logfire.info(f"Runner '{name}' resumed active video from disk.")
                 except Exception as e:
                     logfire.exception(f"Error resuming runner '{name}' from disk: {e}")
                     try:
-                        await runner.clear_active_video()
+                        # Preserve on-disk checkpoints when startup recovery raises unexpectedly
+                        await runner.clear_active_video(purge_disk=False)
                     except Exception as clear_err:
-                        logfire.warning(f"Error clearing active video for failed runner '{name}': {clear_err}")
+                        logfire.warning(f"Error resetting in-memory state for failed runner '{name}': {clear_err}")
 
             start_span.set_attribute("resumed_runners", resumed_count)
 
@@ -255,7 +396,7 @@ class ComboRunnersCoordinator:
             self._sweep_task = asyncio.create_task(self._lease_sweeper_loop())
 
     async def stop(self) -> None:
-        """Stops background sweeper tasks gracefully."""
+        """Stops background sweeper and runner re-encoding tasks gracefully."""
         if self._sweep_task:
             self._sweep_task.cancel()
             try:
@@ -264,14 +405,20 @@ class ComboRunnersCoordinator:
                 pass
             self._sweep_task = None
 
+        for runner in self.runners.values():
+            await runner.stop_background_tasks()
+
         for bg_task in list(self._background_tasks):
             bg_task.cancel()
         self._background_tasks.clear()
 
     async def _lease_sweeper_loop(self) -> None:
-        """Continuously checks for expired worker leases every 15 seconds."""
+        """Continuously checks for expired worker leases every 15 seconds.
+
+        Heartbeat timeouts are treated as retryable failures and reset tasks to PENDING
+        without incrementing non-retryable attempt counts toward max_runs.
+        """
         timeout = self.settings.server.heartbeat_timeout_seconds
-        max_runs = self.settings.retry.max_runs
 
         while True:
             await asyncio.sleep(15)
@@ -282,55 +429,30 @@ class ComboRunnersCoordinator:
                     active_leases = 0
 
                     for runner in self.runners.values():
-                        # Iterate over a snapshot list to avoid RuntimeError if failure handling modifies tasks
                         for task in list(runner.tasks.values()):
-                            if task.status == TaskStatus.CLAIMED:
-                                active_leases += 1
-                                reference_time = task.last_heartbeat or task.claimed_at or 0.0
-                                elapsed = now - reference_time
-                                if elapsed > timeout:
-                                    expired_count += 1
-                                    worker_id = task.worker_id or "unknown"
-                                    total_active_s = round(now - (task.claimed_at or now), 1)
-
-                                    diag_msg = (
-                                        f"Lease timed out after {timeout}s without heartbeat "
-                                        f"(active: {total_active_s}s)."
-                                    )
-
-                                    task.worker_id = None
-                                    task.claimed_at = None
-                                    task.last_heartbeat = None
-                                    task.attempts += 1
-
-                                    try:
-                                        runner.on_task_failed(task.task_id, task.attempts)
-                                    except Exception as e:
-                                        logfire.exception(f"Failed to persist failure for '{task.task_id}': {e}")
-
-                                    if task.attempts >= max_runs:
-                                        task.status = TaskStatus.FAILED
-                                        logfire.error(
-                                            f"Task '{task.task_id}' lease expired ({elapsed:.1f}s). Marked FAILED."
-                                        )
-                                        self._log_activity(
-                                            event_type="fail",
-                                            task=task,
-                                            worker_id=worker_id,
-                                            detail=f"{diag_msg} (max runs exhausted)",
-                                        )
-                                    else:
-                                        task.status = TaskStatus.PENDING
-                                        logfire.warning(
-                                            f"Task '{task.task_id}' lease expired (worker: {worker_id}). "
-                                            "Set to PENDING."
-                                        )
-                                        self._log_activity(
-                                            event_type="timeout",
-                                            task=task,
-                                            worker_id=worker_id,
-                                            detail=diag_msg,
-                                        )
+                            if task.status != TaskStatus.CLAIMED:
+                                continue
+                            active_leases += 1
+                            reference_time = task.last_heartbeat or task.claimed_at or 0.0
+                            if (now - reference_time) > timeout:
+                                expired_count += 1
+                                worker_id = task.worker_id or "unknown"
+                                total_active_s = round(now - (task.claimed_at or now), 1)
+                                diag_msg = (
+                                    f"Lease timed out after {timeout}s without heartbeat (active: {total_active_s}s)."
+                                )
+                                _release_task_lease(task)
+                                task.status = TaskStatus.PENDING
+                                logfire.warning(
+                                    f"Task '{task.task_id}' lease expired (worker: {worker_id}). "
+                                    "Reset to PENDING (retryable)."
+                                )
+                                self._log_activity(
+                                    event_type="timeout",
+                                    task=task,
+                                    worker_id=worker_id,
+                                    detail=diag_msg,
+                                )
 
                     sweep_span.set_attribute("active_leases", active_leases)
                     sweep_span.set_attribute("expired_leases", expired_count)
@@ -368,13 +490,13 @@ class ComboRunnersCoordinator:
                 worker_tools = {t.strip().lower() for t in search_tools}
 
                 for runner in self.runners.values():
+                    if runner.status != RunnerStatus.PROCESSING:
+                        continue
                     for task in runner.tasks.values():
                         if task.status != TaskStatus.PENDING or not runner.is_task_ready_for_claim(task):
                             continue
-
                         if task.model.lower() not in available_models:
                             continue
-
                         if task.task_type in (TaskType.SUMMARY, TaskType.LYRICS):
                             if task.search_tools and not all(t.lower() in worker_tools for t in task.search_tools):
                                 continue
@@ -426,21 +548,21 @@ class ComboRunnersCoordinator:
         """
         now = time()
         async with self._lock:
-            for runner in self.runners.values():
-                if task_id in runner.tasks:
-                    task = runner.tasks[task_id]
-                    if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
-                        task.last_heartbeat = now
-                        return True
-                    else:
-                        logfire.warning(
-                            f"Heartbeat rejected for '{task_id}': status={task.status.value}, "
-                            f"assigned_worker={task.worker_id}, requesting_worker={worker_id}"
-                        )
-                        return False
+            found = self._find_task(task_id)
+            if not found:
+                logfire.warning(f"Heartbeat rejected: task '{task_id}' not found.")
+                return False
 
-        logfire.warning(f"Heartbeat rejected: task '{task_id}' not found.")
-        return False
+            _, task = found
+            if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
+                task.last_heartbeat = now
+                return True
+
+            logfire.warning(
+                f"Heartbeat rejected for '{task_id}': status={task.status.value}, "
+                f"assigned_worker={task.worker_id}, requesting_worker={worker_id}"
+            )
+            return False
 
     def _fail_task_locked(
         self,
@@ -448,7 +570,7 @@ class ComboRunnersCoordinator:
         worker_id: str,
         reason: str,
         error_message: str | None = None,
-        is_transient: bool = False,
+        is_retryable: bool = False,
     ) -> bool:
         """Processes task failure and updates lease state while lock is held.
 
@@ -457,7 +579,7 @@ class ComboRunnersCoordinator:
             worker_id: Worker reporting the failure.
             reason: Error code or exception description.
             error_message: Optional error details. Defaults to None.
-            is_transient: Whether failure is transient and exempt from attempt counting. Defaults to False.
+            is_retryable: Whether failure is retryable and exempt from attempt counting. Defaults to False.
 
         Returns:
             bool: True indicating the task failure was processed.
@@ -467,32 +589,37 @@ class ComboRunnersCoordinator:
         else:
             detail = reason or error_message or "Unknown failure"
 
+        _release_task_lease(task)
+
+        if is_retryable:
+            task.status = TaskStatus.PENDING
+            self._log_activity(event_type="fail", task=task, worker_id=worker_id, detail=detail)
+            logfire.warning(
+                f"Task '{task.task_id}' failed by worker '{worker_id}' (retryable: {reason}). Reset to PENDING."
+            )
+            return True
+
+        runner = self.runners.get(task.pipeline_name)
+        if not runner:
+            task.status = TaskStatus.FAILED
+            self._log_activity(event_type="fail", task=task, worker_id=worker_id, detail=detail)
+            return True
+
+        outcome = runner.on_task_failed(task.task_id)
+        max_runs = self.settings.retry.max_runs
+
+        if outcome.action == "fallback_reencode":
+            detail = f"{detail}\n-> Falling back to {outcome.target_fps} fps (tier {outcome.fallback_tier})"
+        elif outcome.action == "exhausted":
+            detail = f"{detail}\n-> Exhausted all {max_runs} attempt(s) and fallback FPS tiers."
+            logfire.error(f"Task '{task.task_id}' marked FAILED after exhausting retries and fallback tiers.")
+        elif outcome.action == "retry":
+            logfire.warning(
+                f"Task '{task.task_id}' failed by worker '{worker_id}' "
+                f"(attempt {outcome.tier_attempts}/{max_runs}). Reset to PENDING."
+            )
+
         self._log_activity(event_type="fail", task=task, worker_id=worker_id, detail=detail)
-        task.worker_id = None
-        task.claimed_at = None
-        task.last_heartbeat = None
-
-        if not is_transient:
-            task.attempts += 1
-            max_runs = self.settings.retry.max_runs
-
-            runner = self.runners.get(task.pipeline_name)
-            if runner:
-                try:
-                    runner.on_task_failed(task.task_id, task.attempts)
-                except Exception as e:
-                    logfire.exception(f"Failed to persist failure for '{task.task_id}': {e}")
-
-            if task.attempts >= max_runs:
-                task.status = TaskStatus.FAILED
-                logfire.error(f"Task '{task.task_id}' marked FAILED after {task.attempts}/{max_runs} runs.")
-                return True
-
-        task.status = TaskStatus.PENDING
-        logfire.warning(
-            f"Task '{task.task_id}' failed by worker '{worker_id}' (reason: {reason}, "
-            f"transient: {is_transient}). Reset to PENDING."
-        )
         return True
 
     async def complete_task(
@@ -512,57 +639,57 @@ class ComboRunnersCoordinator:
             bool: True if completion was accepted, False otherwise.
         """
         async with self._lock:
-            for runner in self.runners.values():
-                if task_id in runner.tasks:
-                    task = runner.tasks[task_id]
-                    if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
-                        with logfire.span(
-                            "Process Complete Task: {task_id}", task_id=task_id, worker_id=worker_id
-                        ) as comp_span:
-                            duration = time() - (task.claimed_at or time())
-                            try:
-                                runner.on_task_completed(task_id, result)
-                            except Exception as val_err:
-                                logfire.warning(f"Task '{task_id}' validation failed: {val_err}. Routing to fail.")
-                                comp_span.set_attribute("result", "validation_failed")
-                                comp_span.set_attribute("error", str(val_err))
-                                self._fail_task_locked(
-                                    task=task,
-                                    worker_id=worker_id,
-                                    reason="EXECUTION_ERROR",
-                                    error_message=f"Server validation error: {val_err}",
-                                    is_transient=False,
-                                )
-                                return False
-
-                            detail = None
-                            if task.task_type == TaskType.SUMMARY:
-                                ch_len = len(result.get("chapters", []))
-                                ent_len = len(result.get("entities", []))
-                                detail = f"Summary: {ch_len} chapters, {ent_len} entities extracted"
-                            elif task.task_type == TaskType.SUBTITLES:
-                                sub_len = len(result.get("subs", result.get("subtitles", [])))
-                                music_len = len(result.get("detected_musical_performances", []))
-                                detail = f"Subtitles: {sub_len} lines transcribed ({music_len} songs detected)"
-                            elif task.task_type == TaskType.LYRICS:
-                                lyr_len = len(result.get("subs", result.get("subtitles", [])))
-                                detail = f"Lyrics: {lyr_len} lines refined"
-
-                            self._log_activity(
-                                event_type="complete",
-                                task=task,
-                                worker_id=worker_id,
-                                duration_s=duration,
-                                detail=detail,
-                            )
-                            comp_span.set_attribute("result", "accepted")
-                            comp_span.set_attribute("duration_s", round(duration, 1))
-                            logfire.info(f"Task '{task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
-                            return True
-
-            with logfire.span("Process Complete Task Rejected: {task_id}", task_id=task_id, worker_id=worker_id):
+            found = self._find_task(task_id)
+            if not found:
                 logfire.warning(f"Task '{task_id}' completion from worker '{worker_id}' was rejected.")
-            return False
+                return False
+
+            runner, task = found
+            if task.status != TaskStatus.CLAIMED or task.worker_id != worker_id:
+                logfire.warning(f"Task '{task_id}' completion from worker '{worker_id}' was rejected.")
+                return False
+
+            with logfire.span("Process Complete Task: {task_id}", task_id=task_id, worker_id=worker_id) as comp_span:
+                duration = time() - (task.claimed_at or time())
+                try:
+                    runner.on_task_completed(task_id, result)
+                except Exception as val_err:
+                    logfire.warning(f"Task '{task_id}' validation failed: {val_err}. Routing to fail.")
+                    comp_span.set_attribute("result", "validation_failed")
+                    comp_span.set_attribute("error", str(val_err))
+                    self._fail_task_locked(
+                        task=task,
+                        worker_id=worker_id,
+                        reason="EXECUTION_ERROR",
+                        error_message=f"Server validation error: {val_err}",
+                        is_retryable=False,
+                    )
+                    return False
+
+                detail = None
+                if task.task_type == TaskType.SUMMARY:
+                    ch_len = len(result.get("chapters", []))
+                    ent_len = len(result.get("entities", []))
+                    detail = f"Summary: {ch_len} chapters, {ent_len} entities extracted"
+                elif task.task_type == TaskType.SUBTITLES:
+                    sub_len = len(result.get("subs", result.get("subtitles", [])))
+                    music_len = len(result.get("detected_musical_performances", []))
+                    detail = f"Subtitles: {sub_len} lines transcribed ({music_len} songs detected)"
+                elif task.task_type == TaskType.LYRICS:
+                    lyr_len = len(result.get("subs", result.get("subtitles", [])))
+                    detail = f"Lyrics: {lyr_len} lines refined"
+
+                self._log_activity(
+                    event_type="complete",
+                    task=task,
+                    worker_id=worker_id,
+                    duration_s=duration,
+                    detail=detail,
+                )
+                comp_span.set_attribute("result", "accepted")
+                comp_span.set_attribute("duration_s", round(duration, 1))
+                logfire.info(f"Task '{task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
+                return True
 
     async def fail_task(
         self,
@@ -570,7 +697,7 @@ class ComboRunnersCoordinator:
         worker_id: str,
         reason: str,
         error_message: str | None = None,
-        is_transient: bool = False,
+        is_retryable: bool = False,
     ) -> bool:
         """Handles task failure, releasing the lease or marking permanently failed.
 
@@ -579,36 +706,38 @@ class ComboRunnersCoordinator:
             worker_id: Worker reporting the failure.
             reason: Error code or exception description.
             error_message: Optional error details. Defaults to None.
-            is_transient: Whether failure is transient and exempt from attempt counting. Defaults to False.
+            is_retryable: Whether failure is retryable and exempt from attempt counting. Defaults to False.
 
         Returns:
             bool: True if failure was recorded, False otherwise.
         """
         async with self._lock:
-            for runner in self.runners.values():
-                if task_id in runner.tasks:
-                    task = runner.tasks[task_id]
-                    if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
-                        with logfire.span(
-                            "Process Task Failure: {task_id}",
-                            task_id=task_id,
-                            worker_id=worker_id,
-                            reason=reason,
-                        ) as fail_span:
-                            success = self._fail_task_locked(
-                                task=task,
-                                worker_id=worker_id,
-                                reason=reason,
-                                error_message=error_message,
-                                is_transient=is_transient,
-                            )
-                            fail_span.set_attribute("result", task.status.value)
-                            fail_span.set_attribute("attempts", task.attempts)
-                            return success
-
-            with logfire.span("Process Task Failure Rejected: {task_id}", task_id=task_id, worker_id=worker_id):
+            found = self._find_task(task_id)
+            if not found:
                 logfire.warning(f"Task '{task_id}' failure report from worker '{worker_id}' was rejected (not found).")
-            return False
+                return False
+
+            _, task = found
+            if task.status != TaskStatus.CLAIMED or task.worker_id != worker_id:
+                logfire.warning(f"Task '{task_id}' failure report from worker '{worker_id}' was rejected (not found).")
+                return False
+
+            with logfire.span(
+                "Process Task Failure: {task_id}",
+                task_id=task_id,
+                worker_id=worker_id,
+                reason=reason,
+            ) as fail_span:
+                success = self._fail_task_locked(
+                    task=task,
+                    worker_id=worker_id,
+                    reason=reason,
+                    error_message=error_message,
+                    is_retryable=is_retryable,
+                )
+                fail_span.set_attribute("result", task.status.value)
+                fail_span.set_attribute("attempts", task.attempts)
+                return success
 
     def get_task_media_path(self, task_id: str) -> Path | None:
         """Retrieves the local media file path for an active task.
@@ -619,21 +748,22 @@ class ComboRunnersCoordinator:
         Returns:
             Path | None: File path if task exists and file is present, None otherwise.
         """
-        for runner in self.runners.values():
-            if task_id in runner.tasks:
-                task = runner.tasks[task_id]
-                if task.media_path.is_file():
-                    return task.media_path
+        found = self._find_task(task_id)
+        if found and found[1].media_path.is_file():
+            return found[1].media_path
         return None
 
     async def finalize_runner_if_complete(self, runner: ComboRunner) -> bool:
         """Checks if a runner has finished all segments, stitches subtitles, and pushes to Git.
 
+        If the summary stage permanently aborted across all fallback tiers, skips Git push,
+        records the abort with ingestion so the runner does not loop, and clears the workspace.
+
         Args:
             runner: Combination runner instance to check and finalize.
 
         Returns:
-            bool: True if runner was completed and finalized, False otherwise.
+            bool: True if runner was completed or aborted and cleared, False otherwise.
         """
         async with self._lock:
             if runner.config.name in self._finalizing_runners:
@@ -649,6 +779,22 @@ class ComboRunnersCoordinator:
         try:
             vid = runner.active_video
             assert vid is not None
+
+            if vid.pipeline and vid.pipeline.summary_aborted:
+                logfire.error(
+                    f"Runner '{runner.config.name}' aborted '{vid.title}' ({vid.video_id}) "
+                    "due to Summary exhaustion. Skipping Git push and holding from automatic retry."
+                )
+                if self.on_video_aborted is not None:
+                    try:
+                        self.on_video_aborted(runner.config.name, vid.video_id, "Summary failed")
+                    except Exception as cb_err:
+                        logfire.warning(f"Error invoking on_video_aborted callback: {cb_err}")
+
+                async with self._lock:
+                    await runner.clear_active_video()
+                    return True
+
             logfire.info(f"Runner '{runner.config.name}' finalizing for '{vid.title}'...")
 
             srt_filename = f"{vid.filename_stem}.{runner.full_shortcode}.srt"
@@ -680,8 +826,8 @@ class ComboRunnersCoordinator:
                         runner.status = RunnerStatus.PUSH_FAILED
                     return False
             else:
-                # When Git sync is disabled, copy generated subtitles to durable local output directory
-                output_dir = self.settings.server.work_dir / "output" / vid.uploader
+                safe_uploader = sanitize_filename(vid.uploader)
+                output_dir = self.settings.server.work_dir / "output" / safe_uploader
                 output_dir.mkdir(parents=True, exist_ok=True)
                 for srt_path in generated_srts:
                     dest = output_dir / srt_path.name
@@ -762,11 +908,6 @@ class ComboRunnersCoordinator:
             stages_info = None
 
             if runner.active_video and runner.active_video.pipeline:
-                pipe = runner.active_video.pipeline
-                total_chunks = len(pipe.segment_paths)
-                reenc_count = len(pipe.reencoded_segment_paths)
-                pending_reenc = max(0, total_chunks - reenc_count)
-
                 active_info = {
                     "video_id": runner.active_video.video_id,
                     "title": runner.active_video.title,
@@ -775,79 +916,7 @@ class ComboRunnersCoordinator:
                     "duration_ms": runner.active_video.duration_ms,
                     "source_type": runner.active_video.source_type,
                 }
-
-                summary_task = next((t for t in runner.tasks.values() if t.task_type == TaskType.SUMMARY), None)
-                sub_tasks = [t for t in runner.tasks.values() if t.task_type == TaskType.SUBTITLES]
-                lyr_tasks = [t for t in runner.tasks.values() if t.task_type == TaskType.LYRICS]
-
-                sum_done = (
-                    1
-                    if runner.summary_response or (summary_task and summary_task.status == TaskStatus.COMPLETED)
-                    else 0
-                )
-                sum_prog = 1 if summary_task and summary_task.status == TaskStatus.CLAIMED else 0
-
-                sub_done = sum(1 for t in sub_tasks if t.status == TaskStatus.COMPLETED)
-                sub_prog = sum(1 for t in sub_tasks if t.status == TaskStatus.CLAIMED)
-                sub_concluded = sum(1 for t in sub_tasks if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED))
-
-                lyr_done = sum(1 for t in lyr_tasks if t.status == TaskStatus.COMPLETED)
-                lyr_prog = sum(1 for t in lyr_tasks if t.status == TaskStatus.CLAIMED)
-
-                active_lyr_tasks = [
-                    {
-                        "task_id": t.task_id,
-                        "worker_id": t.worker_id,
-                        "elapsed_s": int(now - t.claimed_at) if t.claimed_at else None,
-                    }
-                    for t in lyr_tasks
-                    if t.status == TaskStatus.CLAIMED
-                ]
-
-                has_singing = bool(lyr_tasks)
-                if sub_concluded < total_chunks:
-                    lyr_status = "in_progress" if lyr_prog > 0 else "pending"
-                else:
-                    if lyr_tasks:
-                        lyr_status = (
-                            "completed"
-                            if lyr_done == len(lyr_tasks)
-                            else ("in_progress" if lyr_prog > 0 else "pending")
-                        )
-                    else:
-                        lyr_status = "skipped"
-
-                stages_info = {
-                    "summary": {
-                        "total": 1,
-                        "done": sum_done,
-                        "in_progress": sum_prog,
-                        "status": "completed" if sum_done else ("claimed" if sum_prog else "pending"),
-                        "worker_id": summary_task.worker_id if summary_task else None,
-                        "elapsed_s": int(now - summary_task.claimed_at)
-                        if summary_task and summary_task.claimed_at
-                        else None,
-                    },
-                    "reencoding": {
-                        "total": total_chunks,
-                        "done": reenc_count,
-                        "in_progress": 1 if pending_reenc > 0 else 0,
-                        "pending": pending_reenc,
-                    },
-                    "subtitles": {
-                        "total": total_chunks,
-                        "done": sub_done,
-                        "in_progress": sub_prog,
-                    },
-                    "lyrics": {
-                        "total": len(lyr_tasks),
-                        "done": lyr_done,
-                        "in_progress": lyr_prog,
-                        "has_singing": has_singing,
-                        "status": lyr_status,
-                        "active_leases": active_lyr_tasks,
-                    },
-                }
+                stages_info = _build_stages_info(name, runner, runner.active_video.pipeline, now)
 
             tasks_list = [
                 {
@@ -863,9 +932,6 @@ class ComboRunnersCoordinator:
             ]
 
             q_info = pipeline_queues.get(name, {"total_count": 0, "items": []})
-            queue_total = q_info.get("total_count", 0)
-            next_in_queue = q_info.get("items", [])
-
             pipeline_data.append(
                 {
                     "name": name,
@@ -880,8 +946,8 @@ class ComboRunnersCoordinator:
                     "preparing_video": runner.preparing_video_info,
                     "stages": stages_info,
                     "tasks": tasks_list,
-                    "queue_total": queue_total,
-                    "next_in_queue": next_in_queue,
+                    "queue_total": q_info.get("total_count", 0),
+                    "next_in_queue": q_info.get("items", []),
                     "recent_activity": [event.model_dump() for event in self.runner_activity_logs.get(name, [])],
                 }
             )

@@ -108,14 +108,11 @@ class TaskFailRequest(BaseModel):
 
     worker_id: str = Field(description="Unique identifier of the worker.")
     task_id: str = Field(description="Unique task identifier.")
-    reason: str = Field(
-        description="Failure code (e.g. 'QUOTA_EXHAUSTED', 'TRANSIENT_API_ERROR', or 'EXECUTION_ERROR')."
-    )
-    model: str | None = Field(default=None, description="Model identifier that failed, if applicable.")
+    reason: str = Field(description="Failure code (e.g. 'QUOTA_EXHAUSTED', 'RETRYABLE_ERROR', or 'EXECUTION_ERROR').")
     error_message: str | None = Field(default=None, description="Optional error description or traceback.")
-    is_transient: bool = Field(
+    is_retryable: bool = Field(
         default=False,
         description=(
-            "Whether the failure is transient (e.g. upstream 5xx, timeout) and should not penalize attempt counts."
+            "Whether the failure is retryable (e.g. upstream 5xx, timeout, quota) and should not count toward max_runs."
         ),
     )

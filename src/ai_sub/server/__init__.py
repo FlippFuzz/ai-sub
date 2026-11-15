@@ -2,15 +2,6 @@
 
 from ai_sub.server.app import create_app
 from ai_sub.server.combo_runner import ComboRunner, RunnerStatus
-from ai_sub.server.config import (
-    FilesSourceConfig,
-    GitConfig,
-    PipelineConfig,
-    ServerOptions,
-    ServerSettings,
-    SourcesConfig,
-    YoutubeSourceConfig,
-)
 from ai_sub.server.coordinator import ComboRunnersCoordinator
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.ingestion import IngestionManager, QueuedVideo
@@ -19,6 +10,15 @@ from ai_sub.server.models import (
     ActivityEvent,
     ServerTask,
     TaskStatus,
+)
+from ai_sub.server.server_config import (
+    FilesSourceConfig,
+    GitConfig,
+    PipelineConfig,
+    ServerOptions,
+    ServerSettings,
+    SourcesConfig,
+    YoutubeSourceConfig,
 )
 from ai_sub.server.youtube import (
     DiscoveredVideo,

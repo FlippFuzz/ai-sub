@@ -26,9 +26,6 @@ class StitchResult:
     duration_ms: int
     lyrics_refined: bool
     status: str
-    any_failed: bool
-    max_retries_exceeded: bool
-    any_pending: bool
 
 
 def format_subtitle_metadata(metadata: dict[str, Any]) -> str:
@@ -65,13 +62,15 @@ def stitch_subtitles(
     lyrics_shortcode: str,
     validation_buffer_ms: int,
     settings_dump: dict[str, Any],
-    max_runs: int = 3,
-    status_override: str | None = None,
+    status_override: str,
     summary_available: bool = True,
     initial_offset_ms: int = 0,
     use_lyrics: bool = True,
 ) -> StitchResult:
     """Stitches segment subtitle and lyrics state files into unified, offset-shifted SRT files in a single pass.
+
+    When lyrics refinement is required but fails or is unavailable, the primary output
+    falls back to the completed draft subtitles rather than emitting an error placeholder.
 
     Args:
         segments: Sequence of (segment_stem, segment_duration_ms) pairs in order.
@@ -82,8 +81,7 @@ def stitch_subtitles(
         lyrics_shortcode: Model shortcode used for lyrics YAML state files.
         validation_buffer_ms: Validation buffer tolerance in milliseconds.
         settings_dump: Serialized configuration settings to embed in Event 0.
-        max_runs: Maximum attempt limit for retries. Defaults to 3.
-        status_override: Explicit status string. Defaults to None.
+        status_override: Derived completion status string embedded in Event 0 metadata.
         summary_available: Whether whole-video summary was active. Defaults to True.
         initial_offset_ms: Starting time offset in milliseconds. Defaults to 0.
         use_lyrics: Whether lyrics refinement was enabled. Defaults to True.
@@ -95,10 +93,6 @@ def stitch_subtitles(
     raw_subs = SSAFile() if output_raw_path is not None else None
     generated_files: list[Path] = []
     current_offset_ms = initial_offset_ms
-
-    any_failed = False
-    max_retries_exceeded = False
-    any_pending = False
     lyrics_refined_any = False
 
     for stem, seg_dur_ms in segments:
@@ -113,10 +107,9 @@ def stitch_subtitles(
         )
 
         active_resp = None
-        if lyrics_required:
-            if lyrics_job and lyrics_job.response:
-                active_resp = lyrics_job.response
-                lyrics_refined_any = True
+        if lyrics_required and lyrics_job and lyrics_job.response:
+            active_resp = lyrics_job.response
+            lyrics_refined_any = True
         elif sub_job and sub_job.response:
             active_resp = sub_job.response
 
@@ -132,16 +125,6 @@ def stitch_subtitles(
                     text="Error processing subtitles for this segment.",
                 )
             )
-            any_failed = True
-            attempts = (
-                (lyrics_job.total_attempts if lyrics_job else 0)
-                if lyrics_required
-                else (sub_job.total_attempts if sub_job else 0)
-            )
-            if attempts >= max_runs:
-                max_retries_exceeded = True
-            else:
-                any_pending = True
 
         if raw_subs is not None:
             if sub_job and sub_job.response:
@@ -159,17 +142,13 @@ def stitch_subtitles(
 
         current_offset_ms += seg_dur_ms
 
-    final_status = status_override or (
-        "Completed" if not any_failed else ("RetriesExceeded" if max_retries_exceeded else "InProgress")
-    )
-
     metadata = {
         "ai_sub_version": get_app_version(),
         "generated_at": datetime.now().isoformat(),
         "summary_prompt_version": SUMMARY_PROMPT_VERSION if summary_available else None,
         "subtitles_prompt_version": SUBTITLES_PROMPT_VERSION,
         "lyrics_prompt_version": LYRICS_PROMPT_VERSION,
-        "status": final_status,
+        "status": status_override,
         "settings": settings_dump,
     }
 
@@ -189,8 +168,5 @@ def stitch_subtitles(
         total_events=len(all_subs),
         duration_ms=current_offset_ms,
         lyrics_refined=lyrics_refined_any,
-        status=final_status,
-        any_failed=any_failed,
-        max_retries_exceeded=max_retries_exceeded,
-        any_pending=any_pending,
+        status=status_override,
     )

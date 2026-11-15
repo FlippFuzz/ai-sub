@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import string
-from pathlib import Path
 from textwrap import dedent
 from typing import Any, ClassVar, Self
 
@@ -265,7 +264,7 @@ class SubtitlesAiResponse(BaseSubtitleAiResponse):
 
 
 class BaseSubtitleJob(AiJob):
-    """Base job container holding common subtitle state and export routines."""
+    """Base job container holding common subtitle state."""
 
     video_duration_ms: PositiveInt = Field(description="Segment duration in milliseconds.")
     segment_offset_ms: NonNegativeInt = Field(
@@ -296,15 +295,6 @@ class BaseSubtitleJob(AiJob):
         default=None,
         description="Structured subtitle response once generated.",
     )
-
-    def save_srt(self, srt_path: Path) -> None:
-        """Saves current subtitle response as an SRT file.
-
-        Args:
-            srt_path: Destination file path.
-        """
-        if self.response:
-            self.response.get_ssafile().save(str(srt_path))
 
 
 class SubtitlesJob(BaseSubtitleJob):

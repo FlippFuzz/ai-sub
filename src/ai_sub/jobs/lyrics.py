@@ -8,7 +8,6 @@ from typing import ClassVar
 import logfire
 from pydantic import Field
 
-from ai_sub.config import RetrySettings, ServiceTier
 from ai_sub.jobs.base import (
     Prompt,
     WorkerContext,
@@ -251,21 +250,9 @@ class LyricsJob(BaseSubtitleJob):
         default_factory=list,
         description="Detected singing performances in this segment.",
     )
-    model_name: str | None = Field(
-        default=None,
-        description="Optional Gemini model identifier override.",
-    )
-    service_tier: ServiceTier | None = Field(
-        default=None,
-        description="Optional Google Gemini service tier override.",
-    )
     agentic_video: bool = Field(
         default=True,
         description="Whether to enable agentic video exploration.",
-    )
-    retry_settings: RetrySettings | None = Field(
-        default=None,
-        description="Optional task-specific retry settings.",
     )
     response: LyricsAiResponse | None = Field(
         default=None,

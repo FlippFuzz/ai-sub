@@ -172,10 +172,10 @@ ai-sub --context-file "notes.txt" "video.mp4"
 Inside the temporary directory (`tmp_<video_name>`), AI Sub generates standalone state files (`.yaml`) and intermediate subtitles (`.srt`) tracking the progress of each video chunk and global summary:
 
 - `summary.<summary_shortcode>.yaml`: Caches the global video summary and metadata (where `<summary_shortcode>` combines the summary model shortcode and prompt version, e.g., `g35l-01`).
-- `<part_name>.subtitles.<subtitles_shortcode>.yaml` & `.srt`: Caches raw segment dialogue transcription and timing (where `<subtitles_shortcode>` incorporates summary lineage and subtitle model shortcode/version, e.g., `g35l-01_g38f-19`).
-- `<part_name>.lyrics.<lyrics_shortcode>.yaml` & `.srt`: Caches refined song lyrics and translations when musical performances are detected (where `<lyrics_shortcode>` incorporates subtitle lineage and lyrics model shortcode/version, e.g., `g35l-01_g38f-19_g35l-10`).
+- `<part_name>.subtitles.<subtitles_shortcode>.yaml`: Caches raw segment dialogue transcription, timing, and active fallback FPS tier (where `<subtitles_shortcode>` incorporates summary lineage and subtitle model shortcode/version, e.g., `g35l-01_g38f-19`).
+- `<part_name>.lyrics.<lyrics_shortcode>.yaml`: Caches refined song lyrics and translations when musical performances are detected (where `<lyrics_shortcode>` incorporates subtitle lineage and lyrics model shortcode/version, e.g., `g35l-01_g38f-19_g35l-10`).
 
-Delete the corresponding `.yaml` state files in the temporary directory to force a regeneration of a specific summary, chunk transcription, or lyrics pass.
+You can re-run `ai-sub` as many times as needed—completed units are skipped automatically while unfinished or previously failed chunks are retried. If `reencode.summary.fallback_fps` or `reencode.segment.fallback_fps` is configured (e.g., `0.5,0.1,0.01`), non-retryable failures step down through lower FPS tiers automatically. Delete a specific `.yaml` state file to force regeneration of a completed stage.
 
 ---
 
@@ -192,4 +192,4 @@ For complete setup instructions (systemd services, Nginx reverse proxy, Basic Au
 
 ## Configuration
 
-For advanced settings (such as custom frame rates, custom models, rate limits, per-stage agentic video toggles, and storage cleanup rules), refer to [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md:1).
+For advanced settings (such as custom frame rates, fallback FPS tiers, custom models, rate limits, per-stage agentic video toggles, and storage cleanup rules), refer to [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md:1).

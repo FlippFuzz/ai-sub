@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 import logfire
@@ -15,7 +16,6 @@ import static_ffmpeg
 _FFMPEG_INITIALIZED: bool = False
 _FFMPEG_PATH: str = "ffmpeg"
 _FFPROBE_PATH: str = "ffprobe"
-_FFMPEG_SEMAPHORE: asyncio.Semaphore | None = None
 
 
 def sanitize_filename(name: str) -> str:
@@ -32,28 +32,6 @@ def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
     cleaned = cleaned.strip(" .")
     return cleaned or "video"
-
-
-def set_ffmpeg_concurrency(max_concurrent: int) -> None:
-    """Sets the maximum number of concurrent FFmpeg operations.
-
-    Args:
-        max_concurrent: Maximum concurrent FFmpeg subprocesses allowed.
-    """
-    global _FFMPEG_SEMAPHORE
-    _FFMPEG_SEMAPHORE = asyncio.Semaphore(max(1, max_concurrent))
-
-
-def _get_ffmpeg_semaphore() -> asyncio.Semaphore:
-    """Retrieves or initializes the global FFmpeg concurrency semaphore.
-
-    Returns:
-        asyncio.Semaphore: Global semaphore instance.
-    """
-    global _FFMPEG_SEMAPHORE
-    if _FFMPEG_SEMAPHORE is None:
-        _FFMPEG_SEMAPHORE = asyncio.Semaphore(1)
-    return _FFMPEG_SEMAPHORE
 
 
 def _find_system_binary(binary_name: str) -> str | None:
@@ -248,14 +226,15 @@ async def get_video_duration_ms(video_path: Path) -> int:
         raise RuntimeError(f"Could not determine duration for video file: {video_path.name}") from e
 
 
-async def get_video_fps(video_path: Path) -> float:
-    """Calculates the average framerate (FPS) of a video file.
+async def _probe_stream_fps(video_path: Path, entry: str) -> float:
+    """Probes a framerate stream entry (e.g., 'r_frame_rate' or 'avg_frame_rate') using ffprobe.
 
     Args:
         video_path: Path to the target media file.
+        entry: FFprobe stream entry name to inspect.
 
     Returns:
-        float: Frames per second.
+        float: Probed framerate in frames per second.
 
     Raises:
         RuntimeError: If the framerate cannot be determined.
@@ -269,7 +248,7 @@ async def get_video_fps(video_path: Path) -> float:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=avg_frame_rate",
+            f"stream={entry}",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
             str(video_path),
@@ -278,8 +257,20 @@ async def get_video_fps(video_path: Path) -> float:
         num, den = map(int, stdout.strip().split("/"))
         return num / den
     except (subprocess.CalledProcessError, ValueError, ZeroDivisionError) as e:
-        logfire.exception(f"Could not determine FPS for {video_path.name}")
-        raise RuntimeError(f"Could not determine FPS for video file: {video_path.name}") from e
+        logfire.exception(f"Could not determine {entry} for {video_path.name}")
+        raise RuntimeError(f"Could not determine {entry} for video file: {video_path.name}") from e
+
+
+async def get_video_fps(video_path: Path) -> float:
+    """Calculates the average framerate (FPS) of a video file.
+
+    Args:
+        video_path: Path to the target media file.
+
+    Returns:
+        float: Frames per second.
+    """
+    return await _probe_stream_fps(video_path, "avg_frame_rate")
 
 
 async def get_working_encoder() -> str:
@@ -340,13 +331,27 @@ async def is_valid_reencoded_file(
     if not output_path.is_file() or output_path.stat().st_size == 0:
         return False
     try:
-        input_duration, output_duration, output_fps = await asyncio.gather(
+        input_duration, output_duration, r_fps, avg_fps = await asyncio.gather(
             get_video_duration_ms(input_path),
             get_video_duration_ms(output_path),
-            get_video_fps(output_path),
+            _probe_stream_fps(output_path, "r_frame_rate"),
+            _probe_stream_fps(output_path, "avg_frame_rate"),
         )
         effective_tolerance = duration_tolerance_ms + (int(1000 / fps) if fps < 1.0 else 0)
-        return abs(input_duration - output_duration) < effective_tolerance and abs(fps - output_fps) < 0.01
+        if abs(input_duration - output_duration) >= effective_tolerance:
+            return False
+
+        # Validate target FPS against r_frame_rate (constant stream rate) and avg_frame_rate.
+        fps_tol = max(0.005, fps * 0.1)
+        if abs(fps - r_fps) < fps_tol or abs(fps - avg_fps) < fps_tol:
+            return True
+
+        # Short tail clips at ultra-low FPS (e.g., 45s at 0.01 fps) contain 1 frame, so muxed rate equals 1/duration.
+        duration_s = output_duration / 1000.0
+        if duration_s > 0 and fps < 1.0 and (fps * duration_s) < 1.0:
+            return round(avg_fps * duration_s) == 1
+
+        return False
     except Exception:
         return False
 
@@ -395,13 +400,14 @@ async def split_video(
                 f"Re-splitting {input_video.name}: existing duration ({total_segment_duration}ms) "
                 f"mismatches input ({input_duration}ms)."
             )
-            for segment in existing_segments:
-                try:
-                    segment.unlink()
-                except OSError:
-                    pass
         except Exception:
             logfire.warning(f"Re-splitting {input_video.name}: existing segments verification failed.")
+
+        for segment in existing_segments:
+            try:
+                segment.unlink()
+            except OSError:
+                pass
 
     ffmpeg_bin, _ = ensure_ffmpeg()
     escaped_dir = str(output_dir).replace("%", "%%")
@@ -428,13 +434,11 @@ async def split_video(
         full_output_pattern,
     ]
 
-    sem = _get_ffmpeg_semaphore()
-    async with sem:
-        try:
-            await _run_ffmpeg(cmd)
-        except subprocess.CalledProcessError as e:
-            logfire.exception(f"FFmpeg split failed. Stdout: {e.stdout}, Stderr: {e.stderr}")
-            raise
+    try:
+        await _run_ffmpeg(cmd)
+    except subprocess.CalledProcessError as e:
+        logfire.exception(f"FFmpeg split failed. Stdout: {e.stdout}, Stderr: {e.stderr}")
+        raise
 
     return sorted(output_dir.glob(glob_pattern))
 
@@ -451,6 +455,8 @@ async def reencode_video(
 ) -> None:
     """Compresses a video segment or full video using low framerates and downscaled resolution.
 
+    Encodes atomically via a temporary file and validates output before replacing output_path.
+
     Args:
         input_path: Source video media path.
         output_path: Destination path for compressed output.
@@ -462,6 +468,7 @@ async def reencode_video(
         keyframe_only: Whether to decode only keyframes from the input video.
 
     Raises:
+        RuntimeError: If the re-encoded output fails duration or framerate validation.
         subprocess.CalledProcessError: If FFmpeg re-encoding fails.
     """
     if await is_valid_reencoded_file(
@@ -472,6 +479,9 @@ async def reencode_video(
     ):
         logfire.info(f"Reusing existing valid compressed media: {output_path.name}")
         return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_output = output_path.with_name(f".{output_path.stem}.{uuid.uuid4().hex[:8]}.tmp{output_path.suffix}")
 
     ffmpeg_bin, _ = ensure_ffmpeg()
     video_bytes_per_sec = bitrate_kb * 1024
@@ -500,7 +510,7 @@ async def reencode_video(
         "-c:v",
         encoder,
         "-g",
-        str(int(fps * 10)),
+        str(max(1, int(fps * 10))),
         "-b:v",
         str(video_bytes_per_sec * 8),
         "-maxrate",
@@ -508,13 +518,25 @@ async def reencode_video(
         "-bufsize",
         str(video_bytes_per_sec * 8 * 2),
         *audio_args,
-        str(output_path),
+        str(temp_output),
     ]
 
-    sem = _get_ffmpeg_semaphore()
-    async with sem:
-        try:
-            await _run_ffmpeg(cmd)
-        except subprocess.CalledProcessError as e:
-            logfire.exception(f"FFmpeg re-encoding failed for {input_path.name}. Stderr: {e.stderr}")
-            raise
+    try:
+        await _run_ffmpeg(cmd)
+        if not await is_valid_reencoded_file(
+            input_path=input_path,
+            output_path=temp_output,
+            fps=fps,
+            duration_tolerance_ms=duration_tolerance_ms,
+        ):
+            raise RuntimeError(f"Re-encoded output failed validation for {input_path.name} at {fps} fps.")
+        os.replace(temp_output, output_path)
+    except subprocess.CalledProcessError as e:
+        logfire.exception(f"FFmpeg re-encoding failed for {input_path.name}. Stderr: {e.stderr}")
+        raise
+    finally:
+        if temp_output.exists():
+            try:
+                temp_output.unlink()
+            except OSError:
+                pass

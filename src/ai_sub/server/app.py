@@ -20,10 +20,10 @@ from ai_sub.protocol import (
     TaskHeartbeatRequest,
     TaskHeartbeatResponse,
 )
-from ai_sub.server.config import ServerSettings
 from ai_sub.server.coordinator import ComboRunnersCoordinator
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.ingestion import IngestionManager
+from ai_sub.server.server_config import ServerSettings
 from ai_sub.telemetry import get_app_version
 
 DASHBOARD_HTML_PATH = Path(__file__).parent / "static" / "dashboard.html"
@@ -206,11 +206,6 @@ def create_app(settings: ServerSettings) -> FastAPI:
             req.worker_id,
             req.result,
         )
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Task was not assigned to this worker or has already completed.",
-            )
 
         async def _finalize_and_feed() -> None:
             """Background finalization and runner coordination task."""
@@ -223,6 +218,12 @@ def create_app(settings: ServerSettings) -> FastAPI:
         background_tasks.add(bg_task)
         bg_task.add_done_callback(background_tasks.discard)
 
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Task was not assigned to this worker or has already completed.",
+            )
+
         return {"status": "ok"}
 
     @app.post("/api/v1/tasks/{task_id}/fail")
@@ -231,7 +232,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
         Args:
             task_id: Unique task identifier (already unquoted by FastAPI).
-            req: Failure report request containing reason, optional error details, and transient flag.
+            req: Failure report request containing reason, optional error details, and retryable flag.
 
         Returns:
             dict[str, str]: Operation status confirmation dictionary.
@@ -244,7 +245,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
             worker_id=req.worker_id,
             reason=req.reason,
             error_message=req.error_message,
-            is_transient=req.is_transient,
+            is_retryable=req.is_retryable,
         )
         if not success:
             raise HTTPException(
@@ -287,7 +288,6 @@ def create_app(settings: ServerSettings) -> FastAPI:
         return {
             "status": "online",
             "runners": runner_status,
-            "pipelines": runner_status,
         }
 
     return app

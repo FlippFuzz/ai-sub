@@ -15,7 +15,7 @@ server:
 # Task Execution and Distributed Retry Controls
 retry:
   per_run: 5          # Internal retries on worker before surrendering task lease
-  max_runs: 3         # Maximum total worker attempts before marking task permanently FAILED
+  max_runs: 3         # Non-retryable worker failures per FPS tier before fallback or exhaustion
   multiplier: 2.0
   min_wait_seconds: 30.0
   max_wait_seconds: 300
@@ -63,6 +63,7 @@ reencode:
     threshold_mb: 500
     keyframe_only: true
     fps: 1.0
+    fallback_fps: []             # e.g. [0.5, 0.1, 0.01]
     height: 360
     bitrate_kb: 35
 
@@ -70,6 +71,7 @@ reencode:
     enabled: true
     threshold_mb: 50
     fps: 1.0
+    fallback_fps: []             # e.g. [0.5, 0.1, 0.01]
     height: 360
     bitrate_kb: 35
 

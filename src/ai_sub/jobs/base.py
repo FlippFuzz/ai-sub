@@ -16,6 +16,7 @@ from pydantic import (
     ConfigDict,
     Field,
     NonNegativeInt,
+    PositiveFloat,
     ValidationError,
 )
 
@@ -256,17 +257,12 @@ class BaseJob(BaseModel):
     )
     total_attempts: NonNegativeInt = Field(
         default=0,
-        description="Total processing attempts recorded across all executions.",
+        description="Cumulative processing attempts recorded across all executions and FPS tiers.",
     )
 
 
 class MediaJob(BaseJob):
     """Base class for media manipulation tasks (such as video transcoding)."""
-
-    user_context: str | None = Field(
-        default=None,
-        description="Resolved user-supplied context string applied during execution.",
-    )
 
 
 class AiJob(BaseJob):
@@ -284,6 +280,22 @@ class AiJob(BaseJob):
     segment_index: int | None = Field(
         default=None,
         description="Segment index if applicable.",
+    )
+    fallback_tier: NonNegativeInt = Field(
+        default=0,
+        description="Fallback re-encoding tier index (0 = initial run, 1+ = fallback_fps index + 1).",
+    )
+    tier_attempts: NonNegativeInt = Field(
+        default=0,
+        description="Non-retryable failure attempts recorded at the current FPS tier.",
+    )
+    target_fps: PositiveFloat | None = Field(
+        default=None,
+        description="Active fallback FPS target if fallback re-encoding has been triggered, else None.",
+    )
+    exhausted: bool = Field(
+        default=False,
+        description="Whether this job has permanently exhausted all retries and fallback FPS tiers.",
     )
 
     prompt_version_field: ClassVar[str] = ""

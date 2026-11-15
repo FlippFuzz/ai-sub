@@ -22,8 +22,8 @@ from git.exc import InvalidGitRepositoryError, NoSuchPathError
 from pydantic import BaseModel, RootModel
 from yt_dlp import YoutubeDL
 
-from ai_sub.server.config import YoutubeSourceConfig
-from ai_sub.video import ensure_ffmpeg
+from ai_sub.server.server_config import YoutubeSourceConfig
+from ai_sub.video import ensure_ffmpeg, sanitize_filename
 
 _VALID_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".flv", ".ts"}
 
@@ -82,6 +82,25 @@ class ChannelMap(RootModel[dict[str, ChannelInfo]]):
     """Container mapping channel IDs to channel metadata."""
 
     root: dict[str, ChannelInfo]
+
+
+def _sanitize_uploader(raw_uploader: str, fallback: str = "youtube") -> str:
+    """Normalizes a channel handle into a safe single directory component.
+
+    Args:
+        raw_uploader: Raw handle or uploader ID string.
+        fallback: Value returned if the sanitized result is empty or unsafe. Defaults to 'youtube'.
+
+    Returns:
+        str: Safe single-component uploader identifier (max 20 characters).
+    """
+    stripped = str(raw_uploader).strip().strip("@")
+    if not stripped:
+        return fallback
+    cleaned = sanitize_filename(stripped)[:20].strip(" .")
+    if not cleaned or cleaned in (".", ".."):
+        return fallback
+    return cleaned
 
 
 def _extract_handle(entry: Mapping[str, Any]) -> str | None:
@@ -200,6 +219,7 @@ class YouTubeClient:
     _pot_server_dir: Path | None
     _base_ydl_opts: dict[str, Any]
     _source_last_scan_ts: dict[str, int]
+    _deep_scanned_urls: set[str]
 
     def __init__(self, config: YoutubeSourceConfig, base_work_dir: Path) -> None:
         """Initializes the YouTube client, compiling PO tokens and loading channel mappings.
@@ -212,6 +232,7 @@ class YouTubeClient:
         self.base_work_dir = base_work_dir
         self._channel_lock = threading.Lock()
         self._source_last_scan_ts = {}
+        self._deep_scanned_urls = set()
 
         channels_path = config.channels_file
         if not channels_path.is_absolute():
@@ -227,14 +248,6 @@ class YouTubeClient:
 
         self._base_ydl_opts = self._build_base_ydl_opts()
         self._log_startup_diagnostics()
-
-    def _is_node_runtime_available(self) -> bool:
-        """Checks if Node.js, npm, and npx runtimes are available in PATH.
-
-        Returns:
-            bool: True if all required binaries are found, False otherwise.
-        """
-        return bool(shutil.which("node") and shutil.which("npm") and shutil.which("npx"))
 
     def _ensure_pot_provider(self, pot_dir: Path) -> Path | None:
         """Clones, syncs tags, and compiles bgutil-ytdlp-pot-provider once at startup.
@@ -430,7 +443,9 @@ class YouTubeClient:
             return
 
         c_str = str(channel_id)
-        u_str = str(uploader_id).strip("@")[:20]
+        u_str = _sanitize_uploader(str(uploader_id))
+        if u_str.lower() == "youtube":
+            return
 
         with self._channel_lock:
             existing = self._channel_map.root.get(c_str)
@@ -469,7 +484,7 @@ class YouTubeClient:
                     name = info.get("channel") or info.get("uploader")
                     c_id = info.get("channel_id") or channel_id
                     if handle and str(handle).lower() != "youtube":
-                        clean_handle = str(handle).strip("@")[:20]
+                        clean_handle = _sanitize_uploader(str(handle))
                         self._record_channel_mapping(
                             channel_id=str(c_id) if c_id else None,
                             uploader_id=clean_handle,
@@ -501,7 +516,7 @@ class YouTubeClient:
             url_context: Optional channel handle extracted from the configured source URL.
 
         Returns:
-            str: Resolved and sanitized uploader ID (max 20 characters).
+            str: Resolved and sanitized single-component uploader ID (max 20 characters).
         """
         uploader_id = _extract_handle(entry)
         channel_id = entry.get("channel_id")
@@ -510,7 +525,7 @@ class YouTubeClient:
 
         # 1. Direct explicit handle on entry
         if uploader_id and str(uploader_id).lower() != "youtube":
-            clean_handle = str(uploader_id).strip("@")[:20]
+            clean_handle = _sanitize_uploader(str(uploader_id))
             if channel_id:
                 self._record_channel_mapping(
                     channel_id=str(channel_id),
@@ -526,11 +541,11 @@ class YouTubeClient:
             with self._channel_lock:
                 info = self._channel_map.root.get(c_str)
             if info and info.uploader_id and info.uploader_id.lower() != "youtube":
-                return info.uploader_id
+                return _sanitize_uploader(info.uploader_id)
 
             # 3. Associate channel_id with source URL handle when available
             if url_context and str(url_context).lower() != "youtube":
-                clean_handle = str(url_context).strip("@")[:20]
+                clean_handle = _sanitize_uploader(str(url_context))
                 self._record_channel_mapping(
                     channel_id=c_str,
                     uploader_id=clean_handle,
@@ -547,7 +562,7 @@ class YouTubeClient:
 
         # 5. Fallback to URL context (for channel tabs without channel_id)
         if url_context:
-            return str(url_context).strip("@")[:20]
+            return _sanitize_uploader(str(url_context))
 
         # 6. Generic fallback
         return "youtube"
@@ -555,8 +570,12 @@ class YouTubeClient:
     def scan_sources(self, deep_scan: bool = False) -> list[DiscoveredVideo]:
         """Fetches metadata for configured YouTube sources using flat extraction with early date cutoff.
 
+        Tracks per-URL deep-scan completion so any source that fails with a transient error
+        automatically retries its full history crawl on the next scan without re-crawling
+        already-completed sources.
+
         Args:
-            deep_scan: If True, crawls full channel history; if False, applies lookback window cutoff.
+            deep_scan: If True, forces full channel history crawl across all sources.
 
         Returns:
             list[DiscoveredVideo]: List of discovered videos across all feeds.
@@ -601,20 +620,22 @@ class YouTubeClient:
                         )
                         time_sleep(delay)
 
+                    needs_deep = deep_scan or (url not in self._deep_scanned_urls)
                     source_last_scan = self._source_last_scan_ts.get(url, 0)
-                    if not deep_scan and source_last_scan > 0:
+                    if not needs_deep and source_last_scan > 0:
                         elapsed = (now_ts - source_last_scan) + int(self.config.rescan_jitter_minutes * 60)
                         lookback_seconds = max(base_lookback, elapsed)
                     else:
                         lookback_seconds = base_lookback
 
-                    cutoff_ts = now_ts - lookback_seconds if not deep_scan else 0
+                    cutoff_ts = 0 if needs_deep else (now_ts - lookback_seconds)
 
-                    with logfire.span("Scanning {url}", url=url, _level="debug") as url_span:
+                    with logfire.span("Scanning {url}", url=url, deep_scan=needs_deep, _level="debug") as url_span:
                         try:
                             result = ydl.extract_info(url, download=False)
                             if not result:
                                 url_span.set_attribute("result", "empty")
+                                self._deep_scanned_urls.add(url)
                                 self._source_last_scan_ts[url] = now_ts
                                 continue
 
@@ -653,7 +674,7 @@ class YouTubeClient:
                                     except ValueError:
                                         ts = 0
 
-                                if not deep_scan and ts > 0 and ts < cutoff_ts:
+                                if not needs_deep and ts > 0 and ts < cutoff_ts:
                                     # Break only for chronologically ordered channel tabs (/videos, /streams)
                                     if url.endswith(("/videos", "/streams")):
                                         break
@@ -676,6 +697,7 @@ class YouTubeClient:
                                 url_discovered_count += 1
 
                             url_span.set_attribute("discovered_count", url_discovered_count)
+                            self._deep_scanned_urls.add(url)
                             self._source_last_scan_ts[url] = now_ts
                         except YouTubeBotDetectionError:
                             url_span.set_attribute("error", "bot_detection")

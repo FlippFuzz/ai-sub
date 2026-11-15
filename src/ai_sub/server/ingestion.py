@@ -14,9 +14,9 @@ import logfire
 from pydantic import BaseModel, Field
 
 from ai_sub.server.combo_runner import ComboRunner
-from ai_sub.server.config import SourcesConfig
 from ai_sub.server.coordinator import ComboRunnersCoordinator
 from ai_sub.server.git_sync import GitSyncManager
+from ai_sub.server.server_config import SourcesConfig
 from ai_sub.server.youtube import (
     DiscoveredVideo,
     DownloadedVideo,
@@ -24,6 +24,7 @@ from ai_sub.server.youtube import (
     YouTubeClient,
     YouTubeVideoUnavailableError,
 )
+from ai_sub.video import sanitize_filename
 
 
 @dataclass
@@ -77,7 +78,6 @@ def _cleanup_failed_job_dir(job_dir: Path) -> None:
     """
     if not job_dir.is_dir():
         return
-    # If YAML state checkpoints exist, keep the directory and checkpoints; remove only temporary partial files
     yaml_files = list(job_dir.glob("*.yaml"))
     if yaml_files:
         for part_file in job_dir.glob("*.part"):
@@ -104,6 +104,7 @@ class IngestionManager:
     youtube_client: YouTubeClient
     local_videos: dict[str, QueuedVideo]
     youtube_videos: dict[str, QueuedVideo]
+    _aborted_videos: dict[tuple[str, str], str]
     _youtube_cooldown_until: float
     _youtube_cooldown_reason: str | None
     _last_idle_summary: dict[str, str]
@@ -114,7 +115,6 @@ class IngestionManager:
     _scan_lock: asyncio.Lock
     _feed_lock: asyncio.Lock
     _stopped: bool
-    _pending_deep_scan: bool
 
     def __init__(
         self,
@@ -136,10 +136,12 @@ class IngestionManager:
         self.git_sync = git_sync
         self.base_work_dir = base_work_dir
         self.coordinator.on_runners_finalized = self.feed_idle_runners
+        self.coordinator.on_video_aborted = self.mark_video_aborted
 
         self.youtube_client = YouTubeClient(config.youtube, base_work_dir)
         self.local_videos = {}
         self.youtube_videos = {}
+        self._aborted_videos = {}
         self._youtube_cooldown_until = 0.0
         self._youtube_cooldown_reason = None
         self._last_idle_summary = {}
@@ -150,7 +152,16 @@ class IngestionManager:
         self._scan_lock = asyncio.Lock()
         self._feed_lock = asyncio.Lock()
         self._stopped = False
-        self._pending_deep_scan = True
+
+    def mark_video_aborted(self, runner_name: str, video_id: str, reason: str) -> None:
+        """Records an aborted video for a specific runner so it is held out from automatic retry.
+
+        Args:
+            runner_name: Target combination runner name.
+            video_id: Video identifier that aborted.
+            reason: Human-readable abort reason displayed on the dashboard.
+        """
+        self._aborted_videos[(runner_name, video_id)] = reason
 
     def _is_youtube_in_cooldown(self) -> bool:
         """Checks if YouTube operations are temporarily suspended due to bot detection or failure limit.
@@ -198,8 +209,7 @@ class IngestionManager:
                 if self._stopped:
                     return
                 logfire.info("YouTube intake cooldown expired. Resuming YouTube job feeding...")
-                if self._pending_deep_scan:
-                    await self._scan_youtube_sources_async(deep_scan=True)
+                await self._scan_youtube_sources_async(deep_scan=False)
                 await self.feed_idle_runners()
             except asyncio.CancelledError:
                 pass
@@ -230,8 +240,10 @@ class IngestionManager:
                 if file_path.is_file() and file_path.suffix.lower() in valid_extensions:
                     vid = file_path.stem
                     mtime = int(file_path.stat().st_mtime)
-                    uploader = file_path.parent.name or "local"
-                    uploader = uploader.strip("@")[:20]
+                    raw_uploader = (file_path.parent.name or "local").strip("@")
+                    uploader = sanitize_filename(raw_uploader)[:20].strip(" .") if raw_uploader else "local"
+                    if not uploader or uploader in (".", ".."):
+                        uploader = "local"
                     resolved_path = file_path.resolve()
 
                     discovered[vid] = _DiscoveredLocalFile(
@@ -250,7 +262,7 @@ class IngestionManager:
         """Fetches metadata for YouTube sources off-thread without mutating shared state.
 
         Args:
-            deep_scan: If True, crawls full channel history; if False, applies lookback window cutoff.
+            deep_scan: If True, crawls full channel history; if False, uses per-URL deep-scan state.
 
         Returns:
             list[DiscoveredVideo]: Discovered YouTube video metadata items.
@@ -289,6 +301,9 @@ class IngestionManager:
 
             for vid in set(self.local_videos.keys()) - set(discovered.keys()):
                 self.local_videos.pop(vid, None)
+                if vid not in self.youtube_videos:
+                    for key in [k for k in self._aborted_videos if k[1] == vid]:
+                        self._aborted_videos.pop(key, None)
 
             if self.local_videos:
                 logfire.debug(f"Watch folders scan complete: {len(self.local_videos)} local file(s) tracked.")
@@ -299,7 +314,7 @@ class IngestionManager:
         """Scans YouTube sources off-thread and updates in-memory cache safely on the event loop.
 
         Args:
-            deep_scan: If True, crawls full channel history; if False, applies lookback window cutoff.
+            deep_scan: If True, forces a full channel history crawl across all sources.
 
         Returns:
             list[QueuedVideo]: Discovered YouTube video items.
@@ -312,14 +327,9 @@ class IngestionManager:
             logfire.info(f"Skipping YouTube scan: bot cooldown active ({remaining_m:.1f}m remaining).")
             return list(self.youtube_videos.values())
 
-        # If an initial deep scan is still pending, upgrade this scan to deep_scan
-        effective_deep_scan = deep_scan or self._pending_deep_scan
-
         async with self._scan_lock:
             try:
-                discovered = await asyncio.to_thread(self._scan_youtube_sources, effective_deep_scan)
-                if effective_deep_scan:
-                    self._pending_deep_scan = False
+                discovered = await asyncio.to_thread(self._scan_youtube_sources, deep_scan)
             except YouTubeBotDetectionError as e:
                 self._trigger_youtube_cooldown(reason=str(e))
                 return list(self.youtube_videos.values())
@@ -400,6 +410,23 @@ class IngestionManager:
                 video.channel_name = downloaded.channel_name
             return downloaded.file_path
 
+    def _is_completed_for_runner(self, video: QueuedVideo, full_shortcode: str) -> bool:
+        """Checks completion in Git using global video ID for YouTube and uploader+ID for local files.
+
+        Args:
+            video: Candidate queued video.
+            full_shortcode: Pipeline output shortcode.
+
+        Returns:
+            bool: True if subtitles already exist in Git, False otherwise.
+        """
+        if video.source_type == "youtube":
+            if video.uploader.lower() == "youtube":
+                if known := self.git_sync.get_completed_uploader(video.video_id, full_shortcode):
+                    video.uploader = known
+            return self.git_sync.is_video_completed(video.video_id, full_shortcode, uploader=None)
+        return self.git_sync.is_video_completed(video.video_id, full_shortcode, uploader=video.uploader)
+
     def _get_runner_queue(self, runner: ComboRunner) -> dict[str, Any]:
         """Gathers outstanding queued videos for a given runner with total count and top 50 items.
 
@@ -420,12 +447,19 @@ class IngestionManager:
             if runner.preparing_video_info and runner.preparing_video_info.get("video_id") == v.video_id:
                 continue
 
-            if v.uploader.lower() == "youtube":
-                if known := self.git_sync.get_completed_uploader(v.video_id, runner.full_shortcode):
-                    v.uploader = known
+            if not self._is_completed_for_runner(v, runner.full_shortcode):
+                abort_reason = self._aborted_videos.get((runner.config.name, v.video_id))
+                if abort_reason is not None:
+                    status_val = "failed"
+                    error_reason = abort_reason
+                    retry_after = None
+                    retry_in_s = None
+                else:
+                    status_val = v.status
+                    error_reason = v.error_reason
+                    retry_after = v.retry_after
+                    retry_in_s = max(0, int(v.retry_after - now)) if v.retry_after and v.retry_after > now else None
 
-            if not self.git_sync.is_video_completed(v.video_id, runner.full_shortcode, uploader=v.uploader):
-                retry_in_s = max(0, int(v.retry_after - now)) if v.retry_after and v.retry_after > now else None
                 outstanding.append(
                     {
                         "video_id": v.video_id,
@@ -434,9 +468,9 @@ class IngestionManager:
                         "channel_name": v.channel_name,
                         "source_type": v.source_type,
                         "timestamp": v.timestamp,
-                        "status": v.status,
-                        "error_reason": v.error_reason,
-                        "retry_after": v.retry_after,
+                        "status": status_val,
+                        "error_reason": error_reason,
+                        "retry_after": retry_after,
                         "retry_in_s": retry_in_s,
                         "failure_count": v.failure_count,
                     }
@@ -478,21 +512,19 @@ class IngestionManager:
 
                 completed_in_git = 0
                 in_cooldown = 0
+                aborted_count = 0
                 eligible: list[QueuedVideo] = []
 
                 for v in candidates:
-                    if v.uploader.lower() == "youtube":
-                        if known := self.git_sync.get_completed_uploader(v.video_id, runner.full_shortcode):
-                            v.uploader = known
-
-                    if self.git_sync.is_video_completed(v.video_id, runner.full_shortcode, uploader=v.uploader):
+                    if self._is_completed_for_runner(v, runner.full_shortcode):
                         completed_in_git += 1
+                    elif (runner.config.name, v.video_id) in self._aborted_videos:
+                        aborted_count += 1
                     elif v.retry_after is not None and now < v.retry_after:
                         in_cooldown += 1
                     else:
                         eligible.append(v)
 
-                # Prioritize videos that already have an existing work directory in this runner
                 def _feed_sort_key(v: QueuedVideo) -> tuple[int, int, str]:
                     has_dir = 1 if (runner.work_dir / v.video_id).is_dir() else 0
                     return (has_dir, v.timestamp, v.title.lower())
@@ -504,6 +536,8 @@ class IngestionManager:
                         reason_parts: list[str] = []
                         if completed_in_git:
                             reason_parts.append(f"{completed_in_git} completed in Git")
+                        if aborted_count:
+                            reason_parts.append(f"{aborted_count} aborted")
                         if in_cooldown:
                             reason_parts.append(f"{in_cooldown} in cooldown")
                         reason_str = ", ".join(reason_parts) if reason_parts else "none available"
@@ -548,7 +582,6 @@ class IngestionManager:
                                 source_type="local",
                             )
                             if not acquired:
-                                # Runner is no longer idle; move to next runner
                                 break
 
                             currently_acquired_video_id = video.video_id
@@ -593,12 +626,10 @@ class IngestionManager:
                                 source_type="youtube",
                             )
                             if not acquired:
-                                # Runner is no longer idle; move to next runner
                                 break
 
                             currently_acquired_video_id = video.video_id
 
-                            # 1. Download YouTube video
                             try:
                                 media_path = await self._download_youtube_to_combo_dir(video, runner.work_dir)
                                 video.status = "ready"
@@ -641,7 +672,6 @@ class IngestionManager:
                                     break
                                 continue
 
-                            # 2. Prepare media and assign video to runner
                             try:
                                 logfire.info(f"Feeding '{runner.config.name}' with '{video.title}' ({video.video_id}).")
                                 await self.coordinator.assign_prepared_video(
@@ -669,7 +699,6 @@ class IngestionManager:
                                 video.retry_after = now + 120
                                 continue
                 finally:
-                    # Release runner reservation only if this attempt successfully acquired it without feeding
                     if currently_acquired_video_id is not None and not fed:
                         await self.coordinator.release_preparing_runner(runner.config.name)
                         currently_acquired_video_id = None

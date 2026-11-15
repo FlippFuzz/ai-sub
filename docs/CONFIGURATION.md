@@ -77,27 +77,29 @@ Unified across both standalone execution (`ai-sub`) and distributed workers (`ai
 
 ### Summary Proxy Settings (`--reencode.summary.*`)
 
-| Argument                                         | Environment Variable                           | Description                                                                                       | Default |
-| :----------------------------------------------- | :--------------------------------------------- | :------------------------------------------------------------------------------------------------ | :------ |
-| `--reencode.summary.enabled <bool>`              | `AISUB_REENCODE_SUMMARY_ENABLED`               | Whether whole-video proxy re-encoding is enabled.                                                 | `True`  |
-| `--reencode.summary.threshold-mb <int>`          | `AISUB_REENCODE_SUMMARY_THRESHOLD_MB`          | File size threshold in MB above which the full video is compressed. 0 compresses unconditionally. | `300`   |
-| `--reencode.summary.keyframe-only <bool>`        | `AISUB_REENCODE_SUMMARY_KEYFRAME_ONLY`         | Whether to decode only keyframes from the input video for faster summary proxy re-encoding.       | `True`  |
-| `--reencode.summary.fps <float>`                 | `AISUB_REENCODE_SUMMARY_FPS`                   | Target framerate (FPS) for the summary proxy video.                                               | `1.0`   |
-| `--reencode.summary.height <int>`                | `AISUB_REENCODE_SUMMARY_HEIGHT`                | Target resolution height in pixels (aspect ratio is preserved).                                   | `360`   |
-| `--reencode.summary.bitrate-kb <int>`            | `AISUB_REENCODE_SUMMARY_BITRATE_KB`            | Target video bitrate in Kilobytes per second (KB/s).                                              | `35`    |
-| `--reencode.summary.duration-tolerance-ms <int>` | `AISUB_REENCODE_SUMMARY_DURATION_TOLERANCE_MS` | Allowed duration divergence in milliseconds for summary proxy output.                             | `100`   |
+| Argument                                         | Environment Variable                           | Description                                                                                               | Default |
+| :----------------------------------------------- | :--------------------------------------------- | :-------------------------------------------------------------------------------------------------------- | :------ |
+| `--reencode.summary.enabled <bool>`              | `AISUB_REENCODE_SUMMARY_ENABLED`               | Whether whole-video proxy re-encoding is enabled.                                                         | `True`  |
+| `--reencode.summary.threshold-mb <int>`          | `AISUB_REENCODE_SUMMARY_THRESHOLD_MB`          | File size threshold in MB above which the full video is compressed. 0 compresses unconditionally.         | `300`   |
+| `--reencode.summary.keyframe-only <bool>`        | `AISUB_REENCODE_SUMMARY_KEYFRAME_ONLY`         | Whether to decode only keyframes from the input video for faster summary proxy re-encoding.               | `True`  |
+| `--reencode.summary.fps <float>`                 | `AISUB_REENCODE_SUMMARY_FPS`                   | Target framerate (FPS) for the summary proxy video.                                                       | `1.0`   |
+| `--reencode.summary.fallback-fps <list>`         | `AISUB_REENCODE_SUMMARY_FALLBACK_FPS`          | Ordered list of fallback FPS tiers used to re-encode summary media after repeated non-retryable failures. | `[]`    |
+| `--reencode.summary.height <int>`                | `AISUB_REENCODE_SUMMARY_HEIGHT`                | Target resolution height in pixels (aspect ratio is preserved).                                           | `360`   |
+| `--reencode.summary.bitrate-kb <int>`            | `AISUB_REENCODE_SUMMARY_BITRATE_KB`            | Target video bitrate in Kilobytes per second (KB/s).                                                      | `35`    |
+| `--reencode.summary.duration-tolerance-ms <int>` | `AISUB_REENCODE_SUMMARY_DURATION_TOLERANCE_MS` | Allowed duration divergence in milliseconds for summary proxy output.                                     | `100`   |
 
 ### Segment Chunk Settings (`--reencode.segment.*`)
 
-| Argument                                         | Environment Variable                           | Description                                                                                | Default |
-| :----------------------------------------------- | :--------------------------------------------- | :----------------------------------------------------------------------------------------- | :------ |
-| `--reencode.segment.enabled <bool>`              | `AISUB_REENCODE_SEGMENT_ENABLED`               | Whether segment re-encoding is enabled.                                                    | `False` |
-| `--reencode.segment.threshold-mb <int>`          | `AISUB_REENCODE_SEGMENT_THRESHOLD_MB`          | File size threshold in MB above which chunks are compressed. 0 compresses unconditionally. | `20`    |
-| `--reencode.segment.keyframe-only <bool>`        | `AISUB_REENCODE_SEGMENT_KEYFRAME_ONLY`         | Whether to decode only keyframes from the input video for segment chunk re-encoding.       | `False` |
-| `--reencode.segment.fps <float>`                 | `AISUB_REENCODE_SEGMENT_FPS`                   | Target framerate (FPS) for compressed segment chunks.                                      | `1.0`   |
-| `--reencode.segment.height <int>`                | `AISUB_REENCODE_SEGMENT_HEIGHT`                | Target resolution height in pixels (aspect ratio is preserved).                            | `360`   |
-| `--reencode.segment.bitrate-kb <int>`            | `AISUB_REENCODE_SEGMENT_BITRATE_KB`            | Target video bitrate in Kilobytes per second (KB/s).                                       | `35`    |
-| `--reencode.segment.duration-tolerance-ms <int>` | `AISUB_REENCODE_SEGMENT_DURATION_TOLERANCE_MS` | Allowed duration divergence in milliseconds for re-encoded chunk output.                   | `100`   |
+| Argument                                         | Environment Variable                           | Description                                                                                                | Default |
+| :----------------------------------------------- | :--------------------------------------------- | :--------------------------------------------------------------------------------------------------------- | :------ |
+| `--reencode.segment.enabled <bool>`              | `AISUB_REENCODE_SEGMENT_ENABLED`               | Whether segment re-encoding is enabled.                                                                    | `False` |
+| `--reencode.segment.threshold-mb <int>`          | `AISUB_REENCODE_SEGMENT_THRESHOLD_MB`          | File size threshold in MB above which chunks are compressed. 0 compresses unconditionally.                 | `20`    |
+| `--reencode.segment.keyframe-only <bool>`        | `AISUB_REENCODE_SEGMENT_KEYFRAME_ONLY`         | Whether to decode only keyframes from the input video for segment chunk re-encoding.                       | `False` |
+| `--reencode.segment.fps <float>`                 | `AISUB_REENCODE_SEGMENT_FPS`                   | Target framerate (FPS) for compressed segment chunks.                                                      | `1.0`   |
+| `--reencode.segment.fallback-fps <list>`         | `AISUB_REENCODE_SEGMENT_FALLBACK_FPS`          | Ordered list of fallback FPS tiers used to re-encode video segments after repeated non-retryable failures. | `[]`    |
+| `--reencode.segment.height <int>`                | `AISUB_REENCODE_SEGMENT_HEIGHT`                | Target resolution height in pixels (aspect ratio is preserved).                                            | `360`   |
+| `--reencode.segment.bitrate-kb <int>`            | `AISUB_REENCODE_SEGMENT_BITRATE_KB`            | Target video bitrate in Kilobytes per second (KB/s).                                                       | `35`    |
+| `--reencode.segment.duration-tolerance-ms <int>` | `AISUB_REENCODE_SEGMENT_DURATION_TOLERANCE_MS` | Allowed duration divergence in milliseconds for re-encoded chunk output.                                   | `100`   |
 
 ---
 
@@ -133,13 +135,13 @@ Unified across both standalone execution (`ai-sub`) and distributed workers (`ai
 
 ## Retry Settings (`--retry.*`)
 
-| Argument                           | Environment Variable           | Description                                                                       | Default |
-| :--------------------------------- | :----------------------------- | :-------------------------------------------------------------------------------- | :------ |
-| `--retry.per-run <int>`            | `AISUB_RETRY_PER_RUN`          | Maximum internal retries by the executor on transient network or schema failures. | `5`     |
-| `--retry.max-runs <int>`           | `AISUB_RETRY_MAX_RUNS`         | Maximum total attempt limit persisted across application executions per segment.  | `3`     |
-| `--retry.multiplier <float>`       | `AISUB_RETRY_MULTIPLIER`       | Exponential backoff multiplier between retry attempts.                            | `2.0`   |
-| `--retry.min-wait-seconds <float>` | `AISUB_RETRY_MIN_WAIT_SECONDS` | Minimum backoff wait time in seconds.                                             | `30.0`  |
-| `--retry.max-wait-seconds <int>`   | `AISUB_RETRY_MAX_WAIT_SECONDS` | Maximum backoff wait time in seconds.                                             | `300`   |
+| Argument                           | Environment Variable           | Description                                                                                          | Default |
+| :--------------------------------- | :----------------------------- | :--------------------------------------------------------------------------------------------------- | :------ |
+| `--retry.per-run <int>`            | `AISUB_RETRY_PER_RUN`          | Maximum internal retries by the executor on retryable or schema failures.                            | `5`     |
+| `--retry.max-runs <int>`           | `AISUB_RETRY_MAX_RUNS`         | Maximum non-retryable worker failures per FPS tier before fallback or exhaustion (server mode only). | `3`     |
+| `--retry.multiplier <float>`       | `AISUB_RETRY_MULTIPLIER`       | Exponential backoff multiplier between retry attempts.                                               | `2.0`   |
+| `--retry.min-wait-seconds <float>` | `AISUB_RETRY_MIN_WAIT_SECONDS` | Minimum backoff wait time in seconds.                                                                | `30.0`  |
+| `--retry.max-wait-seconds <int>`   | `AISUB_RETRY_MAX_WAIT_SECONDS` | Maximum backoff wait time in seconds.                                                                | `300`   |
 
 ---
 

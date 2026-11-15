@@ -37,6 +37,10 @@ class ReencodeJob(MediaJob):
         default=False,
         description="Whether this job compresses the whole-video summary proxy.",
     )
+    fallback_tier: NonNegativeInt = Field(
+        default=0,
+        description="Fallback re-encoding tier index (0 = initial, 1+ = fallback FPS tier).",
+    )
 
     async def execute(self) -> Path:
         """Executes FFmpeg re-encoding for this segment or proxy.

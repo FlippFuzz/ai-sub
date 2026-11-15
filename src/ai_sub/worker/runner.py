@@ -22,7 +22,7 @@ from ai_sub.jobs import (
 from ai_sub.protocol import TaskClaimResponse, TaskType
 from ai_sub.search import BaseSearchProvider, create_search_providers
 from ai_sub.worker.client import VersionMismatchError, WorkerClient
-from ai_sub.worker.config import WorkerSettings
+from ai_sub.worker.worker_config import WorkerSettings
 
 
 class LeaseRevokedError(Exception):
@@ -119,7 +119,7 @@ class WorkerRunner:
 
         Args:
             task_id: Unique task identifier.
-            stop_event: Event signaling when task execution finishes normally.
+            stop_event: Event signaling when task execution and submission finish normally.
             lease_revoked: Event set when the server rejects a heartbeat lease renewal.
             on_lease_rejected: Callback to cancel any currently active work immediately.
         """
@@ -140,7 +140,7 @@ class WorkerRunner:
                             )
                             if acked is None:
                                 logfire.warning(
-                                    f"Heartbeat #{hb_num} for '{task_id}' was unacknowledged (transient error)."
+                                    f"Heartbeat #{hb_num} for '{task_id}' was unacknowledged (retryable error)."
                                 )
                                 continue
                             if not acked:
@@ -157,6 +157,8 @@ class WorkerRunner:
         task: TaskClaimResponse,
         executor: GeminiExecutor,
         search_providers: list[BaseSearchProvider],
+        lease_revoked: asyncio.Event,
+        set_active_subtask: Callable[[asyncio.Task[Any] | None], None],
     ) -> dict[str, Any]:
         """Downloads media, runs the canonical Job instance, and returns validated output.
 
@@ -164,6 +166,8 @@ class WorkerRunner:
             task: Assigned task details from the server including retry policy.
             executor: Configured GeminiExecutor instance.
             search_providers: Active search provider instances.
+            lease_revoked: Event signaling whether the server revoked the task lease.
+            set_active_subtask: Callback registering the currently running cancellable subtask.
 
         Returns:
             dict[str, Any]: Validated output data dictionary.
@@ -177,27 +181,8 @@ class WorkerRunner:
         if not Path(raw_name).suffix:
             raw_name = f"{raw_name}.mp4"
 
-        # Organize by pipeline_name and video_id to avoid long filenames and prevent collisions:
-        # e.g. ai_sub_worker/combo_35l/AhCOzPaFyh4/summary_proxy.webm
         chunk_dir = self.settings.work_dir / task.pipeline_name / task.video_id
         chunk_path = chunk_dir / raw_name
-
-        stop_heartbeat = asyncio.Event()
-        lease_revoked = asyncio.Event()
-        active_subtask: asyncio.Task[Any] | None = None
-
-        def _cancel_active() -> None:
-            if active_subtask and not active_subtask.done():
-                active_subtask.cancel()
-
-        heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(
-                task_id=task.task_id,
-                stop_event=stop_heartbeat,
-                lease_revoked=lease_revoked,
-                on_lease_rejected=_cancel_active,
-            )
-        )
 
         try:
             if lease_revoked.is_set():
@@ -206,13 +191,15 @@ class WorkerRunner:
             # 1. Download media under lease-revocation monitoring
             with logfire.span("Downloading Task Media", url=task.media_url):
                 download_task = asyncio.create_task(self.client.download_media(task.media_url, chunk_path))
-                active_subtask = download_task
+                set_active_subtask(download_task)
                 try:
                     await download_task
                 except asyncio.CancelledError:
                     if lease_revoked.is_set():
                         raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected during media download.")
                     raise
+                finally:
+                    set_active_subtask(None)
 
             if lease_revoked.is_set():
                 raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected before inference started.")
@@ -272,7 +259,7 @@ class WorkerRunner:
                 raise ValueError(f"Unknown task type: '{task.task_type}'")
 
             inference_task = asyncio.create_task(job.execute(ctx))
-            active_subtask = inference_task
+            set_active_subtask(inference_task)
             try:
                 res = await inference_task
                 return res.model_dump(mode="json")
@@ -280,17 +267,13 @@ class WorkerRunner:
                 if lease_revoked.is_set():
                     raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected during inference.")
                 raise
+            finally:
+                set_active_subtask(None)
 
         finally:
-            stop_heartbeat.set()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
             if chunk_path.is_file():
                 try:
                     chunk_path.unlink()
-                    # Clean up empty parent directories up to work_dir
                     parent = chunk_path.parent
                     while parent != self.settings.work_dir and parent.exists():
                         try:
@@ -309,7 +292,7 @@ class WorkerRunner:
         executor: GeminiExecutor,
         search_providers: list[BaseSearchProvider],
     ) -> None:
-        """Processes a claimed task, reporting results or failure back to the server.
+        """Processes a claimed task, maintaining heartbeats across execution and completion submission.
 
         Args:
             claim: Assigned task payload from the server.
@@ -320,8 +303,20 @@ class WorkerRunner:
 
         Raises:
             asyncio.CancelledError: If the worker slot task itself is cancelled.
+            LeaseRevokedError: If the server revokes the lease during completion submission.
         """
         slot_label = f"{model}#{slot_id}"
+        stop_heartbeat = asyncio.Event()
+        lease_revoked = asyncio.Event()
+        active_subtask: asyncio.Task[Any] | None = None
+
+        def _set_active(subtask: asyncio.Task[Any] | None) -> None:
+            nonlocal active_subtask
+            active_subtask = subtask
+
+        def _cancel_active() -> None:
+            if active_subtask and not active_subtask.done():
+                active_subtask.cancel()
 
         with logfire.span(
             "Worker Task: {task_id}",
@@ -333,18 +328,55 @@ class WorkerRunner:
             worker_id=self.settings.worker_id,
             slot=slot_id,
         ):
-            try:
-                result_dict = await self._execute_task(
-                    task=claim,
-                    executor=executor,
-                    search_providers=search_providers,
-                )
-                accepted = await self.client.complete_task(
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(
                     task_id=claim.task_id,
-                    worker_id=self.settings.worker_id,
-                    task_type=claim.task_type,
-                    result=result_dict,
+                    stop_event=stop_heartbeat,
+                    lease_revoked=lease_revoked,
+                    on_lease_rejected=_cancel_active,
                 )
+            )
+
+            try:
+                try:
+                    result_dict = await self._execute_task(
+                        task=claim,
+                        executor=executor,
+                        search_providers=search_providers,
+                        lease_revoked=lease_revoked,
+                        set_active_subtask=_set_active,
+                    )
+                    if lease_revoked.is_set():
+                        raise LeaseRevokedError(
+                            f"Lease for task '{claim.task_id}' was rejected before completion submission."
+                        )
+
+                    complete_subtask = asyncio.create_task(
+                        self.client.complete_task(
+                            task_id=claim.task_id,
+                            worker_id=self.settings.worker_id,
+                            task_type=claim.task_type,
+                            result=result_dict,
+                        )
+                    )
+                    _set_active(complete_subtask)
+                    try:
+                        accepted = await complete_subtask
+                    except asyncio.CancelledError:
+                        if lease_revoked.is_set():
+                            raise LeaseRevokedError(
+                                f"Lease for task '{claim.task_id}' was rejected during completion submission."
+                            )
+                        raise
+                    finally:
+                        _set_active(None)
+                finally:
+                    stop_heartbeat.set()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
+
                 if accepted:
                     async with self._lock:
                         count = self._tasks_completed_per_model.get(model, 0) + 1
@@ -385,9 +417,8 @@ class WorkerRunner:
                     task_id=claim.task_id,
                     worker_id=self.settings.worker_id,
                     reason=f"QUOTA_EXHAUSTED: {err_msg}",
-                    model=claim.model,
                     error_message=err_msg,
-                    is_transient=True,
+                    is_retryable=True,
                 )
                 async with self._lock:
                     self._exhausted_models.add(model)
@@ -400,18 +431,17 @@ class WorkerRunner:
                         self._trigger_shutdown()
 
             except Exception as e:
-                is_transient = is_retryable_error(e)
+                is_retryable = is_retryable_error(e)
                 err_msg = str(e).strip() or type(e).__name__
-                prefix = "TRANSIENT_ERROR" if is_transient else "EXECUTION_ERROR"
+                prefix = "RETRYABLE_ERROR" if is_retryable else "EXECUTION_ERROR"
                 fail_reason = f"[{prefix}] {err_msg}"
                 logfire.exception(f"[{slot_label}] Execution error on task '{claim.task_id}': {e}")
                 await self.client.fail_task(
                     task_id=claim.task_id,
                     worker_id=self.settings.worker_id,
                     reason=fail_reason,
-                    model=claim.model,
                     error_message=err_msg,
-                    is_transient=is_transient,
+                    is_retryable=is_retryable,
                 )
 
     async def _model_slot_loop(

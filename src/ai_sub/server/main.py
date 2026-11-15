@@ -64,7 +64,7 @@ def main() -> None:
     import uvicorn
 
     from ai_sub.server.app import create_app
-    from ai_sub.server.config import ServerSettings
+    from ai_sub.server.server_config import ServerSettings
 
     args = parse_args()
 

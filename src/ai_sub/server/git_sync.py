@@ -18,7 +18,7 @@ import logfire
 from git import Repo
 from git.exc import GitCommandError, InvalidGitRepositoryError
 
-from ai_sub.server.config import GitConfig
+from ai_sub.server.server_config import GitConfig
 from ai_sub.shortcode import parse_subtitle_track, subtitle_track_sort_key
 
 os.environ["GIT_TERMINAL_PROMPT"] = "0"

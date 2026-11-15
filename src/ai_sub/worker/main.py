@@ -11,8 +11,8 @@ import logfire
 
 from ai_sub.config import find_config_file
 from ai_sub.telemetry import setup_logging
-from ai_sub.worker.config import WorkerSettings
 from ai_sub.worker.runner import WorkerRunner
+from ai_sub.worker.worker_config import WorkerSettings
 
 
 def parse_args() -> argparse.Namespace:

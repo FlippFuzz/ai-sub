@@ -24,12 +24,11 @@ from rich.progress import (
 )
 
 from ai_sub.config import Settings
-from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError
+from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError, is_retryable_error
 from ai_sub.jobs import (
     BaseJob,
     LyricsJob,
     ReencodeJob,
-    SubtitlesAiResponse,
     SubtitlesJob,
     SummaryJob,
     WorkerContext,
@@ -51,6 +50,69 @@ class AiSubResult(IntEnum):
     COMPLETED = 0
     IN_PROGRESS = -1
     RETRIES_EXCEEDED = -2
+
+
+JobKey = tuple[str, int | None]
+
+
+def _get_job_key(job: BaseJob) -> JobKey:
+    """Computes a unique in-flight tracking key for a job instance.
+
+    Args:
+        job: Job instance returned by Pipeline.get_pending_jobs().
+
+    Returns:
+        JobKey: Tuple of (job_class_name, segment_index).
+    """
+    return (type(job).__name__, getattr(job, "segment_index", None))
+
+
+def _sync_progress(
+    progress: Progress,
+    pipeline: Pipeline,
+    summary_tid: TaskID | None,
+    reencode_tid: TaskID | None,
+    subtitles_tid: TaskID,
+    lyrics_tid: TaskID | None,
+) -> None:
+    """Synchronizes Rich progress bar counters directly from current pipeline unit states.
+
+    Args:
+        progress: Active Rich Progress instance.
+        pipeline: Pipeline holding authoritative unit states.
+        summary_tid: Optional summary progress task ID.
+        reencode_tid: Optional segment re-encoding progress task ID.
+        subtitles_tid: Subtitles progress task ID.
+        lyrics_tid: Optional lyrics refinement progress task ID.
+    """
+    total_chunks = len(pipeline.segments)
+
+    if summary_tid is not None:
+        sum_done = 1 if (pipeline.is_summary_complete() or pipeline.summary.exhausted) else 0
+        progress.update(summary_tid, completed=sum_done)
+
+    if reencode_tid is not None:
+        reenc_done = sum(1 for seg in pipeline.segments if seg.media_ready)
+        progress.update(reencode_tid, completed=reenc_done, total=total_chunks)
+
+    sub_done = sum(1 for seg in pipeline.segments if seg.subtitles_response is not None or seg.subtitles_exhausted)
+    progress.update(subtitles_tid, completed=sub_done, total=total_chunks)
+
+    if lyrics_tid is not None:
+        lyr_done = sum(
+            1
+            for seg in pipeline.segments
+            if seg.subtitles_exhausted
+            or (
+                seg.subtitles_response is not None
+                and (
+                    not seg.subtitles_response.detected_musical_performances
+                    or seg.lyrics_response is not None
+                    or seg.lyrics_exhausted
+                )
+            )
+        )
+        progress.update(lyrics_tid, completed=lyr_done, total=total_chunks)
 
 
 async def _run_job(
@@ -86,9 +148,9 @@ async def _run_job(
                 out_path = await job.execute()
                 return job, out_path, None
 
-        elif isinstance(job, SummaryJob):
+        if isinstance(job, SummaryJob):
             async with summary_sem:
-                media = job.media_path or pipeline.summary_proxy_path or pipeline.raw_video_path
+                media = job.media_path or pipeline.summary.media_path or pipeline.raw_video_path
                 ctx = WorkerContext(
                     executor=executor,
                     media_path=media,
@@ -97,7 +159,7 @@ async def _run_job(
                 res = await job.execute(ctx)
                 return job, res, None
 
-        elif isinstance(job, SubtitlesJob):
+        if isinstance(job, SubtitlesJob):
             async with subtitles_sem:
                 media = job.media_path or pipeline.raw_video_path
                 ctx = WorkerContext(
@@ -108,7 +170,7 @@ async def _run_job(
                 res = await job.execute(ctx)
                 return job, res, None
 
-        elif isinstance(job, LyricsJob):
+        if isinstance(job, LyricsJob):
             async with lyrics_sem:
                 media = job.media_path or pipeline.raw_video_path
                 ctx = WorkerContext(
@@ -143,14 +205,21 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
         if user_context:
             logfire.info(f"Loaded user context ({len(user_context)} characters).")
 
-        if settings.reencode.summary.enabled or settings.reencode.segment.enabled:
+        reencode_possible = bool(
+            settings.reencode.summary.enabled
+            or settings.reencode.segment.enabled
+            or settings.reencode.summary.fallback_fps
+            or settings.reencode.segment.fallback_fps
+        )
+        if reencode_possible:
             _, _, encoder = await init_ffmpeg_engine(settings.reencode.encoder)
             settings.reencode.encoder = encoder
 
         use_summary = settings.concurrency.summary > 0
         use_lyrics = settings.concurrency.lyrics > 0
 
-        # Initialize the unified pipeline: probes duration, splits, applies offset, checks re-encoding
+        # Standalone uses per_run internal retries and cascades fallback FPS within a single run
+        # without imposing cross-run max_runs lockouts.
         pipeline = await Pipeline.create(
             raw_video_path=input_video_path,
             job_dir=settings.dir.tmp,
@@ -173,6 +242,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
             validation_buffer_ms=settings.ai.validation_buffer_ms,
             summary_enabled=use_summary,
             lyrics_enabled=use_lyrics,
+            enforce_max_runs=False,
         )
 
         async with AsyncExitStack() as stack:
@@ -211,7 +281,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                 disable=not settings.log.progress,
             )
 
-            total_chunks = len(pipeline.segment_paths)
+            total_chunks = len(pipeline.segments)
             with progress:
                 summary_tid: TaskID | None = progress.add_task("[yellow]Summary", total=1) if use_summary else None
                 reencode_tid: TaskID | None = (
@@ -224,51 +294,46 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                     progress.add_task("[magenta]Lyrics", total=total_chunks) if use_lyrics else None
                 )
 
-                # Initialize progress for previously completed disk checkpoints
-                if summary_tid is not None and pipeline.is_summary_complete():
-                    progress.update(summary_tid, completed=1)
-                for idx in range(total_chunks):
-                    if reencode_tid is not None and idx in pipeline.reencoded_segment_paths:
-                        progress.update(reencode_tid, advance=1)
-                    if idx in pipeline.subtitles_responses:
-                        progress.update(subtitles_tid, advance=1)
-                        if lyrics_tid is not None:
-                            sub_r = pipeline.subtitles_responses[idx]
-                            if not sub_r.detected_musical_performances or idx in pipeline.lyrics_responses:
-                                progress.update(lyrics_tid, advance=1)
+                _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
 
-                in_flight: dict[str, asyncio.Task[tuple[BaseJob, Any, Exception | None]]] = {}
+                in_flight: dict[JobKey, asyncio.Task[tuple[BaseJob, Any, Exception | None]]] = {}
+                retryable_blocked: set[JobKey] = set()
                 quota_exhausted = False
 
                 # Consumer loop pulling ready DAG jobs directly from the pipeline
                 while not pipeline.is_done():
-                    pending_jobs = pipeline.get_pending_jobs()
-                    for job in pending_jobs:
-                        if job.name not in in_flight:
-                            task = asyncio.create_task(
-                                _run_job(
-                                    job=job,
-                                    pipeline=pipeline,
-                                    executor=executor,
-                                    web_search_providers=web_search_providers,
-                                    lyrics_search_providers=lyrics_search_providers,
-                                    reencode_sem=reencode_sem,
-                                    summary_sem=summary_sem,
-                                    subtitles_sem=subtitles_sem,
-                                    lyrics_sem=lyrics_sem,
-                                )
+                    for job in pipeline.get_pending_jobs():
+                        job_key = _get_job_key(job)
+                        if job_key in in_flight or job_key in retryable_blocked:
+                            continue
+
+                        if isinstance(job, ReencodeJob) and not job.is_summary_proxy and reencode_tid is None:
+                            reencode_tid = progress.add_task("[cyan]Re-encoding", total=total_chunks)
+                            _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
+
+                        task = asyncio.create_task(
+                            _run_job(
+                                job=job,
+                                pipeline=pipeline,
+                                executor=executor,
+                                web_search_providers=web_search_providers,
+                                lyrics_search_providers=lyrics_search_providers,
+                                reencode_sem=reencode_sem,
+                                summary_sem=summary_sem,
+                                subtitles_sem=subtitles_sem,
+                                lyrics_sem=lyrics_sem,
                             )
-                            in_flight[job.name] = task
+                        )
+                        in_flight[job_key] = task
 
                     if not in_flight:
                         break
 
                     done, _ = await asyncio.wait(in_flight.values(), return_when=asyncio.FIRST_COMPLETED)
                     for completed_task in done:
-                        # Find and delete matching in_flight entry before checking cancellation
-                        job_name = next((k for k, v in in_flight.items() if v is completed_task), None)
-                        if job_name:
-                            del in_flight[job_name]
+                        job_key = next((k for k, v in in_flight.items() if v is completed_task), None)
+                        if job_key is not None:
+                            del in_flight[job_key]
 
                         if completed_task.cancelled():
                             continue
@@ -279,62 +344,40 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                             if isinstance(exc, QuotaExceededError):
                                 logfire.warning(
                                     f"Daily quota limit reached during '{job.name}': {exc}. "
-                                    "Suspending remaining jobs without consuming retry limits."
+                                    "Suspending remaining jobs without consuming fallback tiers."
                                 )
                                 quota_exhausted = True
                                 continue
 
-                            logfire.error(f"Job '{job.name}' failed: {exc}")
-
-                            if isinstance(job, SummaryJob):
-                                pipeline.record_failure(TaskType.SUMMARY, attempts=job.total_attempts + 1)
-                                if summary_tid is not None:
-                                    progress.update(summary_tid, completed=1)
-                            elif isinstance(job, SubtitlesJob):
-                                pipeline.record_failure(
-                                    TaskType.SUBTITLES,
-                                    segment_index=job.segment_index,
-                                    attempts=job.total_attempts + 1,
+                            if isinstance(job, ReencodeJob):
+                                logfire.warning(f"Re-encode failed for '{job.name}': {exc}")
+                                pipeline.fail_reencode(job)
+                            elif is_retryable_error(exc):
+                                logfire.warning(
+                                    f"Job '{job.name}' failed with retryable error: {exc}. "
+                                    "Skipping for this run without consuming fallback tiers."
                                 )
-                                progress.update(subtitles_tid, advance=1)
-                            elif isinstance(job, LyricsJob):
-                                pipeline.record_failure(
-                                    TaskType.LYRICS,
-                                    segment_index=job.segment_index,
-                                    attempts=job.total_attempts + 1,
-                                )
-                                if lyrics_tid is not None:
-                                    progress.update(lyrics_tid, advance=1)
-                            elif isinstance(job, ReencodeJob):
-                                logfire.warning(f"Re-encode failed for chunk '{job.name}'. Falling back to raw file.")
-                                pipeline.complete_job(job, job.input_file)
-                                if not job.is_summary_proxy and reencode_tid is not None:
-                                    progress.update(reencode_tid, advance=1)
+                                retryable_blocked.add(_get_job_key(job))
+                            else:
+                                logfire.error(f"Job '{job.name}' failed with non-retryable error: {exc}")
+                                if isinstance(job, SummaryJob):
+                                    pipeline.record_failure(TaskType.SUMMARY)
+                                elif isinstance(job, SubtitlesJob):
+                                    pipeline.record_failure(TaskType.SUBTITLES, segment_index=job.segment_index)
+                                elif isinstance(job, LyricsJob):
+                                    pipeline.record_failure(TaskType.LYRICS, segment_index=job.segment_index)
                         else:
                             pipeline.complete_job(job, result)
-                            if isinstance(job, SummaryJob) and summary_tid is not None:
-                                progress.update(summary_tid, completed=1)
-                            elif isinstance(job, ReencodeJob) and not job.is_summary_proxy and reencode_tid is not None:
-                                progress.update(reencode_tid, advance=1)
-                            elif isinstance(job, SubtitlesJob):
-                                progress.update(subtitles_tid, advance=1)
-                                if (
-                                    lyrics_tid is not None
-                                    and isinstance(result, SubtitlesAiResponse)
-                                    and not result.detected_musical_performances
-                                ):
-                                    progress.update(lyrics_tid, advance=1)
-                            elif isinstance(job, LyricsJob) and lyrics_tid is not None:
-                                progress.update(lyrics_tid, advance=1)
 
-                    if quota_exhausted:
+                        _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
+
+                    if quota_exhausted or pipeline.summary_aborted:
                         for pending_task in in_flight.values():
                             pending_task.cancel()
                         await asyncio.gather(*in_flight.values(), return_exceptions=True)
                         in_flight.clear()
                         break
 
-                # Await any remaining in-flight tasks if loop ended early without quota exhaustion
                 if in_flight:
                     drain_results = await asyncio.gather(*in_flight.values(), return_exceptions=True)
                     for res in drain_results:
@@ -342,6 +385,11 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                             job, out, exc = res
                             if exc is None:
                                 pipeline.complete_job(job, out)
+                    _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
+
+        if pipeline.summary_aborted:
+            logfire.error("Whole-video summary failed across all fallback FPS tiers. Aborting without generating SRT.")
+            return AiSubResult.RETRIES_EXCEEDED
 
         # Finalize and stitch synchronized subtitle tracks
         out_srt = settings.dir.out / f"{input_video_path.stem}.{pipeline.full_shortcode}.srt"
@@ -355,13 +403,10 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
         for g in generated:
             logfire.info(f"Subtitles written to {g.name}")
 
-        has_failures = bool(
-            pipeline.summary_failed or pipeline.failed_subtitles or (use_lyrics and pipeline.failed_lyrics)
-        )
-        if pipeline.is_done() and not has_failures:
+        if pipeline.is_done() and not pipeline.has_failures():
             return AiSubResult.COMPLETED
 
-        if has_failures:
+        if pipeline.has_failures():
             return AiSubResult.RETRIES_EXCEEDED
 
         return AiSubResult.IN_PROGRESS

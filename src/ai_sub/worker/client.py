@@ -114,7 +114,7 @@ class WorkerClient:
             worker_id: Unique identifier of this worker.
 
         Returns:
-            bool | None: True if acknowledged; False if lease expired; None if a transient transport error occurred.
+            bool | None: True if acknowledged; False if lease expired; None if a retryable transport error occurred.
         """
         encoded_task_id = urllib.parse.quote(task_id, safe=":")
         req = TaskHeartbeatRequest(worker_id=worker_id)
@@ -214,9 +214,8 @@ class WorkerClient:
         task_id: str,
         worker_id: str,
         reason: str,
-        model: str | None = None,
         error_message: str | None = None,
-        is_transient: bool = False,
+        is_retryable: bool = False,
     ) -> bool:
         """Notifies the server of a task failure or daily quota limit exhaustion.
 
@@ -224,9 +223,8 @@ class WorkerClient:
             task_id: Unique task identifier.
             worker_id: Unique identifier of this worker.
             reason: Failure code or exception description.
-            model: Gemini model identifier that failed, if applicable. Defaults to None.
             error_message: Optional error description or traceback. Defaults to None.
-            is_transient: Whether the failure is transient and should not penalize server attempts. Defaults to False.
+            is_retryable: Whether the failure is retryable and should not count toward max_runs. Defaults to False.
 
         Returns:
             bool: True if failure was acknowledged; False otherwise.
@@ -236,9 +234,8 @@ class WorkerClient:
             worker_id=worker_id,
             task_id=task_id,
             reason=reason,
-            model=model,
             error_message=error_message,
-            is_transient=is_transient,
+            is_retryable=is_retryable,
         )
         try:
             resp: Response = await self.client.post(

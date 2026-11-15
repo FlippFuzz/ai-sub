@@ -779,11 +779,15 @@
         const queueTable =
           qItems
             .map((q) => {
+              const retrySuffix =
+                q.retry_in_s != null
+                  ? ` · Retry in ${formatDuration(q.retry_in_s)}`
+                  : ""
               let statusCell = `<span class="badge badge-complete">Ready</span>`
               if (q.status === "unplayable") {
-                statusCell = `<span class="badge badge-timeout">Unplayable</span> <span style="font-size:11px; color:var(--muted);">${esc(q.error_reason || "Ineligible")} · Retry in ${formatDuration(q.retry_in_s)}</span>`
+                statusCell = `<span class="badge badge-timeout">Unplayable</span> <span style="font-size:11px; color:var(--muted);">${esc(q.error_reason || "Ineligible")}${retrySuffix}</span>`
               } else if (q.status === "failed") {
-                statusCell = `<span class="badge badge-fail">Failed</span> <span style="font-size:11px; color:var(--muted);">${esc(q.error_reason || "Error")} · Retry in ${formatDuration(q.retry_in_s)}</span>`
+                statusCell = `<span class="badge badge-fail">Failed</span> <span style="font-size:11px; color:var(--muted);">${esc(q.error_reason || "Error")}${retrySuffix}</span>`
               }
 
               const dateDisplay =
