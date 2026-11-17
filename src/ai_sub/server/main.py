@@ -80,17 +80,16 @@ def main() -> None:
     setup_logging(settings.log)
     logfire.info(f"Loading server configuration from {config_path}")
 
-    # Auto-detect hardware encoder if not explicitly configured
-    if settings.reencode.encoder is None:
-        _, _, detected_encoder = asyncio.run(init_ffmpeg_engine())
-        settings.reencode.encoder = detected_encoder
+    # Verify FFmpeg/FFprobe binaries and auto-detect hardware encoder if not explicitly configured
+    _, _, detected_encoder = asyncio.run(init_ffmpeg_engine(settings.reencode.encoder))
+    settings.reencode.encoder = detected_encoder
 
     # Instantiate the FastAPI coordinator application and launch via Uvicorn
     app = create_app(settings)
     uvicorn.run(
         app,
-        host=settings.server.host,
-        port=settings.server.port,
+        host=settings.http.host,
+        port=settings.http.port,
         log_config=None,
     )
 

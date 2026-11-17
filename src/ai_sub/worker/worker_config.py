@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import socket
+from datetime import timedelta
 from pathlib import Path
+from typing import Annotated, Self
 
-from pydantic import (
-    Field,
-    HttpUrl,
-    NonNegativeFloat,
-    NonNegativeInt,
-    PositiveFloat,
-    PositiveInt,
-)
+from annotated_types import Ge, Gt
+from pydantic import Field, HttpUrl, NonNegativeInt, PositiveInt, model_validator
 from pydantic_settings import SettingsConfigDict
 
 from ai_sub.config import (
@@ -23,28 +20,39 @@ from ai_sub.config import (
 )
 
 
+def _default_worker_id() -> str:
+    """Computes a SHA-256 hash of the machine hostname to avoid leaking hostnames.
+
+    Returns:
+        str: Hexadecimal SHA-256 digest of the hostname.
+    """
+    return hashlib.sha256(socket.gethostname().encode("utf-8")).hexdigest()
+
+
 class WorkerSettings(YamlFileSettings):
     """Central configuration for an ephemeral ai-sub-worker node."""
 
     model_config = SettingsConfigDict(
-        env_prefix="AISUB_WORKER_",
+        nested_model_default_partial_update=True,
+        env_prefix="AISUBWORKER_",
+        env_nested_delimiter="_",
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
     )
 
-    server_url: HttpUrl = Field(
+    serverurl: HttpUrl = Field(
         default=HttpUrl("http://127.0.0.1:8000"),
         description="Base URL of the central ai-sub-server.",
     )
-    server_auth: str | None = Field(
+    serverauth: str | None = Field(
         default=None,
         description="Basic Auth credentials in 'username:password' format for Nginx reverse proxy.",
     )
-    worker_id: str = Field(
-        default_factory=socket.gethostname,
-        description="Unique worker node identifier.",
+    id: str = Field(
+        default_factory=_default_worker_id,
+        description="Unique worker node identifier (defaults to SHA-256 of hostname).",
     )
     concurrency: PositiveInt = Field(
         default=2,
@@ -52,53 +60,63 @@ class WorkerSettings(YamlFileSettings):
     )
     models: StringList = Field(
         default_factory=lambda: [
-            "google-gla:gemini-3.8-flash",
-            "google-gla:gemini-3.6-flash",
-            "google-gla:gemini-3.5-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash-lite",
         ],
         description="List of Gemini models offered by this worker.",
     )
     ai: AiSettings = Field(
         default_factory=AiSettings,
-        description="AI models, quotas, storage, and search settings.",
+        description="AI engine quotas, storage, and search settings.",
     )
     log: LoggingSettings = Field(
         default_factory=LoggingSettings,
         description="Telemetry and logging controls.",
     )
-    heartbeat_interval_seconds: PositiveFloat = Field(
-        default=30.0,
-        description="Interval in seconds between task heartbeat pings.",
+    heartbeatinterval: Annotated[timedelta, Gt(timedelta(0))] = Field(
+        default=timedelta(seconds=30),
+        description="Interval between task heartbeat pings (seconds if numeric).",
     )
-    claim_poll_interval_minutes: PositiveFloat = Field(
-        default=3.0,
-        description="Interval in minutes between poll attempts when a slot has no tasks.",
+    pollinterval: Annotated[timedelta, Gt(timedelta(0))] = Field(
+        default=timedelta(minutes=3),
+        description="Interval between poll attempts when a slot has no tasks (seconds if numeric).",
     )
-    idle_timeout_minutes: NonNegativeFloat = Field(
-        default=15.0,
-        description="Minutes all slots must remain idle before worker exits (0 exits immediately when idle).",
+    idletimeout: Annotated[timedelta, Ge(timedelta(0))] = Field(
+        default=timedelta(minutes=15),
+        description="Duration all slots must remain idle before exiting (0 exits immediately; seconds if numeric).",
     )
-    max_duration_minutes: NonNegativeFloat = Field(
-        default=0.0,
-        description="Maximum execution time in minutes before stopping new claims (0 disables).",
+    maxduration: Annotated[timedelta, Ge(timedelta(0))] = Field(
+        default=timedelta(0),
+        description="Maximum execution duration before stopping new claims (0 disables; seconds if numeric).",
     )
-    max_tasks: NonNegativeInt = Field(
+    maxtasks: NonNegativeInt = Field(
         default=0,
         description="Maximum tasks to execute per configured model before exiting (0 runs until idle timeout).",
     )
-    work_dir: Path = Field(
+    workdir: Path = Field(
         default=Path("/tmp/ai_sub_worker"),
         description="Local working directory for temporary media chunk downloads and processing.",
     )
 
     @property
     def basic_auth(self) -> tuple[str, str] | None:
-        """Parses server_auth string into a username and password tuple.
+        """Parses serverauth string into a username and password tuple.
 
         Returns:
             tuple[str, str] | None: (username, password) if configured, or None.
         """
-        if not self.server_auth or ":" not in self.server_auth:
+        if not self.serverauth or ":" not in self.serverauth:
             return None
-        parts = self.server_auth.split(":", 1)
+        parts = self.serverauth.split(":", 1)
         return parts[0], parts[1]
+
+    @model_validator(mode="after")
+    def _validate_search_keys(self) -> Self:
+        """Ensures required search API keys are configured for active search providers.
+
+        Returns:
+            Self: The validated instance.
+        """
+        self.ai.search.validate_required_keys(env_prefix="AISUBWORKER")
+        return self

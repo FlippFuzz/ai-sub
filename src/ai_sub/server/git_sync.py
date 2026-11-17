@@ -10,6 +10,7 @@ import shutil
 import stat
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ import logfire
 from git import Repo
 from git.exc import GitCommandError, InvalidGitRepositoryError
 
+from ai_sub.config import atomic_write_text
 from ai_sub.server.server_config import GitConfig
 from ai_sub.shortcode import parse_subtitle_track, subtitle_track_sort_key
 
@@ -60,16 +62,34 @@ class GitSyncManager:
         self._yt_completed_uploaders = {}
         repo_name = "subtitles-archive"
 
-        if config:
-            url_str = str(config.repo_url).rstrip("/")
+        if config and config.repourl is not None:
+            url_str = str(config.repourl).rstrip("/")
             raw_name = url_str.split("/")[-1]
             repo_name = raw_name[:-4] if raw_name.endswith(".git") else raw_name
-            self.player_base_url = str(config.player_base_url).rstrip("/")
+
+        if config:
+            self.player_base_url = str(config.playerurl).rstrip("/")
         else:
-            default_url = GitConfig.model_fields["player_base_url"].default
+            default_url = GitConfig.model_fields["playerurl"].default
             self.player_base_url = str(default_url).rstrip("/")
 
         self.local_repo_dir = base_work_dir / "git_repo" / repo_name
+
+    def _sanitize_error(self, err: Exception) -> str:
+        """Masks any configured Personal Access Token before logging Git exceptions.
+
+        Args:
+            err: Raised exception instance.
+
+        Returns:
+            str: Sanitized error message string.
+        """
+        msg = str(err)
+        if self.config:
+            pat = self.config.get_pat_value().strip()
+            if pat:
+                msg = msg.replace(pat, "***")
+        return msg
 
     def _get_authenticated_url(self) -> str:
         """Constructs a Git remote URL with embedded authentication tokens.
@@ -77,10 +97,10 @@ class GitSyncManager:
         Returns:
             str: Authenticated Git URL string, or raw URL if PAT is empty.
         """
-        if not self.config:
+        if not self.config or self.config.repourl is None:
             return ""
 
-        raw_url = str(self.config.repo_url)
+        raw_url = str(self.config.repourl)
         pat = self.config.get_pat_value().strip()
 
         # Preserve the raw URL if no PAT is configured to allow anonymous clones
@@ -89,12 +109,32 @@ class GitSyncManager:
 
         auth_part = pat if ":" in pat else f"oauth2:{pat}"
         if raw_url.startswith("https://"):
-            auth_url = raw_url.replace("https://", f"https://{auth_part}@", 1)
-            if auth_url.endswith(".git"):
-                auth_url += "/"
-            return auth_url
+            return raw_url.replace("https://", f"https://{auth_part}@", 1)
 
         return raw_url
+
+    def _record_completed_cache_entry(
+        self,
+        uploader: str,
+        video_id: str,
+        full_shortcode: str,
+        clean_meta: dict[str, Any],
+    ) -> None:
+        """Records a finalized video in the in-memory completed subtitles cache.
+
+        Args:
+            uploader: Channel or uploader identifier.
+            video_id: Video identifier.
+            full_shortcode: Model shortcode.
+            clean_meta: Clean video metadata dictionary.
+        """
+        self._completed_videos.add((uploader, video_id, full_shortcode))
+        # Record to YouTube uploader reverse-lookup only for genuine YouTube source videos,
+        # retaining the lexicographically smallest uploader to match cache rebuilding order
+        if clean_meta.get("source_type") == "youtube":
+            yt_key = (video_id, full_shortcode)
+            if yt_key not in self._yt_completed_uploaders or uploader < self._yt_completed_uploaders[yt_key]:
+                self._yt_completed_uploaders[yt_key] = uploader
 
     def _rebuild_completed_cache_sync(self) -> None:
         """Scans the local repository directory to rebuild the in-memory completed subtitles cache."""
@@ -149,7 +189,7 @@ class GitSyncManager:
 
     def _ensure_repo_sync(self) -> None:
         """Synchronous implementation of cloning or updating the local repository."""
-        if not self.config:
+        if not self.config or self.config.repourl is None:
             self._rebuild_completed_cache_sync()
             return
 
@@ -169,11 +209,13 @@ class GitSyncManager:
                 logfire.info(f"Git repo successfully updated to origin/{branch}.")
                 return
             except (InvalidGitRepositoryError, GitCommandError, AssertionError) as e:
-                logfire.warning(f"Error updating repo at {self.local_repo_dir}: {e}. Re-cloning...")
+                logfire.warning(
+                    f"Error updating repo at {self.local_repo_dir}: {self._sanitize_error(e)}. Re-cloning..."
+                )
                 shutil.rmtree(self.local_repo_dir, onerror=_handle_readonly_rmtree)
 
         self.local_repo_dir.parent.mkdir(parents=True, exist_ok=True)
-        logfire.info(f"Cloning {self.config.repo_url} to {self.local_repo_dir}")
+        logfire.info(f"Cloning {self.config.repourl} to {self.local_repo_dir}")
         repo = Repo.clone_from(auth_url, self.local_repo_dir)
         repo.git.checkout(branch)
         self._rebuild_completed_cache_sync()
@@ -181,7 +223,7 @@ class GitSyncManager:
 
     async def ensure_repo(self) -> None:
         """Clones or updates the local Git repository checkout under mutex protection."""
-        if not self.config:
+        if not self.config or self.config.repourl is None:
             await asyncio.to_thread(self._rebuild_completed_cache_sync)
             return
         async with self._lock:
@@ -266,7 +308,6 @@ class GitSyncManager:
             return
 
         entries: list[dict[str, Any]] = []
-        channel_display_name = uploader
 
         for v_dir in sorted(v_base_dir.iterdir(), key=lambda p: p.name):
             if not v_dir.is_dir() or v_dir.name.startswith("."):
@@ -286,15 +327,12 @@ class GitSyncManager:
             vid = str(meta_data.get("video_id") or v_dir.name)
             title = str(meta_data.get("title") or vid)
             source_type = str(meta_data.get("source_type") or "youtube")
-            ch_name = meta_data.get("channel_name")
+            ch_name = str(meta_data["channel_name"]).strip() if meta_data.get("channel_name") else None
 
             try:
                 timestamp = int(meta_data.get("timestamp") or 0)
             except (ValueError, TypeError):
                 timestamp = 0
-
-            if ch_name and channel_display_name == uploader:
-                channel_display_name = str(ch_name)
 
             date_str = "Unknown"
             if timestamp > 0:
@@ -321,6 +359,7 @@ class GitSyncManager:
                 {
                     "video_id": vid,
                     "title": title,
+                    "channel_name": ch_name,
                     "source_type": source_type,
                     "timestamp": timestamp,
                     "date_str": date_str,
@@ -339,6 +378,7 @@ class GitSyncManager:
             return
 
         entries.sort(key=lambda x: (x["timestamp"], x["video_id"]), reverse=True)
+        channel_display_name = next((e["channel_name"] for e in entries if e["channel_name"]), uploader)
 
         lines: list[str] = [
             f"# {channel_display_name}",
@@ -348,18 +388,21 @@ class GitSyncManager:
         ]
 
         clean_player_url = self.player_base_url.rstrip("/")
+        encoded_uploader = urllib.parse.quote(uploader, safe="")
 
         for item in entries:
             clean_title = (item["title"] or item["video_id"]).replace("|", "\\|").replace("\n", " ").strip()
             vid = item["video_id"]
+            encoded_vid = urllib.parse.quote(vid, safe="")
             model_label = item["best_model_label"]
             version_str = item["best_version_str"]
 
             if item["source_type"] == "youtube":
-                yt_url = f"https://youtu.be/{vid}"
-                p_url = f"{clean_player_url}/?uploader={uploader}&v={vid}"
+                yt_url = f"https://youtu.be/{encoded_vid}"
+                p_url = f"{clean_player_url}/?uploader={encoded_uploader}&v={encoded_vid}"
                 thumb_cell = (
-                    f'<a href="{yt_url}"><img src="https://i.ytimg.com/vi/{vid}/mqdefault.jpg" width="100" /></a>'
+                    f'<a href="{yt_url}">'
+                    f'<img src="https://i.ytimg.com/vi/{encoded_vid}/mqdefault.jpg" width="100" /></a>'
                 )
                 title_cell = f"[{clean_title}]({p_url})"
             else:
@@ -368,7 +411,7 @@ class GitSyncManager:
 
             if model_label != "-":
                 cell_content = f"{model_label}<br>{version_str}" if version_str else model_label
-                model_cell = f"[{cell_content}](./v/{vid})"
+                model_cell = f"[{cell_content}](./v/{encoded_vid})"
             else:
                 model_cell = "-"
 
@@ -376,7 +419,7 @@ class GitSyncManager:
 
         lines.append("")
         readme_path = uploader_dir / "README.md"
-        readme_path.write_text("\n".join(lines), encoding="utf-8")
+        atomic_write_text(readme_path, "\n".join(lines))
         logfire.info(f"Updated channel README at {readme_path.name}")
 
     def _finalize_and_push_sync(
@@ -417,8 +460,6 @@ class GitSyncManager:
         for yf in yaml_files:
             shutil.copy2(yf, int_dir / yf.name)
 
-        self._completed_videos.add((uploader, video_id, full_shortcode))
-
         clean_meta: dict[str, Any] = {
             "video_id": video_id,
             "uploader": uploader,
@@ -440,25 +481,18 @@ class GitSyncManager:
             except Exception as e:
                 logfire.warning(f"Failed to read metadata from {meta_file}: {e}")
 
-        # Record to YouTube uploader reverse-lookup only for genuine YouTube source videos,
-        # retaining the lexicographically smallest uploader to match cache rebuilding order
-        if clean_meta.get("source_type") == "youtube":
-            yt_key = (video_id, full_shortcode)
-            if yt_key not in self._yt_completed_uploaders or uploader < self._yt_completed_uploaders[yt_key]:
-                self._yt_completed_uploaders[yt_key] = uploader
-
         clean_meta["subtitles"] = self._discover_video_subtitles(video_dir)
 
         target_meta = video_dir / "video_meta.json"
-        with open(target_meta, "w", encoding="utf-8") as f:
-            json.dump(clean_meta, f, indent=2, ensure_ascii=False)
+        atomic_write_text(target_meta, json.dumps(clean_meta, indent=2, ensure_ascii=False))
         logfire.info(
             f"Saved clean public metadata with {len(clean_meta['subtitles'])} subtitle track(s) to {target_meta.name}"
         )
 
         self._update_channel_readme_sync(uploader)
 
-        if not self.config:
+        if not self.config or self.config.repourl is None:
+            self._record_completed_cache_entry(uploader, video_id, full_shortcode, clean_meta)
             return
 
         repo = Repo(self.local_repo_dir)
@@ -483,15 +517,14 @@ class GitSyncManager:
             # Check if there are unpublished local commits ahead of remote tracking branch
             has_unpushed = False
             unpushed_count = 0
-            if has_head:
-                try:
-                    unpushed_str = repo.git.rev_list(f"origin/{self.config.branch}..HEAD", count=True).strip()
-                    unpushed_count = int(unpushed_str)
-                    has_unpushed = unpushed_count > 0
-                except Exception:
-                    # If origin/branch cannot be resolved or rev-list fails, assume unpublished commit exists
-                    has_unpushed = True
-                    unpushed_count = 1
+            try:
+                unpushed_str = repo.git.rev_list(f"origin/{self.config.branch}..HEAD", count=True).strip()
+                unpushed_count = int(unpushed_str)
+                has_unpushed = unpushed_count > 0
+            except Exception:
+                # If origin/branch cannot be resolved or rev-list fails, assume unpublished commit exists
+                has_unpushed = True
+                unpushed_count = 1
 
             if has_unpushed:
                 logfire.info(
@@ -499,36 +532,45 @@ class GitSyncManager:
                 )
             else:
                 logfire.info("No Git changes to commit.")
+                self._record_completed_cache_entry(uploader, video_id, full_shortcode, clean_meta)
                 return
 
         # Cross-platform no-op editor command that works on Windows, Linux, and macOS
         editor_cmd = f'"{sys.executable}" -c "import sys; sys.exit(0)"'
         rebase_merge_dir = Path(repo.git_dir) / "rebase-merge"
         rebase_apply_dir = Path(repo.git_dir) / "rebase-apply"
+        pulled = False
 
         for attempt in range(5):
             try:
-                repo.git.push()
+                repo.git.push("-u", "origin", self.config.branch)
                 logfire.info("Git push succeeded.")
+                if pulled:
+                    self._rebuild_completed_cache_sync()
+                else:
+                    self._record_completed_cache_entry(uploader, video_id, full_shortcode, clean_meta)
                 break
             except GitCommandError as e:
                 if attempt >= 4:
-                    logfire.error(f"Git push exhausted retries: {e}")
+                    logfire.error(f"Git push exhausted retries: {self._sanitize_error(e)}")
                     raise
 
                 backoff = random.uniform(1.0, 10.0)
-                logfire.warning(f"Git push failed ({e}). Retrying in {backoff:.1f}s with pull --rebase...")
+                logfire.warning(
+                    f"Git push failed ({self._sanitize_error(e)}). Retrying in {backoff:.1f}s with pull --rebase..."
+                )
                 time.sleep(backoff)
 
                 try:
                     repo.git.pull("origin", self.config.branch, "--rebase")
-                    self._rebuild_completed_cache_sync()
+                    pulled = True
                 except GitCommandError as pull_err:
                     rebase_in_progress = rebase_merge_dir.exists() or rebase_apply_dir.exists()
 
                     if not rebase_in_progress:
                         logfire.warning(
-                            f"Git pull --rebase failed without active rebase (transient network error): {pull_err}"
+                            f"Git pull --rebase failed without active rebase (transient network error): "
+                            f"{self._sanitize_error(pull_err)}"
                         )
                         continue
 
@@ -565,7 +607,7 @@ class GitSyncManager:
                                     f"Git rebase aborted due to unresolvable conflict in files: {unmerged_files}"
                                 ) from pull_err
 
-                        self._rebuild_completed_cache_sync()
+                        pulled = True
                         logfire.info("Resolved all channel README conflicts and completed rebase.")
                     except Exception as rebase_err:
                         if rebase_merge_dir.exists() or rebase_apply_dir.exists():
@@ -573,7 +615,7 @@ class GitSyncManager:
                                 repo.git.rebase("--abort")
                             except Exception:
                                 pass
-                        logfire.error(f"Failed to resolve git rebase: {rebase_err}")
+                        logfire.error(f"Failed to resolve git rebase: {self._sanitize_error(rebase_err)}")
                         raise
 
     async def finalize_and_push(

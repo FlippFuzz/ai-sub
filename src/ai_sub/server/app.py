@@ -38,10 +38,9 @@ def create_app(settings: ServerSettings) -> FastAPI:
     Returns:
         FastAPI: Configured FastAPI application instance.
     """
-    git_sync = GitSyncManager(settings.git, settings.server.work_dir)
+    git_sync = GitSyncManager(settings.git, settings.coordinator.workdir)
     coordinator = ComboRunnersCoordinator(settings, git_sync=git_sync)
-    ingestion = IngestionManager(settings.sources, coordinator, git_sync, settings.server.work_dir)
-    background_tasks: set[asyncio.Task[Any]] = set()
+    ingestion = IngestionManager(settings.sources, coordinator, git_sync, settings.coordinator.workdir)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -56,7 +55,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
         await git_sync.ensure_repo()
         await coordinator.start()
         ingestion_task = asyncio.create_task(ingestion.start())
-        logfire.info(f"ai-sub-server started on {settings.server.host}:{settings.server.port}")
+        logfire.info(f"ai-sub-server started on {settings.http.host}:{settings.http.port}")
         yield
         if not ingestion_task.done():
             ingestion_task.cancel()
@@ -206,17 +205,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
             req.worker_id,
             req.result,
         )
-
-        async def _finalize_and_feed() -> None:
-            """Background finalization and runner coordination task."""
-            try:
-                await coordinator.check_and_finalize_completed_runners()
-            except Exception as e:
-                logfire.exception(f"Background finalization error: {e}")
-
-        bg_task = asyncio.create_task(_finalize_and_feed())
-        background_tasks.add(bg_task)
-        bg_task.add_done_callback(background_tasks.discard)
+        coordinator.schedule_finalize_check()
 
         if not success:
             raise HTTPException(
@@ -253,41 +242,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
                 detail="Task could not be found or was not held by this worker.",
             )
 
-        async def _finalize_on_failure() -> None:
-            """Background check to finalize runners if this failure concluded all tasks."""
-            try:
-                await coordinator.check_and_finalize_completed_runners()
-            except Exception as e:
-                logfire.exception(f"Background finalization check on failure error: {e}")
-
-        bg_task = asyncio.create_task(_finalize_on_failure())
-        background_tasks.add(bg_task)
-        bg_task.add_done_callback(background_tasks.discard)
-
+        coordinator.schedule_finalize_check()
         return {"status": "ok"}
-
-    @app.get("/api/v1/status")
-    async def get_server_status() -> dict[str, Any]:
-        """Returns macroscopic runner and in-memory queue status.
-
-        Returns:
-            dict[str, Any]: Mapping of server status and runner queue metrics.
-        """
-        runner_status = {}
-        for name, runner in coordinator.runners.items():
-            runner_status[name] = {
-                "status": runner.status.value,
-                "idle": runner.is_idle(),
-                "active_video": runner.active_video.video_id if runner.active_video else None,
-                "total_tasks": len(runner.tasks),
-                "pending_tasks": sum(1 for t in runner.tasks.values() if t.status.value == "pending"),
-                "claimed_tasks": sum(1 for t in runner.tasks.values() if t.status.value == "claimed"),
-                "completed_tasks": sum(1 for t in runner.tasks.values() if t.status.value == "completed"),
-            }
-
-        return {
-            "status": "online",
-            "runners": runner_status,
-        }
 
     return app

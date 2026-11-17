@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import shutil
 import urllib.parse
 from collections import deque
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from time import time
+from time import monotonic, time
 from typing import Any, Literal
 
 import logfire
@@ -24,7 +23,8 @@ from ai_sub.server.combo_runner import ComboRunner, RunnerStatus
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.models import ActivityEvent, ServerTask, TaskStatus
 from ai_sub.server.server_config import ServerSettings
-from ai_sub.video import sanitize_filename
+
+_PUSH_RETRY_COOLDOWN_S = 60.0
 
 
 def _format_logfire_query(task: ServerTask) -> str:
@@ -39,7 +39,7 @@ def _format_logfire_query(task: ServerTask) -> str:
     return f"attributes->>'task_id' = '{task.task_id}'"
 
 
-def _is_valid_video_id(video_id: str) -> bool:
+def is_valid_video_id(video_id: str) -> bool:
     """Checks that a video ID is non-empty and free of path traversal characters.
 
     Args:
@@ -74,12 +74,11 @@ def _build_stages_info(name: str, runner: ComboRunner, pipe: Pipeline, now: floa
     Returns:
         dict[str, Any]: Stage progress mapping for summary, reencoding, subtitles, and lyrics.
     """
-    assert runner.active_video is not None
     total_chunks = len(pipe.segments)
     reenc_count = sum(1 for seg in pipe.segments if seg.media_ready)
     pending_reenc = max(0, total_chunks - reenc_count)
 
-    summary_task = runner.tasks.get(f"{name}::{runner.active_video.video_id}::summary")
+    summary_task = runner.tasks.get(f"{name}::{pipe.video_id}::summary")
     sub_tasks = [t for t in runner.tasks.values() if t.task_type == TaskType.SUBTITLES]
     lyr_tasks = [t for t in runner.tasks.values() if t.task_type == TaskType.LYRICS]
 
@@ -101,6 +100,17 @@ def _build_stages_info(name: str, runner: ComboRunner, pipe: Pipeline, now: floa
     )
     lyr_done = sum(1 for seg in pipe.segments if seg.lyrics_response is not None)
     lyr_prog = sum(1 for t in lyr_tasks if t.status == TaskStatus.CLAIMED)
+    lyr_concluded = (
+        sum(
+            1
+            for seg in pipe.segments
+            if seg.subtitles_response is not None
+            and seg.subtitles_response.detected_musical_performances
+            and (seg.lyrics_response is not None or seg.lyrics_exhausted)
+        )
+        if pipe.lyrics_enabled
+        else 0
+    )
 
     active_lyr_tasks = [
         {
@@ -114,16 +124,14 @@ def _build_stages_info(name: str, runner: ComboRunner, pipe: Pipeline, now: floa
 
     has_singing = lyr_total > 0
     if sub_concluded < total_chunks:
-        lyr_status = "in_progress" if lyr_prog > 0 else "pending"
+        lyr_status = "in_progress" if (lyr_prog > 0 or lyr_concluded > 0) else "pending"
     elif has_singing:
-        lyr_concluded = sum(
-            1
-            for seg in pipe.segments
-            if seg.subtitles_response is not None
-            and seg.subtitles_response.detected_musical_performances
-            and (seg.lyrics_response is not None or seg.lyrics_exhausted)
-        )
-        lyr_status = "completed" if lyr_concluded == lyr_total else ("in_progress" if lyr_prog > 0 else "pending")
+        if lyr_concluded == lyr_total:
+            lyr_status = "completed"
+        elif lyr_prog > 0:
+            lyr_status = "in_progress"
+        else:
+            lyr_status = "ready"
     else:
         lyr_status = "skipped"
 
@@ -139,7 +147,7 @@ def _build_stages_info(name: str, runner: ComboRunner, pipe: Pipeline, now: floa
         "reencoding": {
             "total": total_chunks,
             "done": reenc_count,
-            "in_progress": min(pending_reenc, runner.max_reencode_concurrency),
+            "in_progress": runner.active_segment_reencodes,
             "pending": pending_reenc,
         },
         "subtitles": {
@@ -150,6 +158,7 @@ def _build_stages_info(name: str, runner: ComboRunner, pipe: Pipeline, now: floa
         "lyrics": {
             "total": lyr_total,
             "done": lyr_done,
+            "failed": max(0, lyr_concluded - lyr_done),
             "in_progress": lyr_prog,
             "has_singing": has_singing,
             "status": lyr_status,
@@ -162,52 +171,54 @@ class ComboRunnersCoordinator:
     """Orchestrates in-memory combination runners, worker task leases, and dashboard telemetry."""
 
     settings: ServerSettings
-    git_sync: GitSyncManager | None
+    git_sync: GitSyncManager
     runners: dict[str, ComboRunner]
     runner_activity_logs: dict[str, deque[ActivityEvent]]
     reencode_semaphore: asyncio.Semaphore
     _lock: asyncio.Lock
     _finalizing_runners: set[str]
+    _push_retry_after: dict[str, float]
     _sweep_task: asyncio.Task[None] | None
     _background_tasks: set[asyncio.Task[Any]]
     on_runners_finalized: Callable[[], Any] | None
     on_video_aborted: Callable[[str, str, str], None] | None
 
-    def __init__(self, settings: ServerSettings, git_sync: GitSyncManager | None = None) -> None:
+    def __init__(self, settings: ServerSettings, git_sync: GitSyncManager) -> None:
         """Initializes the central combination runners coordinator.
 
         Args:
             settings: Server settings model.
-            git_sync: Optional Git synchronization manager. Defaults to None.
+            git_sync: Git synchronization and output repository manager.
         """
         self.settings = settings
         self.git_sync = git_sync
         self.runners = {}
         self.runner_activity_logs = {
-            p_cfg.name: deque(maxlen=settings.server.activity_log_maxlen) for p_cfg in settings.pipelines
+            p_cfg.name: deque(maxlen=settings.coordinator.activitymaxlen) for p_cfg in settings.pipelines
         }
-        self.reencode_semaphore = asyncio.Semaphore(settings.server.reencode_concurrency)
+        self.reencode_semaphore = asyncio.Semaphore(settings.reencode.concurrency)
         self._lock = asyncio.Lock()
         self._finalizing_runners = set()
+        self._push_retry_after = {}
         self._sweep_task = None
         self._background_tasks = set()
         self.on_runners_finalized = None
         self.on_video_aborted = None
 
-        work_base = settings.server.work_dir
+        work_base = settings.coordinator.workdir
+        val_buffer_ms = int(settings.coordinator.validationbuffer.total_seconds() * 1000)
         for p_cfg in settings.pipelines:
             self.runners[p_cfg.name] = ComboRunner(
                 config=p_cfg,
                 base_work_dir=work_base,
                 reencode_semaphore=self.reencode_semaphore,
                 reencode_settings=settings.reencode,
-                default_search_tools=settings.default_search_tools,
                 split_settings=settings.split,
                 retry_settings=settings.retry,
-                max_reencode_concurrency=settings.server.reencode_concurrency,
+                max_reencode_concurrency=settings.reencode.concurrency,
                 coordinator_lock=self._lock,
-                on_pipeline_done=self._schedule_finalize_check,
-                validation_buffer_ms=settings.server.validation_buffer_ms,
+                on_pipeline_done=self.schedule_finalize_check,
+                validation_buffer_ms=val_buffer_ms,
             )
 
     def _find_task(self, task_id: str) -> tuple[ComboRunner, ServerTask] | None:
@@ -224,8 +235,8 @@ class ComboRunnersCoordinator:
                 return runner, task
         return None
 
-    def _schedule_finalize_check(self) -> None:
-        """Schedules an asynchronous completion check after background re-encoding concludes."""
+    def schedule_finalize_check(self) -> None:
+        """Schedules an asynchronous completion check across all runners in the background."""
 
         async def _run() -> None:
             try:
@@ -270,7 +281,7 @@ class ComboRunnersCoordinator:
         )
 
         runner_log = self.runner_activity_logs.setdefault(
-            task.pipeline_name, deque(maxlen=self.settings.server.activity_log_maxlen)
+            task.pipeline_name, deque(maxlen=self.settings.coordinator.activitymaxlen)
         )
         runner_log.appendleft(event)
 
@@ -296,7 +307,7 @@ class ComboRunnersCoordinator:
         Returns:
             bool: True if the runner was idle and acquired; False otherwise.
         """
-        if not _is_valid_video_id(video_id):
+        if not is_valid_video_id(video_id):
             logfire.warning(f"Rejected invalid or dangerous video ID for acquisition: {video_id!r}")
             return False
 
@@ -349,7 +360,7 @@ class ComboRunnersCoordinator:
         Returns:
             bool: True if video was prepared and assigned; False otherwise.
         """
-        if not _is_valid_video_id(video_id):
+        if not is_valid_video_id(video_id):
             logfire.warning(f"Rejected invalid or dangerous video ID for assignment: {video_id!r}")
             return False
 
@@ -365,7 +376,6 @@ class ComboRunnersCoordinator:
             channel_name=channel_name,
             source_type=source_type,
             timestamp=timestamp,
-            coordinator_lock=self._lock,
         )
         return True
 
@@ -396,7 +406,7 @@ class ComboRunnersCoordinator:
             self._sweep_task = asyncio.create_task(self._lease_sweeper_loop())
 
     async def stop(self) -> None:
-        """Stops background sweeper and runner re-encoding tasks gracefully."""
+        """Stops background sweeper and runner re-encoders, draining active finalizations gracefully."""
         if self._sweep_task:
             self._sweep_task.cancel()
             try:
@@ -408,17 +418,21 @@ class ComboRunnersCoordinator:
         for runner in self.runners.values():
             await runner.stop_background_tasks()
 
-        for bg_task in list(self._background_tasks):
-            bg_task.cancel()
-        self._background_tasks.clear()
+        # Drain in-flight finalizations/Git pushes cleanly instead of interrupting mid-push
+        while self._background_tasks:
+            pending = list(self._background_tasks)
+            results = await asyncio.gather(*pending, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
+                    logfire.warning(f"Background task error during shutdown: {res}")
 
     async def _lease_sweeper_loop(self) -> None:
         """Continuously checks for expired worker leases every 15 seconds.
 
         Heartbeat timeouts are treated as retryable failures and reset tasks to PENDING
-        without incrementing non-retryable attempt counts toward max_runs.
+        without incrementing non-retryable attempt counts toward maxruns.
         """
-        timeout = self.settings.server.heartbeat_timeout_seconds
+        timeout = self.settings.coordinator.heartbeattimeout.total_seconds()
 
         while True:
             await asyncio.sleep(15)
@@ -439,7 +453,8 @@ class ComboRunnersCoordinator:
                                 worker_id = task.worker_id or "unknown"
                                 total_active_s = round(now - (task.claimed_at or now), 1)
                                 diag_msg = (
-                                    f"Lease timed out after {timeout}s without heartbeat (active: {total_active_s}s)."
+                                    f"Lease timed out after {int(timeout)}s without heartbeat "
+                                    f"(active: {total_active_s}s)."
                                 )
                                 _release_task_lease(task)
                                 task.status = TaskStatus.PENDING
@@ -457,10 +472,8 @@ class ComboRunnersCoordinator:
                     sweep_span.set_attribute("active_leases", active_leases)
                     sweep_span.set_attribute("expired_leases", expired_count)
 
-            try:
-                await self.check_and_finalize_completed_runners()
-            except Exception as e:
-                logfire.exception(f"Error checking and finalizing completed runners in lease sweeper: {e}")
+            # Schedule finalization asynchronously so Git retries never block lease sweeping
+            self.schedule_finalize_check()
 
     async def claim_task(
         self,
@@ -490,15 +503,17 @@ class ComboRunnersCoordinator:
                 worker_tools = {t.strip().lower() for t in search_tools}
 
                 for runner in self.runners.values():
-                    if runner.status != RunnerStatus.PROCESSING:
+                    if runner.status != RunnerStatus.PROCESSING or runner.pipeline is None:
                         continue
                     for task in runner.tasks.values():
                         if task.status != TaskStatus.PENDING or not runner.is_task_ready_for_claim(task):
                             continue
                         if task.model.lower() not in available_models:
                             continue
+
+                        required_tools = runner.search_tools_for_task(task.task_type)
                         if task.task_type in (TaskType.SUMMARY, TaskType.LYRICS):
-                            if task.search_tools and not all(t.lower() in worker_tools for t in task.search_tools):
+                            if required_tools and not all(t.lower() in worker_tools for t in required_tools):
                                 continue
 
                         now = time()
@@ -527,7 +542,13 @@ class ComboRunnersCoordinator:
                         safe_task_id = urllib.parse.quote(task.task_id, safe=":")
                         safe_filename = urllib.parse.quote(task.media_path.name)
                         media_url = f"/api/v1/tasks/{safe_task_id}/media/{safe_filename}"
-                        return task.to_claim_response(media_url=media_url, retry=self.settings.retry)
+                        return task.to_claim_response(
+                            pipeline=runner.pipeline,
+                            search_tools=required_tools,
+                            media_url=media_url,
+                            retry=self.settings.retry,
+                            validation_buffer=self.settings.coordinator.validationbuffer,
+                        )
 
                 claim_span.set_attribute("result", "none_available")
                 return None
@@ -564,7 +585,7 @@ class ComboRunnersCoordinator:
             )
             return False
 
-    def _fail_task_locked(
+    async def _fail_task_locked(
         self,
         task: ServerTask,
         worker_id: str,
@@ -605,13 +626,14 @@ class ComboRunnersCoordinator:
             self._log_activity(event_type="fail", task=task, worker_id=worker_id, detail=detail)
             return True
 
-        outcome = runner.on_task_failed(task.task_id)
-        max_runs = self.settings.retry.max_runs
+        outcome = await runner.on_task_failed(task.task_id)
+        max_runs = self.settings.retry.maxruns
 
         if outcome.action == "fallback_reencode":
-            detail = f"{detail}\n-> Falling back to {outcome.target_fps} fps (tier {outcome.fallback_tier})"
+            fps_str = f"{outcome.target_fps:.4g}" if outcome.target_fps is not None else "unknown"
+            detail = f"{detail}\n-> Falling back to {fps_str} fps (tier {outcome.fallback_tier})"
         elif outcome.action == "exhausted":
-            detail = f"{detail}\n-> Exhausted all {max_runs} attempt(s) and fallback FPS tiers."
+            detail = f"{detail}\n-> Exhausted all {max_runs} run(s) and fallback FPS tiers."
             logfire.error(f"Task '{task.task_id}' marked FAILED after exhausting retries and fallback tiers.")
         elif outcome.action == "retry":
             logfire.warning(
@@ -657,7 +679,7 @@ class ComboRunnersCoordinator:
                     logfire.warning(f"Task '{task_id}' validation failed: {val_err}. Routing to fail.")
                     comp_span.set_attribute("result", "validation_failed")
                     comp_span.set_attribute("error", str(val_err))
-                    self._fail_task_locked(
+                    await self._fail_task_locked(
                         task=task,
                         worker_id=worker_id,
                         reason="EXECUTION_ERROR",
@@ -728,7 +750,7 @@ class ComboRunnersCoordinator:
                 worker_id=worker_id,
                 reason=reason,
             ) as fail_span:
-                success = self._fail_task_locked(
+                success = await self._fail_task_locked(
                     task=task,
                     worker_id=worker_id,
                     reason=reason,
@@ -736,7 +758,6 @@ class ComboRunnersCoordinator:
                     is_retryable=is_retryable,
                 )
                 fail_span.set_attribute("result", task.status.value)
-                fail_span.set_attribute("attempts", task.attempts)
                 return success
 
     def get_task_media_path(self, task_id: str) -> Path | None:
@@ -768,73 +789,85 @@ class ComboRunnersCoordinator:
         async with self._lock:
             if runner.config.name in self._finalizing_runners:
                 return False
-            if runner.is_idle() or not runner.active_video:
+            if runner.is_idle() or not runner.pipeline:
                 return False
             if runner.status != RunnerStatus.PUSH_FAILED and not runner.is_video_complete():
+                return False
+
+            was_push_failed = runner.status == RunnerStatus.PUSH_FAILED
+            if was_push_failed and monotonic() < self._push_retry_after.get(runner.config.name, 0.0):
                 return False
 
             self._finalizing_runners.add(runner.config.name)
             runner.status = RunnerStatus.FINALIZING
 
         try:
-            vid = runner.active_video
-            assert vid is not None
+            pipe = runner.pipeline
+            assert pipe is not None
 
-            if vid.pipeline and vid.pipeline.summary_aborted:
+            if pipe.summary_aborted:
                 logfire.error(
-                    f"Runner '{runner.config.name}' aborted '{vid.title}' ({vid.video_id}) "
+                    f"Runner '{runner.config.name}' aborted '{pipe.title}' ({pipe.video_id}) "
                     "due to Summary exhaustion. Skipping Git push and holding from automatic retry."
                 )
                 if self.on_video_aborted is not None:
                     try:
-                        self.on_video_aborted(runner.config.name, vid.video_id, "Summary failed")
+                        self.on_video_aborted(runner.config.name, pipe.video_id, "Summary failed")
                     except Exception as cb_err:
                         logfire.warning(f"Error invoking on_video_aborted callback: {cb_err}")
 
+                # Stop FFmpeg processes before taking coordinator._lock
+                await runner.stop_background_tasks()
                 async with self._lock:
+                    self._push_retry_after.pop(runner.config.name, None)
                     await runner.clear_active_video()
                     return True
 
-            logfire.info(f"Runner '{runner.config.name}' finalizing for '{vid.title}'...")
+            logfire.info(f"Runner '{runner.config.name}' finalizing for '{pipe.title}'...")
 
-            srt_filename = f"{vid.filename_stem}.{runner.full_shortcode}.srt"
-            temp_srt = vid.job_dir / srt_filename
-
-            try:
-                generated_srts = await asyncio.to_thread(runner.stitch_final_subtitles, temp_srt)
-            except Exception as e:
-                logfire.error(f"Subtitle stitching failed for '{runner.config.name}': {e}")
-                async with self._lock:
-                    runner.status = RunnerStatus.PUSH_FAILED
-                return False
-
-            yaml_files = list(vid.job_dir.glob("*.yaml"))
-            meta_file = vid.job_dir / "video_meta.json"
-            if self.git_sync:
+            primary_path = pipe.job_dir / f"{pipe.filename_stem}.{pipe.full_shortcode}.srt"
+            raw_path = pipe.job_dir / f"{pipe.filename_stem}.raw-{pipe.full_shortcode}.srt"
+            if was_push_failed and primary_path.is_file() and primary_path.stat().st_size > 0:
+                generated_srts = [primary_path]
+                if pipe.lyrics_enabled and raw_path.is_file() and raw_path.stat().st_size > 0:
+                    generated_srts.append(raw_path)
+            else:
                 try:
-                    await self.git_sync.finalize_and_push(
-                        uploader=vid.uploader,
-                        video_id=vid.video_id,
-                        full_shortcode=runner.full_shortcode,
-                        srt_files=generated_srts,
-                        yaml_files=yaml_files,
-                        meta_file=meta_file if meta_file.is_file() else None,
-                    )
+                    with logfire.span(
+                        "Stitch Subtitles: {video_id}",
+                        combo=runner.config.name,
+                        video_id=pipe.video_id,
+                    ):
+                        generated_srts = await asyncio.to_thread(pipe.finalize, allow_partial=True)
                 except Exception as e:
-                    logfire.error(f"Git push failed for '{runner.config.name}': {e}. Setting PUSH_FAILED.")
+                    logfire.error(f"Subtitle stitching failed for '{runner.config.name}': {e}")
                     async with self._lock:
                         runner.status = RunnerStatus.PUSH_FAILED
+                        self._push_retry_after[runner.config.name] = monotonic() + _PUSH_RETRY_COOLDOWN_S
                     return False
-            else:
-                safe_uploader = sanitize_filename(vid.uploader)
-                output_dir = self.settings.server.work_dir / "output" / safe_uploader
-                output_dir.mkdir(parents=True, exist_ok=True)
-                for srt_path in generated_srts:
-                    dest = output_dir / srt_path.name
-                    shutil.copy2(srt_path, dest)
-                    logfire.info(f"Saved durable subtitle output to {dest}")
 
+            yaml_files = list(pipe.job_dir.glob("*.yaml"))
+            meta_file = pipe.job_dir / "video_meta.json"
+            try:
+                await self.git_sync.finalize_and_push(
+                    uploader=pipe.uploader,
+                    video_id=pipe.video_id,
+                    full_shortcode=runner.full_shortcode,
+                    srt_files=generated_srts,
+                    yaml_files=yaml_files,
+                    meta_file=meta_file if meta_file.is_file() else None,
+                )
+            except Exception as e:
+                logfire.error(f"Git push failed for '{runner.config.name}': {e}. Setting PUSH_FAILED.")
+                async with self._lock:
+                    runner.status = RunnerStatus.PUSH_FAILED
+                    self._push_retry_after[runner.config.name] = monotonic() + _PUSH_RETRY_COOLDOWN_S
+                return False
+
+            # Stop FFmpeg processes before taking coordinator._lock
+            await runner.stop_background_tasks()
             async with self._lock:
+                self._push_retry_after.pop(runner.config.name, None)
                 await runner.clear_active_video()
                 logfire.info(f"Runner '{runner.config.name}' cleared and ready for next video.")
                 return True
@@ -842,6 +875,7 @@ class ComboRunnersCoordinator:
             logfire.exception(f"Unexpected error finalizing runner '{runner.config.name}': {e}")
             async with self._lock:
                 runner.status = RunnerStatus.PUSH_FAILED
+                self._push_retry_after[runner.config.name] = monotonic() + _PUSH_RETRY_COOLDOWN_S
             return False
         finally:
             async with self._lock:
@@ -907,16 +941,16 @@ class ComboRunnersCoordinator:
             active_info = None
             stages_info = None
 
-            if runner.active_video and runner.active_video.pipeline:
+            if pipe := runner.pipeline:
                 active_info = {
-                    "video_id": runner.active_video.video_id,
-                    "title": runner.active_video.title,
-                    "uploader": runner.active_video.uploader,
-                    "channel_name": runner.active_video.channel_name,
-                    "duration_ms": runner.active_video.duration_ms,
-                    "source_type": runner.active_video.source_type,
+                    "video_id": pipe.video_id,
+                    "title": pipe.title,
+                    "uploader": pipe.uploader,
+                    "channel_name": pipe.channel_name,
+                    "duration_ms": pipe.duration_ms,
+                    "source_type": pipe.source_type,
                 }
-                stages_info = _build_stages_info(name, runner, runner.active_video.pipeline, now)
+                stages_info = _build_stages_info(name, runner, pipe, now)
 
             tasks_list = [
                 {
@@ -924,11 +958,11 @@ class ComboRunnersCoordinator:
                     "type": t.task_type.value,
                     "status": t.status.value,
                     "worker_id": t.worker_id,
-                    "attempts": t.attempts,
                     "elapsed_s": int(now - t.claimed_at) if t.claimed_at else None,
                     "logfire_query": _format_logfire_query(t),
                 }
                 for t in runner.tasks.values()
+                if t.status == TaskStatus.CLAIMED
             ]
 
             q_info = pipeline_queues.get(name, {"total_count": 0, "items": []})
@@ -937,11 +971,10 @@ class ComboRunnersCoordinator:
                     "name": name,
                     "status": runner.status.value,
                     "models": {
-                        "summary": runner.config.summary_model,
-                        "subtitles": runner.config.subtitles_model,
-                        "lyrics": runner.config.lyrics_model,
+                        "summary": runner.config.summary.model,
+                        "subtitles": runner.config.subtitles.model,
+                        "lyrics": runner.config.lyrics.model,
                     },
-                    "idle": runner.is_idle(),
                     "active_video": active_info,
                     "preparing_video": runner.preparing_video_info,
                     "stages": stages_info,

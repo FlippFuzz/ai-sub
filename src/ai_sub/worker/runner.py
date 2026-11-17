@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import urllib.parse
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 from pathlib import Path
-from time import time
-from typing import Any, Callable, cast
+from time import monotonic
+from typing import Any, cast
 
 import logfire
+from httpx import HTTPStatusError
 
 from ai_sub.config import ServiceTier
 from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError, is_retryable_error
@@ -34,17 +36,16 @@ class WorkerRunner:
 
     settings: WorkerSettings
     client: WorkerClient
-    _lock: asyncio.Lock
+    _cond: asyncio.Condition
     _shutdown_event: asyncio.Event
     _model_stop_events: dict[str, asyncio.Event]
     _exhausted_models: set[str]
-    _capped_models: set[str]
-    _active_tasks: int
-    _in_flight_claims: int
     _tasks_completed_per_model: dict[str, int]
+    _tasks_in_flight_per_model: dict[str, int]
     _last_busy_timestamp: float
     _deadline: float | None
     _version_mismatch: bool
+    _fatal_error: bool
 
     def __init__(self, settings: WorkerSettings) -> None:
         """Initializes the worker runner.
@@ -54,29 +55,28 @@ class WorkerRunner:
         """
         self.settings = settings
         self.client = WorkerClient(
-            base_url=str(settings.server_url),
+            base_url=str(settings.serverurl),
             auth=settings.basic_auth,
         )
-        self._lock = asyncio.Lock()
+        unique_models = list(dict.fromkeys(settings.models))
+        self._cond = asyncio.Condition()
         self._shutdown_event = asyncio.Event()
-        self._model_stop_events = {model: asyncio.Event() for model in dict.fromkeys(settings.models)}
+        self._model_stop_events = {model: asyncio.Event() for model in unique_models}
         self._exhausted_models = set()
-        self._capped_models = set()
-        self._active_tasks = 0
-        self._in_flight_claims = 0
-        self._tasks_completed_per_model = {model: 0 for model in dict.fromkeys(settings.models)}
-        self._last_busy_timestamp = time()
+        self._tasks_completed_per_model = {model: 0 for model in unique_models}
+        self._tasks_in_flight_per_model = {model: 0 for model in unique_models}
+        self._last_busy_timestamp = monotonic()
         self._deadline = None
         self._version_mismatch = False
+        self._fatal_error = False
 
-    @property
-    def _tasks_completed(self) -> int:
-        """Total tasks completed across all models.
+    def _total_in_flight(self) -> int:
+        """Returns total reserved claims and running tasks across all models (caller holds _cond).
 
         Returns:
-            int: Aggregate count of completed tasks.
+            int: Total in-flight tasks across all model slots.
         """
-        return sum(self._tasks_completed_per_model.values())
+        return sum(self._tasks_in_flight_per_model.values())
 
     def _is_model_done(self, model: str) -> bool:
         """Checks if a model has exhausted its quota or reached its task limit.
@@ -87,9 +87,9 @@ class WorkerRunner:
         Returns:
             bool: True if the model is done, False otherwise.
         """
-        if model in self._exhausted_models or model in self._capped_models:
+        if model in self._exhausted_models:
             return True
-        if 0 < self.settings.max_tasks <= self._tasks_completed_per_model.get(model, 0):
+        if 0 < self.settings.maxtasks <= self._tasks_completed_per_model.get(model, 0):
             return True
         return False
 
@@ -103,10 +103,11 @@ class WorkerRunner:
         return bool(unique_models and all(self._is_model_done(m) for m in unique_models))
 
     def _trigger_shutdown(self) -> None:
-        """Signals global shutdown across all model slots."""
+        """Signals global shutdown across all model slots (must be called while holding _cond)."""
         self._shutdown_event.set()
         for ev in self._model_stop_events.values():
             ev.set()
+        self._cond.notify_all()
 
     async def _heartbeat_loop(
         self,
@@ -123,7 +124,7 @@ class WorkerRunner:
             lease_revoked: Event set when the server rejects a heartbeat lease renewal.
             on_lease_rejected: Callback to cancel any currently active work immediately.
         """
-        interval = self.settings.heartbeat_interval_seconds
+        interval = self.settings.heartbeatinterval.total_seconds()
         hb_num = 0
 
         with logfire.span("Heartbeats", task_id=task_id, _level="debug"):
@@ -136,7 +137,7 @@ class WorkerRunner:
                         with logfire.span("Heartbeat Ping #{num}", num=hb_num, task_id=task_id, _level="debug"):
                             acked = await self.client.send_heartbeat(
                                 task_id=task_id,
-                                worker_id=self.settings.worker_id,
+                                worker_id=self.settings.id,
                             )
                             if acked is None:
                                 logfire.warning(
@@ -181,7 +182,7 @@ class WorkerRunner:
         if not Path(raw_name).suffix:
             raw_name = f"{raw_name}.mp4"
 
-        chunk_dir = self.settings.work_dir / task.pipeline_name / task.video_id
+        chunk_dir = self.settings.workdir / task.pipeline_name / task.video_id
         chunk_path = chunk_dir / raw_name
 
         try:
@@ -211,6 +212,7 @@ class WorkerRunner:
                 media_path=chunk_path,
                 search_providers=active_tools,
             )
+            validation_buffer_ms = int(task.validation_buffer.total_seconds() * 1000)
 
             if task.task_type == TaskType.SUMMARY:
                 job = SummaryJob(
@@ -222,6 +224,7 @@ class WorkerRunner:
                     service_tier=cast(ServiceTier | None, task.service_tier),
                     agentic_video=task.agentic_video,
                     retry_settings=task.retry,
+                    validation_buffer_ms=validation_buffer_ms,
                 )
             elif task.task_type == TaskType.SUBTITLES:
                 job = SubtitlesJob(
@@ -235,6 +238,7 @@ class WorkerRunner:
                     service_tier=cast(ServiceTier | None, task.service_tier),
                     agentic_video=task.agentic_video,
                     retry_settings=task.retry,
+                    validation_buffer_ms=validation_buffer_ms,
                 )
             elif task.task_type == TaskType.LYRICS:
                 if not task.draft_subtitles:
@@ -254,6 +258,7 @@ class WorkerRunner:
                     service_tier=cast(ServiceTier | None, task.service_tier),
                     agentic_video=task.agentic_video,
                     retry_settings=task.retry,
+                    validation_buffer_ms=validation_buffer_ms,
                 )
             else:
                 raise ValueError(f"Unknown task type: '{task.task_type}'")
@@ -275,7 +280,7 @@ class WorkerRunner:
                 try:
                     chunk_path.unlink()
                     parent = chunk_path.parent
-                    while parent != self.settings.work_dir and parent.exists():
+                    while parent != self.settings.workdir and parent.exists():
                         try:
                             parent.rmdir()
                             parent = parent.parent
@@ -325,7 +330,7 @@ class WorkerRunner:
             video_id=claim.video_id,
             model=claim.model,
             task_type=claim.task_type.value,
-            worker_id=self.settings.worker_id,
+            worker_id=self.settings.id,
             slot=slot_id,
         ):
             heartbeat_task = asyncio.create_task(
@@ -354,8 +359,7 @@ class WorkerRunner:
                     complete_subtask = asyncio.create_task(
                         self.client.complete_task(
                             task_id=claim.task_id,
-                            worker_id=self.settings.worker_id,
-                            task_type=claim.task_type,
+                            worker_id=self.settings.id,
                             result=result_dict,
                         )
                     )
@@ -378,17 +382,17 @@ class WorkerRunner:
                         pass
 
                 if accepted:
-                    async with self._lock:
+                    async with self._cond:
                         count = self._tasks_completed_per_model.get(model, 0) + 1
                         self._tasks_completed_per_model[model] = count
-                        if 0 < self.settings.max_tasks <= count and model not in self._capped_models:
-                            self._capped_models.add(model)
+                        if count == self.settings.maxtasks:
                             logfire.info(
-                                f"[{slot_label}] Reached max tasks limit ({self.settings.max_tasks}) "
+                                f"[{slot_label}] Reached max tasks limit ({self.settings.maxtasks}) "
                                 f"for model '{model}'. Stopping new task claims for this model."
                             )
                             if model in self._model_stop_events:
                                 self._model_stop_events[model].set()
+                            self._cond.notify_all()
                             if self._all_models_finished():
                                 logfire.info(
                                     "All configured models have reached their task limits or exhausted quotas. "
@@ -415,15 +419,16 @@ class WorkerRunner:
                 err_msg = str(e).strip() or "Daily quota limit reached"
                 await self.client.fail_task(
                     task_id=claim.task_id,
-                    worker_id=self.settings.worker_id,
+                    worker_id=self.settings.id,
                     reason=f"QUOTA_EXHAUSTED: {err_msg}",
                     error_message=err_msg,
                     is_retryable=True,
                 )
-                async with self._lock:
+                async with self._cond:
                     self._exhausted_models.add(model)
                     if model in self._model_stop_events:
                         self._model_stop_events[model].set()
+                    self._cond.notify_all()
                     if self._all_models_finished():
                         logfire.info(
                             "All configured models have exhausted quotas or reached task limits. Shutting down worker."
@@ -438,11 +443,47 @@ class WorkerRunner:
                 logfire.exception(f"[{slot_label}] Execution error on task '{claim.task_id}': {e}")
                 await self.client.fail_task(
                     task_id=claim.task_id,
-                    worker_id=self.settings.worker_id,
+                    worker_id=self.settings.id,
                     reason=fail_reason,
                     error_message=err_msg,
                     is_retryable=is_retryable,
                 )
+
+    async def _release_model_reservation(self, model: str, touch_busy: bool = False) -> None:
+        """Releases one reserved in-flight task slot for a model and wakes waiting slots.
+
+        Args:
+            model: Model identifier.
+            touch_busy: Whether to update _last_busy_timestamp to now. Defaults to False.
+        """
+        async with self._cond:
+            self._tasks_in_flight_per_model[model] = max(0, self._tasks_in_flight_per_model.get(model, 0) - 1)
+            if touch_busy:
+                self._last_busy_timestamp = monotonic()
+            self._cond.notify_all()
+
+    async def _wait_for_condition(
+        self, timeout_s: float, stop_event: asyncio.Event, wake_on_idle: bool = False
+    ) -> None:
+        """Sleeps while holding _cond until timeout expires, shutdown is signaled, or worker becomes idle.
+
+        Args:
+            timeout_s: Maximum duration to wait in seconds.
+            stop_event: Per-model or global shutdown event.
+            wake_on_idle: If True, returns early if total in-flight tasks drops to 0. Defaults to False.
+        """
+        deadline = monotonic() + timeout_s
+        while not stop_event.is_set():
+            if wake_on_idle and self._total_in_flight() == 0:
+                break
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            try:
+                async with asyncio.timeout(remaining):
+                    await self._cond.wait()
+            except TimeoutError:
+                break
 
     async def _model_slot_loop(
         self,
@@ -461,101 +502,122 @@ class WorkerRunner:
         """
         slot_label = f"{model}#{slot_id}"
         stop_event = self._model_stop_events.get(model, self._shutdown_event)
+        idle_timeout_seconds = self.settings.idletimeout.total_seconds()
+        poll_seconds = self.settings.pollinterval.total_seconds()
 
         while not stop_event.is_set():
-            async with self._lock:
-                if model in self._exhausted_models:
-                    logfire.info(f"[{slot_label}] Model quota exhausted. Exiting slot.")
+            async with self._cond:
+                while (
+                    not stop_event.is_set()
+                    and not self._is_model_done(model)
+                    and 0
+                    < self.settings.maxtasks
+                    <= (self._tasks_completed_per_model.get(model, 0) + self._tasks_in_flight_per_model.get(model, 0))
+                ):
+                    await self._cond.wait()
+
+                if stop_event.is_set() or model in self._exhausted_models:
+                    if model in self._exhausted_models:
+                        logfire.info(f"[{slot_label}] Model quota exhausted. Exiting slot.")
                     break
 
-                if model in self._capped_models or (
-                    0 < self.settings.max_tasks <= self._tasks_completed_per_model.get(model, 0)
-                ):
+                if 0 < self.settings.maxtasks <= self._tasks_completed_per_model.get(model, 0):
                     logfire.info(
-                        f"[{slot_label}] Reached max tasks limit ({self.settings.max_tasks}) "
+                        f"[{slot_label}] Reached max tasks limit ({self.settings.maxtasks}) "
                         f"for model '{model}'. Exiting slot."
                     )
                     break
 
-                if self._deadline is not None and time() >= self._deadline:
+                if self._deadline is not None and monotonic() >= self._deadline:
+                    max_dur_m = self.settings.maxduration.total_seconds() / 60.0
                     logfire.info(
-                        f"[{slot_label}] Maximum run duration ({self.settings.max_duration_minutes:.1f}m) "
-                        "reached. Draining slot and exiting."
+                        f"[{slot_label}] Maximum run duration ({max_dur_m:.1f}m) reached. Draining slot and exiting."
                     )
                     self._trigger_shutdown()
                     break
 
-                self._in_flight_claims += 1
+                self._tasks_in_flight_per_model[model] = self._tasks_in_flight_per_model.get(model, 0) + 1
 
             claim = None
             claim_failed = False
             try:
                 claim = await self.client.claim_task(
-                    worker_id=self.settings.worker_id,
+                    worker_id=self.settings.id,
                     models=[model],
-                    search_tools=self.settings.ai.search.tools,
+                    search_tools=[str(t) for t in self.settings.ai.search.tools],
                 )
             except VersionMismatchError as e:
                 logfire.error(
                     f"[{slot_label}] ai-sub package version mismatch: {e}. "
                     "Shutting down worker so worker.sh can update to latest version."
                 )
-                self._version_mismatch = True
-                self._trigger_shutdown()
+                async with self._cond:
+                    self._version_mismatch = True
+                    self._trigger_shutdown()
+                await self._release_model_reservation(model)
                 break
+            except HTTPStatusError as e:
+                if e.response.status_code in (401, 403, 404):
+                    logfire.error(
+                        f"[{slot_label}] Server rejected task claim with HTTP {e.response.status_code}: {e}. "
+                        "Check serverurl and serverauth. Shutting down worker."
+                    )
+                    async with self._cond:
+                        self._fatal_error = True
+                        self._trigger_shutdown()
+                    await self._release_model_reservation(model)
+                    break
+                claim_failed = True
+                logfire.warning(f"[{slot_label}] Failed to claim task from server: {e}. Retrying in 5s...")
             except Exception as e:
                 claim_failed = True
                 logfire.warning(f"[{slot_label}] Failed to claim task from server: {e}. Retrying in 5s...")
-            finally:
-                async with self._lock:
-                    self._in_flight_claims -= 1
 
             if claim_failed:
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
+                await self._release_model_reservation(model)
+                async with self._cond:
+                    if self._total_in_flight() == 0:
+                        idle_duration = monotonic() - self._last_busy_timestamp
+                        error_timeout = idle_timeout_seconds if idle_timeout_seconds > 0 else 15.0
+                        if idle_duration >= error_timeout:
+                            logfire.error(
+                                f"[{slot_label}] Server unreachable or failing claims for {idle_duration:.1f}s. "
+                                "Shutting down worker."
+                            )
+                            self._fatal_error = True
+                            self._trigger_shutdown()
+                            break
+                    await self._wait_for_condition(5.0, stop_event)
                 continue
 
             if claim is not None:
-                async with self._lock:
-                    self._active_tasks += 1
-                    self._last_busy_timestamp = time()
-
+                async with self._cond:
+                    self._last_busy_timestamp = monotonic()
                 try:
                     await self._process_claimed_task(claim, model, slot_id, executor, search_providers)
                 finally:
-                    async with self._lock:
-                        self._active_tasks -= 1
-                        self._last_busy_timestamp = time()
+                    await self._release_model_reservation(model, touch_busy=True)
                 continue
 
             # claim is None (HTTP 204: no task available for this model)
-            async with self._lock:
-                active_or_claiming = self._active_tasks + self._in_flight_claims
-                idle_duration = time() - self._last_busy_timestamp
-                idle_timeout_seconds = self.settings.idle_timeout_minutes * 60.0
+            await self._release_model_reservation(model)
+            async with self._cond:
+                in_flight_now = self._total_in_flight()
+                if in_flight_now == 0:
+                    idle_duration = monotonic() - self._last_busy_timestamp
+                    if idle_duration >= idle_timeout_seconds:
+                        logfire.info(
+                            f"[{slot_label}] All slots have been idle for {idle_duration / 60:.1f}m "
+                            f"(timeout: {idle_timeout_seconds / 60:.1f}m). Shutting down worker."
+                        )
+                        self._trigger_shutdown()
+                        break
 
-                if active_or_claiming == 0 and idle_duration >= idle_timeout_seconds:
-                    logfire.info(
-                        f"[{slot_label}] All slots have been idle for {idle_duration / 60:.1f}m "
-                        f"(timeout: {self.settings.idle_timeout_minutes:.1f}m). Shutting down worker."
-                    )
-                    self._trigger_shutdown()
-                    break
-
-                poll_seconds = self.settings.claim_poll_interval_minutes * 60.0
-                if active_or_claiming == 0:
                     remaining_idle = max(1.0, idle_timeout_seconds - idle_duration)
-                    sleep_duration = min(poll_seconds, remaining_idle)
+                    await self._wait_for_condition(min(poll_seconds, remaining_idle), stop_event)
                 else:
-                    sleep_duration = poll_seconds
-
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=sleep_duration)
-                break
-            except asyncio.TimeoutError:
-                pass
+                    # Re-check immediately if active slots across other models become idle while sleeping
+                    await self._wait_for_condition(poll_seconds, stop_event, wake_on_idle=True)
 
     async def run(self) -> int:
         """Executes concurrent per-model worker slots until queues are drained or quotas are exhausted.
@@ -563,10 +625,10 @@ class WorkerRunner:
         Returns:
             int: Application exit code (0 for clean finish, 1 for abnormal exit or update required).
         """
-        if not self.settings.ai.key:
+        if not self.settings.ai.key or not self.settings.ai.key.get_secret_value().strip():
             logfire.error(
                 "Gemini API key is missing in worker configuration. "
-                "Specify ai.key in worker YAML or GEMINI_API_KEY environment variable."
+                "Specify ai.key in worker YAML or AISUBWORKER_AI_KEY / GEMINI_API_KEY environment variable."
             )
             return 1
 
@@ -575,25 +637,26 @@ class WorkerRunner:
             logfire.info("No configured models available. Exiting cleanly.")
             return 0
 
-        self.settings.work_dir.mkdir(parents=True, exist_ok=True)
-        executor = GeminiExecutor(self.settings.ai)
+        self.settings.workdir.mkdir(parents=True, exist_ok=True)
+        self._last_busy_timestamp = monotonic()
 
         concurrency = self.settings.concurrency
         total_slots = len(models) * concurrency
         limit_desc = (
-            f"up to {self.settings.max_tasks} tasks per model"
-            if self.settings.max_tasks > 0
+            f"up to {self.settings.maxtasks} tasks per model"
+            if self.settings.maxtasks > 0
             else "unlimited tasks per model"
         )
         logfire.info(
-            f"Starting worker '{self.settings.worker_id}' with {len(models)} model(s), "
+            f"Starting worker '{self.settings.id}' with {len(models)} model(s), "
             f"{concurrency} slot(s) per model ({total_slots} total concurrent slot(s)), and {limit_desc}."
         )
 
-        if self.settings.max_duration_minutes > 0:
-            self._deadline = time() + (self.settings.max_duration_minutes * 60.0)
+        max_duration_s = self.settings.maxduration.total_seconds()
+        if max_duration_s > 0:
+            self._deadline = monotonic() + max_duration_s
             logfire.info(
-                f"Worker session time limit set to {self.settings.max_duration_minutes:.1f} minute(s). "
+                f"Worker session time limit set to {max_duration_s / 60:.1f} minute(s). "
                 "New task claims will stop after deadline."
             )
 
@@ -601,6 +664,9 @@ class WorkerRunner:
             search_providers = create_search_providers(self.settings.ai.search)
             for sp in search_providers:
                 await stack.enter_async_context(sp)
+
+            executor = GeminiExecutor(self.settings.ai)
+            stack.push_async_callback(executor.aclose)
 
             slots = [
                 asyncio.create_task(self._model_slot_loop(model, slot_id, executor, search_providers))
@@ -615,7 +681,11 @@ class WorkerRunner:
             logfire.warning("Worker exited due to an ai-sub package version mismatch. Update required.")
             return 1
 
-        total_completed = self._tasks_completed
+        if self._fatal_error:
+            logfire.error("Worker exited due to a server authentication or connection error.")
+            return 1
+
+        total_completed = sum(self._tasks_completed_per_model.values())
         details = ", ".join(f"{m}: {c}" for m, c in self._tasks_completed_per_model.items())
         logfire.info(f"Worker finished cleanly. Total tasks completed: {total_completed} ({details}).")
         return 0

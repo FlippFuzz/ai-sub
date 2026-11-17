@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Callable
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import (
+from ai_sub.search.builtin import GoogleBuiltinSearchProvider
+from ai_sub.search.duckduckgo import DuckDuckGoSearchProvider
+from ai_sub.search.langsearch import LangsearchSearchProvider
+from ai_sub.search.lrclib import LrclibSearchProvider
+from ai_sub.search.ollama import OllamaSearchProvider
+from ai_sub.search.search_base import (
     BaseHttpSearchProvider,
     BaseSearchProvider,
     WebQueryResult,
@@ -13,11 +18,6 @@ from ai_sub.search.base import (
     normalize_query,
     parse_retry_after,
 )
-from ai_sub.search.builtin import GoogleBuiltinSearchProvider
-from ai_sub.search.duckduckgo import DuckDuckGoSearchProvider
-from ai_sub.search.langsearch import LangsearchSearchProvider
-from ai_sub.search.lrclib import LrclibSearchProvider
-from ai_sub.search.ollama import OllamaSearchProvider
 from ai_sub.search.tinyfish import TinyfishSearchProvider
 
 _SEARCH_PROVIDER_REGISTRY: dict[str, Callable[[SearchSettings], BaseSearchProvider]] = {

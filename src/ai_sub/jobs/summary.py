@@ -5,15 +5,10 @@ from __future__ import annotations
 from textwrap import dedent
 from typing import ClassVar
 
-from pydantic import (
-    BaseModel,
-    Field,
-    PositiveInt,
-)
+from pydantic import BaseModel, Field
 from pydantic.json_schema import SkipJsonSchema
 
-from ai_sub.config import RetrySettings, ServiceTier
-from ai_sub.jobs.base import AiJob, CleanTimestamp, Prompt, WorkerContext
+from ai_sub.jobs.job_base import AiJob, CleanTimestamp, Prompt, WorkerContext, build_user_prompt
 
 SUMMARY_PROMPT_VERSION = 1
 
@@ -82,23 +77,16 @@ def get_summary_prompt(user_context: str | None = None) -> Prompt:
     Returns:
         Prompt: Configured system and user prompt pair.
     """
-    parts = [
-        "<task>",
-        "  Analyze the provided video using your agentic video exploration capabilities.",
-        "  Build the global summary, divide the video into natural chapters, identify participants and domain terms,",
-        "  research participant lore, species/roles, and verbal ticks using web search in parallel batches,",
-        "  and compile game mechanics and glossary terminology for accurate downstream subtitle translation.",
-        "</task>",
-    ]
-    if user_context and user_context.strip():
-        parts.extend(
-            [
-                "<user_provided_context>",
-                f"  {user_context.strip()}",
-                "</user_provided_context>",
-            ]
-        )
-    return Prompt(system=_SUMMARY_SYSTEM_TEMPLATE, user="\n".join(parts))
+    user_prompt = build_user_prompt(
+        task_lines=[
+            "Analyze the provided video using your agentic video exploration capabilities.",
+            "Build the global summary, divide the video into natural chapters, identify participants and domain terms,",
+            "research participant lore, species/roles, and verbal ticks using web search in parallel batches,",
+            "and compile game mechanics and glossary terminology for accurate downstream subtitle translation.",
+        ],
+        user_context=user_context,
+    )
+    return Prompt(system=_SUMMARY_SYSTEM_TEMPLATE, user=user_prompt)
 
 
 class ChapterItem(BaseModel):
@@ -181,26 +169,17 @@ class SummaryJob(AiJob):
     prompt_version_field: ClassVar[str] = "summary_prompt_version"
     prompt_version: ClassVar[int] = SUMMARY_PROMPT_VERSION
 
-    video_duration_ms: PositiveInt = Field(description="Total video duration in milliseconds.")
     summary_prompt_version: int = Field(
         default=SUMMARY_PROMPT_VERSION,
         description="Prompt version employed for this summary response.",
     )
-    model_name: str | None = Field(
-        default=None,
-        description="Optional Gemini model identifier override.",
-    )
-    service_tier: ServiceTier | None = Field(
-        default=None,
-        description="Optional Google Gemini service tier override.",
+    model_name: str = Field(
+        default="gemini-3.5-flash-lite",
+        description="Gemini model identifier.",
     )
     agentic_video: bool = Field(
         default=True,
         description="Whether to enable agentic video exploration.",
-    )
-    retry_settings: RetrySettings | None = Field(
-        default=None,
-        description="Optional task-specific retry settings.",
     )
     response: SummaryAiResponse | None = Field(
         default=None,
@@ -216,23 +195,10 @@ class SummaryJob(AiJob):
         Returns:
             SummaryAiResponse: Parsed AI summary response.
         """
-        prompt = get_summary_prompt(user_context=self.user_context)
-        media = self.media_path or ctx.media_path
-        model = self.model_name or ctx.executor.ai_settings.model_summary
-        tier = self.service_tier if self.service_tier is not None else ctx.executor.ai_settings.service_tier_summary
-
-        res = await ctx.executor.run_structured(
-            prompt=prompt,
-            media_path=media,
-            video_duration_ms=self.video_duration_ms,
+        return await self._run_structured(
+            ctx=ctx,
+            prompt=get_summary_prompt(user_context=self.user_context),
             response_type=SummaryAiResponse,
-            model_name=model,
-            service_tier=tier,
-            tools=ctx.search_providers,
-            agentic_video=self.agentic_video,
             task_label="summary",
-            retry_settings=self.retry_settings,
+            tools=ctx.search_providers,
         )
-        self.response = res
-        self.total_attempts += 1
-        return res

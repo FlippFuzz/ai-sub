@@ -134,7 +134,7 @@ sudo fail2ban-client status nginx-http-auth
 
 ### Step 6: Install Node.js LTS via NVM (For YouTube PO Token Provider)
 
-The default YouTube intake configuration enables `bgutil-ytdlp-pot-provider`, which compiles a local Node.js server using TypeScript (`npm ci && npx tsc`). Install NVM and the Node.js LTS runtime under your `ubuntu` user:
+The default YouTube intake configuration enables `bgutil-ytdlp-pot-provider` (via `potdir`), which compiles a local Node.js server using TypeScript (`npm ci && npx tsc`). Install NVM and the Node.js LTS runtime under your `ubuntu` user:
 
 ```bash
 # 1. Install NVM
@@ -231,7 +231,7 @@ chmod +x worker.sh
 
 ### Step 4: Scheduled Execution via Crontab
 
-Configure recurring cron tasks with environment variable overrides to schedule model execution windows:
+Configure recurring cron tasks with environment variable overrides (`AISUBWORKER_*`) to schedule model execution windows:
 
 ```bash
 crontab -e
@@ -240,17 +240,17 @@ crontab -e
 Add scheduled runs:
 
 ```cron
-# Every 4 hours: Run up to 15 tasks using only gemini-3.5-flash-lite
-7 1,5,9,13,17 * * * cd /home/ubuntu/ai-sub-worker && AISUB_WORKER_MODELS='google-gla:gemini-3.5-flash-lite' AISUB_WORKER_MAX_TASKS=15 AISUB_WORKER_MAX_DURATION_MINUTES=180 ./worker.sh > /tmp/ai-sub-worker-35fl.log 2>&1
+# Every 4 hours: Run up to 15 tasks using only gemini-3.5-flash-lite (max 3 hours = 10800s)
+7 1,5,9,13,17 * * * cd /home/ubuntu/ai-sub-worker && AISUBWORKER_MODELS='gemini-3.5-flash-lite' AISUBWORKER_MAXTASKS=15 AISUBWORKER_MAXDURATION=10800 ./worker.sh > /tmp/ai-sub-worker-35fl.log 2>&1
 
 # Daily at 21:00 UTC: Offer all models during peak availability windows
-7 21 * * * cd /home/ubuntu/ai-sub-worker && AISUB_WORKER_MAX_TASKS=50 AISUB_WORKER_MAX_DURATION_MINUTES=180 ./worker.sh > /tmp/ai-sub-worker-all.log 2>&1
+7 21 * * * cd /home/ubuntu/ai-sub-worker && AISUBWORKER_MAXTASKS=50 AISUBWORKER_MAXDURATION=10800 ./worker.sh > /tmp/ai-sub-worker-all.log 2>&1
 ```
 
 ### Worker Operational Behavior
 
 - **Per-Model Concurrency:** `concurrency` applies per configured model (e.g. `concurrency: 2` with 3 models executes up to 6 concurrent tasks simultaneously, fully utilizing per-model quotas).
-- **Per-Model Task Limits:** `max_tasks` applies per configured model (e.g. `max_tasks: 100` with 3 models executes up to 100 tasks for each model). Reaching the limit retires slots for that specific model while other models continue running uninterrupted.
-- **Time-Based Idle Shutdown:** If all slots across all models remain idle for `idle_timeout_minutes` (default: 15 minutes), the worker exits cleanly. Setting `AISUB_WORKER_IDLE_TIMEOUT_MINUTES=0` exits immediately in ~1 second if the server queue is empty.
-- **Graceful Draining:** In-flight tasks drain gracefully before exiting when `max_duration_minutes` or `max_tasks` is reached.
+- **Per-Model Task Limits:** `maxtasks` applies per configured model (e.g. `maxtasks: 100` with 3 models executes up to 100 tasks for each model). Reaching the limit retires slots for that specific model while other models continue running uninterrupted.
+- **Time-Based Idle Shutdown:** If all slots across all models remain idle for `idletimeout` (default: `900` seconds / 15 minutes), the worker exits cleanly. Setting `AISUBWORKER_IDLETIMEOUT=0` exits immediately in ~1 second if the server queue is empty.
+- **Graceful Draining:** In-flight tasks drain gracefully before exiting when `maxduration` or `maxtasks` is reached.
 - **Quota Isolation:** Quota exhaustion (HTTP 429) shuts down only the slots assigned to that specific model for the remainder of the worker run, while slots for other models continue running uninterrupted.

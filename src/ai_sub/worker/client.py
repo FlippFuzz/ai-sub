@@ -17,7 +17,6 @@ from ai_sub.protocol import (
     TaskFailRequest,
     TaskHeartbeatRequest,
     TaskHeartbeatResponse,
-    TaskType,
 )
 from ai_sub.telemetry import get_app_version
 
@@ -160,7 +159,6 @@ class WorkerClient:
         self,
         task_id: str,
         worker_id: str,
-        task_type: TaskType,
         result: dict[str, Any],
     ) -> bool:
         """Submits completed and validated structured AI results to the server with retries.
@@ -168,19 +166,13 @@ class WorkerClient:
         Args:
             task_id: Unique task identifier.
             worker_id: Unique identifier of this worker.
-            task_type: Type of task completed.
             result: Validated AI result data dictionary.
 
         Returns:
             bool: True if completion was accepted; False otherwise.
         """
         encoded_task_id = urllib.parse.quote(task_id, safe=":")
-        req = TaskCompleteRequest(
-            worker_id=worker_id,
-            task_id=task_id,
-            task_type=task_type,
-            result=result,
-        )
+        req = TaskCompleteRequest(worker_id=worker_id, result=result)
 
         for attempt in range(3):
             try:
@@ -232,7 +224,6 @@ class WorkerClient:
         encoded_task_id = urllib.parse.quote(task_id, safe=":")
         req = TaskFailRequest(
             worker_id=worker_id,
-            task_id=task_id,
             reason=reason,
             error_message=error_message,
             is_retryable=is_retryable,

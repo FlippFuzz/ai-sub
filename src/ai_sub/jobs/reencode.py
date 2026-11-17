@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, NonNegativeInt, PositiveFloat, PositiveInt
 
-from ai_sub.jobs.base import MediaJob
+from ai_sub.jobs.job_base import MediaJob
 from ai_sub.video import reencode_video
 
 
@@ -15,9 +16,11 @@ class ReencodeJob(MediaJob):
 
     input_file: Path = Field(description="Source video segment or raw video path.")
     output_file: Path = Field(description="Destination path for the compressed output.")
-    fps: PositiveFloat = Field(description="Target framerate for the re-encoded video.")
+    fps: PositiveFloat | Literal["keyframes"] = Field(
+        description="Target framerate in FPS, or 'keyframes' for native keyframe extraction.",
+    )
     height: PositiveInt = Field(description="Target resolution height in pixels.")
-    bitrate_kb: PositiveInt = Field(description="Target video bitrate in Kilobytes per second.")
+    bitrate: PositiveInt = Field(description="Target video bitrate in bytes per second.")
     duration_tolerance_ms: NonNegativeInt = Field(
         description="Allowed duration difference in milliseconds to consider an existing re-encoded file valid.",
     )
@@ -53,7 +56,7 @@ class ReencodeJob(MediaJob):
             output_path=self.output_file,
             fps=self.fps,
             height=self.height,
-            bitrate_kb=self.bitrate_kb,
+            bitrate=self.bitrate,
             encoder=self.encoder or "libx264",
             duration_tolerance_ms=self.duration_tolerance_ms,
             keyframe_only=self.keyframe_only,

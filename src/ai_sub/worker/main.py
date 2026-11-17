@@ -45,7 +45,7 @@ def main() -> None:
     settings = WorkerSettings.from_yaml(config_path)
 
     # Configure logging using worker configuration settings
-    setup_logging(settings.log, service_name=settings.worker_id)
+    setup_logging(settings.log, service_name=settings.id)
     logfire.info(f"Loaded worker configuration from {config_path}")
 
     runner = WorkerRunner(settings)

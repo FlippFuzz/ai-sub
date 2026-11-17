@@ -23,9 +23,9 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-from ai_sub.config import Settings
 from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError, is_retryable_error
 from ai_sub.jobs import (
+    AiJob,
     BaseJob,
     LyricsJob,
     ReencodeJob,
@@ -33,13 +33,10 @@ from ai_sub.jobs import (
     SummaryJob,
     WorkerContext,
 )
-from ai_sub.pipeline import Pipeline
+from ai_sub.pipeline import FailureOutcome, Pipeline
 from ai_sub.protocol import TaskType
-from ai_sub.search import (
-    BaseSearchProvider,
-    create_search_provider,
-    create_search_providers,
-)
+from ai_sub.search import BaseSearchProvider, create_search_providers
+from ai_sub.standalone_config import StandaloneSettings
 from ai_sub.telemetry import setup_logging
 from ai_sub.video import init_ffmpeg_engine
 
@@ -65,6 +62,18 @@ def _get_job_key(job: BaseJob) -> JobKey:
         JobKey: Tuple of (job_class_name, segment_index).
     """
     return (type(job).__name__, getattr(job, "segment_index", None))
+
+
+def _job_model(job: BaseJob) -> str | None:
+    """Returns the target Gemini model name for AI jobs, or None for local media jobs.
+
+    Args:
+        job: Job instance.
+
+    Returns:
+        str | None: Gemini model name or None.
+    """
+    return job.model_name if isinstance(job, AiJob) else None
 
 
 def _sync_progress(
@@ -145,60 +154,43 @@ async def _run_job(
     try:
         if isinstance(job, ReencodeJob):
             async with reencode_sem:
-                out_path = await job.execute()
-                return job, out_path, None
+                return job, await job.execute(), None
 
         if isinstance(job, SummaryJob):
-            async with summary_sem:
-                media = job.media_path or pipeline.summary.media_path or pipeline.raw_video_path
-                ctx = WorkerContext(
-                    executor=executor,
-                    media_path=media,
-                    search_providers=web_search_providers,
-                )
-                res = await job.execute(ctx)
-                return job, res, None
+            sem, providers, fallback_media = summary_sem, web_search_providers, pipeline.summary.media_path
+        elif isinstance(job, SubtitlesJob):
+            sem, providers, fallback_media = subtitles_sem, [], pipeline.raw_video_path
+        elif isinstance(job, LyricsJob):
+            sem, providers, fallback_media = lyrics_sem, lyrics_search_providers, pipeline.raw_video_path
+        else:
+            return job, None, ValueError(f"Unknown job type: {type(job)}")
 
-        if isinstance(job, SubtitlesJob):
-            async with subtitles_sem:
-                media = job.media_path or pipeline.raw_video_path
-                ctx = WorkerContext(
-                    executor=executor,
-                    media_path=media,
-                    search_providers=[],
-                )
-                res = await job.execute(ctx)
-                return job, res, None
-
-        if isinstance(job, LyricsJob):
-            async with lyrics_sem:
-                media = job.media_path or pipeline.raw_video_path
-                ctx = WorkerContext(
-                    executor=executor,
-                    media_path=media,
-                    search_providers=lyrics_search_providers,
-                )
-                res = await job.execute(ctx)
-                return job, res, None
-
-        return job, None, ValueError(f"Unknown job type: {type(job)}")
+        async with sem:
+            ctx = WorkerContext(
+                executor=executor,
+                media_path=job.media_path or fallback_media or pipeline.raw_video_path,
+                search_providers=providers,
+            )
+            return job, await job.execute(ctx), None
 
     except Exception as e:
         return job, None, e
 
 
-async def run_pipeline(settings: Settings) -> AiSubResult:
+async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
     """Executes the subtitle generation pipeline driven by Pipeline.
 
     Args:
-        settings: Configured application settings.
+        settings: Configured standalone application settings.
 
     Returns:
         AiSubResult: Overall status code.
     """
     console = Console(stderr=True)
-    setup_logging(settings, console=console)
-    input_video_path = cast(Path, settings.input_video_file)
+    setup_logging(settings.log, console=console)
+    input_video_path = cast(Path, settings.video)
+    tmp_dir = cast(Path, settings.dir.tmp)
+    out_dir = cast(Path, settings.dir.out)
     user_context = settings.get_resolved_user_context()
 
     with logfire.span("Pipeline: {video_file}", video_file=input_video_path.name):
@@ -206,10 +198,10 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
             logfire.info(f"Loaded user context ({len(user_context)} characters).")
 
         reencode_possible = bool(
-            settings.reencode.summary.enabled
-            or settings.reencode.segment.enabled
-            or settings.reencode.summary.fallback_fps
-            or settings.reencode.segment.fallback_fps
+            settings.reencode.summary.threshold > 0
+            or settings.reencode.segment.threshold > 0
+            or settings.reencode.summary.fallback.attempts > 0
+            or settings.reencode.segment.fallback.attempts > 0
         )
         if reencode_possible:
             _, _, encoder = await init_ffmpeg_engine(settings.reencode.encoder)
@@ -218,31 +210,22 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
         use_summary = settings.concurrency.summary > 0
         use_lyrics = settings.concurrency.lyrics > 0
 
-        # Standalone uses per_run internal retries and cascades fallback FPS within a single run
-        # without imposing cross-run max_runs lockouts.
         pipeline = await Pipeline.create(
             raw_video_path=input_video_path,
-            job_dir=settings.dir.tmp,
+            job_dir=tmp_dir,
             title=input_video_path.stem,
             uploader="local",
-            summary_model=settings.ai.model_summary,
-            subtitles_model=settings.ai.model_subtitles,
-            lyrics_model=settings.ai.model_lyrics,
-            service_tier_summary=settings.ai.service_tier_summary,
-            service_tier_subtitles=settings.ai.service_tier_subtitles,
-            service_tier_lyrics=settings.ai.service_tier_lyrics,
-            agentic_video_summary=settings.ai.agentic_video_summary,
-            agentic_video_subtitles=settings.ai.agentic_video_subtitles,
-            agentic_video_lyrics=settings.ai.agentic_video_lyrics,
+            summary_config=settings.ai.summary,
+            subtitles_config=settings.ai.subtitles,
+            lyrics_config=settings.ai.lyrics,
             reencode_settings=settings.reencode,
             search_settings=settings.ai.search,
             split_settings=settings.split,
             retry_settings=settings.retry,
             user_context=user_context,
-            validation_buffer_ms=settings.ai.validation_buffer_ms,
+            validation_buffer_ms=int(settings.ai.buffer.total_seconds() * 1000),
             summary_enabled=use_summary,
             lyrics_enabled=use_lyrics,
-            enforce_max_runs=False,
         )
 
         async with AsyncExitStack() as stack:
@@ -256,16 +239,14 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                 web_search_providers = [p for p in configured if p.provider_name != "lrclib"]
 
                 if use_lyrics:
-                    lrclib_candidates = [p for p in configured if p.provider_name == "lrclib"]
-                    if lrclib_candidates:
-                        lrclib_provider = lrclib_candidates[0]
-                    else:
-                        lrclib_provider = create_search_provider("lrclib", settings.ai.search)
-                        await stack.enter_async_context(lrclib_provider)
-                    lyrics_search_providers = [lrclib_provider, *web_search_providers]
+                    # Keep lrclib first so lyrics pre-fetch and tools prioritize official lyrics
+                    lrclib_providers = [p for p in configured if p.provider_name == "lrclib"]
+                    lyrics_search_providers = [*lrclib_providers, *web_search_providers]
 
-            executor = GeminiExecutor(settings)
-            reencode_sem = asyncio.Semaphore(settings.concurrency.re_encode)
+            executor = GeminiExecutor(settings.ai, settings.retry)
+            stack.push_async_callback(executor.aclose)
+
+            reencode_sem = asyncio.Semaphore(settings.concurrency.reencode)
             summary_sem = asyncio.Semaphore(settings.concurrency.summary if settings.concurrency.summary > 0 else 1)
             subtitles_sem = asyncio.Semaphore(settings.concurrency.subtitles)
             lyrics_sem = asyncio.Semaphore(settings.concurrency.lyrics if settings.concurrency.lyrics > 0 else 1)
@@ -286,7 +267,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                 summary_tid: TaskID | None = progress.add_task("[yellow]Summary", total=1) if use_summary else None
                 reencode_tid: TaskID | None = (
                     progress.add_task("[cyan]Re-encoding", total=total_chunks)
-                    if settings.reencode.segment.enabled
+                    if settings.reencode.segment.threshold > 0
                     else None
                 )
                 subtitles_tid: TaskID = progress.add_task("[green]Subtitles", total=total_chunks)
@@ -296,15 +277,18 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
 
                 _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
 
-                in_flight: dict[JobKey, asyncio.Task[tuple[BaseJob, Any, Exception | None]]] = {}
-                retryable_blocked: set[JobKey] = set()
-                quota_exhausted = False
+                in_flight: dict[JobKey, tuple[asyncio.Task[tuple[BaseJob, Any, Exception | None]], str | None]] = {}
+                blocked_this_run: set[JobKey] = set()
+                exhausted_models: set[str] = set()
 
                 # Consumer loop pulling ready DAG jobs directly from the pipeline
                 while not pipeline.is_done():
                     for job in pipeline.get_pending_jobs():
                         job_key = _get_job_key(job)
-                        if job_key in in_flight or job_key in retryable_blocked:
+                        job_model = _job_model(job)
+                        if job_key in in_flight or job_key in blocked_this_run:
+                            continue
+                        if job_model and job_model in exhausted_models:
                             continue
 
                         if isinstance(job, ReencodeJob) and not job.is_summary_proxy and reencode_tid is None:
@@ -324,14 +308,17 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
                                 lyrics_sem=lyrics_sem,
                             )
                         )
-                        in_flight[job_key] = task
+                        in_flight[job_key] = (task, job_model)
 
                     if not in_flight:
                         break
 
-                    done, _ = await asyncio.wait(in_flight.values(), return_when=asyncio.FIRST_COMPLETED)
+                    tasks_only = [entry[0] for entry in in_flight.values()]
+                    done, _ = await asyncio.wait(tasks_only, return_when=asyncio.FIRST_COMPLETED)
+                    newly_exhausted: set[str] = set()
+
                     for completed_task in done:
-                        job_key = next((k for k, v in in_flight.items() if v is completed_task), None)
+                        job_key = next((k for k, (t, _) in in_flight.items() if t is completed_task), None)
                         if job_key is not None:
                             del in_flight[job_key]
 
@@ -342,44 +329,78 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
 
                         if exc is not None:
                             if isinstance(exc, QuotaExceededError):
+                                job_model = _job_model(job)
+                                model_label = job_model or "unknown"
                                 logfire.warning(
-                                    f"Daily quota limit reached during '{job.name}': {exc}. "
-                                    "Suspending remaining jobs without consuming fallback tiers."
+                                    f"Daily quota reached for '{job.name}' ({model_label}): {exc}. "
+                                    "Skipping remaining jobs for this model without consuming run attempts."
                                 )
-                                quota_exhausted = True
+                                if job_model:
+                                    exhausted_models.add(job_model)
+                                    newly_exhausted.add(job_model)
                                 continue
 
                             if isinstance(job, ReencodeJob):
                                 logfire.warning(f"Re-encode failed for '{job.name}': {exc}")
-                                pipeline.fail_reencode(job)
+                                outcome = await pipeline.fail_reencode(job)
+                                if outcome.action != "retry":
+                                    blocked_this_run.add(_get_job_key(job))
                             elif is_retryable_error(exc):
                                 logfire.warning(
                                     f"Job '{job.name}' failed with retryable error: {exc}. "
-                                    "Skipping for this run without consuming fallback tiers."
+                                    "Skipping for this run without consuming run attempts."
                                 )
-                                retryable_blocked.add(_get_job_key(job))
+                                blocked_this_run.add(_get_job_key(job))
                             else:
                                 logfire.error(f"Job '{job.name}' failed with non-retryable error: {exc}")
+                                outcome = FailureOutcome(action="ignored")
                                 if isinstance(job, SummaryJob):
-                                    pipeline.record_failure(TaskType.SUMMARY)
+                                    outcome = await pipeline.record_failure(TaskType.SUMMARY)
                                 elif isinstance(job, SubtitlesJob):
-                                    pipeline.record_failure(TaskType.SUBTITLES, segment_index=job.segment_index)
+                                    outcome = await pipeline.record_failure(
+                                        TaskType.SUBTITLES, segment_index=job.segment_index
+                                    )
                                 elif isinstance(job, LyricsJob):
-                                    pipeline.record_failure(TaskType.LYRICS, segment_index=job.segment_index)
+                                    outcome = await pipeline.record_failure(
+                                        TaskType.LYRICS, segment_index=job.segment_index
+                                    )
+
+                                # Defer retries and newly triggered fallback re-encodes to subsequent invocations
+                                blocked_this_run.add(_get_job_key(job))
+                                if outcome.action == "fallback_reencode":
+                                    seg_idx = getattr(job, "segment_index", None)
+                                    blocked_this_run.add(("ReencodeJob", seg_idx))
                         else:
                             pipeline.complete_job(job, result)
 
                         _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
 
-                    if quota_exhausted or pipeline.summary_aborted:
-                        for pending_task in in_flight.values():
+                    if pipeline.summary_aborted:
+                        for pending_task, _ in in_flight.values():
                             pending_task.cancel()
-                        await asyncio.gather(*in_flight.values(), return_exceptions=True)
+                        await asyncio.gather(*(t for t, _ in in_flight.values()), return_exceptions=True)
                         in_flight.clear()
                         break
 
+                    if newly_exhausted:
+                        to_cancel = [k for k, (_, model) in in_flight.items() if model in newly_exhausted]
+                        cancelled_tasks: list[asyncio.Task[tuple[BaseJob, Any, Exception | None]]] = []
+                        for k in to_cancel:
+                            pending_task, _ = in_flight.pop(k)
+                            if not pending_task.done():
+                                pending_task.cancel()
+                            cancelled_tasks.append(pending_task)
+                        if cancelled_tasks:
+                            drain_results = await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+                            for res in drain_results:
+                                if isinstance(res, tuple):
+                                    drained_job, drained_out, drained_exc = res
+                                    if drained_exc is None:
+                                        pipeline.complete_job(drained_job, drained_out)
+                            _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
+
                 if in_flight:
-                    drain_results = await asyncio.gather(*in_flight.values(), return_exceptions=True)
+                    drain_results = await asyncio.gather(*(t for t, _ in in_flight.values()), return_exceptions=True)
                     for res in drain_results:
                         if isinstance(res, tuple):
                             job, out, exc = res
@@ -391,9 +412,13 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
             logfire.error("Whole-video summary failed across all fallback FPS tiers. Aborting without generating SRT.")
             return AiSubResult.RETRIES_EXCEEDED
 
+        if not pipeline.is_summary_complete():
+            logfire.info("Whole-video summary incomplete; skipping subtitle generation for this run.")
+            return AiSubResult.IN_PROGRESS
+
         # Finalize and stitch synchronized subtitle tracks
-        out_srt = settings.dir.out / f"{input_video_path.stem}.{pipeline.full_shortcode}.srt"
-        raw_out_srt = settings.dir.out / f"{input_video_path.stem}.raw-{pipeline.full_shortcode}.srt"
+        out_srt = out_dir / f"{input_video_path.stem}.{pipeline.full_shortcode}.srt"
+        raw_out_srt = out_dir / f"{input_video_path.stem}.raw-{pipeline.full_shortcode}.srt"
 
         generated = pipeline.finalize(
             output_primary_path=out_srt,
@@ -414,7 +439,7 @@ async def run_pipeline(settings: Settings) -> AiSubResult:
 
 def main() -> None:
     """CLI entrypoint for the AI Sub standalone subtitle generation pipeline."""
-    settings = CliApp.run(Settings)
+    settings = CliApp.run(StandaloneSettings)
     sys.exit(asyncio.run(run_pipeline(settings)).value)
 
 

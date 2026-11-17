@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import BaseSearchProvider, WebSearchResult
+from ai_sub.search.search_base import BaseSearchProvider, WebSearchResult
 
 
 class GoogleBuiltinSearchProvider(BaseSearchProvider):

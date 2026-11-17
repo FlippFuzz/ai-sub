@@ -19,24 +19,21 @@ from typing import Any, cast
 import logfire
 from git import Repo
 from git.exc import InvalidGitRepositoryError, NoSuchPathError
-from pydantic import BaseModel, RootModel
+from pydantic import BaseModel, Field, RootModel
 from yt_dlp import YoutubeDL
 
+from ai_sub.config import atomic_write_text
 from ai_sub.server.server_config import YoutubeSourceConfig
-from ai_sub.video import ensure_ffmpeg, sanitize_filename
+from ai_sub.video import ensure_ffmpeg, sanitize_uploader
 
-_VALID_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".flv", ".ts"}
-
-
-class YouTubeError(Exception):
-    """Base exception for YouTube operations."""
+VALID_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".flv", ".ts"}
 
 
-class YouTubeBotDetectionError(YouTubeError):
+class YouTubeBotDetectionError(Exception):
     """Raised when YouTube returns a bot check, reCAPTCHA, or HTTP 429 response."""
 
 
-class YouTubeVideoUnavailableError(YouTubeError):
+class YouTubeVideoUnavailableError(Exception):
     """Raised when a video is permanently inaccessible (e.g. geo-blocked, private, deleted)."""
 
     def __init__(self, message: str, reason: str) -> None:
@@ -51,7 +48,7 @@ class YouTubeVideoUnavailableError(YouTubeError):
 
 
 class DiscoveredVideo(BaseModel):
-    """Metadata extracted during a flat YouTube feed scan."""
+    """Metadata extracted during a local watch-folder or flat YouTube feed scan."""
 
     video_id: str
     uploader: str
@@ -59,6 +56,14 @@ class DiscoveredVideo(BaseModel):
     title: str
     source_ref: str
     timestamp: int
+    local_path: Path | None = None
+
+
+class ScanResult(BaseModel):
+    """Result returned by scanning configured YouTube feeds."""
+
+    videos: list[DiscoveredVideo] = Field(default_factory=list)
+    members_only_ids: set[str] = Field(default_factory=set)
 
 
 class DownloadedVideo(BaseModel):
@@ -68,6 +73,8 @@ class DownloadedVideo(BaseModel):
     uploader: str
     channel_name: str
     file_path: Path
+    title: str | None = None
+    timestamp: int = 0
 
 
 class ChannelInfo(BaseModel):
@@ -82,25 +89,6 @@ class ChannelMap(RootModel[dict[str, ChannelInfo]]):
     """Container mapping channel IDs to channel metadata."""
 
     root: dict[str, ChannelInfo]
-
-
-def _sanitize_uploader(raw_uploader: str, fallback: str = "youtube") -> str:
-    """Normalizes a channel handle into a safe single directory component.
-
-    Args:
-        raw_uploader: Raw handle or uploader ID string.
-        fallback: Value returned if the sanitized result is empty or unsafe. Defaults to 'youtube'.
-
-    Returns:
-        str: Safe single-component uploader identifier (max 20 characters).
-    """
-    stripped = str(raw_uploader).strip().strip("@")
-    if not stripped:
-        return fallback
-    cleaned = sanitize_filename(stripped)[:20].strip(" .")
-    if not cleaned or cleaned in (".", ".."):
-        return fallback
-    return cleaned
 
 
 def _extract_handle(entry: Mapping[str, Any]) -> str | None:
@@ -128,7 +116,7 @@ def _extract_handle(entry: Mapping[str, Any]) -> str | None:
 
 
 def _parse_entry_timestamp(entry: Mapping[str, Any]) -> int:
-    """Extracts integer timestamp from metadata entry.
+    """Extracts integer timestamp from metadata entry, falling back to upload_date.
 
     Args:
         entry: Video metadata dictionary.
@@ -136,11 +124,22 @@ def _parse_entry_timestamp(entry: Mapping[str, Any]) -> int:
     Returns:
         int: Unix timestamp in seconds.
     """
-    ts = entry.get("timestamp") or entry.get("release_timestamp") or entry.get("available_at") or 0
+    raw_ts = entry.get("timestamp") or entry.get("release_timestamp") or entry.get("available_at") or 0
     try:
-        return int(ts)
+        ts = int(raw_ts)
     except (ValueError, TypeError):
-        return 0
+        ts = 0
+
+    if not ts and (ud := entry.get("upload_date")):
+        try:
+            # Use end of the upload day (23:59:59 UTC) so date-only entries are not
+            # prematurely cut off during midday scans
+            dt = datetime.strptime(str(ud), "%Y%m%d").replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+            ts = int(dt.timestamp())
+        except ValueError:
+            ts = 0
+
+    return ts
 
 
 def _is_bot_detection_error(err_msg: str) -> bool:
@@ -176,7 +175,12 @@ def _check_permanent_video_error(err_msg: str) -> str | None:
     lower = err_msg.lower()
     if "georestricted" in lower or "not available in your country" in lower:
         return "Region locked"
-    if "members-only" in lower or "members only" in lower or "join this channel" in lower:
+    if (
+        "members-only" in lower
+        or "members only" in lower
+        or "join this channel" in lower
+        or "channel's members" in lower
+    ):
         return "Members only"
     if "private video" in lower or "this video is private" in lower or "granted access" in lower:
         return "Private video"
@@ -234,17 +238,18 @@ class YouTubeClient:
         self._source_last_scan_ts = {}
         self._deep_scanned_urls = set()
 
-        channels_path = config.channels_file
+        channels_path = config.channelsfile
         if not channels_path.is_absolute():
             channels_path = base_work_dir / channels_path
         self.mapping_file = channels_path
         self._channel_map = ChannelMap(root={})
         self._load_channel_map()
 
-        pot_path = config.pot_dir
-        if not pot_path.is_absolute():
-            pot_path = base_work_dir / pot_path
-        self._pot_server_dir = self._ensure_pot_provider(pot_path) if config.enable_pot_provider else None
+        if config.potdir is not None:
+            pot_path = config.potdir if config.potdir.is_absolute() else base_work_dir / config.potdir
+            self._pot_server_dir = self._ensure_pot_provider(pot_path)
+        else:
+            self._pot_server_dir = None
 
         self._base_ydl_opts = self._build_base_ydl_opts()
         self._log_startup_diagnostics()
@@ -350,8 +355,8 @@ class YouTubeClient:
         }
         if self.config.proxy:
             opts["proxy"] = str(self.config.proxy).rstrip("/")
-        if self.config.cookie_file and self.config.cookie_file.is_file():
-            opts["cookiefile"] = str(self.config.cookie_file.resolve())
+        if self.config.cookiefile and self.config.cookiefile.is_file():
+            opts["cookiefile"] = str(self.config.cookiefile.resolve())
 
         return opts
 
@@ -362,7 +367,7 @@ class YouTubeClient:
         npx_bin = shutil.which("npx")
         ffmpeg_bin, _ = ensure_ffmpeg()
 
-        cookie_p = self.config.cookie_file
+        cookie_p = self.config.cookiefile
         cookie_resolved = cookie_p.resolve() if cookie_p else None
         cookie_exists = bool(cookie_resolved and cookie_resolved.is_file())
 
@@ -384,7 +389,7 @@ class YouTubeClient:
             cookie_file=str(cookie_p) if cookie_p else "None",
             cookie_exists=cookie_exists,
             proxy=masked_proxy,
-            pot_enabled=self.config.enable_pot_provider,
+            pot_enabled=self.config.potdir is not None,
             pot_plugin_version=pot_plugin_ver,
             pot_server_dir=str(self._pot_server_dir) if self._pot_server_dir else "None",
         ):
@@ -409,19 +414,10 @@ class YouTubeClient:
 
     def _save_channel_map_locked(self) -> None:
         """Saves current channel mappings atomically to disk while holding _channel_lock."""
-        temp_file = self.mapping_file.with_name(f"{self.mapping_file.name}.tmp.{os.getpid()}.{threading.get_ident()}")
         try:
-            self.mapping_file.parent.mkdir(parents=True, exist_ok=True)
-            data = self._channel_map.model_dump()
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
-            os.replace(temp_file, self.mapping_file)
+            content = json.dumps(self._channel_map.model_dump(), indent=2, sort_keys=True, ensure_ascii=False)
+            atomic_write_text(self.mapping_file, content)
         except Exception as e:
-            if temp_file.exists():
-                try:
-                    temp_file.unlink()
-                except OSError:
-                    pass
             logfire.warning(f"Failed to save channel mapping file {self.mapping_file.name}: {e}")
 
     def _record_channel_mapping(
@@ -443,7 +439,7 @@ class YouTubeClient:
             return
 
         c_str = str(channel_id)
-        u_str = _sanitize_uploader(str(uploader_id))
+        u_str = sanitize_uploader(str(uploader_id), fallback="youtube")
         if u_str.lower() == "youtube":
             return
 
@@ -484,7 +480,7 @@ class YouTubeClient:
                     name = info.get("channel") or info.get("uploader")
                     c_id = info.get("channel_id") or channel_id
                     if handle and str(handle).lower() != "youtube":
-                        clean_handle = _sanitize_uploader(str(handle))
+                        clean_handle = sanitize_uploader(str(handle), fallback="youtube")
                         self._record_channel_mapping(
                             channel_id=str(c_id) if c_id else None,
                             uploader_id=clean_handle,
@@ -525,7 +521,7 @@ class YouTubeClient:
 
         # 1. Direct explicit handle on entry
         if uploader_id and str(uploader_id).lower() != "youtube":
-            clean_handle = _sanitize_uploader(str(uploader_id))
+            clean_handle = sanitize_uploader(str(uploader_id), fallback="youtube")
             if channel_id:
                 self._record_channel_mapping(
                     channel_id=str(channel_id),
@@ -541,11 +537,11 @@ class YouTubeClient:
             with self._channel_lock:
                 info = self._channel_map.root.get(c_str)
             if info and info.uploader_id and info.uploader_id.lower() != "youtube":
-                return _sanitize_uploader(info.uploader_id)
+                return sanitize_uploader(info.uploader_id, fallback="youtube")
 
             # 3. Associate channel_id with source URL handle when available
             if url_context and str(url_context).lower() != "youtube":
-                clean_handle = _sanitize_uploader(str(url_context))
+                clean_handle = sanitize_uploader(str(url_context), fallback="youtube")
                 self._record_channel_mapping(
                     channel_id=c_str,
                     uploader_id=clean_handle,
@@ -562,36 +558,44 @@ class YouTubeClient:
 
         # 5. Fallback to URL context (for channel tabs without channel_id)
         if url_context:
-            return _sanitize_uploader(str(url_context))
+            return sanitize_uploader(str(url_context), fallback="youtube")
 
         # 6. Generic fallback
         return "youtube"
 
-    def scan_sources(self, deep_scan: bool = False) -> list[DiscoveredVideo]:
+    def scan_sources(
+        self,
+        deep_scan: bool = False,
+        ignored_ids: frozenset[str] | None = None,
+    ) -> ScanResult:
         """Fetches metadata for configured YouTube sources using flat extraction with early date cutoff.
 
         Tracks per-URL deep-scan completion so any source that fails with a transient error
         automatically retries its full history crawl on the next scan without re-crawling
-        already-completed sources.
+        already-completed sources. Skips members-only ('subscriber_only') videos.
 
         Args:
             deep_scan: If True, forces full channel history crawl across all sources.
+            ignored_ids: Optional set of video IDs already ignored (e.g. members-only) to skip.
 
         Returns:
-            list[DiscoveredVideo]: List of discovered videos across all feeds.
+            ScanResult: Discovered public/unlisted videos and newly spotted members-only video IDs.
 
         Raises:
             YouTubeBotDetectionError: If a bot check or HTTP 429 block is triggered.
         """
         if not self.config.urls:
-            return []
+            return ScanResult()
 
         ydl_opts = dict(self._base_ydl_opts)
         ydl_opts["extract_flat"] = True
         ydl_opts["lazy_playlist"] = True
 
         now_ts = int(datetime.now(timezone.utc).timestamp())
-        base_lookback = int((2 * self.config.rescan_interval_minutes + self.config.rescan_jitter_minutes) * 60)
+        lookback_s = int(self.config.lookback.total_seconds())
+        jitter_s = self.config.jitter.total_seconds()
+        channel_delay_s = self.config.channeldelay.total_seconds()
+        skip_ids = ignored_ids or frozenset()
 
         target_items: list[tuple[str, str | None]] = []
         for raw_url in self.config.urls:
@@ -609,26 +613,26 @@ class YouTubeClient:
                 target_items.append((clean_url, url_handle))
 
         discovered: list[DiscoveredVideo] = []
+        members_only_ids: set[str] = set()
 
         with logfire.span("Scanning YouTube Sources", deep_scan=deep_scan, total_sources=len(target_items)):
             with YoutubeDL(cast(Any, ydl_opts)) as ydl:
                 for idx, (url, url_context_handle) in enumerate(target_items):
-                    if idx > 0 and self.config.channel_delay_seconds > 0:
-                        delay = random.uniform(
-                            0.5 * self.config.channel_delay_seconds,
-                            1.5 * self.config.channel_delay_seconds,
-                        )
+                    if idx > 0 and channel_delay_s > 0:
+                        delay = random.uniform(0.5 * channel_delay_s, 1.5 * channel_delay_s)
                         time_sleep(delay)
 
                     needs_deep = deep_scan or (url not in self._deep_scanned_urls)
-                    source_last_scan = self._source_last_scan_ts.get(url, 0)
-                    if not needs_deep and source_last_scan > 0:
-                        elapsed = (now_ts - source_last_scan) + int(self.config.rescan_jitter_minutes * 60)
-                        lookback_seconds = max(base_lookback, elapsed)
+                    if needs_deep or lookback_s == 0:
+                        cutoff_ts = 0
                     else:
-                        lookback_seconds = base_lookback
-
-                    cutoff_ts = 0 if needs_deep else (now_ts - lookback_seconds)
+                        source_last_scan = self._source_last_scan_ts.get(url, 0)
+                        if source_last_scan > 0:
+                            elapsed = (now_ts - source_last_scan) + int(jitter_s)
+                            effective_lookback = max(lookback_s, elapsed)
+                        else:
+                            effective_lookback = lookback_s
+                        cutoff_ts = now_ts - effective_lookback
 
                     with logfire.span("Scanning {url}", url=url, deep_scan=needs_deep, _level="debug") as url_span:
                         try:
@@ -640,8 +644,10 @@ class YouTubeClient:
                                 continue
 
                             entries_raw = result.get("entries")
-                            entries_iterable = [result] if entries_raw is None else cast(Any, entries_raw)
+                            is_single_video = entries_raw is None
+                            entries_iterable = [result] if is_single_video else cast(Any, entries_raw)
                             url_discovered_count = 0
+                            skipped_live_single = False
 
                             for entry in entries_iterable:
                                 if not entry:
@@ -649,32 +655,24 @@ class YouTubeClient:
                                 vid = entry.get("id")
                                 if not vid or len(vid) != 11:
                                     continue
+                                if entry.get("availability") == "subscriber_only":
+                                    members_only_ids.add(vid)
+                                    continue
+                                if vid in skip_ids:
+                                    continue
                                 title = str(entry.get("title") or "Unknown")
                                 if title in ["[Deleted video]", "[Private video]", "[Unavailable video]"]:
                                     continue
                                 if entry.get("live_status") in ("is_upcoming", "is_live", "post_live"):
+                                    if is_single_video:
+                                        skipped_live_single = True
                                     continue
                                 if "/shorts/" in (entry.get("url") or entry.get("webpage_url") or ""):
                                     continue
 
-                                raw_ts = entry.get("timestamp") or entry.get("release_timestamp") or 0
-                                try:
-                                    ts = int(raw_ts)
-                                except (ValueError, TypeError):
-                                    ts = 0
+                                ts = _parse_entry_timestamp(entry)
 
-                                if not ts and (ud := entry.get("upload_date")):
-                                    try:
-                                        # Use end of the upload day (23:59:59 UTC) so date-only entries are not
-                                        # prematurely cut off during midday scans
-                                        dt = datetime.strptime(str(ud), "%Y%m%d").replace(
-                                            hour=23, minute=59, second=59, tzinfo=timezone.utc
-                                        )
-                                        ts = int(dt.timestamp())
-                                    except ValueError:
-                                        ts = 0
-
-                                if not needs_deep and ts > 0 and ts < cutoff_ts:
+                                if not is_single_video and cutoff_ts > 0 and ts > 0 and ts < cutoff_ts:
                                     # Break only for chronologically ordered channel tabs (/videos, /streams)
                                     if url.endswith(("/videos", "/streams")):
                                         break
@@ -697,8 +695,9 @@ class YouTubeClient:
                                 url_discovered_count += 1
 
                             url_span.set_attribute("discovered_count", url_discovered_count)
-                            self._deep_scanned_urls.add(url)
-                            self._source_last_scan_ts[url] = now_ts
+                            if not skipped_live_single:
+                                self._deep_scanned_urls.add(url)
+                                self._source_last_scan_ts[url] = now_ts
                         except YouTubeBotDetectionError:
                             url_span.set_attribute("error", "bot_detection")
                             raise
@@ -709,7 +708,7 @@ class YouTubeClient:
                             if _is_bot_detection_error(err_msg):
                                 raise YouTubeBotDetectionError(f"Bot detection scanning source {url}") from e
 
-        return discovered
+        return ScanResult(videos=discovered, members_only_ids=members_only_ids)
 
     def download_video(self, video_id: str, source_ref: str, destination_dir: Path) -> DownloadedVideo:
         """Downloads a video stream and extracts authoritative metadata.
@@ -724,13 +723,17 @@ class YouTubeClient:
 
         Raises:
             YouTubeBotDetectionError: If a bot check is detected during download.
-            YouTubeVideoUnavailableError: If the video is deleted, private, or age/geo-restricted.
+            YouTubeVideoUnavailableError: If the video is deleted, private, members-only, or age/geo-restricted.
             RuntimeError: If download fails or output file cannot be located.
         """
         destination_dir.mkdir(parents=True, exist_ok=True)
         ydl_opts = dict(self._base_ydl_opts)
-        ydl_opts["format"] = "bestvideo[height<=360]+bestaudio/best[height<=360]"
-        ydl_opts["outtmpl"] = str(destination_dir / f"%(title).{self.config.max_title_bytes}B [%(id)s].%(ext)s")
+        ydl_opts["format"] = (
+            "bestvideo[height<=360]+bestaudio/best[height<=360]/"
+            "bestvideo[width<=360]+bestaudio/best[width<=360]/"
+            "bestvideo+bestaudio/best"
+        )
+        ydl_opts["outtmpl"] = str(destination_dir / f"%(title).{self.config.maxtitlebytes}B [%(id)s].%(ext)s")
 
         try:
             with YoutubeDL(cast(Any, ydl_opts)) as ydl:
@@ -738,17 +741,23 @@ class YouTubeClient:
                 if not info:
                     raise RuntimeError(f"Could not extract download info for {source_ref}")
 
+                if info.get("availability") == "subscriber_only":
+                    raise YouTubeVideoUnavailableError(
+                        f"Video {video_id} is members-only.",
+                        reason="Members only",
+                    )
+
                 uploader_handle = self.get_uploader_id(info)
                 channel_name = str(info.get("channel") or info.get("uploader") or uploader_handle)
+                raw_title = str(info.get("title") or "").strip() or None
+                ts = _parse_entry_timestamp(info)
 
                 downloaded_path = Path(ydl.prepare_filename(info))
                 if not downloaded_path.is_file():
                     matches = [
                         p
                         for p in destination_dir.glob(f"*{video_id}*.*")
-                        if p.is_file()
-                        and not p.name.startswith("part_")
-                        and p.suffix.lower() in _VALID_VIDEO_EXTENSIONS
+                        if p.is_file() and not p.name.startswith("part_") and p.suffix.lower() in VALID_VIDEO_EXTENSIONS
                     ]
                     if matches:
                         # Prioritize the largest file (e.g. merged stream over unmerged track)
@@ -762,7 +771,11 @@ class YouTubeClient:
                     uploader=uploader_handle,
                     channel_name=channel_name,
                     file_path=downloaded_path,
+                    title=raw_title,
+                    timestamp=ts,
                 )
+        except YouTubeVideoUnavailableError:
+            raise
         except Exception as e:
             err_msg = str(e)
             perm_reason = _check_permanent_video_error(err_msg)

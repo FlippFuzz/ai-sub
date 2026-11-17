@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
-import logfire
 from pydantic import HttpUrl
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import BaseHttpSearchProvider, WebSearchResult, normalize_query
+from ai_sub.search.search_base import BaseHttpSearchProvider, WebSearchResult, normalize_query
 from ai_sub.telemetry import get_app_version
 
 
@@ -59,13 +59,6 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
         Returns:
             list[dict[str, Any]]: Matching track entries containing track_name, artist_name, and plain_lyrics.
         """
-        norm_title = normalize_query(track_title)
-        norm_artist = normalize_query(artist_name or "")
-        cache_key = f"lrclib:{norm_title}:{norm_artist}"
-        if cache_key in self._cache:
-            logfire.debug("Using cached LRCLIB search result for {title=}", title=track_title)
-            return self._cache[cache_key]
-
         params: dict[str, str] = {"track_name": track_title.strip()}
         if artist_name and artist_name.strip():
             params["artist_name"] = artist_name.strip()
@@ -82,17 +75,16 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
                             {
                                 "track_name": item.get("trackName") or item.get("name"),
                                 "artist_name": item.get("artistName"),
-                                "plain_lyrics": plain[: self.settings.max_length],
+                                "plain_lyrics": plain[: self.settings.maxlength],
                             }
                         )
                         if len(extracted) >= 3:
                             break
             return extracted
 
-        with logfire.span("lrclib_search: {title=}, {artist=}", title=track_title, artist=artist_name or ""):
+        async def _fetch() -> list[dict[str, Any]]:
             res = await self._request("GET", "https://lrclib.net/api/search", params=params)
             results = _extract(res.json())
-
             if not results:
                 fallback_res = await self._request(
                     "GET",
@@ -100,9 +92,17 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
                     params={"q": track_title.strip()},
                 )
                 results = _extract(fallback_res.json())
-
-            self._cache[cache_key] = results
             return results
+
+        cache_key = f"lrclib:{normalize_query(track_title)}:{normalize_query(artist_name or '')}"
+        return await self._cached_search(
+            cache_key=cache_key,
+            span_template="lrclib_search: {title=}, {artist=}",
+            fetcher=_fetch,
+            cache_empty=True,
+            title=track_title,
+            artist=artist_name or "",
+        )
 
     async def search_single(self, query: str) -> list[WebSearchResult]:
         """Performs a lyrics search query returning normalized search results.

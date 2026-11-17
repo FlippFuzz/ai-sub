@@ -8,12 +8,7 @@ from typing import ClassVar
 import logfire
 from pydantic import Field
 
-from ai_sub.jobs.base import (
-    Prompt,
-    WorkerContext,
-    format_ms_timestamp,
-    serialize_prompt_context,
-)
+from ai_sub.jobs.job_base import Prompt, WorkerContext, build_user_prompt
 from ai_sub.jobs.subtitles import (
     BaseSubtitleAiResponse,
     BaseSubtitleJob,
@@ -21,8 +16,8 @@ from ai_sub.jobs.subtitles import (
     Subtitles,
 )
 from ai_sub.jobs.summary import SummaryAiResponse
-from ai_sub.search.base import BaseSearchProvider
 from ai_sub.search.lrclib import LrclibSearchProvider
+from ai_sub.search.search_base import BaseSearchProvider
 
 LYRICS_PROMPT_VERSION = 10
 
@@ -127,8 +122,11 @@ async def prefetch_lyrics(
 
         if not perf_found and web_provider is not None:
             try:
-                query = f"{clean_title} {clean_artist or ''} lyrics 歌詞"
-                search_res = await web_provider.search_single(query.strip())
+                query_parts = [clean_title]
+                if clean_artist:
+                    query_parts.append(clean_artist)
+                query_parts.append("lyrics")
+                search_res = await web_provider.search_single(" ".join(query_parts))
                 if search_res:
                     snippets = "\n---\n".join(f"[{r.title}]: {r.content}" for r in search_res[:2])
                     results_parts.append(f"Web Search Results for '{clean_title}':\n{snippets}")
@@ -161,66 +159,21 @@ def get_lyrics_prompt(
     Returns:
         Prompt: Configured system and user prompt pair.
     """
-    parts = [
-        "<task>",
-        "  Refine the provided draft subtitles for the musical performance. Correct Japanese lyrics and polish English translations while keeping all timestamps strictly frozen.",  # noqa: E501
-        "</task>",
-    ]
-    if segment_duration_ms > 0:
-        start_tc = format_ms_timestamp(segment_offset_ms)
-        end_tc = format_ms_timestamp(segment_offset_ms + segment_duration_ms)
-        parts.extend(
-            [
-                "<segment_time_window>",
-                f"  This video segment covers {start_tc} to {end_tc} of the full video.",
-                "</segment_time_window>",
-            ]
-        )
-    if user_context and user_context.strip():
-        parts.extend(
-            [
-                "<user_provided_context>",
-                f"  {user_context.strip()}",
-                "</user_provided_context>",
-            ]
-        )
-    if global_summary:
-        summary_json = serialize_prompt_context(global_summary)
-        parts.extend(
-            [
-                "<global_video_summary>",
-                f"  {summary_json}",
-                "</global_video_summary>",
-            ]
-        )
-    if detected_performances:
-        perf_json = serialize_prompt_context(detected_performances)
-        parts.extend(
-            [
-                "<detected_musical_performances>",
-                f"  {perf_json}",
-                "</detected_musical_performances>",
-            ]
-        )
-    if initial_search_results and initial_search_results.strip():
-        parts.extend(
-            [
-                "<initial_search_results>",
-                f"  {initial_search_results.strip()}",
-                "</initial_search_results>",
-            ]
-        )
-
-    draft_json = serialize_prompt_context(draft_subtitles)
-    parts.extend(
-        [
-            "<draft_subtitles_to_refine>",
-            f"  {draft_json}",
-            "</draft_subtitles_to_refine>",
-        ]
+    user_prompt = build_user_prompt(
+        task_lines=[
+            "Refine the provided draft subtitles for the musical performance. Correct Japanese lyrics and polish English translations while keeping all timestamps strictly frozen.",  # noqa: E501
+        ],
+        user_context=user_context,
+        global_summary=global_summary,
+        segment_offset_ms=segment_offset_ms,
+        segment_duration_ms=segment_duration_ms,
+        extra_sections=[
+            ("detected_musical_performances", detected_performances),
+            ("initial_search_results", initial_search_results),
+            ("draft_subtitles_to_refine", draft_subtitles),
+        ],
     )
-
-    return Prompt(system=_LYRICS_SYSTEM_TEMPLATE, user="\n".join(parts))
+    return Prompt(system=_LYRICS_SYSTEM_TEMPLATE, user=user_prompt)
 
 
 class LyricsAiResponse(BaseSubtitleAiResponse):
@@ -241,6 +194,10 @@ class LyricsJob(BaseSubtitleJob):
     lyrics_prompt_version: int = Field(
         default=LYRICS_PROMPT_VERSION,
         description="Prompt version employed for this refinement response.",
+    )
+    model_name: str = Field(
+        default="gemini-3.5-flash-lite",
+        description="Gemini model identifier.",
     )
     draft_subtitles: list[Subtitles] = Field(
         default_factory=list,
@@ -272,7 +229,6 @@ class LyricsJob(BaseSubtitleJob):
             performances=self.detected_performances,
             search_providers=ctx.search_providers,
         )
-
         prompt = get_lyrics_prompt(
             draft_subtitles=self.draft_subtitles,
             detected_performances=self.detected_performances,
@@ -282,23 +238,10 @@ class LyricsJob(BaseSubtitleJob):
             segment_offset_ms=self.segment_offset_ms,
             segment_duration_ms=self.video_duration_ms,
         )
-
-        media = self.media_path or ctx.media_path
-        model = self.model_name or ctx.executor.ai_settings.model_lyrics
-        tier = self.service_tier if self.service_tier is not None else ctx.executor.ai_settings.service_tier_lyrics
-
-        res = await ctx.executor.run_structured(
+        return await self._run_structured(
+            ctx=ctx,
             prompt=prompt,
-            media_path=media,
-            video_duration_ms=self.video_duration_ms,
             response_type=LyricsAiResponse,
-            model_name=model,
-            service_tier=tier,
-            tools=ctx.search_providers,
-            agentic_video=self.agentic_video,
             task_label="lyrics",
-            retry_settings=self.retry_settings,
+            tools=ctx.search_providers,
         )
-        self.response = res
-        self.total_attempts += 1
-        return res

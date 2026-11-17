@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
-import random
 import string
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Callable, Self
+from fractions import Fraction
+from typing import Any, LiteralString, Self, TypeVar
 
 import logfire
 from httpx import AsyncClient, HTTPStatusError, Response, TimeoutException, TransportError
@@ -19,6 +20,8 @@ from pydantic import BaseModel, Field, HttpUrl, SecretStr
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
 from ai_sub.config import SearchSettings
+
+T = TypeVar("T")
 
 
 class _BoundedCache(OrderedDict[str, Any]):
@@ -62,6 +65,7 @@ class WebQueryResult(BaseModel):
 
     query: str = Field(description="The original search query.")
     results: list[WebSearchResult] = Field(description="Retrieved search result items.")
+    error: str | None = Field(default=None, description="Error message if this query failed.")
 
 
 def normalize_query(query: str) -> str:
@@ -110,6 +114,7 @@ class BaseSearchProvider(ABC):
     settings: SearchSettings
     provider_name: str
     _cache: _BoundedCache
+    _limiter: Limiter
 
     def __init__(self, settings: SearchSettings, provider_name: str) -> None:
         """Initializes the search provider.
@@ -121,6 +126,27 @@ class BaseSearchProvider(ABC):
         self.settings = settings
         self.provider_name = provider_name
         self._cache = _BoundedCache(max_size=1000)
+        self._limiter = self._create_rate_limiter()
+
+    def _create_rate_limiter(self) -> Limiter:
+        """Creates an in-memory QPS rate limiter preserving fractional rates from search settings.
+
+        Returns:
+            Limiter: Configured rate limiter instance.
+        """
+        qps = self.settings.qps
+        second_ms = int(Duration.SECOND.value)
+        if qps < 1.0:
+            rate = 1
+            duration_ms = max(1, math.ceil(second_ms / qps))
+        elif float(qps).is_integer():
+            rate = int(qps)
+            duration_ms = second_ms
+        else:
+            frac = Fraction(str(qps)).limit_denominator(20)
+            rate = frac.numerator
+            duration_ms = frac.denominator * second_ms
+        return limiter_factory.create_inmemory_limiter(rate_per_duration=rate, duration=duration_ms)
 
     async def __aenter__(self) -> Self:
         """Initializes the provider async context.
@@ -136,14 +162,14 @@ class BaseSearchProvider(ABC):
         exc_val: BaseException | None,
         exc_tb: Any,
     ) -> None:
-        """Closes the provider async context.
+        """Closes the provider async context and underlying rate limiter.
 
         Args:
             exc_type: Exception type if raised.
             exc_val: Exception value if raised.
             exc_tb: Traceback if raised.
         """
-        return None
+        self._limiter.close()
 
     @abstractmethod
     def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
@@ -154,6 +180,108 @@ class BaseSearchProvider(ABC):
         """
         ...
 
+    def _to_web_results(self, entries: Iterable[tuple[Any, Any, Any]]) -> list[WebSearchResult]:
+        """Normalizes raw (title, url, content) tuples into validated WebSearchResult items.
+
+        Args:
+            entries: Iterable of raw (title, url, content) tuples.
+
+        Returns:
+            list[WebSearchResult]: Validated and truncated search result models.
+        """
+        max_len = self.settings.maxlength
+        results: list[WebSearchResult] = []
+        for title, url, content in entries:
+            if title and url and content:
+                try:
+                    results.append(
+                        WebSearchResult(
+                            title=str(title),
+                            url=url,
+                            content=str(content)[:max_len],
+                        )
+                    )
+                except Exception:
+                    continue
+        return results
+
+    async def _execute_with_retry(
+        self,
+        action_desc: str,
+        operation: Callable[[], Awaitable[T]],
+        is_retryable: Callable[[Exception], bool] | None = None,
+        get_retry_after: Callable[[Exception], float | None] | None = None,
+    ) -> T:
+        """Executes an operation under rate limiting with exponential backoff retries.
+
+        Args:
+            action_desc: Description of the request for warning logs.
+            operation: Zero-argument async callable executing the lookup.
+            is_retryable: Predicate determining whether a raised exception should be retried.
+                Defaults to retrying all exceptions.
+            get_retry_after: Optional extractor returning Retry-After seconds from an exception.
+
+        Returns:
+            T: Result produced by the operation.
+
+        Raises:
+            RuntimeError: If retries are unexpectedly exhausted without returning or raising.
+        """
+        max_attempts = self.settings.retries + 1
+        for attempt in range(max_attempts):
+            await self._limiter.try_acquire_async(self.provider_name, blocking=True)
+            try:
+                return await operation()
+            except Exception as e:
+                can_retry = is_retryable(e) if is_retryable is not None else True
+                if can_retry and attempt < self.settings.retries:
+                    retry_after = get_retry_after(e) if get_retry_after is not None else None
+                    backoff = self.settings.backoff.compute_delay(attempt, retry_after=retry_after)
+                    logfire.warning(
+                        f"{action_desc} failed with {e} (attempt {attempt + 1}/{max_attempts}). "
+                        f"Retrying in {backoff:.2f}s..."
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
+
+        raise RuntimeError(f"{action_desc} failed after {max_attempts} attempts.")
+
+    async def _cached_search(
+        self,
+        cache_key: str,
+        span_template: LiteralString,
+        fetcher: Callable[[], Awaitable[Any]],
+        cache_empty: bool = False,
+        **span_attrs: Any,
+    ) -> Any:
+        """Executes an async lookup with bounded caching and Logfire span tracing.
+
+        Args:
+            cache_key: Normalized key for cache lookup and storage.
+            span_template: Static Logfire span template string.
+            fetcher: Zero-argument async callable returning search results.
+            cache_empty: Whether to store empty result lists in cache. Defaults to False.
+            **span_attrs: Span attributes passed to Logfire.
+
+        Returns:
+            Any: Cached or newly fetched results.
+        """
+        if cache_key in self._cache:
+            logfire.debug(
+                "Using cached {provider} result for {cache_key=}",
+                provider=self.provider_name,
+                cache_key=cache_key,
+            )
+            return self._cache[cache_key]
+
+        with logfire.span(span_template, **span_attrs):
+            results = await fetcher()
+
+        if results or cache_empty:
+            self._cache[cache_key] = results
+        return results
+
     async def search_single(self, query: str) -> list[WebSearchResult]:
         """Performs a single search query with caching and telemetry spans.
 
@@ -163,21 +291,13 @@ class BaseSearchProvider(ABC):
         Returns:
             list[WebSearchResult]: Formatted search result items.
         """
-        cache_key = normalize_query(query)
-        if cache_key in self._cache:
-            logfire.debug(
-                "Using cached {provider} query result for {query=}",
-                provider=self.provider_name,
-                query=query,
-            )
-            return self._cache[cache_key]
-
-        with logfire.span("{provider}_search: {query=}", provider=self.provider_name, query=query):
-            results = await self._do_search(query)
-
-        if results:
-            self._cache[cache_key] = results
-        return results
+        return await self._cached_search(
+            cache_key=normalize_query(query),
+            span_template="{provider}_search: {query=}",
+            fetcher=lambda: self._do_search(query),
+            provider=self.provider_name,
+            query=query,
+        )
 
     async def _do_search(self, query: str) -> list[WebSearchResult]:
         """Executes provider-specific single search query. Subclasses override this.
@@ -198,6 +318,9 @@ class BaseSearchProvider(ABC):
     ) -> list[dict[str, Any]]:
         """Gathers search results for multiple queries concurrently into standardized query-result dicts.
 
+        Individual query failures are isolated per item so successful results in the same
+        batch are still returned immediately.
+
         Args:
             queries: A list of search query strings to execute concurrently.
             search_fn: Optional custom callable taking a single query. Defaults to None.
@@ -213,23 +336,29 @@ class BaseSearchProvider(ABC):
             return []
 
         async def _run(q: str) -> dict[str, Any]:
-            if search_fn is not None:
-                res = search_fn(q)
-                if inspect.isawaitable(res):
-                    res = await res
-            else:
-                res = await self.search_single(q)
-            return WebQueryResult.model_validate({"query": q, "results": res}).model_dump(mode="json")
+            try:
+                if search_fn is not None:
+                    res = search_fn(q)
+                    if inspect.isawaitable(res):
+                        res = await res
+                else:
+                    res = await self.search_single(q)
+                return WebQueryResult.model_validate({"query": q, "results": res}).model_dump(
+                    mode="json",
+                    exclude_none=True,
+                )
+            except Exception as e:
+                logfire.warning(f"{self.provider_name.capitalize()} query '{q}' failed: {e}")
+                return WebQueryResult(query=q, results=[], error=str(e)).model_dump(mode="json", exclude_none=True)
 
         return await asyncio.gather(*(_run(q) for q in clean_queries))
 
 
 class BaseHttpSearchProvider(BaseSearchProvider, ABC):
-    """Abstract base class managing rate limits, HTTP sessions, retries, and caching for HTTP providers."""
+    """Abstract base class managing HTTP sessions, rate limits, retries, and caching for HTTP providers."""
 
     requires_api_key: bool
     _client: AsyncClient | None
-    _limiter: Limiter
 
     def __init__(self, settings: SearchSettings, provider_name: str, requires_api_key: bool = True) -> None:
         """Initializes the base HTTP search provider.
@@ -243,10 +372,6 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
         self.requires_api_key = requires_api_key
         self._client = None
 
-        rate = 1 if self.settings.qps < 1 else int(self.settings.qps)
-        duration = int(math.ceil(1 / self.settings.qps)) * Duration.SECOND if self.settings.qps < 1 else Duration.SECOND
-        self._limiter = limiter_factory.create_inmemory_limiter(rate_per_duration=rate, duration=duration)
-
     def _get_api_key(self) -> SecretStr | None:
         """Resolves the API key for this provider from settings.
 
@@ -254,6 +379,20 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
             SecretStr | None: Secret key or None.
         """
         return self.settings.get_key_for_provider(self.provider_name)
+
+    def _bearer_headers(self) -> dict[str, str]:
+        """Builds a standard Bearer Authorization header using this provider's API key.
+
+        Returns:
+            dict[str, str]: Authorization header mapping.
+
+        Raises:
+            ValueError: If the required API key is not configured.
+        """
+        key = self._get_api_key()
+        if key is None:
+            raise ValueError(f"{self.provider_name.capitalize()} API key is required but not configured.")
+        return {"Authorization": f"Bearer {key.get_secret_value()}"}
 
     @abstractmethod
     def _get_headers(self) -> dict[str, str]:
@@ -275,7 +414,7 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
         """
         if self.requires_api_key and self._get_api_key() is None:
             raise ValueError(f"{self.provider_name.capitalize()} API key is required but not configured.")
-        self._client = AsyncClient(headers=self._get_headers(), timeout=self.settings.timeout)
+        self._client = AsyncClient(headers=self._get_headers(), timeout=self.settings.timeout.total_seconds())
         await self._client.__aenter__()
         return self
 
@@ -285,16 +424,19 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
         exc_val: BaseException | None,
         exc_tb: Any,
     ) -> None:
-        """Closes the HTTP client session.
+        """Closes the HTTP client session and rate limiter.
 
         Args:
             exc_type: Exception type if raised.
             exc_val: Exception value if raised.
             exc_tb: Traceback if raised.
         """
-        if self._client:
-            await self._client.__aexit__(exc_type, exc_val, exc_tb)
-            self._client = None
+        try:
+            if self._client:
+                await self._client.__aexit__(exc_type, exc_val, exc_tb)
+                self._client = None
+        finally:
+            await super().__aexit__(exc_type, exc_val, exc_tb)
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> Response:
         """Sends an HTTP request with rate limiting, Retry-After compliance, and exponential backoff.
@@ -308,51 +450,32 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
             Response: Validated HTTP response.
 
         Raises:
-            ConnectionError: If connection fails and retries are exhausted.
-            HTTPStatusError: If HTTP status code indicates an error and retries are exhausted.
-            RuntimeError: If client session is not active or retries are exhausted.
-            TimeoutError: If async task times out and retries are exhausted.
-            TimeoutException: If request times out and retries are exhausted.
-            TransportError: If network transport fails and retries are exhausted.
+            RuntimeError: If client session is not active.
         """
-        if self._client is None:
+        client = self._client
+        if client is None:
             raise RuntimeError(
                 f"{self.provider_name.capitalize()} client session is not active. Use within 'async with'."
             )
 
-        max_attempts = self.settings.retries + 1
-        for attempt in range(max_attempts):
-            await self._limiter.try_acquire_async(self.provider_name, blocking=True)
-            try:
-                response = await self._client.request(method, url, **kwargs)
-                response.raise_for_status()
-                return response
-            except (
-                HTTPStatusError,
-                TransportError,
-                TimeoutException,
-                ConnectionError,
-                asyncio.TimeoutError,
-            ) as e:
-                is_retryable = (
-                    e.response.status_code in (429, 500, 502, 503, 504) if isinstance(e, HTTPStatusError) else True
-                )
-                if is_retryable and attempt < self.settings.retries:
-                    retry_after = (
-                        parse_retry_after(e.response.headers.get("retry-after"))
-                        if isinstance(e, HTTPStatusError)
-                        else None
-                    )
-                    exp_backoff = self.settings.min_wait_seconds * (self.settings.multiplier**attempt)
-                    effective = max(exp_backoff, retry_after or 0.0)
-                    backoff = min(self.settings.max_wait_seconds, effective) + random.uniform(0, 1)
+        async def _send() -> Response:
+            response = await client.request(method, url, **kwargs)
+            response.raise_for_status()
+            return response
 
-                    logfire.warning(
-                        f"{self.provider_name.capitalize()} {method} to {url} failed with {e} "
-                        f"(attempt {attempt + 1}/{max_attempts}). Retrying in {backoff:.2f}s..."
-                    )
-                    await asyncio.sleep(backoff)
-                    continue
-                raise
+        def _is_retryable(e: Exception) -> bool:
+            if isinstance(e, HTTPStatusError):
+                return e.response.status_code in (429, 500, 502, 503, 504)
+            return isinstance(e, (TransportError, TimeoutException, ConnectionError, asyncio.TimeoutError))
 
-        raise RuntimeError(f"{self.provider_name.capitalize()} request to {url} failed after {max_attempts} attempts.")
+        def _get_retry_after(e: Exception) -> float | None:
+            if isinstance(e, HTTPStatusError):
+                return parse_retry_after(e.response.headers.get("retry-after"))
+            return None
+
+        return await self._execute_with_retry(
+            action_desc=f"{self.provider_name.capitalize()} {method} to {url}",
+            operation=_send,
+            is_retryable=_is_retryable,
+            get_retry_after=_get_retry_after,
+        )

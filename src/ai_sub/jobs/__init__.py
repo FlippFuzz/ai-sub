@@ -1,6 +1,6 @@
 """Job definitions, data schemas, and runtime execution contexts."""
 
-from ai_sub.jobs.base import AiJob, BaseJob, MediaJob, Prompt, WorkerContext
+from ai_sub.jobs.job_base import AiJob, BaseJob, MediaJob, Prompt, WorkerContext
 from ai_sub.jobs.lyrics import LyricsAiResponse, LyricsJob
 from ai_sub.jobs.reencode import ReencodeJob
 from ai_sub.jobs.subtitles import (

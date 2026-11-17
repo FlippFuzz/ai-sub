@@ -557,7 +557,7 @@
         const tabs = document.getElementById("pipeline-tabs")
         tabs.innerHTML = currentData.pipelines
           .map((p, idx) => {
-            const pStatus = p.status || (p.idle ? "idle" : "processing")
+            const pStatus = p.status || "idle"
             return `
               <button class="tab-btn ${idx === selectedPipelineIndex ? "active" : ""}" onclick="selectTab(${idx})">
                 ${esc(p.name)}
@@ -617,9 +617,13 @@
                           `Refining with <b>${esc(l.worker_id)}</b> (${formatDuration(l.elapsed_s)})`,
                       )
                       .join(", ")
-                  : lyr.done === lyr.total
-                    ? "All singing chunks refined."
-                    : "Waiting for worker pickup."
+                  : lyr.status === "completed"
+                    ? lyr.failed > 0
+                      ? `Finished with ${lyr.failed} chunk(s) using draft subtitles.`
+                      : "All singing chunks refined."
+                    : lyr.done > 0 && lyr.done === lyr.total
+                      ? `${lyr.done} singing chunk(s) refined; checking remaining chunks...`
+                      : "Waiting for worker pickup."
 
           const isYt = v.source_type === "youtube"
           const thumbHtml =
@@ -649,9 +653,9 @@
                   </div>
                 </div>
                 <div style="text-align: right; display: flex; flex-direction: column; gap: 4px; flex-shrink: 0;">
-                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Summary:</span> ${esc(pipe.models.summary.split(":").pop())}</div>
-                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Subtitles:</span> ${esc(pipe.models.subtitles.split(":").pop())}</div>
-                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Lyrics:</span> ${esc(pipe.models.lyrics.split(":").pop())}</div>
+                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Summary:</span> ${esc(pipe.models.summary)}</div>
+                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Subtitles:</span> ${esc(pipe.models.subtitles)}</div>
+                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Lyrics:</span> ${esc(pipe.models.lyrics)}</div>
                 </div>
               </div>
 
@@ -757,7 +761,7 @@
               <p style="color: var(--muted); margin: 0;">${esc(statusDesc)}</p>
               ${prepDetail}
               <div class="mono" style="font-size: 12px; margin-top: 14px; color: var(--muted);">
-                Models: ${esc(pipe.models.summary.split(":").pop())} / ${esc(pipe.models.subtitles.split(":").pop())} / ${esc(pipe.models.lyrics.split(":").pop())}
+                Models: ${esc(pipe.models.summary)} / ${esc(pipe.models.subtitles)} / ${esc(pipe.models.lyrics)}
               </div>
             </div>
           `

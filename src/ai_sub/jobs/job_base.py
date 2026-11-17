@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Self
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Self, TypeVar
 
 import logfire
 import yaml
@@ -17,12 +18,17 @@ from pydantic import (
     Field,
     NonNegativeInt,
     PositiveFloat,
+    PositiveInt,
     ValidationError,
 )
 
+from ai_sub.config import RetrySettings, ServiceTier, atomic_write_text
+
 if TYPE_CHECKING:
     from ai_sub.gemini_executor import GeminiExecutor
-    from ai_sub.search.base import BaseSearchProvider
+    from ai_sub.search.search_base import BaseSearchProvider
+
+T = TypeVar("T", bound=BaseModel)
 
 
 class _YamlDumper(yaml.SafeDumper):
@@ -53,7 +59,8 @@ _YamlDumper.add_representer(str, _str_presenter)
 def clean_timestamp_string(ts_str: str) -> str:
     """Extracts a valid timestamp pattern from a potentially noisy LLM string.
 
-    Supports both period and comma decimal delimiters (e.g. '01:23.450' and '01:23,450').
+    Supports both period and comma decimal delimiters (e.g. '01:23.450' and '01:23,450')
+    as well as 'HH:MM:SS:mmm' and 'MM:SS:mmm'.
 
     Args:
         ts_str: Potentially noisy timestamp string.
@@ -64,7 +71,9 @@ def clean_timestamp_string(ts_str: str) -> str:
     if not isinstance(ts_str, str):
         return ts_str
     match = re.search(
-        r"(\d{1,2}:\d{2}:\d{2}(?!\d)(?:[.,]\d{1,3})?|\d{1,2}:\d{2}(?:[.,]\d{1,3}|:\d{3}(?!\d))|\d{1,2}:\d{2}(?!\d))",
+        r"(\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3}|:\d{3})?(?!\d)"
+        r"|\d{1,2}:\d{2}(?:[.,]\d{1,3}|:\d{3}(?!\d))"
+        r"|\d{1,2}:\d{2}(?!\d))",
         ts_str,
     )
     return match.group(1).replace(",", ".") if match else ts_str
@@ -76,8 +85,8 @@ CleanTimestamp = Annotated[str, BeforeValidator(clean_timestamp_string)]
 def parse_timestamp_string_ms(timestamp_string: str) -> int:
     """Parses standard timestamp formats into total milliseconds.
 
-    Supports 'MM:SS.mmm', 'HH:MM:SS.mmm', 'HH:MM:SS', 'MM:SS:mmm', 'MM:SS',
-    and comma millisecond delimiters (e.g., '01:23,450').
+    Supports 'MM:SS.mmm', 'HH:MM:SS.mmm', 'HH:MM:SS', 'MM:SS:mmm', 'HH:MM:SS:mmm',
+    'MM:SS', and comma millisecond delimiters (e.g., '01:23,450').
 
     Args:
         timestamp_string: Timestamp string to parse.
@@ -171,7 +180,7 @@ def validate_duration_bound(
         items: List of objects with an 'end' timestamp attribute.
         duration_ms: Total duration of the video segment in milliseconds.
         buffer_ms: Allowed tolerance buffer in milliseconds.
-        item_label: Label for error messages (e.g., 'Scene', 'Subtitle').
+        item_label: Label for error messages (e.g., 'Subtitle').
 
     Raises:
         ValueError: If an item's end timestamp exceeds duration + buffer.
@@ -231,6 +240,78 @@ def serialize_prompt_context(data: Any) -> str:
     return json.dumps(cleaned, ensure_ascii=False)
 
 
+def append_xml_section(parts: list[str], tag: str, *lines: str) -> None:
+    """Appends an XML-tagged section with 2-space indented lines to prompt parts.
+
+    Args:
+        parts: Accumulator list of prompt lines.
+        tag: XML tag name wrapping the content.
+        *lines: Content lines to include inside the tag.
+    """
+    parts.append(f"<{tag}>")
+    parts.extend(f"  {line}" for line in lines)
+    parts.append(f"</{tag}>")
+
+
+def build_user_prompt(
+    task_lines: Sequence[str],
+    user_context: str | None = None,
+    global_summary: Any | None = None,
+    segment_offset_ms: int = 0,
+    segment_duration_ms: int = 0,
+    include_local_timecode_note: bool = False,
+    extra_sections: Sequence[tuple[str, Any]] = (),
+) -> str:
+    """Assembles an XML-sectioned user prompt from common pipeline inputs.
+
+    Args:
+        task_lines: Lines describing the primary task.
+        user_context: Optional background text or directives supplied by the user. Defaults to None.
+        global_summary: Optional Phase 1 global video summary object. Defaults to None.
+        segment_offset_ms: Absolute start offset of the segment in milliseconds. Defaults to 0.
+        segment_duration_ms: Segment duration in milliseconds. Defaults to 0.
+        include_local_timecode_note: Whether to include local-timecode instructions inside the window tag.
+            Defaults to False.
+        extra_sections: Additional (tag, content_or_model) pairs appended after global summary. Defaults to ().
+
+    Returns:
+        str: Formatted user prompt string.
+    """
+    parts: list[str] = []
+    append_xml_section(parts, "task", *task_lines)
+
+    if segment_duration_ms > 0:
+        start_tc = format_ms_timestamp(segment_offset_ms)
+        end_tc = format_ms_timestamp(segment_offset_ms + segment_duration_ms)
+        window_lines = [f"This video segment covers {start_tc} to {end_tc} of the full video."]
+        if include_local_timecode_note:
+            window_lines.extend(
+                [
+                    "The <global_video_summary> references absolute full-video timestamps.",
+                    "CRITICAL: All output timestamps (start, end, s, e) MUST be local timecodes relative to this file",
+                    "starting at 00:00.000. Never use full-video absolute timestamps in your output.",
+                ]
+            )
+        append_xml_section(parts, "segment_time_window", *window_lines)
+
+    if user_context and user_context.strip():
+        append_xml_section(parts, "user_provided_context", user_context.strip())
+
+    if global_summary:
+        append_xml_section(parts, "global_video_summary", serialize_prompt_context(global_summary))
+
+    for tag, content in extra_sections:
+        if content is None:
+            continue
+        if isinstance(content, str):
+            if text := content.strip():
+                append_xml_section(parts, tag, text)
+        elif content:
+            append_xml_section(parts, tag, serialize_prompt_context(content))
+
+    return "\n".join(parts)
+
+
 class Prompt(BaseModel):
     """Container for system and user prompt strings."""
 
@@ -255,10 +336,6 @@ class BaseJob(BaseModel):
     name: str = Field(
         description="Unique name identifier for this job (e.g., 'part_001' or 'summary').",
     )
-    total_attempts: NonNegativeInt = Field(
-        default=0,
-        description="Cumulative processing attempts recorded across all executions and FPS tiers.",
-    )
 
 
 class MediaJob(BaseJob):
@@ -268,6 +345,16 @@ class MediaJob(BaseJob):
 class AiJob(BaseJob):
     """Base class for AI-executed jobs with YAML persistence and prompt version validation."""
 
+    video_duration_ms: PositiveInt = Field(description="Media duration in milliseconds.")
+    model_name: str = Field(default="gemini-3.8-flash", description="Gemini model identifier.")
+    service_tier: ServiceTier | None = Field(
+        default=None,
+        description="Optional Google Gemini service tier override.",
+    )
+    agentic_video: bool = Field(
+        default=False,
+        description="Whether to enable agentic video exploration.",
+    )
     user_context: str | None = Field(
         default=None,
         description="Resolved user-supplied context string applied during execution.",
@@ -277,21 +364,35 @@ class AiJob(BaseJob):
         description="Local media path bound to this AI job.",
         exclude=True,
     )
+    retry_settings: RetrySettings | None = Field(
+        default=None,
+        description="Optional task-specific retry settings.",
+        exclude=True,
+    )
+    validation_buffer_ms: NonNegativeInt = Field(
+        default=2000,
+        description="Allowed timestamp overflow tolerance in milliseconds.",
+        exclude=True,
+    )
     segment_index: int | None = Field(
         default=None,
         description="Segment index if applicable.",
     )
+    total_attempts: NonNegativeInt = Field(
+        default=0,
+        description="Cumulative processing attempts recorded across all executions and FPS tiers.",
+    )
     fallback_tier: NonNegativeInt = Field(
         default=0,
-        description="Fallback re-encoding tier index (0 = initial run, 1+ = fallback_fps index + 1).",
+        description="Fallback re-encoding tier index (0 = initial run, 1+ = fallback FPS tier).",
     )
     tier_attempts: NonNegativeInt = Field(
         default=0,
         description="Non-retryable failure attempts recorded at the current FPS tier.",
     )
-    target_fps: PositiveFloat | None = Field(
+    target_fps: PositiveFloat | Literal["keyframes"] | None = Field(
         default=None,
-        description="Active fallback FPS target if fallback re-encoding has been triggered, else None.",
+        description="Active FPS or 'keyframes' target for this job, or None if using raw media.",
     )
     exhausted: bool = Field(
         default=False,
@@ -301,15 +402,49 @@ class AiJob(BaseJob):
     prompt_version_field: ClassVar[str] = ""
     prompt_version: ClassVar[int] = 0
 
+    async def _run_structured(
+        self,
+        ctx: WorkerContext,
+        prompt: Prompt,
+        response_type: type[T],
+        task_label: str,
+        tools: Sequence[Callable[..., Any] | dict[str, Any] | BaseSearchProvider] | None = None,
+    ) -> T:
+        """Executes structured Gemini inference using this job's execution settings.
+
+        Args:
+            ctx: Worker runtime context containing executor and search providers.
+            prompt: System and user prompt pair.
+            response_type: Expected Pydantic response schema.
+            task_label: Telemetry span label for the task.
+            tools: Optional tool callables or search providers. Defaults to None.
+
+        Returns:
+            T: Parsed and validated response instance.
+        """
+        return await ctx.executor.run_structured(
+            prompt=prompt,
+            media_path=self.media_path or ctx.media_path,
+            video_duration_ms=self.video_duration_ms,
+            response_type=response_type,
+            model_name=self.model_name,
+            service_tier=self.service_tier,
+            tools=tools,
+            agentic_video=self.agentic_video,
+            task_label=task_label,
+            retry_settings=self.retry_settings,
+            validation_buffer_ms=self.validation_buffer_ms,
+        )
+
     def save(self, filename: Path) -> None:
-        """Serializes the job state to a human-readable YAML file.
+        """Serializes the job state atomically to a human-readable YAML file.
 
         Args:
             filename: Destination file path.
         """
         data: dict[str, Any] = self.model_dump(mode="json")
-        with open(filename, "w", encoding="utf-8") as file:
-            yaml.dump(data, file, Dumper=_YamlDumper, sort_keys=False, allow_unicode=True)
+        content = yaml.dump(data, Dumper=_YamlDumper, sort_keys=False, allow_unicode=True)
+        atomic_write_text(filename, content)
 
     @classmethod
     def load(cls, save_path: Path, validation_buffer_ms: int = 0) -> Self | None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from enum import Enum
 from typing import Any
 
@@ -76,6 +77,10 @@ class TaskClaimResponse(BaseModel):
         default=None,
         description="Optional Google Gemini service tier.",
     )
+    validation_buffer: timedelta = Field(
+        default=timedelta(seconds=2),
+        description="Allowed subtitle timestamp overflow tolerance buffer configured by the server.",
+    )
     retry: RetrySettings = Field(
         default_factory=RetrySettings,
         description="Task execution retry and backoff policy configured by the server.",
@@ -98,8 +103,6 @@ class TaskCompleteRequest(BaseModel):
     """Payload sent by a worker upon successful execution of a task."""
 
     worker_id: str = Field(description="Unique identifier of the worker.")
-    task_id: str = Field(description="Unique task identifier.")
-    task_type: TaskType = Field(description="Task type completed.")
     result: dict[str, Any] = Field(description="Parsed and validated AI output dictionary.")
 
 
@@ -107,7 +110,6 @@ class TaskFailRequest(BaseModel):
     """Payload sent by a worker when task execution fails."""
 
     worker_id: str = Field(description="Unique identifier of the worker.")
-    task_id: str = Field(description="Unique task identifier.")
     reason: str = Field(description="Failure code (e.g. 'QUOTA_EXHAUSTED', 'RETRYABLE_ERROR', or 'EXECUTION_ERROR').")
     error_message: str | None = Field(default=None, description="Optional error description or traceback.")
     is_retryable: bool = Field(

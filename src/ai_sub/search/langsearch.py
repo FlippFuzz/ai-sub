@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import BaseHttpSearchProvider, WebSearchResult
+from ai_sub.search.search_base import BaseHttpSearchProvider, WebSearchResult
 
 
 class LangsearchSearchProvider(BaseHttpSearchProvider):
@@ -25,9 +26,7 @@ class LangsearchSearchProvider(BaseHttpSearchProvider):
         Returns:
             dict[str, str]: HTTP request headers.
         """
-        key = self._get_api_key()
-        assert key is not None
-        return {"Authorization": f"Bearer {key.get_secret_value()}"}
+        return self._bearer_headers()
 
     def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
         """Returns tool callables for Gemini model registration.
@@ -46,27 +45,17 @@ class LangsearchSearchProvider(BaseHttpSearchProvider):
         Returns:
             list[WebSearchResult]: Formatted search results.
         """
-        max_length = self.settings.max_length
         payload = {
             "query": query,
             "count": 5,
-            "contents": {"text": {"maxCharacters": max_length}},
+            "contents": {"text": {"maxCharacters": self.settings.maxlength}},
             "freshness": "noLimit",
         }
         response = await self._request("POST", "https://api.langsearch.com/v1/web-search", json=payload)
-        data = response.json()
-
-        results: list[WebSearchResult] = []
-        for item in data.get("data", {}).get("webPages", {}).get("value", []):
-            name = item.get("name")
-            url = item.get("url")
-            raw_content = item.get("text") or item.get("summary")
-            if name and url and raw_content:
-                try:
-                    results.append(WebSearchResult(title=name, url=url, content=str(raw_content)[:max_length]))
-                except Exception:
-                    continue
-        return results
+        pages = response.json().get("data", {}).get("webPages", {}).get("value", [])
+        return self._to_web_results(
+            (item.get("name"), item.get("url"), item.get("text") or item.get("summary")) for item in pages
+        )
 
     async def web_search_langsearch_multi(self, queries: list[str]) -> list[dict[str, Any]]:
         """Perform multiple web search queries in parallel using Langsearch.

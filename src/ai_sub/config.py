@@ -1,20 +1,27 @@
-"""Configuration settings for the AI Sub subtitle generation pipeline."""
+"""Shared configuration models, types, and YAML loading utilities for AI Sub."""
 
 from __future__ import annotations
 
+import importlib
 import json
+import os
+import random
 import socket
+import uuid
+from collections.abc import Sequence
 from contextvars import ContextVar
+from datetime import timedelta
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self, cast
+from typing import Annotated, Any, Literal, Self
 
-import yaml
+from annotated_types import Ge, Gt
 from logfire import LevelName
 from pydantic import (
-    AliasChoices,
+    BaseModel,
     BeforeValidator,
+    ByteSize,
+    ConfigDict,
     Field,
-    FilePath,
     HttpUrl,
     NonNegativeInt,
     PositiveFloat,
@@ -24,15 +31,41 @@ from pydantic import (
 )
 from pydantic_settings import (
     BaseSettings,
-    CliPositionalArg,
     NoDecode,
     PydanticBaseSettingsSource,
-    SettingsConfigDict,
+    YamlConfigSettingsSource,
 )
 
-ServiceTier = Literal["auto", "default", "flex", "priority"]
+ServiceTier = Literal["standard", "flex", "priority"]
+SearchTool = Literal["builtin", "duckduckgo", "ollama", "langsearch", "tinyfish", "lrclib"]
 
-_LOADING_FROM_YAML: ContextVar[bool] = ContextVar("_loading_from_yaml", default=False)
+_YAML_PATH: ContextVar[Path | None] = ContextVar("_yaml_path", default=None)
+
+
+def _get_env_value(*names: str) -> str | None:
+    """Reads the first non-empty value from OS environment variables or a local .env file.
+
+    Args:
+        *names: Environment variable names in priority order.
+
+    Returns:
+        str | None: First matching non-empty variable value, or None.
+    """
+    for name in names:
+        if (val := os.getenv(name)) and (stripped := val.strip()):
+            return stripped
+
+    env_path = Path(".env")
+    if env_path.is_file():
+        try:
+            dotenv_mod = importlib.import_module("dotenv")
+            dotenv_map = dotenv_mod.dotenv_values(env_path)
+            for name in names:
+                if (val := dotenv_map.get(name)) and (stripped := str(val).strip()):
+                    return stripped
+        except ImportError:
+            pass
+    return None
 
 
 def _parse_string_list(val: Any) -> list[str] | Any:
@@ -67,19 +100,19 @@ def _parse_string_list(val: Any) -> list[str] | Any:
     return val
 
 
-def _parse_float_list(val: Any) -> list[float] | Any:
-    """Parses a list of floats from a Python list, JSON array, or comma-separated string.
+def _parse_search_tools(val: Any) -> list[str] | Any:
+    """Parses and lowercases search tool names prior to Literal validation.
 
     Args:
         val: Raw input value from environment variable, CLI, or YAML.
 
     Returns:
-        list[float] | Any: Normalized list of floats or unparsed raw input.
+        list[str] | Any: Lowercased list of tool names or unparsed raw input.
     """
-    raw_list = _parse_string_list(val)
-    if not isinstance(raw_list, list):
-        return raw_list
-    return [float(item) for item in raw_list]
+    parsed = _parse_string_list(val)
+    if isinstance(parsed, list):
+        return [item.lower() for item in parsed]
+    return parsed
 
 
 def _parse_path_list(val: Any) -> list[Path] | Any:
@@ -98,12 +131,31 @@ def _parse_path_list(val: Any) -> list[Path] | Any:
 
 
 StringList = Annotated[list[str], NoDecode, BeforeValidator(_parse_string_list)]
-FloatList = Annotated[list[PositiveFloat], NoDecode, BeforeValidator(_parse_float_list)]
+SearchToolList = Annotated[list[SearchTool], NoDecode, BeforeValidator(_parse_search_tools)]
 PathList = Annotated[list[Path], NoDecode, BeforeValidator(_parse_path_list)]
 
 
+class BaseConfigModel(BaseModel):
+    """Shared base model for nested configuration sections."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_empty_dict(cls, val: Any) -> Any:
+        """Normalizes YAML null into an empty dictionary so nested defaults apply.
+
+        Args:
+            val: Raw input value before validation.
+
+        Returns:
+            Any: Empty dictionary if None, otherwise original value.
+        """
+        return {} if val is None else val
+
+
 class YamlFileSettings(BaseSettings):
-    """Base settings model supporting YAML loading where ENV and .env override YAML values."""
+    """Base settings model supporting standard YAML loading overridden by ENV and .env."""
 
     @classmethod
     def settings_customise_sources(
@@ -114,10 +166,7 @@ class YamlFileSettings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Prioritizes ENV and .env over YAML init kwargs when invoked via from_yaml().
-
-        When not loading from YAML (e.g. CLI invocation or explicit instantiation), keeps
-        init_settings ahead of ENV and .env so CLI flags override environment variables.
+        """Configures settings source priority with optional runtime YAML path.
 
         Args:
             settings_cls: Target settings class.
@@ -129,9 +178,11 @@ class YamlFileSettings(BaseSettings):
         Returns:
             tuple[PydanticBaseSettingsSource, ...]: Source priority sequence.
         """
-        if _LOADING_FROM_YAML.get():
-            return (env_settings, dotenv_settings, init_settings)
-        return (init_settings, env_settings, dotenv_settings)
+        sources: list[PydanticBaseSettingsSource] = [init_settings, env_settings, dotenv_settings]
+        if (yaml_path := _YAML_PATH.get()) is not None:
+            sources.append(YamlConfigSettingsSource(settings_cls, yaml_file=yaml_path))
+        sources.append(file_secret_settings)
+        return tuple(sources)
 
     @classmethod
     def from_yaml(cls, yaml_path: Path | str) -> Self:
@@ -145,21 +196,16 @@ class YamlFileSettings(BaseSettings):
 
         Raises:
             FileNotFoundError: If the configuration file does not exist.
-            ValueError: If YAML content is not a mapping.
         """
         path = Path(yaml_path)
         if not path.is_file():
             raise FileNotFoundError(f"Configuration file not found: {path}")
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        if not isinstance(data, dict):
-            raise ValueError(f"Invalid YAML content in {path}, expected dictionary mapping.")
 
-        token = _LOADING_FROM_YAML.set(True)
+        token = _YAML_PATH.set(path)
         try:
-            return cls(**data)
+            return cls()
         finally:
-            _LOADING_FROM_YAML.reset(token)
+            _YAML_PATH.reset(token)
 
 
 def find_config_file(kind: Literal["server", "worker"], cli_arg: str | Path | None = None) -> Path:
@@ -199,131 +245,206 @@ def find_config_file(kind: Literal["server", "worker"], cli_arg: str | Path | No
     raise FileNotFoundError(f"No {kind} configuration file found. Checked: {checked_str}.")
 
 
-class StorageSettings(YamlFileSettings):
+def atomic_write_text(path: Path, content: str) -> None:
+    """Writes UTF-8 text atomically via a temporary file and os.replace.
+
+    Args:
+        path: Destination file path.
+        content: UTF-8 string content to write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    replaced = False
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(temp_path, path)
+        replaced = True
+    finally:
+        if not replaced and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+class LoggingSettings(BaseConfigModel):
+    """Telemetry and console logging configuration."""
+
+    level: LevelName = Field(
+        default="info",
+        description="Minimum log level to output.",
+    )
+    timestamps: bool = Field(
+        default=False,
+        description="Whether to prefix console log lines with timestamps.",
+    )
+    scrub: bool = Field(
+        default=True,
+        description="Whether to scrub sensitive API keys and secrets from logs.",
+    )
+
+
+class StorageSettings(BaseConfigModel):
     """Configuration for Gemini Files API storage lifecycle and cleanup."""
 
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_AI_STORAGE_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
+    max: Annotated[ByteSize, Gt(0)] = Field(
+        default=ByteSize(15_000_000_000),
+        description="High-water storage mark triggering managed file cleanup (e.g. '15GB').",
     )
-
-    max_gb: PositiveFloat = Field(
-        description="High-water mark in Gigabytes (GB) triggering managed file cleanup.",
-        default=15.0,
+    target: Annotated[ByteSize, Gt(0)] = Field(
+        default=ByteSize(10_000_000_000),
+        description="Low-water storage target to delete down to during cleanup (e.g. '10GB').",
     )
-    target_gb: PositiveFloat = Field(
-        description="Low-water mark in Gigabytes (GB) to delete down to during cleanup.",
-        default=10.0,
+    cleanupinterval: Annotated[timedelta, Gt(timedelta(0))] = Field(
+        default=timedelta(minutes=30),
+        description="Minimum cooldown interval between storage cleanup checks (seconds if numeric).",
     )
-    cleanup_interval_minutes: PositiveInt = Field(
-        description="Minimum cooldown period in minutes between storage cleanup checks.",
-        default=30,
-    )
-    polling_interval_seconds: PositiveFloat = Field(
-        description="Interval in seconds to poll the Gemini Files API while processing an uploaded file.",
-        default=10.0,
+    pollinterval: Annotated[timedelta, Gt(timedelta(0))] = Field(
+        default=timedelta(seconds=10),
+        description="Polling interval while waiting for Gemini Files API processing (seconds if numeric).",
     )
 
     @model_validator(mode="after")
     def _validate_thresholds(self) -> Self:
-        """Validates that low-water mark target_gb is strictly less than max_gb.
+        """Validates that low-water mark target is strictly less than max.
 
         Returns:
             Self: Validated instance.
 
         Raises:
-            ValueError: If target_gb is greater than or equal to max_gb.
+            ValueError: If target is greater than or equal to max.
         """
-        if self.target_gb >= self.max_gb:
+        if self.target >= self.max:
             raise ValueError(
-                f"Storage low-water mark 'target_gb' ({self.target_gb} GB) must be strictly "
-                f"less than high-water mark 'max_gb' ({self.max_gb} GB)."
+                f"Storage low-water mark 'target' ({self.target}) must be strictly "
+                f"less than high-water mark 'max' ({self.max})."
             )
         return self
 
 
-class SearchSettings(YamlFileSettings):
+class BackoffSettings(BaseConfigModel):
+    """Exponential backoff timing parameters shared across retryable operations."""
+
+    multiplier: PositiveFloat = Field(
+        default=2.0,
+        description="Exponential backoff multiplier between retry attempts.",
+    )
+    minwait: Annotated[timedelta, Gt(timedelta(0))] = Field(
+        default=timedelta(seconds=30),
+        description="Minimum backoff wait duration (seconds if numeric).",
+    )
+    maxwait: Annotated[timedelta, Gt(timedelta(0))] = Field(
+        default=timedelta(seconds=300),
+        description="Maximum backoff wait duration (seconds if numeric).",
+    )
+
+    def compute_delay(self, attempt: int, retry_after: float | None = None) -> float:
+        """Computes jittered exponential backoff delay in seconds for a retry attempt.
+
+        Args:
+            attempt: Zero-based retry attempt index.
+            retry_after: Optional server-suggested delay in seconds (e.g. from Retry-After header).
+
+        Returns:
+            float: Delay duration in seconds with [0, 1) second random jitter.
+        """
+        exp_backoff = self.minwait.total_seconds() * (float(self.multiplier) ** attempt)
+        effective = max(exp_backoff, retry_after or 0.0)
+        return min(self.maxwait.total_seconds(), effective) + random.uniform(0, 1)
+
+
+class RetrySettings(BaseConfigModel):
+    """Retry parameters for transient API failures, output validation, and cross-run limits."""
+
+    perturn: NonNegativeInt = Field(
+        default=5,
+        description="Maximum retries per API turn on transient network, rate-limit, or 5xx errors.",
+    )
+    validation: NonNegativeInt = Field(
+        default=3,
+        description="Maximum full-session retries per run when AI output fails schema validation.",
+    )
+    maxruns: PositiveInt = Field(
+        default=3,
+        description="Maximum non-retryable failed runs per FPS tier before fallback or exhaustion.",
+    )
+    backoff: BackoffSettings = Field(
+        default_factory=BackoffSettings,
+        description="Exponential backoff settings for API and validation retries.",
+    )
+
+
+def _default_search_tools() -> list[SearchTool]:
+    """Returns default search tools list with explicit literal typing.
+
+    Returns:
+        list[SearchTool]: Default search tools list.
+    """
+    return ["duckduckgo", "lrclib"]
+
+
+class SearchSettings(BaseConfigModel):
     """Configuration for auxiliary web search tools used by the AI model."""
 
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_AI_SEARCH_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
-    )
-
-    tools: StringList = Field(
+    tools: SearchToolList = Field(
+        default_factory=_default_search_tools,
         description="List of search providers to enable.",
-        default_factory=lambda: ["duckduckgo"],
     )
-    key: SecretStr | None = Field(
-        description="Fallback API key for search services.",
+    tinyfishkey: SecretStr | None = Field(
         default=None,
-        validation_alias=AliasChoices(
-            "AISUB_AI_SEARCH_KEY",
-            "SEARCH_API_KEY",
-        ),
-    )
-    tinyfish_key: SecretStr | None = Field(
         description="Dedicated API key for Tinyfish search.",
-        default=None,
-        validation_alias=AliasChoices(
-            "AISUB_AI_SEARCH_TINYFISH_KEY",
-            "TINYFISH_API_KEY",
-        ),
     )
-    langsearch_key: SecretStr | None = Field(
+    langsearchkey: SecretStr | None = Field(
+        default=None,
         description="Dedicated API key for Langsearch.",
-        default=None,
-        validation_alias=AliasChoices(
-            "AISUB_AI_SEARCH_LANGSEARCH_KEY",
-            "LANGSEARCH_API_KEY",
-        ),
     )
-    ollama_key: SecretStr | None = Field(
+    ollamakey: SecretStr | None = Field(
+        default=None,
         description="Dedicated API key for Ollama search.",
-        default=None,
-        validation_alias=AliasChoices(
-            "AISUB_AI_SEARCH_OLLAMA_KEY",
-            "OLLAMA_API_KEY",
-        ),
     )
-    max_turns: PositiveInt = Field(
-        description="Maximum function-calling search turns permitted per segment.",
+    maxturns: PositiveInt = Field(
         default=3,
+        description="Maximum function-calling search turns permitted per segment.",
     )
     qps: PositiveFloat = Field(
-        description="Maximum queries per second for web search requests.",
         default=0.3,
+        description="Maximum queries per second for web search requests.",
     )
-    max_length: PositiveInt = Field(
-        description="Maximum characters permitted in a single search result snippet or fetched page.",
+    maxlength: PositiveInt = Field(
         default=4096,
+        description="Maximum characters permitted in a single search result snippet or fetched page.",
     )
-    timeout: PositiveFloat = Field(
-        description="Timeout in seconds for external search HTTP requests.",
-        default=60.0,
+    timeout: Annotated[timedelta, Gt(timedelta(0))] = Field(
+        default=timedelta(seconds=60),
+        description="Timeout for external search HTTP requests (seconds if numeric).",
     )
     retries: NonNegativeInt = Field(
-        description="Maximum retries for search requests on transient errors.",
         default=3,
+        description="Maximum retries for search requests on transient errors.",
     )
-    min_wait_seconds: PositiveFloat = Field(
-        description="Minimum wait time in seconds for search exponential backoff.",
-        default=5.0,
+    backoff: BackoffSettings = Field(
+        default_factory=lambda: BackoffSettings(
+            minwait=timedelta(seconds=5),
+            maxwait=timedelta(seconds=60),
+        ),
+        description="Exponential backoff settings for search retries.",
     )
-    max_wait_seconds: PositiveFloat = Field(
-        description="Maximum wait time in seconds for search exponential backoff.",
-        default=60.0,
-    )
-    multiplier: PositiveFloat = Field(
-        description="Exponential backoff multiplier for search retries.",
-        default=2.0,
-    )
+
+    @model_validator(mode="after")
+    def _apply_env_fallbacks(self) -> Self:
+        """Populates unprefixed standard search API keys from environment variables or .env when unset.
+
+        Returns:
+            Self: Validated instance.
+        """
+        if self.tinyfishkey is None and (val := _get_env_value("TINYFISH_API_KEY")):
+            self.tinyfishkey = SecretStr(val)
+        if self.langsearchkey is None and (val := _get_env_value("LANGSEARCH_API_KEY")):
+            self.langsearchkey = SecretStr(val)
+        if self.ollamakey is None and (val := _get_env_value("OLLAMA_API_KEY")):
+            self.ollamakey = SecretStr(val)
+        return self
 
     def get_key_for_provider(self, provider_name: str) -> SecretStr | None:
         """Resolves the API key for a specific search provider.
@@ -336,512 +457,168 @@ class SearchSettings(YamlFileSettings):
         """
         p = provider_name.strip().lower()
         if p == "tinyfish":
-            return self.tinyfish_key or self.key
+            return self.tinyfishkey
         if p == "langsearch":
-            return self.langsearch_key or self.key
+            return self.langsearchkey
         if p == "ollama":
-            return self.ollama_key or self.key
-        return self.key
+            return self.ollamakey
+        return None
 
-    @model_validator(mode="after")
-    def _validate_tools_list(self) -> Self:
-        """Validates that configured search tools are supported.
+    def validate_required_keys(self, tools: Sequence[str] | None = None, env_prefix: str = "AISUB") -> None:
+        """Ensures API keys are present for configured search providers that require authentication.
 
-        Returns:
-            Self: Validated instance.
+        Args:
+            tools: Optional subset of tool names to validate. Defaults to self.tools.
+            env_prefix: Environment variable prefix for error messages (e.g. 'AISUB' or 'AISUBWORKER').
 
         Raises:
-            ValueError: If an unknown search tool is specified.
+            ValueError: If a required search API key is missing or blank.
         """
-        valid_tools = {"builtin", "duckduckgo", "ollama", "langsearch", "tinyfish", "lrclib"}
-        for t in self.tools:
-            if t.lower() not in valid_tools:
-                raise ValueError(f"Unknown search provider '{t}'. Supported providers: {sorted(valid_tools)}")
-        return self
+        for tool in tools if tools is not None else self.tools:
+            clean = tool.strip().lower()
+            if clean in ("ollama", "langsearch", "tinyfish"):
+                key = self.get_key_for_provider(clean)
+                if key is None or not key.get_secret_value().strip():
+                    raise ValueError(
+                        f"A search API key must be provided for '{clean}' via 'ai.search.{clean}key', "
+                        f"'{env_prefix}_AI_SEARCH_{clean.upper()}KEY', or the "
+                        f"{clean.upper()}_API_KEY environment variable."
+                    )
 
 
-class SummaryReEncodeSettings(YamlFileSettings):
-    """Re-encoding configuration for the whole-video summary proxy."""
+class FallbackSettings(BaseConfigModel):
+    """Fallback FPS step-down rules triggered after repeated non-retryable failures."""
 
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_REENCODE_SUMMARY_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
+    attempts: NonNegativeInt = Field(
+        default=5,
+        description="Number of fallback FPS re-encoding tiers (0 disables fallback re-encoding).",
+    )
+    multiplier: Annotated[float, Gt(1.0)] = Field(
+        default=2.0,
+        description="Divisor multiplier applied per tier (base_fps / multiplier ** tier).",
     )
 
-    enabled: bool = Field(
-        default=True,
-        description="Whether whole-video proxy re-encoding is enabled.",
+
+class StageReencodeSettings(BaseConfigModel):
+    """Re-encoding configuration for a specific pipeline stage (summary or segment)."""
+
+    threshold: Annotated[ByteSize, Ge(0)] = Field(
+        default=ByteSize(0),
+        description="Minimum file size triggering initial re-encoding (0 disables initial re-encoding).",
     )
-    threshold_mb: NonNegativeInt = Field(
-        default=300,
-        description="File size threshold in MB above which the full video is compressed. 0 compresses unconditionally.",
-    )
-    keyframe_only: bool = Field(
-        default=True,
-        description="Whether to decode only keyframes from the input video for faster summary proxy re-encoding.",
-    )
-    fps: PositiveFloat = Field(
+    fps: PositiveFloat | Literal["keyframes"] = Field(
         default=1.0,
-        description="Target framerate (FPS) for the summary proxy video.",
-    )
-    fallback_fps: FloatList = Field(
-        default_factory=list,
-        description=(
-            "Ordered fallback FPS tiers used to re-encode summary media after repeated non-retryable failures."
-        ),
+        description="Target framerate in FPS, or 'keyframes' to extract native keyframes only.",
     )
     height: PositiveInt = Field(
         default=360,
         description="Target resolution height in pixels (aspect ratio is preserved).",
     )
-    bitrate_kb: PositiveInt = Field(
-        default=35,
-        description="Target video bitrate in Kilobytes per second (KB/s).",
+    bitrate: Annotated[ByteSize, Gt(0)] = Field(
+        default=ByteSize(35_000),
+        description="Target video bitrate in bytes per second (e.g. '35KB' = 280 kbps).",
     )
-    duration_tolerance_ms: NonNegativeInt = Field(
-        default=100,
-        description="Allowed duration divergence in milliseconds for summary proxy output.",
+    tolerance: Annotated[timedelta, Ge(timedelta(0))] = Field(
+        default=timedelta(milliseconds=100),
+        description="Allowed duration divergence for re-encoded output (seconds if numeric).",
     )
-
-
-class SegmentReEncodeSettings(YamlFileSettings):
-    """Re-encoding configuration for individual video chunk segments."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_REENCODE_SEGMENT_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
-    )
-
-    enabled: bool = Field(
-        default=False,
-        description="Whether segment re-encoding is enabled.",
-    )
-    threshold_mb: NonNegativeInt = Field(
-        default=20,
-        description="File size threshold in MB above which chunks are compressed. 0 compresses unconditionally.",
-    )
-    keyframe_only: bool = Field(
-        default=False,
-        description="Whether to decode only keyframes from the input video for segment chunk re-encoding.",
-    )
-    fps: PositiveFloat = Field(
-        default=1.0,
-        description="Target framerate (FPS) for compressed segment chunks.",
-    )
-    fallback_fps: FloatList = Field(
-        default_factory=list,
-        description=(
-            "Ordered fallback FPS tiers used to re-encode video segments after repeated non-retryable failures."
-        ),
-    )
-    height: PositiveInt = Field(
-        default=360,
-        description="Target resolution height in pixels (aspect ratio is preserved).",
-    )
-    bitrate_kb: PositiveInt = Field(
-        default=35,
-        description="Target video bitrate in Kilobytes per second (KB/s).",
-    )
-    duration_tolerance_ms: NonNegativeInt = Field(
-        default=100,
-        description="Allowed duration divergence in milliseconds for re-encoded chunk output.",
+    fallback: FallbackSettings = Field(
+        default_factory=FallbackSettings,
+        description="Fallback FPS step-down configuration.",
     )
 
 
-class ReEncodeSettings(YamlFileSettings):
+class ReencodeSettings(BaseConfigModel):
     """Configuration for FFmpeg video re-encoding across pipeline stages."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_REENCODE_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
-    )
 
     encoder: str | None = Field(
         default=None,
         description="Specific H.264 encoder to use (e.g., 'h264_nvenc', 'libx264'). Auto-detected if null.",
     )
-    summary: SummaryReEncodeSettings = Field(
+    summary: StageReencodeSettings = Field(
+        default_factory=lambda: StageReencodeSettings(
+            threshold=ByteSize(300_000_000),
+            fps="keyframes",
+        ),
         description="Re-encoding rules for the whole-video summary proxy.",
-        default_factory=SummaryReEncodeSettings,
     )
-    segment: SegmentReEncodeSettings = Field(
+    segment: StageReencodeSettings = Field(
+        default_factory=lambda: StageReencodeSettings(
+            threshold=ByteSize(0),
+            fps=1.0,
+        ),
         description="Re-encoding rules for individual video chunk segments.",
-        default_factory=SegmentReEncodeSettings,
     )
 
 
-class SplittingSettings(YamlFileSettings):
+class SplittingSettings(BaseConfigModel):
     """Configuration for splitting input videos into uniform segments."""
 
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_SPLIT_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
+    duration: Annotated[timedelta, Gt(timedelta(0))] = Field(
+        default=timedelta(seconds=300),
+        description="Maximum duration for each video chunk (seconds if numeric).",
     )
-
-    max_seconds: PositiveInt = Field(
-        description="Maximum duration in seconds for each video chunk.",
-        default=300,
+    offset: Annotated[timedelta, Ge(timedelta(0))] = Field(
+        default=timedelta(0),
+        description="Duration to skip from the beginning of the video (0 disables; seconds if numeric).",
     )
-    start_offset_min: NonNegativeInt = Field(
-        description="Duration in minutes to skip from the beginning of the video.",
-        default=0,
-    )
-    duration_tolerance_ms: NonNegativeInt = Field(
-        description="Maximum allowed duration variance in milliseconds per segment during split validation.",
-        default=100,
+    tolerance: Annotated[timedelta, Ge(timedelta(0))] = Field(
+        default=timedelta(milliseconds=100),
+        description="Maximum allowed duration variance per segment during split validation (seconds if numeric).",
     )
 
 
-class ConcurrencySettings(YamlFileSettings):
-    """Concurrency settings controlling parallel worker tasks in standalone mode."""
+class StageExecutionConfig(BaseConfigModel):
+    """Per-stage model, tier, and agentic execution configuration."""
 
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_CONCURRENCY_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
+    model: str = Field(description="Gemini model identifier (e.g. 'gemini-3.8-flash').")
+    tier: ServiceTier | None = Field(
+        default=None,
+        description="Optional Google Gemini service tier.",
     )
-
-    re_encode: PositiveInt = Field(
-        description="Number of concurrent FFmpeg compression processes.",
-        default=2,
-    )
-    summary: NonNegativeInt = Field(
-        description="Number of concurrent summary tasks. Set to 0 to skip whole-video summary.",
-        default=1,
-    )
-    subtitles: PositiveInt = Field(
-        description="Number of concurrent subtitle generation tasks.",
-        default=4,
-    )
-    lyrics: NonNegativeInt = Field(
-        description="Number of concurrent lyrics refinement tasks. Set to 0 to skip lyrics lookup.",
-        default=4,
-    )
-
-
-class RetrySettings(YamlFileSettings):
-    """Retry parameters for transient API failures and server worker attempt limits."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_RETRY_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
-    )
-
-    per_run: NonNegativeInt = Field(
-        description="Maximum internal retries by the executor on retryable or schema failures.",
-        default=5,
-    )
-    max_runs: PositiveInt = Field(
-        description=(
-            "Maximum non-retryable worker failure attempts per FPS tier before fallback or exhaustion (server mode)."
-        ),
-        default=3,
-    )
-    multiplier: PositiveFloat = Field(
-        description="Exponential backoff multiplier between retry attempts.",
-        default=2.0,
-    )
-    min_wait_seconds: PositiveFloat = Field(
-        description="Minimum backoff wait time in seconds.",
-        default=30.0,
-    )
-    max_wait_seconds: PositiveInt = Field(
-        description="Maximum backoff wait time in seconds.",
-        default=300,
-    )
-
-
-class DirectorySettings(YamlFileSettings):
-    """Configuration for working directories."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_DIR_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
-    )
-
-    tmp: Path = Field(
-        description="Temporary directory for intermediate segments and state files.",
-        default=Path("tmp_input_video_file"),
-    )
-    out: Path = Field(
-        description="Output directory for generated subtitle files.",
-        default=Path("directory_of_input_file"),
-    )
-
-
-class LoggingSettings(YamlFileSettings):
-    """Telemetry and console logging configuration."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_LOG_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
-    )
-
-    level: LevelName = Field(
-        description="Minimum log level to output.",
-        default="info",
-    )
-    timestamps: bool = Field(
-        description="Whether to prefix console log lines with timestamps.",
+    agentic: bool = Field(
         default=False,
-    )
-    scrub: bool = Field(
-        description="Whether to scrub sensitive API keys and secrets from logs.",
-        default=True,
-    )
-    progress: bool = Field(
-        description="Whether to display live Rich progress bars.",
-        default=True,
+        description="Whether to enable agentic video understanding for this stage.",
     )
 
 
-class AiSettings(YamlFileSettings):
-    """Configuration for Google Gemini models and rate limiting."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="AISUB_AI_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
-    )
+class AiSettings(BaseConfigModel):
+    """Configuration for the Google Gemini execution engine, rate limits, storage, and search."""
 
     key: SecretStr | None = Field(
+        default=None,
         description="Google Gemini API key.",
-        default=None,
-        validation_alias=AliasChoices("AISUB_AI_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"),
     )
-    base_url: HttpUrl | None = Field(
+    baseurl: HttpUrl | None = Field(
+        default=None,
         description="Optional custom base URL or proxy for Google Gemini API calls.",
-        default=None,
-        validation_alias=AliasChoices("AISUB_AI_BASE_URL", "GEMINI_BASE_URL"),
-    )
-    model_summary: str = Field(
-        description="AI model for whole-video summary, entity extraction, and chapter indexing.",
-        default="google-gla:gemini-3.5-flash-lite",
-    )
-    model_subtitles: str = Field(
-        description="AI model for audio-visual subtitle transcription and alignment.",
-        default="google-gla:gemini-3.8-flash",
-    )
-    model_lyrics: str = Field(
-        description="AI model for musical lyrics search and refinement with agentic video inspection.",
-        default="google-gla:gemini-3.5-flash-lite",
-    )
-    service_tier_summary: ServiceTier | None = Field(
-        default=None,
-        description="Google Gemini service tier for whole-video summary.",
-    )
-    service_tier_subtitles: ServiceTier | None = Field(
-        default=None,
-        description="Google Gemini service tier for subtitle generation.",
-    )
-    service_tier_lyrics: ServiceTier | None = Field(
-        default=None,
-        description="Google Gemini service tier for lyrics refinement.",
-    )
-    agentic_video_summary: bool = Field(
-        default=True,
-        description="Whether to use agentic video understanding for whole-video summary.",
-    )
-    agentic_video_subtitles: bool = Field(
-        default=False,
-        description="Whether to use agentic video understanding for subtitle generation.",
-    )
-    agentic_video_lyrics: bool = Field(
-        default=True,
-        description="Whether to use agentic video understanding for lyrics refinement.",
     )
     rpm: PositiveInt = Field(
-        description="Maximum Requests Per Minute (RPM) allowed for the model.",
         default=4,
+        description="Maximum Requests Per Minute (RPM) allowed per model.",
     )
     tpm: PositiveInt = Field(
-        description="Maximum Tokens Per Minute (TPM) allowed for the model.",
         default=250000,
-    )
-    validation_buffer_ms: NonNegativeInt = Field(
-        description="Allowed tolerance buffer in milliseconds for timestamps exceeding segment duration.",
-        default=2000,
+        description="Maximum Tokens Per Minute (TPM) allowed per model.",
     )
     storage: StorageSettings = Field(
-        description="Files API storage thresholds and cleanup rules.",
         default_factory=StorageSettings,
+        description="Files API storage thresholds and cleanup rules.",
     )
     search: SearchSettings = Field(
-        description="Web search configuration for lyrics and metadata retrieval.",
         default_factory=SearchSettings,
+        description="Web search configuration for lyrics and metadata retrieval.",
     )
 
     @model_validator(mode="after")
-    def _validate_models(self) -> Self:
-        """Validates required provider prefixes for models.
+    def _apply_env_fallbacks(self) -> Self:
+        """Populates unprefixed Gemini API key and base URL from environment variables or .env when unset.
 
         Returns:
-            Self: The validated instance.
-
-        Raises:
-            ValueError: If a model identifier does not start with 'google-gla:'.
+            Self: Validated instance.
         """
-        for field_name, model_val in (
-            ("model_summary", self.model_summary),
-            ("model_lyrics", self.model_lyrics),
-            ("model_subtitles", self.model_subtitles),
-        ):
-            if not model_val.lower().startswith("google-gla:"):
-                raise ValueError(
-                    f"Invalid model '{model_val}' for '{field_name}'. "
-                    "Model identifier must start with 'google-gla:' (e.g., 'google-gla:gemini-3.8-flash')."
-                )
-        return self
-
-
-class Settings(YamlFileSettings):
-    """Root standalone application configuration model."""
-
-    model_config = SettingsConfigDict(
-        nested_model_default_partial_update=True,
-        cli_avoid_json=True,
-        cli_kebab_case=True,
-        env_prefix="AISUB_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
-    )
-
-    ai: AiSettings = Field(
-        description="AI models, quotas, storage, and search settings.",
-        default_factory=AiSettings,
-    )
-    reencode: ReEncodeSettings = Field(
-        description="Video re-encoding and compression parameters.",
-        default_factory=ReEncodeSettings,
-    )
-    split: SplittingSettings = Field(
-        description="Video segmentation parameters.",
-        default_factory=SplittingSettings,
-    )
-    concurrency: ConcurrencySettings = Field(
-        description="Local concurrency limits.",
-        default_factory=ConcurrencySettings,
-    )
-    retry: RetrySettings = Field(
-        description="Retry policy parameters.",
-        default_factory=RetrySettings,
-    )
-    dir: DirectorySettings = Field(
-        description="Input and output directory paths.",
-        default_factory=DirectorySettings,
-    )
-    log: LoggingSettings = Field(
-        description="Telemetry and logging controls.",
-        default_factory=LoggingSettings,
-    )
-    context: str | None = Field(
-        default=None,
-        description="Inline text providing background context, speaker names, or translation preferences.",
-    )
-    context_file: FilePath | None = Field(
-        default=None,
-        description="Path to a text file containing user background context.",
-    )
-    input_video_file: CliPositionalArg[FilePath] = Field(
-        description="Path to the video file to transcribe and subtitle.",
-    )
-
-    def get_resolved_user_context(self) -> str | None:
-        """Reads and merges context from context_file and inline context if provided.
-
-        Returns:
-            str | None: Combined user context string or None.
-
-        Raises:
-            ValueError: If context_file cannot be read.
-        """
-        parts: list[str] = []
-        if self.context_file is not None:
-            try:
-                content = self.context_file.read_text(encoding="utf-8").strip()
-                if content:
-                    parts.append(content)
-            except (OSError, UnicodeDecodeError) as e:
-                raise ValueError(f"Could not read context file '{self.context_file}': {e}") from e
-
-        if self.context is not None and self.context.strip():
-            parts.append(self.context.strip())
-
-        return "\n\n".join(parts) if parts else None
-
-    @model_validator(mode="after")
-    def _validate_api_keys(self) -> Self:
-        """Ensures required API keys are configured before pipeline initialization.
-
-        Returns:
-            Self: The validated instance.
-
-        Raises:
-            ValueError: If a required API key is missing.
-        """
-        if self.ai.key is None:
-            raise ValueError(
-                "A Google Gemini API key must be provided via '--ai.key', "
-                "or the GEMINI_API_KEY / GOOGLE_API_KEY environment variables."
-            )
-
-        if self.concurrency.summary > 0 or self.concurrency.lyrics > 0:
-            for tool in self.ai.search.tools:
-                clean_tool = tool.strip().lower()
-                if clean_tool in ("ollama", "langsearch", "tinyfish"):
-                    if self.ai.search.get_key_for_provider(clean_tool) is None:
-                        raise ValueError(
-                            f"A search API key must be provided for '{clean_tool}' via '--ai.search.{clean_tool}-key', "
-                            f"'--ai.search.key', or the {clean_tool.upper()}_API_KEY environment variable."
-                        )
-
-        return self
-
-    @model_validator(mode="after")
-    def _setup_file_locations(self) -> Self:
-        """Resolves input, output, and temporary paths to absolute directory locations.
-
-        Returns:
-            Self: The validated instance.
-        """
-        input_video_path = cast(Path, self.input_video_file).resolve()
-        self.input_video_file = cast(Any, input_video_path)
-
-        if self.dir.out == Path("directory_of_input_file"):
-            self.dir.out = input_video_path.parent
-
-        if self.dir.tmp == Path("tmp_input_video_file"):
-            self.dir.tmp = self.dir.out / f"tmp_{input_video_path.stem}"
-
-        self.dir.out = self.dir.out.resolve()
-        self.dir.tmp = self.dir.tmp.resolve()
-        self.dir.tmp.mkdir(parents=True, exist_ok=True)
-
+        if self.key is None and (val := _get_env_value("GEMINI_API_KEY", "GOOGLE_API_KEY")):
+            self.key = SecretStr(val)
+        if self.baseurl is None and (val := _get_env_value("GEMINI_BASE_URL")):
+            self.baseurl = HttpUrl(val)
         return self

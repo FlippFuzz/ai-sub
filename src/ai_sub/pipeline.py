@@ -3,39 +3,38 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, Self
 
 import logfire
 from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, PositiveFloat
+from pysubs2 import SSAEvent, SSAFile
 
 from ai_sub.config import (
-    ReEncodeSettings,
+    ReencodeSettings,
     RetrySettings,
     SearchSettings,
-    SegmentReEncodeSettings,
-    ServiceTier,
     SplittingSettings,
-    SummaryReEncodeSettings,
+    StageExecutionConfig,
+    StageReencodeSettings,
 )
-from ai_sub.jobs.base import AiJob, BaseJob
-from ai_sub.jobs.lyrics import LyricsAiResponse, LyricsJob
+from ai_sub.jobs.job_base import AiJob, BaseJob
+from ai_sub.jobs.lyrics import LYRICS_PROMPT_VERSION, LyricsAiResponse, LyricsJob
 from ai_sub.jobs.reencode import ReencodeJob
-from ai_sub.jobs.subtitles import SubtitlesAiResponse, SubtitlesJob
-from ai_sub.jobs.summary import SummaryAiResponse, SummaryJob
+from ai_sub.jobs.subtitles import SUBTITLES_PROMPT_VERSION, SubtitlesAiResponse, SubtitlesJob
+from ai_sub.jobs.summary import SUMMARY_PROMPT_VERSION, SummaryAiResponse, SummaryJob
 from ai_sub.protocol import TaskType
-from ai_sub.shortcode import (
-    generate_full_shortcode,
-    generate_lyrics_shortcode,
-    generate_subtitles_shortcode,
-    generate_summary_shortcode,
-)
-from ai_sub.stitching import stitch_subtitles
+from ai_sub.shortcode import generate_full_shortcode, generate_model_shortcode
+from ai_sub.telemetry import get_app_version
 from ai_sub.video import (
+    get_keyframe_fps,
     get_video_duration_ms,
+    get_video_fps,
     is_valid_reencoded_file,
     sanitize_filename,
     split_video,
@@ -52,41 +51,36 @@ class FailureOutcome:
     tier_attempts: int = 0
 
 
-class SummaryState(BaseModel):
-    """Per-unit execution and media state for the Phase 1 whole-video summary."""
+class MediaStageState(BaseModel):
+    """Shared media preparation and FPS fallback state for a summary or segment unit."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    media_ready: bool = Field(default=False, description="Whether summary media is ready for AI inference.")
-    media_path: Path | None = Field(default=None, description="Path to active summary media file.")
-    target_fps: PositiveFloat | None = Field(
+    media_ready: bool = Field(default=False, description="Whether media is ready for AI inference.")
+    media_path: Path | None = Field(default=None, description="Path to active compressed or raw media.")
+    target_fps: PositiveFloat | Literal["keyframes"] | None = Field(
         default=None,
-        description="Target FPS for re-encoding, or None if using raw video.",
+        description="Target FPS or 'keyframes' for re-encoding, or None if using raw media.",
     )
     fallback_tier: NonNegativeInt = Field(default=0, description="Active fallback FPS tier index.")
+
+
+class SummaryState(MediaStageState):
+    """Per-unit execution and media state for the Phase 1 whole-video summary."""
+
     tier_attempts: NonNegativeInt = Field(default=0, description="Non-retryable failures at the current FPS tier.")
     total_attempts: NonNegativeInt = Field(default=0, description="Cumulative attempts across all executions.")
     response: SummaryAiResponse | None = Field(default=None, description="Completed summary response.")
     exhausted: bool = Field(default=False, description="Whether summary exhausted all retries and fallback tiers.")
 
 
-class SegmentState(BaseModel):
+class SegmentState(MediaStageState):
     """Per-unit execution, media, and AI stage state for an individual video chunk."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     index: int = Field(description="Zero-based segment index.")
     raw_path: Path = Field(description="Path to the split uncompressed segment chunk.")
     duration_ms: int = Field(description="Duration of this segment in milliseconds.")
     offset_ms: int = Field(description="Absolute start offset of this segment in milliseconds.")
-
-    media_ready: bool = Field(default=False, description="Whether segment media is ready for AI inference.")
-    media_path: Path | None = Field(default=None, description="Path to active compressed or raw segment media.")
-    target_fps: PositiveFloat | None = Field(
-        default=None,
-        description="Target FPS for re-encoding, or None if using raw segment.",
-    )
-    fallback_tier: NonNegativeInt = Field(default=0, description="Active fallback FPS tier index.")
 
     subtitles_tier_attempts: NonNegativeInt = Field(
         default=0,
@@ -108,27 +102,116 @@ class SegmentState(BaseModel):
     lyrics_exhausted: bool = Field(default=False, description="Whether lyrics exhausted retries.")
 
 
+def _float_fps(val: float | Literal["keyframes"] | None) -> float | None:
+    """Converts a numeric FPS value to float, returning None for 'keyframes' or None.
+
+    Args:
+        val: FPS target value.
+
+    Returns:
+        float | None: Numeric FPS or None.
+    """
+    return float(val) if isinstance(val, (int, float)) else None
+
+
+def _content_dump(model: BaseModel | None) -> dict[str, Any] | None:
+    """Serializes a response model excluding internal reasoning traces for upstream checks.
+
+    Args:
+        model: Pydantic model instance or None.
+
+    Returns:
+        dict[str, Any] | None: Serialized dictionary without 'thoughts', or None.
+    """
+    if model is None:
+        return None
+    return model.model_dump(mode="json", exclude={"thoughts"})
+
+
+def _apply_metadata_header(subs: SSAFile, metadata: dict[str, Any]) -> None:
+    """Inserts a 1ms metadata comment event at index 0 of an SSAFile.
+
+    Shifts any events starting at 0ms forward to 1ms so Event 0 stays cleanly ordered.
+
+    Args:
+        subs: The SSAFile to mutate.
+        metadata: Metadata dictionary to serialize.
+    """
+    for ev in subs:
+        if ev.start < 1:
+            ev.start = 1
+            if ev.end <= ev.start:
+                ev.end = ev.start + 1
+    info_str = json.dumps(metadata, indent=2, ensure_ascii=False).replace("{", "(").replace("}", ")")
+    subs.insert(0, SSAEvent(start=0, end=1, text=info_str))
+
+
 def _resolve_target_fps(
-    current_target: float | None,
-    cfg: SummaryReEncodeSettings | SegmentReEncodeSettings,
+    current_target: float | Literal["keyframes"] | None,
+    fallback_tier: int,
+    cfg: StageReencodeSettings,
     source_path: Path,
-) -> float | None:
+) -> float | Literal["keyframes"] | None:
     """Determines target compression FPS from fallback state or size threshold configuration.
 
     Args:
         current_target: Persisted fallback target FPS if already in fallback, else None.
+        fallback_tier: Active fallback tier index (0 = initial, 1+ = fallback).
         cfg: Re-encoding settings for this stage.
-        source_path: Input media file path to evaluate against threshold_mb.
+        source_path: Input media file path to evaluate against threshold.
 
     Returns:
-        float | None: Target FPS if re-encoding is needed, or None to use raw media.
+        float | Literal["keyframes"] | None: Target FPS or 'keyframes' if re-encoding is needed, or None for raw.
     """
-    if current_target is not None:
+    if fallback_tier > 0 and current_target is not None:
         return current_target
-    file_mb = source_path.stat().st_size / (1024 * 1024)
-    if cfg.enabled and (cfg.threshold_mb == 0 or file_mb >= cfg.threshold_mb):
+    if cfg.threshold > 0 and source_path.stat().st_size >= cfg.threshold:
         return cfg.fps
     return None
+
+
+async def _compute_next_fallback_fps(
+    cfg: StageReencodeSettings,
+    current_tier: int,
+    current_target: float | Literal["keyframes"] | None,
+    existing_media: Path | None,
+    source_path: Path,
+) -> float:
+    """Computes the target FPS for the next fallback re-encoding tier.
+
+    Args:
+        cfg: Stage re-encoding settings containing base FPS and fallback multiplier.
+        current_tier: Current fallback tier index before incrementing.
+        current_target: Active FPS or 'keyframes' target at the current tier.
+        existing_media: Compressed media path from the current tier, if present.
+        source_path: Uncompressed source video path.
+
+    Returns:
+        float: Target FPS for the next fallback tier.
+    """
+    if current_tier > 0 and isinstance(current_target, (int, float)):
+        base_fps = float(current_target)
+    elif cfg.fps == "keyframes":
+        try:
+            if current_target == "keyframes" and existing_media is not None and existing_media.is_file():
+                probed_fps = await get_video_fps(existing_media)
+            else:
+                probed_fps = await get_keyframe_fps(source_path)
+            if probed_fps > 0:
+                base_fps = probed_fps
+            else:
+                logfire.warning(
+                    f"Probed non-positive keyframe rate ({probed_fps}) for {source_path.name}; "
+                    "defaulting base FPS to 1.0."
+                )
+                base_fps = 1.0
+        except Exception as e:
+            logfire.warning(f"Failed to probe keyframe rate for {source_path.name} ({e}); defaulting base FPS to 1.0.")
+            base_fps = 1.0
+    else:
+        base_fps = float(cfg.fps)
+
+    return base_fps / float(cfg.fallback.multiplier)
 
 
 class Pipeline(BaseModel):
@@ -150,62 +233,33 @@ class Pipeline(BaseModel):
     validation_buffer_ms: int = Field(default=2000, description="Timestamp validation tolerance in milliseconds.")
     summary_enabled: bool = Field(default=True, description="Whether whole-video summary stage is enabled.")
     lyrics_enabled: bool = Field(default=True, description="Whether musical lyrics refinement is enabled.")
-    enforce_max_runs: bool = Field(
-        default=True,
-        description="Whether to enforce RetrySettings.max_runs per FPS tier across runs.",
-    )
 
-    summary_model: str = Field(description="Gemini model identifier for summary.")
-    subtitles_model: str = Field(description="Gemini model identifier for subtitles.")
-    lyrics_model: str = Field(description="Gemini model identifier for lyrics.")
-    service_tier_summary: ServiceTier | None = Field(
-        default=None,
-        description="Optional Google Gemini service tier override for summary.",
-    )
-    service_tier_subtitles: ServiceTier | None = Field(
-        default=None,
-        description="Optional Google Gemini service tier override for subtitles.",
-    )
-    service_tier_lyrics: ServiceTier | None = Field(
-        default=None,
-        description="Optional Google Gemini service tier override for lyrics.",
-    )
-    agentic_video_summary: bool = Field(
-        default=True,
-        description="Whether agentic video understanding is enabled for summary.",
-    )
-    agentic_video_subtitles: bool = Field(
-        default=False,
-        description="Whether agentic video understanding is enabled for subtitles.",
-    )
-    agentic_video_lyrics: bool = Field(
-        default=True,
-        description="Whether agentic video understanding is enabled for lyrics.",
-    )
+    summary_config: StageExecutionConfig = Field(description="Model, tier, and agentic config for summary.")
+    subtitles_config: StageExecutionConfig = Field(description="Model, tier, and agentic config for subtitles.")
+    lyrics_config: StageExecutionConfig = Field(description="Model, tier, and agentic config for lyrics.")
 
     summary_shortcode: str = Field(description="Model shortcode for summary.")
-    subtitles_shortcode: str = Field(description="Model shortcode for subtitles.")
-    lyrics_shortcode: str = Field(description="Model shortcode for lyrics.")
+    subtitles_shortcode: str = Field(description="Model lineage shortcode for subtitles.")
+    lyrics_shortcode: str = Field(description="Model lineage shortcode for lyrics.")
     full_shortcode: str = Field(description="Combined full shortcode for final output.")
 
-    reencode_settings: ReEncodeSettings = Field(description="Re-encoding configuration settings.")
+    reencode_settings: ReencodeSettings = Field(description="Re-encoding configuration settings.")
     search_settings: SearchSettings = Field(description="Search configuration settings.")
     split_settings: SplittingSettings = Field(description="Splitting configuration settings.")
     retry_settings: RetrySettings = Field(description="Retry configuration settings.")
 
-    initial_offset_ms: int = Field(default=0, description="Initial start offset in milliseconds from start_offset_min.")
+    initial_offset_ms: int = Field(default=0, description="Initial start offset in milliseconds from split.offset.")
     summary: SummaryState = Field(default_factory=SummaryState, description="Whole-video summary unit state.")
     segments: list[SegmentState] = Field(default_factory=list, description="Ordered per-segment state machines.")
 
     @property
     def summary_aborted(self) -> bool:
-        """Whether the summary stage permanently failed and aborted pipeline execution."""
-        return self.summary_enabled and self.summary.exhausted
+        """Whether the summary stage permanently failed and aborted pipeline execution.
 
-    @property
-    def _effective_max_runs(self) -> int:
-        """Maximum non-retryable failures per FPS tier before fallback or exhaustion."""
-        return self.retry_settings.max_runs if self.enforce_max_runs else 1
+        Returns:
+            bool: True if summary is enabled and exhausted all retries, False otherwise.
+        """
+        return self.summary_enabled and self.summary.exhausted
 
     @classmethod
     async def create(
@@ -214,10 +268,10 @@ class Pipeline(BaseModel):
         job_dir: Path,
         title: str,
         uploader: str,
-        summary_model: str,
-        subtitles_model: str,
-        lyrics_model: str,
-        reencode_settings: ReEncodeSettings,
+        summary_config: StageExecutionConfig,
+        subtitles_config: StageExecutionConfig,
+        lyrics_config: StageExecutionConfig,
+        reencode_settings: ReencodeSettings,
         search_settings: SearchSettings,
         split_settings: SplittingSettings,
         retry_settings: RetrySettings,
@@ -229,13 +283,6 @@ class Pipeline(BaseModel):
         validation_buffer_ms: int = 2000,
         summary_enabled: bool = True,
         lyrics_enabled: bool = True,
-        enforce_max_runs: bool = True,
-        service_tier_summary: ServiceTier | None = None,
-        service_tier_subtitles: ServiceTier | None = None,
-        service_tier_lyrics: ServiceTier | None = None,
-        agentic_video_summary: bool = True,
-        agentic_video_subtitles: bool = False,
-        agentic_video_lyrics: bool = True,
     ) -> Self:
         """Asynchronously initializes the pipeline, probes media, splits segments, and resumes checkpoints.
 
@@ -247,9 +294,9 @@ class Pipeline(BaseModel):
             job_dir: Working directory containing state files and segments for this video.
             title: Display title of the video.
             uploader: Channel or uploader identifier.
-            summary_model: Gemini model identifier for summary.
-            subtitles_model: Gemini model identifier for subtitles.
-            lyrics_model: Gemini model identifier for lyrics.
+            summary_config: Summary stage model, tier, and agentic configuration.
+            subtitles_config: Subtitles stage model, tier, and agentic configuration.
+            lyrics_config: Lyrics stage model, tier, and agentic configuration.
             reencode_settings: Re-encoding configuration settings.
             search_settings: Search configuration settings.
             split_settings: Splitting configuration settings.
@@ -262,20 +309,13 @@ class Pipeline(BaseModel):
             validation_buffer_ms: Timestamp validation tolerance in milliseconds. Defaults to 2000.
             summary_enabled: Whether the whole-video summary stage is enabled. Defaults to True.
             lyrics_enabled: Whether musical lyrics refinement is enabled. Defaults to True.
-            enforce_max_runs: Whether to enforce RetrySettings.max_runs per FPS tier across runs. Defaults to True.
-            service_tier_summary: Optional Google Gemini service tier override for summary. Defaults to None.
-            service_tier_subtitles: Optional Google Gemini service tier override for subtitles. Defaults to None.
-            service_tier_lyrics: Optional Google Gemini service tier override for lyrics. Defaults to None.
-            agentic_video_summary: Whether agentic video is enabled for summary. Defaults to True.
-            agentic_video_subtitles: Whether agentic video is enabled for subtitles. Defaults to False.
-            agentic_video_lyrics: Whether agentic video is enabled for lyrics. Defaults to True.
 
         Returns:
             Pipeline: Initialized pipeline instance with media prepared and checkpoints loaded.
 
         Raises:
             RuntimeError: If no video segments could be created.
-            ValueError: If start_offset_min exceeds the total video duration.
+            ValueError: If split offset exceeds the total video duration.
         """
         raw_resolved = raw_video_path.resolve()
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -288,33 +328,35 @@ class Pipeline(BaseModel):
         total_duration_ms = await get_video_duration_ms(raw_resolved)
 
         # 2. Split video into uniform segments
+        split_duration_s = max(1, int(split_settings.duration.total_seconds()))
+        split_tolerance_ms = int(split_settings.tolerance.total_seconds() * 1000)
         all_segments = await split_video(
             input_video=raw_resolved,
             output_dir=job_dir,
-            split_duration_s=split_settings.max_seconds,
+            split_duration_s=split_duration_s,
             output_pattern="part_%03d",
-            duration_tolerance_ms=split_settings.duration_tolerance_ms,
+            duration_tolerance_ms=split_tolerance_ms,
         )
         if not all_segments:
             raise RuntimeError(f"No video segments produced for {raw_resolved.name}.")
 
         all_durations = await asyncio.gather(*(get_video_duration_ms(p) for p in all_segments))
 
-        # 3. Apply start_offset_min using actual durations of skipped segments
-        if split_settings.start_offset_min > 0:
-            start_offset_s = split_settings.start_offset_min * 60
-            skip_count = start_offset_s // split_settings.max_seconds
+        # 3. Apply start offset using actual durations of skipped segments
+        start_offset_s = int(split_settings.offset.total_seconds())
+        if start_offset_s > 0:
+            skip_count = start_offset_s // split_duration_s
             if skip_count >= len(all_segments):
                 raise ValueError(
-                    f"start_offset_min ({split_settings.start_offset_min}m) exceeds or equals total "
-                    f"video duration ({total_duration_ms / 60000:.1f}m)."
+                    f"split.offset ({start_offset_s}s) exceeds or equals total "
+                    f"video duration ({total_duration_ms / 1000:.1f}s)."
                 )
             initial_offset_ms = sum(all_durations[:skip_count])
             segment_paths = all_segments[skip_count:]
             segment_durations_ms = all_durations[skip_count:]
             logfire.info(
                 f"Skipping first {skip_count} segment(s) ({initial_offset_ms / 60000:.1f}m) "
-                f"due to start_offset_min={split_settings.start_offset_min}."
+                f"due to split.offset={start_offset_s}s."
             )
         else:
             initial_offset_ms = 0
@@ -336,16 +378,11 @@ class Pipeline(BaseModel):
             current_offset_ms += seg_dur_ms
 
         # 5. Generate shortcodes
-        summary_shortcode = generate_summary_shortcode(summary_model) if summary_enabled else ""
-        subtitles_shortcode = generate_subtitles_shortcode(
-            model_name=subtitles_model,
-            summary_shortcode=summary_shortcode if summary_enabled else None,
-        )
-        lyrics_shortcode = generate_lyrics_shortcode(
-            lyrics_model_name=lyrics_model,
-            subtitles_shortcode=subtitles_shortcode,
-        )
-        full_shortcode = generate_full_shortcode(subtitles_model)
+        summary_shortcode = generate_model_shortcode(summary_config.model) if summary_enabled else ""
+        subtitles_code = generate_model_shortcode(subtitles_config.model)
+        subtitles_shortcode = f"{summary_shortcode}-{subtitles_code}" if summary_enabled else subtitles_code
+        lyrics_shortcode = f"{subtitles_shortcode}-{generate_model_shortcode(lyrics_config.model)}"
+        full_shortcode = generate_full_shortcode(subtitles_config.model)
 
         instance = cls(
             raw_video_path=raw_resolved,
@@ -362,16 +399,9 @@ class Pipeline(BaseModel):
             validation_buffer_ms=validation_buffer_ms,
             summary_enabled=summary_enabled,
             lyrics_enabled=lyrics_enabled,
-            enforce_max_runs=enforce_max_runs,
-            summary_model=summary_model,
-            subtitles_model=subtitles_model,
-            lyrics_model=lyrics_model,
-            service_tier_summary=service_tier_summary,
-            service_tier_subtitles=service_tier_subtitles,
-            service_tier_lyrics=service_tier_lyrics,
-            agentic_video_summary=agentic_video_summary,
-            agentic_video_subtitles=agentic_video_subtitles,
-            agentic_video_lyrics=agentic_video_lyrics,
+            summary_config=summary_config,
+            subtitles_config=subtitles_config,
+            lyrics_config=lyrics_config,
             summary_shortcode=summary_shortcode,
             subtitles_shortcode=subtitles_shortcode,
             lyrics_shortcode=lyrics_shortcode,
@@ -389,34 +419,41 @@ class Pipeline(BaseModel):
         await instance._prepare_media_states()
         return instance
 
-    def _restore_failure_state(self, job: AiJob, fallback_count: int) -> tuple[int, int, float | None, bool]:
+    def _restore_failure_state(
+        self,
+        job: AiJob,
+        fallback_attempts: int,
+    ) -> tuple[int, int, float | Literal["keyframes"] | None, bool]:
         """Resolves fallback tier, attempt count, target FPS, and exhaustion from an incomplete checkpoint.
-
-        In standalone mode (enforce_max_runs=False), previously exhausted jobs reset to initial settings
-        so users can re-run freely.
 
         Args:
             job: Loaded incomplete AiJob checkpoint (response is None).
-            fallback_count: Number of configured fallback FPS tiers for this stage.
+            fallback_attempts: Configured fallback tier count for this stage.
 
         Returns:
-            tuple[int, int, float | None, bool]: (fallback_tier, tier_attempts, target_fps, exhausted).
+            tuple[int, int, float | Literal["keyframes"] | None, bool]:
+                (fallback_tier, tier_attempts, target_fps, exhausted).
         """
         was_exhausted = job.exhausted or (
-            job.tier_attempts >= self.retry_settings.max_runs and job.fallback_tier >= fallback_count
+            job.tier_attempts >= self.retry_settings.maxruns and job.fallback_tier >= fallback_attempts
         )
-        if not self.enforce_max_runs and was_exhausted:
-            return 0, 0, None, False
         return job.fallback_tier, job.tier_attempts, job.target_fps, was_exhausted
 
     def _discover_on_disk_state(self) -> None:
         """Inspects job_dir for existing valid YAML checkpoints and restores unit states."""
-        summary_fallbacks = len(self.reencode_settings.summary.fallback_fps)
-        segment_fallbacks = len(self.reencode_settings.segment.fallback_fps)
+        summary_fallbacks = self.reencode_settings.summary.fallback.attempts
+        segment_fallbacks = self.reencode_settings.segment.fallback.attempts
 
         if self.summary_enabled:
             summary_file = self.job_dir / f"summary.{self.summary_shortcode}.yaml"
             loaded_summary = SummaryJob.load(summary_file, self.validation_buffer_ms)
+            if loaded_summary and loaded_summary.model_name != self.summary_config.model:
+                logfire.info(
+                    f"Model mismatch for summary (file: {loaded_summary.model_name}, "
+                    f"current: {self.summary_config.model}). Re-processing."
+                )
+                loaded_summary = None
+
             if loaded_summary:
                 self.summary.total_attempts = loaded_summary.total_attempts
                 if loaded_summary.response is not None:
@@ -434,10 +471,25 @@ class Pipeline(BaseModel):
                     if exhausted:
                         logfire.warning("Summary stage previously exhausted all retries and fallback tiers.")
 
+            # Downstream subtitles and lyrics are invalid until the current summary completes.
+            if self.summary.response is None:
+                return
+
+        expected_summary_dump = _content_dump(self.summary.response) if self.summary_enabled else None
+
         for seg in self.segments:
             sub_file = self.job_dir / f"{seg.raw_path.stem}.subtitles.{self.subtitles_shortcode}.yaml"
             loaded_sub = SubtitlesJob.load(sub_file, self.validation_buffer_ms)
             if not loaded_sub:
+                continue
+            if loaded_sub.model_name != self.subtitles_config.model:
+                logfire.info(
+                    f"Model mismatch for {seg.raw_path.stem} subtitles "
+                    f"(file: {loaded_sub.model_name}, current: {self.subtitles_config.model}). Re-processing."
+                )
+                continue
+            if self.summary_enabled and _content_dump(loaded_sub.global_summary) != expected_summary_dump:
+                logfire.info(f"Upstream summary changed for {seg.raw_path.stem}. Re-processing subtitles.")
                 continue
 
             seg.subtitles_total_attempts = loaded_sub.total_attempts
@@ -450,15 +502,32 @@ class Pipeline(BaseModel):
                 if self.lyrics_enabled and loaded_sub.response.detected_musical_performances:
                     lyr_file = self.job_dir / f"{seg.raw_path.stem}.lyrics.{self.lyrics_shortcode}.yaml"
                     loaded_lyr = LyricsJob.load(lyr_file, self.validation_buffer_ms)
-                    if loaded_lyr:
-                        seg.lyrics_total_attempts = loaded_lyr.total_attempts
-                        if loaded_lyr.response is not None:
-                            seg.lyrics_response = loaded_lyr.response
-                            seg.lyrics_tier_attempts = loaded_lyr.tier_attempts
-                        else:
-                            _, attempts, _, exhausted = self._restore_failure_state(loaded_lyr, 0)
-                            seg.lyrics_tier_attempts = attempts
-                            seg.lyrics_exhausted = exhausted
+                    if not loaded_lyr:
+                        continue
+                    if loaded_lyr.model_name != self.lyrics_config.model:
+                        logfire.info(
+                            f"Model mismatch for {seg.raw_path.stem} lyrics "
+                            f"(file: {loaded_lyr.model_name}, current: {self.lyrics_config.model}). Re-processing."
+                        )
+                        continue
+                    if (
+                        loaded_lyr.draft_subtitles != loaded_sub.response.subtitles
+                        or loaded_lyr.detected_performances != loaded_sub.response.detected_musical_performances
+                        or (self.summary_enabled and _content_dump(loaded_lyr.global_summary) != expected_summary_dump)
+                    ):
+                        logfire.info(
+                            f"Upstream subtitles or summary changed for {seg.raw_path.stem}. Re-processing lyrics."
+                        )
+                        continue
+
+                    seg.lyrics_total_attempts = loaded_lyr.total_attempts
+                    if loaded_lyr.response is not None:
+                        seg.lyrics_response = loaded_lyr.response
+                        seg.lyrics_tier_attempts = loaded_lyr.tier_attempts
+                    else:
+                        _, attempts, _, exhausted = self._restore_failure_state(loaded_lyr, 0)
+                        seg.lyrics_tier_attempts = attempts
+                        seg.lyrics_exhausted = exhausted
             else:
                 tier, attempts, fps, exhausted = self._restore_failure_state(loaded_sub, segment_fallbacks)
                 seg.fallback_tier = tier
@@ -487,7 +556,7 @@ class Pipeline(BaseModel):
         self,
         source_path: Path,
         encoded_path: Path,
-        fps: float,
+        fps: float | Literal["keyframes"],
         duration_tolerance_ms: int,
     ) -> tuple[Path | None, bool]:
         """Validates an existing compressed file on disk against expected duration and FPS.
@@ -495,7 +564,7 @@ class Pipeline(BaseModel):
         Args:
             source_path: Uncompressed source file path.
             encoded_path: Candidate re-encoded file path.
-            fps: Expected target framerate.
+            fps: Expected target framerate or 'keyframes'.
             duration_tolerance_ms: Allowed duration tolerance in milliseconds.
 
         Returns:
@@ -517,7 +586,12 @@ class Pipeline(BaseModel):
                 self.summary.media_ready = True
             else:
                 sum_cfg = self.reencode_settings.summary
-                desired_sum_fps = _resolve_target_fps(self.summary.target_fps, sum_cfg, self.raw_video_path)
+                desired_sum_fps = _resolve_target_fps(
+                    self.summary.target_fps,
+                    self.summary.fallback_tier,
+                    sum_cfg,
+                    self.raw_video_path,
+                )
                 self.summary.target_fps = desired_sum_fps
                 if desired_sum_fps is None:
                     proxy_path = self.job_dir / f"summary_proxy{self.raw_video_path.suffix}"
@@ -546,10 +620,11 @@ class Pipeline(BaseModel):
                         self.raw_video_path,
                         self.job_dir / "summary_proxy.mp4",
                         desired_sum_fps,
-                        sum_cfg.duration_tolerance_ms,
+                        int(sum_cfg.tolerance.total_seconds() * 1000),
                     )
 
         seg_cfg = self.reencode_settings.segment
+        seg_tolerance_ms = int(seg_cfg.tolerance.total_seconds() * 1000)
         reencode_dir = self.job_dir / "reencoded"
         probe_sem = asyncio.Semaphore(8)
 
@@ -561,7 +636,12 @@ class Pipeline(BaseModel):
                     seg.media_ready = True
                     return
 
-                desired_fps = _resolve_target_fps(seg.target_fps, seg_cfg, seg.raw_path)
+                desired_fps = _resolve_target_fps(
+                    seg.target_fps,
+                    seg.fallback_tier,
+                    seg_cfg,
+                    seg.raw_path,
+                )
                 seg.target_fps = desired_fps
                 if desired_fps is None:
                     seg.media_path = seg.raw_path
@@ -571,7 +651,7 @@ class Pipeline(BaseModel):
                         seg.raw_path,
                         out_p,
                         desired_fps,
-                        seg_cfg.duration_tolerance_ms,
+                        seg_tolerance_ms,
                     )
 
         await asyncio.gather(*(_check_segment(seg) for seg in self.segments))
@@ -635,6 +715,93 @@ class Pipeline(BaseModel):
                 return True
         return False
 
+    def _build_summary_job(self) -> SummaryJob:
+        """Constructs a SummaryJob reflecting current summary state and configuration.
+
+        Returns:
+            SummaryJob: Populated SummaryJob instance.
+        """
+        return SummaryJob(
+            name="summary",
+            video_duration_ms=self.duration_ms,
+            user_context=self.user_context,
+            media_path=self.summary.media_path,
+            model_name=self.summary_config.model,
+            service_tier=self.summary_config.tier,
+            agentic_video=self.summary_config.agentic,
+            retry_settings=self.retry_settings,
+            validation_buffer_ms=self.validation_buffer_ms,
+            total_attempts=self.summary.total_attempts,
+            tier_attempts=self.summary.tier_attempts,
+            fallback_tier=self.summary.fallback_tier,
+            target_fps=self.summary.target_fps,
+            exhausted=self.summary.exhausted,
+            response=self.summary.response,
+        )
+
+    def _build_subtitles_job(self, seg: SegmentState) -> SubtitlesJob:
+        """Constructs a SubtitlesJob reflecting current segment subtitles state and configuration.
+
+        Args:
+            seg: Target segment state.
+
+        Returns:
+            SubtitlesJob: Populated SubtitlesJob instance.
+        """
+        return SubtitlesJob(
+            name=seg.raw_path.stem,
+            video_duration_ms=seg.duration_ms,
+            segment_offset_ms=seg.offset_ms,
+            global_summary=self.summary.response,
+            user_context=self.user_context,
+            media_path=seg.media_path,
+            model_name=self.subtitles_config.model,
+            service_tier=self.subtitles_config.tier,
+            agentic_video=self.subtitles_config.agentic,
+            retry_settings=self.retry_settings,
+            validation_buffer_ms=self.validation_buffer_ms,
+            segment_index=seg.index,
+            total_attempts=seg.subtitles_total_attempts,
+            tier_attempts=seg.subtitles_tier_attempts,
+            fallback_tier=seg.fallback_tier,
+            target_fps=seg.target_fps,
+            exhausted=seg.subtitles_exhausted,
+            response=seg.subtitles_response,
+        )
+
+    def _build_lyrics_job(self, seg: SegmentState) -> LyricsJob:
+        """Constructs a LyricsJob reflecting current segment lyrics state and configuration.
+
+        Args:
+            seg: Target segment state.
+
+        Returns:
+            LyricsJob: Populated LyricsJob instance.
+        """
+        sub_resp = seg.subtitles_response
+        return LyricsJob(
+            name=seg.raw_path.stem,
+            video_duration_ms=seg.duration_ms,
+            segment_offset_ms=seg.offset_ms,
+            draft_subtitles=sub_resp.subtitles if sub_resp else [],
+            detected_performances=sub_resp.detected_musical_performances if sub_resp else [],
+            global_summary=self.summary.response,
+            user_context=self.user_context,
+            media_path=seg.media_path,
+            model_name=self.lyrics_config.model,
+            service_tier=self.lyrics_config.tier,
+            agentic_video=self.lyrics_config.agentic,
+            retry_settings=self.retry_settings,
+            validation_buffer_ms=self.validation_buffer_ms,
+            segment_index=seg.index,
+            total_attempts=seg.lyrics_total_attempts,
+            tier_attempts=seg.lyrics_tier_attempts,
+            fallback_tier=seg.fallback_tier,
+            target_fps=seg.target_fps,
+            exhausted=seg.lyrics_exhausted,
+            response=seg.lyrics_response,
+        )
+
     def get_pending_jobs(self) -> list[BaseJob]:
         """Evaluates DAG dependencies and returns all jobs currently ready to execute.
 
@@ -666,10 +833,10 @@ class Pipeline(BaseModel):
                     output_file=self.job_dir / "summary_proxy.mp4",
                     fps=self.summary.target_fps,
                     height=sum_cfg.height,
-                    bitrate_kb=sum_cfg.bitrate_kb,
-                    duration_tolerance_ms=sum_cfg.duration_tolerance_ms,
+                    bitrate=int(sum_cfg.bitrate),
+                    duration_tolerance_ms=int(sum_cfg.tolerance.total_seconds() * 1000),
                     encoder=self.reencode_settings.encoder,
-                    keyframe_only=sum_cfg.keyframe_only,
+                    keyframe_only=sum_cfg.fps == "keyframes",
                     is_summary_proxy=True,
                     fallback_tier=self.summary.fallback_tier,
                 )
@@ -677,6 +844,7 @@ class Pipeline(BaseModel):
 
         # 2. Segment re-encode jobs (Priority 2, normal segment index order)
         seg_cfg = self.reencode_settings.segment
+        seg_tolerance_ms = int(seg_cfg.tolerance.total_seconds() * 1000)
         reencode_dir = self.job_dir / "reencoded"
         for seg in self.segments:
             if not self._is_segment_ai_concluded(seg) and not seg.media_ready and seg.target_fps is not None:
@@ -687,10 +855,10 @@ class Pipeline(BaseModel):
                         output_file=reencode_dir / f"{seg.raw_path.stem}.mp4",
                         fps=seg.target_fps,
                         height=seg_cfg.height,
-                        bitrate_kb=seg_cfg.bitrate_kb,
-                        duration_tolerance_ms=seg_cfg.duration_tolerance_ms,
+                        bitrate=int(seg_cfg.bitrate),
+                        duration_tolerance_ms=seg_tolerance_ms,
                         encoder=self.reencode_settings.encoder,
-                        keyframe_only=seg_cfg.keyframe_only,
+                        keyframe_only=seg_cfg.fps == "keyframes",
                         segment_index=seg.index,
                         is_summary_proxy=False,
                         fallback_tier=seg.fallback_tier,
@@ -700,22 +868,7 @@ class Pipeline(BaseModel):
         # 3. Whole-video Summary AI job
         if self.summary_enabled and self.summary.response is None and not self.summary.exhausted:
             if self.summary.media_ready and self.summary.media_path is not None:
-                jobs.append(
-                    SummaryJob(
-                        name="summary",
-                        video_duration_ms=self.duration_ms,
-                        user_context=self.user_context,
-                        media_path=self.summary.media_path,
-                        model_name=self.summary_model,
-                        service_tier=self.service_tier_summary,
-                        agentic_video=self.agentic_video_summary,
-                        retry_settings=self.retry_settings,
-                        total_attempts=self.summary.total_attempts,
-                        tier_attempts=self.summary.tier_attempts,
-                        fallback_tier=self.summary.fallback_tier,
-                        target_fps=self.summary.target_fps,
-                    )
-                )
+                jobs.append(self._build_summary_job())
             return jobs
 
         # 4. Per-segment Subtitles and Lyrics AI jobs (independent per segment once summary completes)
@@ -724,49 +877,11 @@ class Pipeline(BaseModel):
                 continue
 
             if seg.subtitles_response is None and not seg.subtitles_exhausted:
-                jobs.append(
-                    SubtitlesJob(
-                        name=seg.raw_path.stem,
-                        video_duration_ms=seg.duration_ms,
-                        segment_offset_ms=seg.offset_ms,
-                        global_summary=self.summary.response,
-                        user_context=self.user_context,
-                        media_path=seg.media_path,
-                        model_name=self.subtitles_model,
-                        service_tier=self.service_tier_subtitles,
-                        agentic_video=self.agentic_video_subtitles,
-                        retry_settings=self.retry_settings,
-                        segment_index=seg.index,
-                        total_attempts=seg.subtitles_total_attempts,
-                        tier_attempts=seg.subtitles_tier_attempts,
-                        fallback_tier=seg.fallback_tier,
-                        target_fps=seg.target_fps,
-                    )
-                )
+                jobs.append(self._build_subtitles_job(seg))
             elif self.lyrics_enabled and seg.subtitles_response is not None:
                 sub_resp = seg.subtitles_response
                 if sub_resp.detected_musical_performances and seg.lyrics_response is None and not seg.lyrics_exhausted:
-                    jobs.append(
-                        LyricsJob(
-                            name=seg.raw_path.stem,
-                            video_duration_ms=seg.duration_ms,
-                            segment_offset_ms=seg.offset_ms,
-                            draft_subtitles=sub_resp.subtitles,
-                            detected_performances=sub_resp.detected_musical_performances,
-                            global_summary=self.summary.response,
-                            user_context=self.user_context,
-                            media_path=seg.media_path,
-                            model_name=self.lyrics_model,
-                            service_tier=self.service_tier_lyrics,
-                            agentic_video=self.agentic_video_lyrics,
-                            retry_settings=self.retry_settings,
-                            segment_index=seg.index,
-                            total_attempts=seg.lyrics_total_attempts,
-                            tier_attempts=seg.lyrics_tier_attempts,
-                            fallback_tier=seg.fallback_tier,
-                            target_fps=seg.target_fps,
-                        )
-                    )
+                    jobs.append(self._build_lyrics_job(seg))
 
         return jobs
 
@@ -778,145 +893,95 @@ class Pipeline(BaseModel):
             seg: SegmentState required when task_type is SUBTITLES or LYRICS. Defaults to None.
         """
         if task_type == TaskType.SUMMARY:
-            SummaryJob(
-                name="summary",
-                video_duration_ms=self.duration_ms,
-                user_context=self.user_context,
-                service_tier=self.service_tier_summary,
-                agentic_video=self.agentic_video_summary,
-                total_attempts=self.summary.total_attempts,
-                tier_attempts=self.summary.tier_attempts,
-                fallback_tier=self.summary.fallback_tier,
-                target_fps=self.summary.target_fps,
-                exhausted=self.summary.exhausted,
-                response=self.summary.response,
-            ).save(self.job_dir / f"summary.{self.summary_shortcode}.yaml")
+            self._build_summary_job().save(self.job_dir / f"summary.{self.summary_shortcode}.yaml")
             return
 
         assert seg is not None
         if task_type == TaskType.SUBTITLES:
-            SubtitlesJob(
-                name=seg.raw_path.stem,
-                video_duration_ms=seg.duration_ms,
-                segment_offset_ms=seg.offset_ms,
-                global_summary=self.summary.response,
-                user_context=self.user_context,
-                service_tier=self.service_tier_subtitles,
-                agentic_video=self.agentic_video_subtitles,
-                segment_index=seg.index,
-                total_attempts=seg.subtitles_total_attempts,
-                tier_attempts=seg.subtitles_tier_attempts,
-                fallback_tier=seg.fallback_tier,
-                target_fps=seg.target_fps,
-                exhausted=seg.subtitles_exhausted,
-                response=seg.subtitles_response,
-            ).save(self.job_dir / f"{seg.raw_path.stem}.subtitles.{self.subtitles_shortcode}.yaml")
+            self._build_subtitles_job(seg).save(
+                self.job_dir / f"{seg.raw_path.stem}.subtitles.{self.subtitles_shortcode}.yaml"
+            )
         elif task_type == TaskType.LYRICS:
-            sub_resp = seg.subtitles_response
-            LyricsJob(
-                name=seg.raw_path.stem,
-                video_duration_ms=seg.duration_ms,
-                segment_offset_ms=seg.offset_ms,
-                draft_subtitles=sub_resp.subtitles if sub_resp else [],
-                detected_performances=sub_resp.detected_musical_performances if sub_resp else [],
-                global_summary=self.summary.response,
-                user_context=self.user_context,
-                service_tier=self.service_tier_lyrics,
-                agentic_video=self.agentic_video_lyrics,
-                segment_index=seg.index,
-                total_attempts=seg.lyrics_total_attempts,
-                tier_attempts=seg.lyrics_tier_attempts,
-                fallback_tier=seg.fallback_tier,
-                target_fps=seg.target_fps,
-                exhausted=seg.lyrics_exhausted,
-                response=seg.lyrics_response,
-            ).save(self.job_dir / f"{seg.raw_path.stem}.lyrics.{self.lyrics_shortcode}.yaml")
+            self._build_lyrics_job(seg).save(self.job_dir / f"{seg.raw_path.stem}.lyrics.{self.lyrics_shortcode}.yaml")
 
-    def _advance_or_exhaust_summary(self, log_context: str | None = None) -> FailureOutcome:
-        """Advances summary to the next fallback FPS tier or marks it exhausted, persisting to disk.
+    async def _advance_or_exhaust_stage(
+        self,
+        task_type: TaskType,
+        seg: SegmentState | None = None,
+        log_context: str | None = None,
+    ) -> FailureOutcome:
+        """Advances a stage to the next fallback FPS tier or marks it exhausted, persisting to disk.
 
         Args:
+            task_type: Target AI stage (SUMMARY or SUBTITLES).
+            seg: Target segment state when task_type is SUBTITLES. Defaults to None.
             log_context: Optional failure threshold description to log. Defaults to None.
 
         Returns:
             FailureOutcome: Resulting state transition.
         """
-        fallbacks = self.reencode_settings.summary.fallback_fps
-        if self.summary.fallback_tier < len(fallbacks):
-            self.summary.fallback_tier += 1
-            next_fps = fallbacks[self.summary.fallback_tier - 1]
-            self.summary.target_fps = next_fps
-            self.summary.tier_attempts = 0
-            self.summary.media_path = None
-            self.summary.media_ready = False
-            self._save_checkpoint(TaskType.SUMMARY)
+        is_summary = task_type == TaskType.SUMMARY
+        if is_summary:
+            media_state: MediaStageState = self.summary
+            cfg = self.reencode_settings.summary
+            source_path = self.raw_video_path
+            tier_attempts = self.summary.tier_attempts
+            label = "Summary"
+        else:
+            assert seg is not None
+            media_state = seg
+            cfg = self.reencode_settings.segment
+            source_path = seg.raw_path
+            tier_attempts = seg.subtitles_tier_attempts
+            label = f"Subtitles for '{seg.raw_path.stem}'"
+
+        current_tier = media_state.fallback_tier
+        current_target = media_state.target_fps
+
+        if current_tier < cfg.fallback.attempts:
+            next_fps = await _compute_next_fallback_fps(
+                cfg=cfg,
+                current_tier=current_tier,
+                current_target=current_target,
+                existing_media=media_state.media_path,
+                source_path=source_path,
+            )
+            next_tier = current_tier + 1
+            media_state.fallback_tier = next_tier
+            media_state.target_fps = next_fps
+            media_state.media_path = None
+            media_state.media_ready = False
+            if is_summary:
+                self.summary.tier_attempts = 0
+            else:
+                assert seg is not None
+                seg.subtitles_tier_attempts = 0
+
+            self._save_checkpoint(task_type, seg)
             if log_context:
-                logfire.warning(
-                    f"Summary {log_context}; falling back to {next_fps} fps (tier {self.summary.fallback_tier})."
-                )
+                logfire.warning(f"{label} {log_context}; falling back to {next_fps:.4g} fps (tier {next_tier}).")
             return FailureOutcome(
                 action="fallback_reencode",
-                fallback_tier=self.summary.fallback_tier,
+                fallback_tier=next_tier,
                 target_fps=next_fps,
                 tier_attempts=0,
             )
 
-        self.summary.exhausted = True
-        self._save_checkpoint(TaskType.SUMMARY)
+        if is_summary:
+            self.summary.exhausted = True
+        else:
+            assert seg is not None
+            seg.subtitles_exhausted = True
+
+        self._save_checkpoint(task_type, seg)
         if log_context:
-            logfire.error(
-                f"Summary exhausted all {self._effective_max_runs} attempt(s) across all FPS tiers. Aborting."
-            )
+            suffix = " Aborting." if is_summary else ""
+            logfire.error(f"{label} exhausted all {self.retry_settings.maxruns} run(s) across all FPS tiers.{suffix}")
         return FailureOutcome(
             action="exhausted",
-            fallback_tier=self.summary.fallback_tier,
-            target_fps=self.summary.target_fps,
-            tier_attempts=self.summary.tier_attempts,
-        )
-
-    def _advance_or_exhaust_segment(self, seg: SegmentState, log_context: str | None = None) -> FailureOutcome:
-        """Advances a segment to the next fallback FPS tier or marks subtitles exhausted, persisting to disk.
-
-        Args:
-            seg: Target segment state.
-            log_context: Optional failure threshold description to log. Defaults to None.
-
-        Returns:
-            FailureOutcome: Resulting state transition.
-        """
-        fallbacks = self.reencode_settings.segment.fallback_fps
-        if seg.fallback_tier < len(fallbacks):
-            seg.fallback_tier += 1
-            next_fps = fallbacks[seg.fallback_tier - 1]
-            seg.target_fps = next_fps
-            seg.subtitles_tier_attempts = 0
-            seg.media_path = None
-            seg.media_ready = False
-            self._save_checkpoint(TaskType.SUBTITLES, seg)
-            if log_context:
-                logfire.warning(
-                    f"Subtitles for '{seg.raw_path.stem}' {log_context}; "
-                    f"falling back to {next_fps} fps (tier {seg.fallback_tier})."
-                )
-            return FailureOutcome(
-                action="fallback_reencode",
-                fallback_tier=seg.fallback_tier,
-                target_fps=next_fps,
-                tier_attempts=0,
-            )
-
-        seg.subtitles_exhausted = True
-        self._save_checkpoint(TaskType.SUBTITLES, seg)
-        if log_context:
-            logfire.error(
-                f"Subtitles for '{seg.raw_path.stem}' exhausted all "
-                f"{self._effective_max_runs} attempt(s) across all FPS tiers."
-            )
-        return FailureOutcome(
-            action="exhausted",
-            fallback_tier=seg.fallback_tier,
-            target_fps=seg.target_fps,
-            tier_attempts=seg.subtitles_tier_attempts,
+            fallback_tier=current_tier,
+            target_fps=_float_fps(current_target),
+            tier_attempts=tier_attempts,
         )
 
     def complete_reencode(self, job: ReencodeJob, media_path: Path) -> None:
@@ -926,15 +991,16 @@ class Pipeline(BaseModel):
             job: Completed ReencodeJob instance.
             media_path: Resulting media file path.
         """
-        if job.is_summary_proxy:
-            self.summary.media_path = media_path
-            self.summary.media_ready = True
-        elif job.segment_index is not None:
-            seg = self.segments[job.segment_index]
-            seg.media_path = media_path
-            seg.media_ready = True
+        media_state: MediaStageState | None = (
+            self.summary
+            if job.is_summary_proxy
+            else (self.segments[job.segment_index] if job.segment_index is not None else None)
+        )
+        if media_state is not None:
+            media_state.media_path = media_path
+            media_state.media_ready = True
 
-    def fail_reencode(self, job: ReencodeJob) -> FailureOutcome:
+    async def fail_reencode(self, job: ReencodeJob) -> FailureOutcome:
         """Handles a failed FFmpeg re-encode job.
 
         On initial encoding (fallback_tier == 0), falls back safely to the raw input file.
@@ -947,23 +1013,24 @@ class Pipeline(BaseModel):
         Returns:
             FailureOutcome: Resulting state transition.
         """
+        if job.is_summary_proxy:
+            media_state: MediaStageState = self.summary
+            task_type = TaskType.SUMMARY
+            seg: SegmentState | None = None
+        elif job.segment_index is not None:
+            seg = self.segments[job.segment_index]
+            media_state = seg
+            task_type = TaskType.SUBTITLES
+        else:
+            return FailureOutcome(action="ignored")
+
         if job.fallback_tier == 0:
-            if job.is_summary_proxy:
-                self.summary.media_path = job.input_file
-                self.summary.media_ready = True
-                self.summary.target_fps = None
-            elif job.segment_index is not None:
-                seg = self.segments[job.segment_index]
-                seg.media_path = job.input_file
-                seg.media_ready = True
-                seg.target_fps = None
+            media_state.media_path = job.input_file
+            media_state.media_ready = True
+            media_state.target_fps = None
             return FailureOutcome(action="retry")
 
-        if job.is_summary_proxy:
-            return self._advance_or_exhaust_summary()
-        if job.segment_index is not None:
-            return self._advance_or_exhaust_segment(self.segments[job.segment_index])
-        return FailureOutcome(action="ignored")
+        return await self._advance_or_exhaust_stage(task_type, seg=seg)
 
     def complete_ai_task(
         self,
@@ -993,7 +1060,6 @@ class Pipeline(BaseModel):
             self.summary.response = resp
             self.summary.exhausted = False
             self.summary.total_attempts += 1
-            self.summary.tier_attempts += 1
             self._save_checkpoint(TaskType.SUMMARY)
             return
 
@@ -1004,20 +1070,22 @@ class Pipeline(BaseModel):
         val_ctx["video_duration_ms"] = seg.duration_ms
 
         if task_type == TaskType.SUBTITLES:
-            payload = (
-                result_data.model_dump(mode="json") if isinstance(result_data, SubtitlesAiResponse) else result_data
+            seg.subtitles_response = (
+                result_data
+                if isinstance(result_data, SubtitlesAiResponse)
+                else SubtitlesAiResponse.model_validate(result_data, context=val_ctx)
             )
-            seg.subtitles_response = SubtitlesAiResponse.model_validate(payload, context=val_ctx)
             seg.subtitles_exhausted = False
             seg.subtitles_total_attempts += 1
-            seg.subtitles_tier_attempts += 1
             self._save_checkpoint(TaskType.SUBTITLES, seg)
         elif task_type == TaskType.LYRICS:
-            payload = result_data.model_dump(mode="json") if isinstance(result_data, LyricsAiResponse) else result_data
-            seg.lyrics_response = LyricsAiResponse.model_validate(payload, context=val_ctx)
+            seg.lyrics_response = (
+                result_data
+                if isinstance(result_data, LyricsAiResponse)
+                else LyricsAiResponse.model_validate(result_data, context=val_ctx)
+            )
             seg.lyrics_exhausted = False
             seg.lyrics_total_attempts += 1
-            seg.lyrics_tier_attempts += 1
             self._save_checkpoint(TaskType.LYRICS, seg)
 
     def complete_job(self, job: BaseJob, result_data: Any) -> None:
@@ -1041,7 +1109,7 @@ class Pipeline(BaseModel):
         else:
             raise TypeError(f"Unsupported job type: {type(job).__name__}")
 
-    def record_failure(
+    async def record_failure(
         self,
         task_type: TaskType,
         segment_index: int | None = None,
@@ -1058,7 +1126,7 @@ class Pipeline(BaseModel):
         Raises:
             ValueError: If segment_index is missing for a segment task.
         """
-        max_runs = self._effective_max_runs
+        max_runs = self.retry_settings.maxruns
         log_reason = f"reached {max_runs} non-retryable failure(s)"
 
         if task_type == TaskType.SUMMARY:
@@ -1067,12 +1135,12 @@ class Pipeline(BaseModel):
             self.summary.total_attempts += 1
             self.summary.tier_attempts += 1
             if self.summary.tier_attempts >= max_runs:
-                return self._advance_or_exhaust_summary(log_context=log_reason)
+                return await self._advance_or_exhaust_stage(TaskType.SUMMARY, log_context=log_reason)
             self._save_checkpoint(TaskType.SUMMARY)
             return FailureOutcome(
                 action="retry",
                 fallback_tier=self.summary.fallback_tier,
-                target_fps=self.summary.target_fps,
+                target_fps=_float_fps(self.summary.target_fps),
                 tier_attempts=self.summary.tier_attempts,
             )
 
@@ -1080,6 +1148,7 @@ class Pipeline(BaseModel):
             raise ValueError(f"segment_index is required for task_type '{task_type.value}'.")
 
         seg = self.segments[segment_index]
+        target_fps_float = _float_fps(seg.target_fps)
 
         if task_type == TaskType.SUBTITLES:
             if seg.subtitles_response is not None or seg.subtitles_exhausted:
@@ -1087,12 +1156,12 @@ class Pipeline(BaseModel):
             seg.subtitles_total_attempts += 1
             seg.subtitles_tier_attempts += 1
             if seg.subtitles_tier_attempts >= max_runs:
-                return self._advance_or_exhaust_segment(seg, log_context=log_reason)
+                return await self._advance_or_exhaust_stage(TaskType.SUBTITLES, seg=seg, log_context=log_reason)
             self._save_checkpoint(TaskType.SUBTITLES, seg)
             return FailureOutcome(
                 action="retry",
                 fallback_tier=seg.fallback_tier,
-                target_fps=seg.target_fps,
+                target_fps=target_fps_float,
                 tier_attempts=seg.subtitles_tier_attempts,
             )
 
@@ -1105,20 +1174,20 @@ class Pipeline(BaseModel):
                 seg.lyrics_exhausted = True
                 self._save_checkpoint(TaskType.LYRICS, seg)
                 logfire.error(
-                    f"Lyrics for '{seg.raw_path.stem}' exhausted all {max_runs} attempt(s); "
+                    f"Lyrics for '{seg.raw_path.stem}' exhausted all {max_runs} run(s); "
                     "falling back to draft subtitles."
                 )
                 return FailureOutcome(
                     action="exhausted",
                     fallback_tier=seg.fallback_tier,
-                    target_fps=seg.target_fps,
+                    target_fps=target_fps_float,
                     tier_attempts=seg.lyrics_tier_attempts,
                 )
             self._save_checkpoint(TaskType.LYRICS, seg)
             return FailureOutcome(
                 action="retry",
                 fallback_tier=seg.fallback_tier,
-                target_fps=seg.target_fps,
+                target_fps=target_fps_float,
                 tier_attempts=seg.lyrics_tier_attempts,
             )
 
@@ -1142,20 +1211,20 @@ class Pipeline(BaseModel):
         """
         search_dump = self.search_settings.model_dump(
             mode="json",
-            exclude={"key": True, "tinyfish_key": True, "langsearch_key": True, "ollama_key": True},
+            exclude={"tinyfishkey": True, "langsearchkey": True, "ollamakey": True},
         )
         return {
             "ai": {
-                "model_summary": self.summary_model,
-                "model_subtitles": self.subtitles_model,
-                "model_lyrics": self.lyrics_model,
-                "service_tier_summary": self.service_tier_summary,
-                "service_tier_subtitles": self.service_tier_subtitles,
-                "service_tier_lyrics": self.service_tier_lyrics,
+                "model_summary": self.summary_config.model,
+                "model_subtitles": self.subtitles_config.model,
+                "model_lyrics": self.lyrics_config.model,
+                "service_tier_summary": self.summary_config.tier,
+                "service_tier_subtitles": self.subtitles_config.tier,
+                "service_tier_lyrics": self.lyrics_config.tier,
                 "search": search_dump,
-                "agentic_video_summary": self.agentic_video_summary,
-                "agentic_video_subtitles": self.agentic_video_subtitles,
-                "agentic_video_lyrics": self.agentic_video_lyrics,
+                "agentic_video_summary": self.summary_config.agentic,
+                "agentic_video_subtitles": self.subtitles_config.agentic,
+                "agentic_video_lyrics": self.lyrics_config.agentic,
                 "validation_buffer_ms": self.validation_buffer_ms,
             },
             "reencode": self.reencode_settings.model_dump(mode="json"),
@@ -1171,7 +1240,10 @@ class Pipeline(BaseModel):
         status_override: str | None = None,
         allow_partial: bool = False,
     ) -> list[Path]:
-        """Stitches all segment YAML files into synchronized SRT files with timeline offset shifting.
+        """Stitches all segment responses into synchronized SRT files with timeline offset shifting.
+
+        When lyrics refinement is required but fails or is unavailable, the primary output
+        falls back to the completed draft subtitles rather than emitting an error placeholder.
 
         Args:
             output_primary_path: Destination path for primary SRT file. Defaults to auto-generated path in job_dir.
@@ -1199,20 +1271,69 @@ class Pipeline(BaseModel):
             else (self.job_dir / f"{self.filename_stem}.raw-{self.full_shortcode}.srt" if self.lyrics_enabled else None)
         )
 
-        segments = [(seg.raw_path.stem, seg.duration_ms) for seg in self.segments]
+        all_subs = SSAFile()
+        raw_subs = SSAFile() if raw_path is not None else None
+        lyrics_refined_any = False
 
-        result = stitch_subtitles(
-            segments=segments,
-            state_dir=self.job_dir,
-            output_primary_path=primary_path,
-            output_raw_path=raw_path,
-            subtitles_shortcode=self.subtitles_shortcode,
-            lyrics_shortcode=self.lyrics_shortcode,
-            validation_buffer_ms=self.validation_buffer_ms,
-            settings_dump=self._build_settings_metadata(),
-            status_override=status_override or self._derive_status(),
-            summary_available=self.summary.response is not None,
-            initial_offset_ms=self.initial_offset_ms,
-            use_lyrics=self.lyrics_enabled,
-        )
-        return result.generated_files
+        for seg in self.segments:
+            sub_resp = seg.subtitles_response
+            lyr_resp = seg.lyrics_response
+            lyrics_required = bool(self.lyrics_enabled and sub_resp and sub_resp.detected_musical_performances)
+
+            active_resp: SubtitlesAiResponse | LyricsAiResponse | None = None
+            if lyrics_required and lyr_resp is not None:
+                active_resp = lyr_resp
+                lyrics_refined_any = True
+            elif sub_resp is not None:
+                active_resp = sub_resp
+
+            if active_resp is not None:
+                seg_subs = active_resp.get_ssafile()
+                seg_subs.shift(ms=seg.offset_ms)
+                all_subs += seg_subs
+            else:
+                all_subs.append(
+                    SSAEvent(
+                        start=seg.offset_ms,
+                        end=seg.offset_ms + seg.duration_ms,
+                        text="Error processing subtitles for this segment.",
+                    )
+                )
+
+            if raw_subs is not None:
+                if sub_resp is not None:
+                    seg_raw_subs = sub_resp.get_ssafile()
+                    seg_raw_subs.shift(ms=seg.offset_ms)
+                    raw_subs += seg_raw_subs
+                else:
+                    raw_subs.append(
+                        SSAEvent(
+                            start=seg.offset_ms,
+                            end=seg.offset_ms + seg.duration_ms,
+                            text="Error processing subtitles for this segment.",
+                        )
+                    )
+
+        metadata = {
+            "ai_sub_version": get_app_version(),
+            "generated_at": datetime.now().isoformat(),
+            "summary_prompt_version": SUMMARY_PROMPT_VERSION if self.summary.response is not None else None,
+            "subtitles_prompt_version": SUBTITLES_PROMPT_VERSION,
+            "lyrics_prompt_version": LYRICS_PROMPT_VERSION,
+            "status": status_override or self._derive_status(),
+            "settings": self._build_settings_metadata(),
+        }
+
+        generated_files: list[Path] = []
+        _apply_metadata_header(all_subs, metadata)
+        primary_path.parent.mkdir(parents=True, exist_ok=True)
+        all_subs.save(str(primary_path))
+        generated_files.append(primary_path)
+
+        if lyrics_refined_any and raw_subs is not None and raw_path is not None:
+            _apply_metadata_header(raw_subs, metadata)
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_subs.save(str(raw_path))
+            generated_files.append(raw_path)
+
+        return generated_files
