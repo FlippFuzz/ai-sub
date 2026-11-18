@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from textwrap import dedent
-from typing import ClassVar
+from typing import ClassVar, Self
 
 import logfire
-from pydantic import Field
+from pydantic import Field, ValidationInfo, model_validator
 
 from ai_sub.jobs.job_base import Prompt, WorkerContext, build_user_prompt
 from ai_sub.jobs.subtitles import (
@@ -180,15 +180,33 @@ class LyricsAiResponse(BaseSubtitleAiResponse):
     """Structured response schema returned by the model for musical subtitle refinement.
 
     Note: Preserving draft timestamps and block count parity is intentionally guided via
-    the system prompt rather than enforced in Pydantic validators; strict equality checks
-    are omitted intentionally and Pipeline.finalize falls back to draft subtitles on failure.
+    the system prompt rather than enforced in Pydantic validators; validation ensures non-empty
+    subtitles when draft subtitles exist, and Pipeline.finalize falls back to draft subtitles
+    if retries are exhausted.
     """
 
-    # Intentionally no cross-validation of timestamps or block count against draft_subtitles.
     subtitles: list[Subtitles] = Field(
         alias="subs",
         description="Refined chronological synchronized subtitle events with frozen timestamps.",
     )
+
+    @model_validator(mode="after")
+    def validate_non_empty_subtitles(self, info: ValidationInfo) -> Self:
+        """Ensures refined lyrics are non-empty when draft subtitles were supplied.
+
+        Args:
+            info: Pydantic validation context.
+
+        Returns:
+            Self: Validated instance.
+
+        Raises:
+            ValueError: If refined subtitles are empty while draft subtitles exist.
+        """
+        context = info.context or {}
+        if context.get("require_subtitles") and not self.subtitles:
+            raise ValueError("Refined lyrics output cannot be empty when draft subtitles exist.")
+        return self
 
 
 class LyricsJob(BaseSubtitleJob):
@@ -222,6 +240,20 @@ class LyricsJob(BaseSubtitleJob):
         description="Structured AI output once refined.",
     )
 
+    @model_validator(mode="after")
+    def validate_response_non_empty(self) -> Self:
+        """Rejects saved checkpoints whose refined response is empty when draft subtitles exist.
+
+        Returns:
+            Self: Validated instance.
+
+        Raises:
+            ValueError: If saved response subtitles are empty while draft subtitles exist.
+        """
+        if self.draft_subtitles and self.response is not None and not self.response.subtitles:
+            raise ValueError("Saved lyrics response cannot be empty when draft subtitles exist.")
+        return self
+
     async def execute(self, ctx: WorkerContext) -> LyricsAiResponse:
         """Refines draft subtitles for detected singing performances using lyrics search.
 
@@ -250,4 +282,5 @@ class LyricsJob(BaseSubtitleJob):
             response_type=LyricsAiResponse,
             task_label="lyrics",
             tools=ctx.search_providers,
+            validation_context={"require_subtitles": bool(self.draft_subtitles)},
         )

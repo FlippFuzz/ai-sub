@@ -22,6 +22,7 @@ from ai_sub.jobs import (
 )
 from ai_sub.protocol import TaskClaimResponse, TaskType
 from ai_sub.search import BaseSearchProvider, create_search_providers
+from ai_sub.video import sanitize_filename
 from ai_sub.worker.client import VersionMismatchError, WorkerClient
 from ai_sub.worker.worker_config import WorkerSettings
 
@@ -147,6 +148,16 @@ class WorkerRunner:
             or (self._deadline is not None and monotonic() >= self._deadline)
         )
 
+    def _is_idle_timed_out(self) -> bool:
+        """Checks whether all slots are idle and idle timeout has elapsed (caller holds _cond).
+
+        Returns:
+            bool: True if no slots are in flight and idle duration reached idletimeout.
+        """
+        if sum(self._tasks_in_flight_per_model.values()) > 0:
+            return False
+        return (monotonic() - self._last_busy_timestamp) >= self.settings.idletimeout.total_seconds()
+
     async def _heartbeat_loop(
         self,
         task_id: str,
@@ -217,9 +228,10 @@ class WorkerRunner:
         raw_name = Path(urllib.parse.unquote(task.media_url)).name
         if not Path(raw_name).suffix:
             raw_name = f"{raw_name}.mp4"
+        safe_name = sanitize_filename(raw_name)
 
-        chunk_dir = self.settings.workdir / task.pipeline_name / task.video_id
-        chunk_path = chunk_dir / raw_name
+        chunk_dir = self.settings.workdir / sanitize_filename(task.pipeline_name) / sanitize_filename(task.video_id)
+        chunk_path = chunk_dir / safe_name
 
         try:
             with logfire.span("Downloading Task Media", url=task.media_url):
@@ -455,7 +467,7 @@ class WorkerRunner:
                 )
 
     async def _wait_for_condition(self, timeout_s: float, model: str) -> None:
-        """Sleeps while holding _cond until timeout expires, slot should stop, or maxduration deadline arrives.
+        """Sleeps while holding _cond until timeout expires, slot should stop, or idle timeout is reached.
 
         Args:
             timeout_s: Maximum duration to wait in seconds.
@@ -465,7 +477,7 @@ class WorkerRunner:
         if self._deadline is not None:
             deadline = min(deadline, self._deadline)
 
-        while not self._should_stop(model):
+        while not self._should_stop(model) and not self._is_idle_timed_out():
             remaining = deadline - monotonic()
             if remaining <= 0:
                 break
@@ -616,13 +628,6 @@ class WorkerRunner:
         Returns:
             int: Application exit code (0 for clean finish, 1 for abnormal exit or update required).
         """
-        if not self.settings.ai.key or not self.settings.ai.key.get_secret_value().strip():
-            logfire.error(
-                "Gemini API key is missing in worker configuration. "
-                "Specify ai.key in worker YAML or AISUBWORKER_AI_KEY / GEMINI_API_KEY environment variable."
-            )
-            return 1
-
         models = list(dict.fromkeys(self.settings.models))
         if not models:
             logfire.info("No configured models available. Exiting cleanly.")

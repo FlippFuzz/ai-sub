@@ -571,8 +571,7 @@ class IngestionManager:
 
             try:
                 logfire.info(f"Feeding '{runner.config.name}' with '{video.title}' ({video.video_id}).")
-                await self.coordinator.assign_prepared_video(
-                    runner_name=runner.config.name,
+                await runner.prepare_and_set_video(
                     video_id=video.video_id,
                     uploader=video.uploader,
                     title=video.title,
@@ -684,13 +683,19 @@ class IngestionManager:
         """Starts the ingestion manager with an initial scan, followed by periodic delta intake loops."""
         self._stopped = False
         self._loop = asyncio.get_running_loop()
-        await self._scan_watch_folders_async()
-        await self._scan_youtube_sources_async(deep_scan=True)
+
+        if self.config.files.folders:
+            await self._scan_watch_folders_async()
+        if self.config.youtube.urls:
+            await self._scan_youtube_sources_async(deep_scan=True)
+
         self._started = True
         await self.feed_idle_runners()
 
-        self._files_rescan_task = asyncio.create_task(self._periodic_files_loop())
-        self._youtube_rescan_task = asyncio.create_task(self._periodic_youtube_loop())
+        if self.config.files.folders:
+            self._files_rescan_task = asyncio.create_task(self._periodic_files_loop())
+        if self.config.youtube.urls:
+            self._youtube_rescan_task = asyncio.create_task(self._periodic_youtube_loop())
 
     async def stop(self) -> None:
         """Stops the periodic intake loops gracefully."""

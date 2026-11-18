@@ -246,14 +246,15 @@ class YouTubeClient:
         self._channel_map = ChannelMap(root={})
         self._load_channel_map()
 
-        if config.potdir is not None:
+        if config.urls and config.potdir is not None:
             pot_path = config.potdir if config.potdir.is_absolute() else base_work_dir / config.potdir
             self._pot_server_dir = self._ensure_pot_provider(pot_path)
         else:
             self._pot_server_dir = None
 
         self._base_ydl_opts = self._build_base_ydl_opts()
-        self._log_startup_diagnostics()
+        if config.urls:
+            self._log_startup_diagnostics()
 
     def _ensure_pot_provider(self, pot_dir: Path) -> Path | None:
         """Clones, syncs tags, and compiles bgutil-ytdlp-pot-provider once at startup.
@@ -764,8 +765,22 @@ class YouTubeClient:
                 raw_title = str(info.get("title") or "").strip() or None
                 ts = _parse_entry_timestamp(info)
 
-                downloaded_path = Path(ydl.prepare_filename(info))
-                if not downloaded_path.is_file():
+                downloaded_path: Path | None = None
+                requested_downloads = info.get("requested_downloads")
+                if isinstance(requested_downloads, list):
+                    for dl in requested_downloads:
+                        if isinstance(dl, Mapping) and (fp := dl.get("filepath")):
+                            candidate = Path(str(fp))
+                            if candidate.is_file() and candidate.suffix.lower() in VALID_VIDEO_EXTENSIONS:
+                                downloaded_path = candidate
+                                break
+
+                if downloaded_path is None:
+                    candidate = Path(ydl.prepare_filename(info))
+                    if candidate.is_file():
+                        downloaded_path = candidate
+
+                if downloaded_path is None:
                     matches = [
                         p
                         for p in destination_dir.glob(f"*{video_id}*.*")

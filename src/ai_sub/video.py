@@ -467,12 +467,11 @@ async def is_valid_reencoded_file(
         return False
 
 
-def _find_split_segments(output_dir: Path, output_pattern: str, ext: str) -> list[Path]:
-    """Finds and numerically sorts generated split segments matching output_pattern.
+def _find_split_segments(output_dir: Path, ext: str) -> list[Path]:
+    """Finds and numerically sorts generated split segments matching 'part_%03d'.
 
     Args:
         output_dir: Directory containing segment files.
-        output_pattern: Pattern formatting segment filenames (e.g. 'part_%03d').
         ext: File extension including leading dot.
 
     Returns:
@@ -480,8 +479,7 @@ def _find_split_segments(output_dir: Path, output_pattern: str, ext: str) -> lis
     """
     if not output_dir.is_dir():
         return []
-    escaped_pattern = re.escape(output_pattern).replace(re.escape("%03d"), r"(\d{3,})")
-    segment_re = re.compile(rf"^{escaped_pattern}{re.escape(ext)}$")
+    segment_re = re.compile(rf"^part_(\d{{3,}}){re.escape(ext)}$")
     matched: list[tuple[int, Path]] = []
     for entry in output_dir.iterdir():
         if entry.is_file() and (m := segment_re.match(entry.name)):
@@ -495,18 +493,16 @@ async def split_video(
     input_video: Path,
     output_dir: Path,
     split_duration_s: int,
-    output_pattern: str = "part_%03d",
     duration_tolerance_ms: int = 100,
 ) -> list[Path]:
     """Splits an input video into uniform segments using FFmpeg stream copying.
 
-    Skips splitting if valid segments matching the pattern and duration already exist.
+    Skips splitting if valid segments matching 'part_%03d' and duration already exist.
 
     Args:
         input_video: Path to the input video.
         output_dir: Directory where segments will be saved.
         split_duration_s: Target segment length in seconds.
-        output_pattern: Pattern formatting segment filenames. Defaults to 'part_%03d'.
         duration_tolerance_ms: Allowed total duration variance in milliseconds.
 
     Returns:
@@ -516,7 +512,7 @@ async def split_video(
         subprocess.CalledProcessError: If FFmpeg segmentation fails.
     """
     ext = input_video.suffix
-    existing_segments = _find_split_segments(output_dir, output_pattern, ext)
+    existing_segments = _find_split_segments(output_dir, ext)
 
     if existing_segments:
         try:
@@ -544,7 +540,7 @@ async def split_video(
 
     ffmpeg_bin, _ = ensure_ffmpeg()
     escaped_dir = str(output_dir).replace("%", "%%")
-    full_output_pattern = str(Path(escaped_dir) / f"{output_pattern}{ext}")
+    full_output_pattern = str(Path(escaped_dir) / f"part_%03d{ext}")
 
     cmd = [
         ffmpeg_bin,
@@ -575,7 +571,7 @@ async def split_video(
         logfire.exception(f"FFmpeg split failed. Stdout: {e.stdout}, Stderr: {e.stderr}")
         raise
 
-    return _find_split_segments(output_dir, output_pattern, ext)
+    return _find_split_segments(output_dir, ext)
 
 
 async def reencode_video(

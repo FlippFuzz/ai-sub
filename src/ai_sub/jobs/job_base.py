@@ -60,7 +60,8 @@ def clean_timestamp_string(ts_str: str) -> str:
     """Extracts a valid timestamp pattern from a potentially noisy LLM string.
 
     Supports both period and comma decimal delimiters (e.g. '01:23.450' and '01:23,450')
-    as well as 'HH:MM:SS:mmm', 'MM:SS:mmm', and 3-digit minute stamps (e.g. '105:30').
+    as well as 'HH:MM:SS:mmm', 'MM:SS:mmm', 3-digit minute stamps (e.g. '105:30'),
+    and standalone 'SS.mmm' stamps.
 
     Args:
         ts_str: Potentially noisy timestamp string.
@@ -71,11 +72,12 @@ def clean_timestamp_string(ts_str: str) -> str:
     if not isinstance(ts_str, str):
         return ts_str
     match = re.search(
-        r"(\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3}|:\d{3})?(?!\d)"
-        r"|\d{1,3}:\d{2}(?:[.,]\d{1,3}|:\d{3}(?!\d))"
-        r"|\d{1,3}:\d{2}(?!\d))",
+        r"(\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3}|:\d{3}(?!\d)|(?!\d))"
+        r"|\d{1,3}:\d{2}(?:[.,]\d{1,3}|:\d{3}(?!\d)|(?!\d)))",
         ts_str,
     )
+    if match is None:
+        match = re.search(r"(\d+[.,]\d{1,3})", ts_str)
     return match.group(1).replace(",", ".") if match else ts_str
 
 
@@ -314,10 +316,6 @@ class BaseJob(BaseModel):
     )
 
 
-class MediaJob(BaseJob):
-    """Base class for media manipulation tasks (such as video transcoding)."""
-
-
 class AiJob(BaseJob):
     """Base class for AI-executed jobs with YAML persistence and prompt version validation."""
 
@@ -385,6 +383,7 @@ class AiJob(BaseJob):
         response_type: type[T],
         task_label: str,
         tools: Sequence[Callable[..., Any] | dict[str, Any] | BaseSearchProvider] | None = None,
+        validation_context: dict[str, Any] | None = None,
     ) -> T:
         """Executes structured Gemini inference using this job's execution settings.
 
@@ -394,6 +393,7 @@ class AiJob(BaseJob):
             response_type: Expected Pydantic response schema.
             task_label: Telemetry span label for the task.
             tools: Optional tool callables or search providers. Defaults to None.
+            validation_context: Optional extra context passed to Pydantic validation. Defaults to None.
 
         Returns:
             T: Parsed and validated response instance.
@@ -410,6 +410,7 @@ class AiJob(BaseJob):
             task_label=task_label,
             retry_settings=self.retry_settings,
             validation_buffer_ms=self.validation_buffer_ms,
+            validation_context=validation_context,
         )
 
     def save(self, filename: Path) -> None:

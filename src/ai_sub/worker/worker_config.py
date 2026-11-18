@@ -112,11 +112,19 @@ class WorkerSettings(YamlFileSettings):
         return parts[0], parts[1]
 
     @model_validator(mode="after")
-    def _validate_search_keys(self) -> Self:
-        """Ensures required search API keys are configured for active search providers.
+    def _validate_api_keys(self) -> Self:
+        """Ensures required Gemini and search API keys are configured.
 
         Returns:
             Self: The validated instance.
+
+        Raises:
+            ValueError: If the Gemini API key or a required search API key is missing.
         """
+        if self.ai.key is None or not self.ai.key.get_secret_value().strip():
+            raise ValueError(
+                "A Google Gemini API key must be provided via 'ai.key', "
+                "'AISUBWORKER_AI_KEY', or the GEMINI_API_KEY / GOOGLE_API_KEY environment variables."
+            )
         self.ai.search.validate_required_keys(env_prefix="AISUBWORKER")
         return self

@@ -730,6 +730,7 @@ class GeminiExecutor:
         video_duration_ms: int,
         validation_buffer_ms: int,
         accumulated_thoughts: list[str],
+        validation_context: dict[str, Any] | None = None,
     ) -> T:
         """Parses output text into the target Pydantic schema, applying json_repair fallback if needed.
 
@@ -739,20 +740,22 @@ class GeminiExecutor:
             video_duration_ms: Duration in milliseconds for timestamp context validation.
             validation_buffer_ms: Allowed subtitle end timestamp overflow buffer in milliseconds.
             accumulated_thoughts: Collected reasoning traces to attach to the output.
+            validation_context: Optional extra context merged into Pydantic validation. Defaults to None.
 
         Returns:
             T: Validated Pydantic model instance.
         """
-        validation_context = {
+        merged_context: dict[str, Any] = {
+            **(validation_context or {}),
             "video_duration_ms": video_duration_ms,
             "validation_buffer_ms": validation_buffer_ms,
         }
 
         try:
-            output = response_type.model_validate_json(text_content, context=validation_context)
+            output = response_type.model_validate_json(text_content, context=merged_context)
         except Exception:
             repaired = json_repair.loads(text_content)
-            output = response_type.model_validate(repaired, context=validation_context)
+            output = response_type.model_validate(repaired, context=merged_context)
 
         if hasattr(output, "thoughts") and accumulated_thoughts:
             setattr(output, "thoughts", accumulated_thoughts)
@@ -776,6 +779,7 @@ class GeminiExecutor:
         video_duration_ms: int,
         validation_buffer_ms: int,
         retry: RetrySettings,
+        validation_context: dict[str, Any] | None = None,
     ) -> T:
         """Executes a single end-to-end multi-turn interaction session until final model output is validated.
 
@@ -795,6 +799,7 @@ class GeminiExecutor:
             video_duration_ms: Segment duration in milliseconds.
             validation_buffer_ms: Allowed subtitle end timestamp overflow buffer in milliseconds.
             retry: Effective retry settings for turn execution.
+            validation_context: Optional extra context passed to Pydantic validation. Defaults to None.
 
         Returns:
             T: Parsed and validated Pydantic model instance.
@@ -876,6 +881,7 @@ class GeminiExecutor:
                     video_duration_ms=video_duration_ms,
                     validation_buffer_ms=validation_buffer_ms,
                     accumulated_thoughts=accumulated_thoughts,
+                    validation_context=validation_context,
                 )
 
     async def run_structured(
@@ -891,6 +897,7 @@ class GeminiExecutor:
         task_label: str | None = None,
         retry_settings: RetrySettings | None = None,
         validation_buffer_ms: int = 2000,
+        validation_context: dict[str, Any] | None = None,
     ) -> T:
         """Uploads media and generates validated structured outputs using the Gemini Interactions API.
 
@@ -906,6 +913,7 @@ class GeminiExecutor:
             task_label: Optional label for display in turn spans.
             retry_settings: Optional task-specific retry policy overriding default settings.
             validation_buffer_ms: Allowed subtitle timestamp overflow tolerance in milliseconds. Defaults to 2000.
+            validation_context: Optional extra context passed to Pydantic validation. Defaults to None.
 
         Returns:
             T: Parsed and validated Pydantic model instance.
@@ -961,6 +969,7 @@ class GeminiExecutor:
                     video_duration_ms=video_duration_ms,
                     validation_buffer_ms=validation_buffer_ms,
                     retry=effective_retry,
+                    validation_context=validation_context,
                 )
             except QuotaExceededError:
                 raise

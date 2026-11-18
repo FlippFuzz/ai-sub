@@ -147,6 +147,32 @@ def _apply_metadata_header(subs: SSAFile, metadata: dict[str, Any]) -> None:
     subs.insert(0, SSAEvent(start=0, end=1, text=info_str))
 
 
+def _append_segment_events(
+    target: SSAFile,
+    resp: SubtitlesAiResponse | LyricsAiResponse | None,
+    seg: SegmentState,
+) -> None:
+    """Appends time-shifted subtitle events for a segment, or an error placeholder if missing.
+
+    Args:
+        target: Destination SSAFile accumulating stitched subtitle events.
+        resp: Completed subtitle or lyrics response, or None if unavailable.
+        seg: Segment metadata providing offset and duration.
+    """
+    if resp is not None:
+        seg_subs = resp.get_ssafile()
+        seg_subs.shift(ms=seg.offset_ms)
+        target += seg_subs
+    else:
+        target.append(
+            SSAEvent(
+                start=seg.offset_ms,
+                end=seg.offset_ms + seg.duration_ms,
+                text="Error processing subtitles for this segment.",
+            )
+        )
+
+
 def _resolve_target_fps(
     current_target: float | Literal["keyframes"] | None,
     fallback_tier: int,
@@ -262,6 +288,50 @@ class Pipeline(BaseModel):
         """
         return self.summary_enabled and self.summary.exhausted
 
+    def segment_subtitles_concluded(self, seg: SegmentState) -> bool:
+        """Checks whether subtitle transcription for a segment has completed or exhausted retries.
+
+        Args:
+            seg: Target segment state.
+
+        Returns:
+            bool: True if subtitles completed or exhausted, False otherwise.
+        """
+        return seg.subtitles_response is not None or seg.subtitles_exhausted
+
+    def segment_needs_lyrics(self, seg: SegmentState) -> bool:
+        """Checks whether a segment requires lyrics refinement based on non-empty draft subtitles and singing.
+
+        Args:
+            seg: Target segment state.
+
+        Returns:
+            bool: True if lyrics refinement is enabled and segment has both subtitles and detected singing.
+        """
+        return bool(
+            self.lyrics_enabled
+            and seg.subtitles_response is not None
+            and seg.subtitles_response.subtitles
+            and seg.subtitles_response.detected_musical_performances
+        )
+
+    def segment_lyrics_concluded(self, seg: SegmentState) -> bool:
+        """Checks whether lyrics refinement for a segment is unnecessary or has finished/exhausted.
+
+        Args:
+            seg: Target segment state.
+
+        Returns:
+            bool: True if subtitles exhausted, lyrics not required, or lyrics completed/exhausted.
+        """
+        if seg.subtitles_exhausted:
+            return True
+        if seg.subtitles_response is None:
+            return False
+        if not self.segment_needs_lyrics(seg):
+            return True
+        return seg.lyrics_response is not None or seg.lyrics_exhausted
+
     @classmethod
     async def create(
         cls,
@@ -335,7 +405,6 @@ class Pipeline(BaseModel):
             input_video=raw_resolved,
             output_dir=job_dir,
             split_duration_s=split_duration_s,
-            output_pattern="part_%03d",
             duration_tolerance_ms=split_tolerance_ms,
         )
         if not all_segments:
@@ -500,7 +569,7 @@ class Pipeline(BaseModel):
                 seg.fallback_tier = loaded_sub.fallback_tier
                 seg.target_fps = loaded_sub.target_fps
 
-                if self.lyrics_enabled and loaded_sub.response.detected_musical_performances:
+                if self.segment_needs_lyrics(seg):
                     lyr_file = self.job_dir / f"{seg.raw_path.stem}.lyrics.{self.lyrics_shortcode}.yaml"
                     loaded_lyr = LyricsJob.load(lyr_file, self.validation_buffer_ms)
                     if not loaded_lyr:
@@ -545,13 +614,7 @@ class Pipeline(BaseModel):
         Returns:
             bool: True if no further AI processing is needed for this segment.
         """
-        if seg.subtitles_exhausted:
-            return True
-        if seg.subtitles_response is None:
-            return False
-        if self.lyrics_enabled and seg.subtitles_response.detected_musical_performances:
-            return seg.lyrics_response is not None or seg.lyrics_exhausted
-        return True
+        return self.segment_subtitles_concluded(seg) and self.segment_lyrics_concluded(seg)
 
     async def _validate_encoded_media(
         self,
@@ -673,23 +736,17 @@ class Pipeline(BaseModel):
         Returns:
             bool: True if all chunks have completed or exhausted subtitles, False otherwise.
         """
-        return all(seg.subtitles_response is not None or seg.subtitles_exhausted for seg in self.segments)
+        return all(self.segment_subtitles_concluded(seg) for seg in self.segments)
 
     def is_lyrics_complete(self) -> bool:
-        """Checks if all segments with detected musical performances have concluded lyrics.
+        """Checks if all segments requiring musical lyrics refinement have concluded.
 
         Returns:
-            bool: True if all singing segments have resolved or exhausted lyrics, False otherwise.
+            bool: True if lyrics refinement is disabled or all segments have concluded lyrics, False otherwise.
         """
         if not self.lyrics_enabled:
             return True
-        if not self.is_subtitles_complete():
-            return False
-        for seg in self.segments:
-            if seg.subtitles_response and seg.subtitles_response.detected_musical_performances:
-                if seg.lyrics_response is None and not seg.lyrics_exhausted:
-                    return False
-        return True
+        return all(self.segment_lyrics_concluded(seg) for seg in self.segments)
 
     def is_done(self) -> bool:
         """Checks if the entire video has completed all stages or aborted on summary exhaustion.
@@ -879,10 +936,8 @@ class Pipeline(BaseModel):
 
             if seg.subtitles_response is None and not seg.subtitles_exhausted:
                 jobs.append(self._build_subtitles_job(seg))
-            elif self.lyrics_enabled and seg.subtitles_response is not None:
-                sub_resp = seg.subtitles_response
-                if sub_resp.detected_musical_performances and seg.lyrics_response is None and not seg.lyrics_exhausted:
-                    jobs.append(self._build_lyrics_job(seg))
+            elif self.segment_needs_lyrics(seg) and seg.lyrics_response is None and not seg.lyrics_exhausted:
+                jobs.append(self._build_lyrics_job(seg))
 
         return jobs
 
@@ -1047,7 +1102,7 @@ class Pipeline(BaseModel):
             segment_index: Zero-based segment index for SUBTITLES or LYRICS. Defaults to None.
 
         Raises:
-            ValueError: If segment_index is missing for a segment task.
+            ValueError: If segment_index is missing or lyrics output is empty when draft subtitles exist.
         """
         val_ctx: dict[str, Any] = {"validation_buffer_ms": self.validation_buffer_ms}
 
@@ -1080,11 +1135,16 @@ class Pipeline(BaseModel):
             seg.subtitles_total_attempts += 1
             self._save_checkpoint(TaskType.SUBTITLES, seg)
         elif task_type == TaskType.LYRICS:
-            seg.lyrics_response = (
+            require_subtitles = bool(seg.subtitles_response and seg.subtitles_response.subtitles)
+            val_ctx["require_subtitles"] = require_subtitles
+            lyr_resp = (
                 result_data
                 if isinstance(result_data, LyricsAiResponse)
                 else LyricsAiResponse.model_validate(result_data, context=val_ctx)
             )
+            if require_subtitles and not lyr_resp.subtitles:
+                raise ValueError("Refined lyrics output cannot be empty when draft subtitles exist.")
+            seg.lyrics_response = lyr_resp
             seg.lyrics_exhausted = False
             seg.lyrics_total_attempts += 1
             self._save_checkpoint(TaskType.LYRICS, seg)
@@ -1109,6 +1169,28 @@ class Pipeline(BaseModel):
             self.complete_ai_task(TaskType.LYRICS, result_data, segment_index=job.segment_index)
         else:
             raise TypeError(f"Unsupported job type: {type(job).__name__}")
+
+    async def record_job_failure(self, job: BaseJob) -> FailureOutcome:
+        """Records a non-retryable or re-encode failure for a typed Job instance.
+
+        Args:
+            job: Failed BaseJob subclass instance.
+
+        Returns:
+            FailureOutcome: Resulting state transition.
+
+        Raises:
+            TypeError: If job is an unsupported BaseJob subclass.
+        """
+        if isinstance(job, ReencodeJob):
+            return await self.fail_reencode(job)
+        if isinstance(job, SummaryJob):
+            return await self.record_failure(TaskType.SUMMARY)
+        if isinstance(job, SubtitlesJob):
+            return await self.record_failure(TaskType.SUBTITLES, segment_index=job.segment_index)
+        if isinstance(job, LyricsJob):
+            return await self.record_failure(TaskType.LYRICS, segment_index=job.segment_index)
+        raise TypeError(f"Unsupported job type: {type(job).__name__}")
 
     async def record_failure(
         self,
@@ -1280,41 +1362,18 @@ class Pipeline(BaseModel):
         for seg in self.segments:
             sub_resp = seg.subtitles_response
             lyr_resp = seg.lyrics_response
-            lyrics_required = bool(self.lyrics_enabled and sub_resp and sub_resp.detected_musical_performances)
+            lyrics_required = self.segment_needs_lyrics(seg)
 
             active_resp: SubtitlesAiResponse | LyricsAiResponse | None = None
-            if lyrics_required and lyr_resp is not None:
+            if lyrics_required and lyr_resp is not None and lyr_resp.subtitles:
                 active_resp = lyr_resp
                 lyrics_refined_any = True
             elif sub_resp is not None:
                 active_resp = sub_resp
 
-            if active_resp is not None:
-                seg_subs = active_resp.get_ssafile()
-                seg_subs.shift(ms=seg.offset_ms)
-                all_subs += seg_subs
-            else:
-                all_subs.append(
-                    SSAEvent(
-                        start=seg.offset_ms,
-                        end=seg.offset_ms + seg.duration_ms,
-                        text="Error processing subtitles for this segment.",
-                    )
-                )
-
+            _append_segment_events(all_subs, active_resp, seg)
             if raw_subs is not None:
-                if sub_resp is not None:
-                    seg_raw_subs = sub_resp.get_ssafile()
-                    seg_raw_subs.shift(ms=seg.offset_ms)
-                    raw_subs += seg_raw_subs
-                else:
-                    raw_subs.append(
-                        SSAEvent(
-                            start=seg.offset_ms,
-                            end=seg.offset_ms + seg.duration_ms,
-                            text="Error processing subtitles for this segment.",
-                        )
-                    )
+                _append_segment_events(raw_subs, sub_resp, seg)
 
         metadata = {
             "ai_sub_version": get_app_version(),

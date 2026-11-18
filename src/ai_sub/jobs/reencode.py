@@ -7,11 +7,11 @@ from typing import Literal
 
 from pydantic import Field, NonNegativeInt, PositiveFloat, PositiveInt
 
-from ai_sub.jobs.job_base import MediaJob
+from ai_sub.jobs.job_base import BaseJob
 from ai_sub.video import reencode_video
 
 
-class ReencodeJob(MediaJob):
+class ReencodeJob(BaseJob):
     """Represents a video segment or proxy compression task using FFmpeg."""
 
     input_file: Path = Field(description="Source video segment or raw video path.")

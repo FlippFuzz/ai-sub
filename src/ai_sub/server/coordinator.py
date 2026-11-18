@@ -36,7 +36,8 @@ def _format_logfire_query(task: ServerTask) -> str:
     Returns:
         str: Formatted Logfire search query string.
     """
-    return f"attributes->>'task_id' = '{task.task_id}'"
+    escaped = task.task_id.replace("'", "''")
+    return f"attributes->>'task_id' = '{escaped}'"
 
 
 def is_valid_video_id(video_id: str) -> bool:
@@ -87,29 +88,13 @@ def _build_stages_info(name: str, runner: ComboRunner, pipe: Pipeline, now: floa
 
     sub_done = sum(1 for seg in pipe.segments if seg.subtitles_response is not None)
     sub_prog = sum(1 for t in sub_tasks if t.status == TaskStatus.CLAIMED)
-    sub_concluded = sum(1 for seg in pipe.segments if seg.subtitles_response is not None or seg.subtitles_exhausted)
+    sub_concluded = sum(1 for seg in pipe.segments if pipe.segment_subtitles_concluded(seg))
 
-    lyr_total = (
-        sum(
-            1
-            for seg in pipe.segments
-            if seg.subtitles_response is not None and seg.subtitles_response.detected_musical_performances
-        )
-        if pipe.lyrics_enabled
-        else 0
-    )
+    lyr_total = sum(1 for seg in pipe.segments if pipe.segment_needs_lyrics(seg))
     lyr_done = sum(1 for seg in pipe.segments if seg.lyrics_response is not None)
     lyr_prog = sum(1 for t in lyr_tasks if t.status == TaskStatus.CLAIMED)
-    lyr_concluded = (
-        sum(
-            1
-            for seg in pipe.segments
-            if seg.subtitles_response is not None
-            and seg.subtitles_response.detected_musical_performances
-            and (seg.lyrics_response is not None or seg.lyrics_exhausted)
-        )
-        if pipe.lyrics_enabled
-        else 0
+    lyr_concluded = sum(
+        1 for seg in pipe.segments if pipe.segment_needs_lyrics(seg) and pipe.segment_lyrics_concluded(seg)
     )
 
     active_lyr_tasks = [
@@ -124,7 +109,12 @@ def _build_stages_info(name: str, runner: ComboRunner, pipe: Pipeline, now: floa
 
     has_singing = lyr_total > 0
     if sub_concluded < total_chunks:
-        lyr_status = "in_progress" if (lyr_prog > 0 or lyr_concluded > 0) else "pending"
+        if lyr_prog > 0 or lyr_concluded > 0:
+            lyr_status = "in_progress"
+        elif has_singing:
+            lyr_status = "ready"
+        else:
+            lyr_status = "pending"
     elif has_singing:
         if lyr_concluded == lyr_total:
             lyr_status = "completed"
@@ -333,51 +323,6 @@ class ComboRunnersCoordinator:
         async with self._lock:
             if runner := self.runners.get(runner_name):
                 runner.clear_preparing()
-
-    async def assign_prepared_video(
-        self,
-        runner_name: str,
-        video_id: str,
-        uploader: str,
-        title: str,
-        raw_video_path: Path,
-        channel_name: str | None = None,
-        source_type: Literal["local", "youtube"] = "local",
-        timestamp: int = 0,
-    ) -> bool:
-        """Prepares media and sets video into the runner, synchronizing state safely under lock.
-
-        Args:
-            runner_name: Target runner name.
-            video_id: Video identifier string.
-            uploader: Channel or uploader handle.
-            title: Video title.
-            raw_video_path: Local media file path.
-            channel_name: Channel display name. Defaults to None.
-            source_type: Ingestion category ('local' or 'youtube'). Defaults to 'local'.
-            timestamp: Video publication Unix timestamp. Defaults to 0.
-
-        Returns:
-            bool: True if video was prepared and assigned; False otherwise.
-        """
-        if not is_valid_video_id(video_id):
-            logfire.warning(f"Rejected invalid or dangerous video ID for assignment: {video_id!r}")
-            return False
-
-        runner = self.runners.get(runner_name)
-        if not runner:
-            return False
-
-        await runner.prepare_and_set_video(
-            video_id=video_id,
-            uploader=uploader,
-            title=title,
-            raw_video_path=raw_video_path,
-            channel_name=channel_name,
-            source_type=source_type,
-            timestamp=timestamp,
-        )
-        return True
 
     async def start(self) -> None:
         """Starts background lease monitoring and attempts disk resumption on all runners."""
@@ -791,7 +736,7 @@ class ComboRunnersCoordinator:
                 return False
             if runner.is_idle() or not runner.pipeline:
                 return False
-            if runner.status != RunnerStatus.PUSH_FAILED and not runner.is_video_complete():
+            if not runner.is_video_complete():
                 return False
 
             was_push_failed = runner.status == RunnerStatus.PUSH_FAILED
