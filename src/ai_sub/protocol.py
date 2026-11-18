@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ai_sub.config import RetrySettings
+from ai_sub.config import RetrySettings, ServiceTier
 from ai_sub.jobs.subtitles import DetectedMusicalPerformance, Subtitles
 from ai_sub.jobs.summary import SummaryAiResponse
 
@@ -73,7 +73,7 @@ class TaskClaimResponse(BaseModel):
         default=False,
         description="Whether to enable agentic video inspection.",
     )
-    service_tier: str | None = Field(
+    service_tier: ServiceTier | None = Field(
         default=None,
         description="Optional Google Gemini service tier.",
     )

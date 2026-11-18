@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from contextlib import AsyncExitStack
 from pathlib import Path
 from time import monotonic
-from typing import Any, cast
+from typing import Any, TypeVar
 
 import logfire
 from httpx import HTTPStatusError
 
-from ai_sub.config import ServiceTier
 from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError, is_retryable_error
 from ai_sub.jobs import (
     LyricsJob,
@@ -26,9 +25,50 @@ from ai_sub.search import BaseSearchProvider, create_search_providers
 from ai_sub.worker.client import VersionMismatchError, WorkerClient
 from ai_sub.worker.worker_config import WorkerSettings
 
+T = TypeVar("T")
+
 
 class LeaseRevokedError(Exception):
     """Raised when a task lease is revoked or rejected by the server."""
+
+
+async def _run_cancellable(
+    coro: Coroutine[Any, Any, T],
+    task_id: str,
+    stage: str,
+    lease_revoked: asyncio.Event,
+    set_active_subtask: Callable[[asyncio.Task[Any] | None], None],
+) -> T:
+    """Executes a coroutine as a cancellable subtask, translating heartbeat revocations into LeaseRevokedError.
+
+    Args:
+        coro: Coroutine to schedule as an asyncio task.
+        task_id: Unique task identifier for diagnostics.
+        stage: Human-readable stage description (e.g. 'media download').
+        lease_revoked: Event indicating whether the server rejected the task lease.
+        set_active_subtask: Callback registering or clearing the active subtask handle.
+
+    Returns:
+        T: Result produced by the wrapped coroutine.
+
+    Raises:
+        asyncio.CancelledError: If the subtask is cancelled while the lease is still active.
+        LeaseRevokedError: If the lease was revoked before or during execution.
+    """
+    if lease_revoked.is_set():
+        coro.close()
+        raise LeaseRevokedError(f"Lease for task '{task_id}' was rejected before {stage}.")
+
+    subtask = asyncio.create_task(coro)
+    set_active_subtask(subtask)
+    try:
+        return await subtask
+    except asyncio.CancelledError:
+        if lease_revoked.is_set():
+            raise LeaseRevokedError(f"Lease for task '{task_id}' was rejected during {stage}.")
+        raise
+    finally:
+        set_active_subtask(None)
 
 
 class WorkerRunner:
@@ -37,8 +77,7 @@ class WorkerRunner:
     settings: WorkerSettings
     client: WorkerClient
     _cond: asyncio.Condition
-    _shutdown_event: asyncio.Event
-    _model_stop_events: dict[str, asyncio.Event]
+    _shutdown: bool
     _exhausted_models: set[str]
     _tasks_completed_per_model: dict[str, int]
     _tasks_in_flight_per_model: dict[str, int]
@@ -60,8 +99,7 @@ class WorkerRunner:
         )
         unique_models = list(dict.fromkeys(settings.models))
         self._cond = asyncio.Condition()
-        self._shutdown_event = asyncio.Event()
-        self._model_stop_events = {model: asyncio.Event() for model in unique_models}
+        self._shutdown = False
         self._exhausted_models = set()
         self._tasks_completed_per_model = {model: 0 for model in unique_models}
         self._tasks_in_flight_per_model = {model: 0 for model in unique_models}
@@ -69,14 +107,6 @@ class WorkerRunner:
         self._deadline = None
         self._version_mismatch = False
         self._fatal_error = False
-
-    def _total_in_flight(self) -> int:
-        """Returns total reserved claims and running tasks across all models (caller holds _cond).
-
-        Returns:
-            int: Total in-flight tasks across all model slots.
-        """
-        return sum(self._tasks_in_flight_per_model.values())
 
     def _is_model_done(self, model: str) -> bool:
         """Checks if a model has exhausted its quota or reached its task limit.
@@ -102,12 +132,20 @@ class WorkerRunner:
         unique_models = set(self.settings.models)
         return bool(unique_models and all(self._is_model_done(m) for m in unique_models))
 
-    def _trigger_shutdown(self) -> None:
-        """Signals global shutdown across all model slots (must be called while holding _cond)."""
-        self._shutdown_event.set()
-        for ev in self._model_stop_events.values():
-            ev.set()
-        self._cond.notify_all()
+    def _should_stop(self, model: str) -> bool:
+        """Checks whether a slot for this model should stop claiming tasks (caller holds _cond).
+
+        Args:
+            model: Model identifier.
+
+        Returns:
+            bool: True if global shutdown, model completion, or maxduration deadline was reached.
+        """
+        return (
+            self._shutdown
+            or self._is_model_done(model)
+            or (self._deadline is not None and monotonic() >= self._deadline)
+        )
 
     async def _heartbeat_loop(
         self,
@@ -174,8 +212,6 @@ class WorkerRunner:
             dict[str, Any]: Validated output data dictionary.
 
         Raises:
-            asyncio.CancelledError: If task execution is cancelled while waiting for download or inference.
-            LeaseRevokedError: If the server rejects task lease during download or inference.
             ValueError: If task type is unknown or structured input is invalid.
         """
         raw_name = Path(urllib.parse.unquote(task.media_url)).name
@@ -186,26 +222,15 @@ class WorkerRunner:
         chunk_path = chunk_dir / raw_name
 
         try:
-            if lease_revoked.is_set():
-                raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected before download started.")
-
-            # 1. Download media under lease-revocation monitoring
             with logfire.span("Downloading Task Media", url=task.media_url):
-                download_task = asyncio.create_task(self.client.download_media(task.media_url, chunk_path))
-                set_active_subtask(download_task)
-                try:
-                    await download_task
-                except asyncio.CancelledError:
-                    if lease_revoked.is_set():
-                        raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected during media download.")
-                    raise
-                finally:
-                    set_active_subtask(None)
+                await _run_cancellable(
+                    coro=self.client.download_media(task.media_url, chunk_path),
+                    task_id=task.task_id,
+                    stage="media download",
+                    lease_revoked=lease_revoked,
+                    set_active_subtask=set_active_subtask,
+                )
 
-            if lease_revoked.is_set():
-                raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected before inference started.")
-
-            # 2. Construct canonical Job and execute under lease-revocation monitoring
             active_tools = [p for p in search_providers if p.provider_name in task.search_tools]
             ctx = WorkerContext(
                 executor=executor,
@@ -221,7 +246,7 @@ class WorkerRunner:
                     user_context=task.user_context,
                     media_path=chunk_path,
                     model_name=task.model,
-                    service_tier=cast(ServiceTier | None, task.service_tier),
+                    service_tier=task.service_tier,
                     agentic_video=task.agentic_video,
                     retry_settings=task.retry,
                     validation_buffer_ms=validation_buffer_ms,
@@ -235,7 +260,7 @@ class WorkerRunner:
                     user_context=task.user_context,
                     media_path=chunk_path,
                     model_name=task.model,
-                    service_tier=cast(ServiceTier | None, task.service_tier),
+                    service_tier=task.service_tier,
                     agentic_video=task.agentic_video,
                     retry_settings=task.retry,
                     validation_buffer_ms=validation_buffer_ms,
@@ -255,7 +280,7 @@ class WorkerRunner:
                     user_context=task.user_context,
                     media_path=chunk_path,
                     model_name=task.model,
-                    service_tier=cast(ServiceTier | None, task.service_tier),
+                    service_tier=task.service_tier,
                     agentic_video=task.agentic_video,
                     retry_settings=task.retry,
                     validation_buffer_ms=validation_buffer_ms,
@@ -263,17 +288,14 @@ class WorkerRunner:
             else:
                 raise ValueError(f"Unknown task type: '{task.task_type}'")
 
-            inference_task = asyncio.create_task(job.execute(ctx))
-            set_active_subtask(inference_task)
-            try:
-                res = await inference_task
-                return res.model_dump(mode="json")
-            except asyncio.CancelledError:
-                if lease_revoked.is_set():
-                    raise LeaseRevokedError(f"Lease for task '{task.task_id}' was rejected during inference.")
-                raise
-            finally:
-                set_active_subtask(None)
+            res = await _run_cancellable(
+                coro=job.execute(ctx),
+                task_id=task.task_id,
+                stage="inference",
+                lease_revoked=lease_revoked,
+                set_active_subtask=set_active_subtask,
+            )
+            return res.model_dump(mode="json")
 
         finally:
             if chunk_path.is_file():
@@ -308,7 +330,6 @@ class WorkerRunner:
 
         Raises:
             asyncio.CancelledError: If the worker slot task itself is cancelled.
-            LeaseRevokedError: If the server revokes the lease during completion submission.
         """
         slot_label = f"{model}#{slot_id}"
         stop_heartbeat = asyncio.Event()
@@ -351,29 +372,17 @@ class WorkerRunner:
                         lease_revoked=lease_revoked,
                         set_active_subtask=_set_active,
                     )
-                    if lease_revoked.is_set():
-                        raise LeaseRevokedError(
-                            f"Lease for task '{claim.task_id}' was rejected before completion submission."
-                        )
-
-                    complete_subtask = asyncio.create_task(
-                        self.client.complete_task(
+                    accepted = await _run_cancellable(
+                        coro=self.client.complete_task(
                             task_id=claim.task_id,
                             worker_id=self.settings.id,
                             result=result_dict,
-                        )
+                        ),
+                        task_id=claim.task_id,
+                        stage="completion submission",
+                        lease_revoked=lease_revoked,
+                        set_active_subtask=_set_active,
                     )
-                    _set_active(complete_subtask)
-                    try:
-                        accepted = await complete_subtask
-                    except asyncio.CancelledError:
-                        if lease_revoked.is_set():
-                            raise LeaseRevokedError(
-                                f"Lease for task '{claim.task_id}' was rejected during completion submission."
-                            )
-                        raise
-                    finally:
-                        _set_active(None)
                 finally:
                     stop_heartbeat.set()
                     try:
@@ -390,15 +399,13 @@ class WorkerRunner:
                                 f"[{slot_label}] Reached max tasks limit ({self.settings.maxtasks}) "
                                 f"for model '{model}'. Stopping new task claims for this model."
                             )
-                            if model in self._model_stop_events:
-                                self._model_stop_events[model].set()
-                            self._cond.notify_all()
-                            if self._all_models_finished():
-                                logfire.info(
-                                    "All configured models have reached their task limits or exhausted quotas. "
-                                    "Shutting down worker."
-                                )
-                                self._trigger_shutdown()
+                        if self._all_models_finished():
+                            logfire.info(
+                                "All configured models have reached their task limits or exhausted quotas. "
+                                "Shutting down worker."
+                            )
+                            self._shutdown = True
+                        self._cond.notify_all()
                     logfire.info(f"[{slot_label}] Task '{claim.task_id}' processed and accepted by server.")
                 else:
                     logfire.warning(f"[{slot_label}] Task '{claim.task_id}' completion was not accepted by server.")
@@ -426,14 +433,12 @@ class WorkerRunner:
                 )
                 async with self._cond:
                     self._exhausted_models.add(model)
-                    if model in self._model_stop_events:
-                        self._model_stop_events[model].set()
-                    self._cond.notify_all()
                     if self._all_models_finished():
                         logfire.info(
                             "All configured models have exhausted quotas or reached task limits. Shutting down worker."
                         )
-                        self._trigger_shutdown()
+                        self._shutdown = True
+                    self._cond.notify_all()
 
             except Exception as e:
                 is_retryable = is_retryable_error(e)
@@ -449,33 +454,18 @@ class WorkerRunner:
                     is_retryable=is_retryable,
                 )
 
-    async def _release_model_reservation(self, model: str, touch_busy: bool = False) -> None:
-        """Releases one reserved in-flight task slot for a model and wakes waiting slots.
-
-        Args:
-            model: Model identifier.
-            touch_busy: Whether to update _last_busy_timestamp to now. Defaults to False.
-        """
-        async with self._cond:
-            self._tasks_in_flight_per_model[model] = max(0, self._tasks_in_flight_per_model.get(model, 0) - 1)
-            if touch_busy:
-                self._last_busy_timestamp = monotonic()
-            self._cond.notify_all()
-
-    async def _wait_for_condition(
-        self, timeout_s: float, stop_event: asyncio.Event, wake_on_idle: bool = False
-    ) -> None:
-        """Sleeps while holding _cond until timeout expires, shutdown is signaled, or worker becomes idle.
+    async def _wait_for_condition(self, timeout_s: float, model: str) -> None:
+        """Sleeps while holding _cond until timeout expires, slot should stop, or maxduration deadline arrives.
 
         Args:
             timeout_s: Maximum duration to wait in seconds.
-            stop_event: Per-model or global shutdown event.
-            wake_on_idle: If True, returns early if total in-flight tasks drops to 0. Defaults to False.
+            model: Model identifier bound to this slot.
         """
         deadline = monotonic() + timeout_s
-        while not stop_event.is_set():
-            if wake_on_idle and self._total_in_flight() == 0:
-                break
+        if self._deadline is not None:
+            deadline = min(deadline, self._deadline)
+
+        while not self._should_stop(model):
             remaining = deadline - monotonic()
             if remaining <= 0:
                 break
@@ -501,39 +491,32 @@ class WorkerRunner:
             search_providers: List of initialized search providers.
         """
         slot_label = f"{model}#{slot_id}"
-        stop_event = self._model_stop_events.get(model, self._shutdown_event)
         idle_timeout_seconds = self.settings.idletimeout.total_seconds()
         poll_seconds = self.settings.pollinterval.total_seconds()
 
-        while not stop_event.is_set():
+        while True:
             async with self._cond:
-                while (
-                    not stop_event.is_set()
-                    and not self._is_model_done(model)
-                    and 0
-                    < self.settings.maxtasks
-                    <= (self._tasks_completed_per_model.get(model, 0) + self._tasks_in_flight_per_model.get(model, 0))
+                while not self._should_stop(model) and 0 < self.settings.maxtasks <= (
+                    self._tasks_completed_per_model.get(model, 0) + self._tasks_in_flight_per_model.get(model, 0)
                 ):
                     await self._cond.wait()
 
-                if stop_event.is_set() or model in self._exhausted_models:
-                    if model in self._exhausted_models:
-                        logfire.info(f"[{slot_label}] Model quota exhausted. Exiting slot.")
-                    break
-
-                if 0 < self.settings.maxtasks <= self._tasks_completed_per_model.get(model, 0):
-                    logfire.info(
-                        f"[{slot_label}] Reached max tasks limit ({self.settings.maxtasks}) "
-                        f"for model '{model}'. Exiting slot."
-                    )
-                    break
-
-                if self._deadline is not None and monotonic() >= self._deadline:
+                if self._deadline is not None and monotonic() >= self._deadline and not self._shutdown:
                     max_dur_m = self.settings.maxduration.total_seconds() / 60.0
                     logfire.info(
                         f"[{slot_label}] Maximum run duration ({max_dur_m:.1f}m) reached. Draining slot and exiting."
                     )
-                    self._trigger_shutdown()
+                    self._shutdown = True
+                    self._cond.notify_all()
+
+                if self._should_stop(model):
+                    if model in self._exhausted_models:
+                        logfire.info(f"[{slot_label}] Model quota exhausted. Exiting slot.")
+                    elif 0 < self.settings.maxtasks <= self._tasks_completed_per_model.get(model, 0):
+                        logfire.info(
+                            f"[{slot_label}] Reached max tasks limit ({self.settings.maxtasks}) "
+                            f"for model '{model}'. Exiting slot."
+                        )
                     break
 
                 self._tasks_in_flight_per_model[model] = self._tasks_in_flight_per_model.get(model, 0) + 1
@@ -552,9 +535,10 @@ class WorkerRunner:
                     "Shutting down worker so worker.sh can update to latest version."
                 )
                 async with self._cond:
+                    self._tasks_in_flight_per_model[model] = max(0, self._tasks_in_flight_per_model[model] - 1)
                     self._version_mismatch = True
-                    self._trigger_shutdown()
-                await self._release_model_reservation(model)
+                    self._shutdown = True
+                    self._cond.notify_all()
                 break
             except HTTPStatusError as e:
                 if e.response.status_code in (401, 403, 404):
@@ -563,9 +547,10 @@ class WorkerRunner:
                         "Check serverurl and serverauth. Shutting down worker."
                     )
                     async with self._cond:
+                        self._tasks_in_flight_per_model[model] = max(0, self._tasks_in_flight_per_model[model] - 1)
                         self._fatal_error = True
-                        self._trigger_shutdown()
-                    await self._release_model_reservation(model)
+                        self._shutdown = True
+                        self._cond.notify_all()
                     break
                 claim_failed = True
                 logfire.warning(f"[{slot_label}] Failed to claim task from server: {e}. Retrying in 5s...")
@@ -574,9 +559,9 @@ class WorkerRunner:
                 logfire.warning(f"[{slot_label}] Failed to claim task from server: {e}. Retrying in 5s...")
 
             if claim_failed:
-                await self._release_model_reservation(model)
                 async with self._cond:
-                    if self._total_in_flight() == 0:
+                    self._tasks_in_flight_per_model[model] = max(0, self._tasks_in_flight_per_model[model] - 1)
+                    if sum(self._tasks_in_flight_per_model.values()) == 0:
                         idle_duration = monotonic() - self._last_busy_timestamp
                         error_timeout = idle_timeout_seconds if idle_timeout_seconds > 0 else 15.0
                         if idle_duration >= error_timeout:
@@ -585,9 +570,11 @@ class WorkerRunner:
                                 "Shutting down worker."
                             )
                             self._fatal_error = True
-                            self._trigger_shutdown()
+                            self._shutdown = True
+                            self._cond.notify_all()
                             break
-                    await self._wait_for_condition(5.0, stop_event)
+                    self._cond.notify_all()
+                    await self._wait_for_condition(5.0, model)
                 continue
 
             if claim is not None:
@@ -596,28 +583,32 @@ class WorkerRunner:
                 try:
                     await self._process_claimed_task(claim, model, slot_id, executor, search_providers)
                 finally:
-                    await self._release_model_reservation(model, touch_busy=True)
+                    async with self._cond:
+                        self._tasks_in_flight_per_model[model] = max(0, self._tasks_in_flight_per_model[model] - 1)
+                        self._last_busy_timestamp = monotonic()
+                        self._cond.notify_all()
                 continue
 
-            # claim is None (HTTP 204: no task available for this model)
-            await self._release_model_reservation(model)
+            # claim is None (HTTP 204): release reservation and check idle timeout atomically under _cond
             async with self._cond:
-                in_flight_now = self._total_in_flight()
-                if in_flight_now == 0:
+                self._tasks_in_flight_per_model[model] = max(0, self._tasks_in_flight_per_model[model] - 1)
+                if sum(self._tasks_in_flight_per_model.values()) == 0:
                     idle_duration = monotonic() - self._last_busy_timestamp
                     if idle_duration >= idle_timeout_seconds:
                         logfire.info(
                             f"[{slot_label}] All slots have been idle for {idle_duration / 60:.1f}m "
                             f"(timeout: {idle_timeout_seconds / 60:.1f}m). Shutting down worker."
                         )
-                        self._trigger_shutdown()
+                        self._shutdown = True
+                        self._cond.notify_all()
                         break
 
-                    remaining_idle = max(1.0, idle_timeout_seconds - idle_duration)
-                    await self._wait_for_condition(min(poll_seconds, remaining_idle), stop_event)
+                    wait_s = min(poll_seconds, max(1.0, idle_timeout_seconds - idle_duration))
                 else:
-                    # Re-check immediately if active slots across other models become idle while sleeping
-                    await self._wait_for_condition(poll_seconds, stop_event, wake_on_idle=True)
+                    wait_s = poll_seconds
+
+                self._cond.notify_all()
+                await self._wait_for_condition(wait_s, model)
 
     async def run(self) -> int:
         """Executes concurrent per-model worker slots until queues are drained or quotas are exhausted.

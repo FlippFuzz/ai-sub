@@ -569,7 +569,7 @@ class GitSyncManager:
 
                     if not rebase_in_progress:
                         logfire.warning(
-                            f"Git pull --rebase failed without active rebase (transient network error): "
+                            f"Git pull --rebase failed without active rebase (retryable network error): "
                             f"{self._sanitize_error(pull_err)}"
                         )
                         continue

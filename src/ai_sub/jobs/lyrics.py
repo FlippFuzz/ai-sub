@@ -177,8 +177,14 @@ def get_lyrics_prompt(
 
 
 class LyricsAiResponse(BaseSubtitleAiResponse):
-    """Structured response schema returned by the model for musical subtitle refinement."""
+    """Structured response schema returned by the model for musical subtitle refinement.
 
+    Note: Preserving draft timestamps and block count parity is intentionally guided via
+    the system prompt rather than enforced in Pydantic validators; strict equality checks
+    are omitted intentionally and Pipeline.finalize falls back to draft subtitles on failure.
+    """
+
+    # Intentionally no cross-validation of timestamps or block count against draft_subtitles.
     subtitles: list[Subtitles] = Field(
         alias="subs",
         description="Refined chronological synchronized subtitle events with frozen timestamps.",

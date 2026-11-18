@@ -129,7 +129,7 @@ def _content_dump(model: BaseModel | None) -> dict[str, Any] | None:
 
 
 def _apply_metadata_header(subs: SSAFile, metadata: dict[str, Any]) -> None:
-    """Inserts a 1ms metadata comment event at index 0 of an SSAFile.
+    """Sorts events chronologically and inserts a 1ms metadata comment event at index 0.
 
     Shifts any events starting at 0ms forward to 1ms so Event 0 stays cleanly ordered.
 
@@ -137,6 +137,7 @@ def _apply_metadata_header(subs: SSAFile, metadata: dict[str, Any]) -> None:
         subs: The SSAFile to mutate.
         metadata: Metadata dictionary to serialize.
     """
+    subs.sort()
     for ev in subs:
         if ev.start < 1:
             ev.start = 1
@@ -1127,49 +1128,19 @@ class Pipeline(BaseModel):
             ValueError: If segment_index is missing for a segment task.
         """
         max_runs = self.retry_settings.maxruns
-        log_reason = f"reached {max_runs} non-retryable failure(s)"
-
-        if task_type == TaskType.SUMMARY:
-            if self.summary.response is not None or self.summary.exhausted:
-                return FailureOutcome(action="ignored")
-            self.summary.total_attempts += 1
-            self.summary.tier_attempts += 1
-            if self.summary.tier_attempts >= max_runs:
-                return await self._advance_or_exhaust_stage(TaskType.SUMMARY, log_context=log_reason)
-            self._save_checkpoint(TaskType.SUMMARY)
-            return FailureOutcome(
-                action="retry",
-                fallback_tier=self.summary.fallback_tier,
-                target_fps=_float_fps(self.summary.target_fps),
-                tier_attempts=self.summary.tier_attempts,
-            )
-
-        if segment_index is None:
-            raise ValueError(f"segment_index is required for task_type '{task_type.value}'.")
-
-        seg = self.segments[segment_index]
-        target_fps_float = _float_fps(seg.target_fps)
-
-        if task_type == TaskType.SUBTITLES:
-            if seg.subtitles_response is not None or seg.subtitles_exhausted:
-                return FailureOutcome(action="ignored")
-            seg.subtitles_total_attempts += 1
-            seg.subtitles_tier_attempts += 1
-            if seg.subtitles_tier_attempts >= max_runs:
-                return await self._advance_or_exhaust_stage(TaskType.SUBTITLES, seg=seg, log_context=log_reason)
-            self._save_checkpoint(TaskType.SUBTITLES, seg)
-            return FailureOutcome(
-                action="retry",
-                fallback_tier=seg.fallback_tier,
-                target_fps=target_fps_float,
-                tier_attempts=seg.subtitles_tier_attempts,
-            )
+        seg: SegmentState | None = None
+        if task_type in (TaskType.SUBTITLES, TaskType.LYRICS):
+            if segment_index is None:
+                raise ValueError(f"segment_index is required for task_type '{task_type.value}'.")
+            seg = self.segments[segment_index]
 
         if task_type == TaskType.LYRICS:
+            assert seg is not None
             if seg.lyrics_response is not None or seg.lyrics_exhausted:
                 return FailureOutcome(action="ignored")
             seg.lyrics_total_attempts += 1
             seg.lyrics_tier_attempts += 1
+            target_fps = _float_fps(seg.target_fps)
             if seg.lyrics_tier_attempts >= max_runs:
                 seg.lyrics_exhausted = True
                 self._save_checkpoint(TaskType.LYRICS, seg)
@@ -1180,18 +1151,49 @@ class Pipeline(BaseModel):
                 return FailureOutcome(
                     action="exhausted",
                     fallback_tier=seg.fallback_tier,
-                    target_fps=target_fps_float,
+                    target_fps=target_fps,
                     tier_attempts=seg.lyrics_tier_attempts,
                 )
             self._save_checkpoint(TaskType.LYRICS, seg)
             return FailureOutcome(
                 action="retry",
                 fallback_tier=seg.fallback_tier,
-                target_fps=target_fps_float,
+                target_fps=target_fps,
                 tier_attempts=seg.lyrics_tier_attempts,
             )
 
-        return FailureOutcome(action="ignored")
+        if task_type == TaskType.SUMMARY:
+            if self.summary.response is not None or self.summary.exhausted:
+                return FailureOutcome(action="ignored")
+            self.summary.total_attempts += 1
+            self.summary.tier_attempts += 1
+            tier_attempts = self.summary.tier_attempts
+            media_state: MediaStageState = self.summary
+        elif task_type == TaskType.SUBTITLES:
+            assert seg is not None
+            if seg.subtitles_response is not None or seg.subtitles_exhausted:
+                return FailureOutcome(action="ignored")
+            seg.subtitles_total_attempts += 1
+            seg.subtitles_tier_attempts += 1
+            tier_attempts = seg.subtitles_tier_attempts
+            media_state = seg
+        else:
+            return FailureOutcome(action="ignored")
+
+        if tier_attempts >= max_runs:
+            return await self._advance_or_exhaust_stage(
+                task_type,
+                seg=seg,
+                log_context=f"reached {max_runs} non-retryable failure(s)",
+            )
+
+        self._save_checkpoint(task_type, seg)
+        return FailureOutcome(
+            action="retry",
+            fallback_tier=media_state.fallback_tier,
+            target_fps=_float_fps(media_state.target_fps),
+            tier_attempts=tier_attempts,
+        )
 
     def _derive_status(self) -> str:
         """Derives completion status based on session progress and recorded failures.

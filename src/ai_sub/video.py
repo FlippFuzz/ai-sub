@@ -646,6 +646,8 @@ async def reencode_video(
         vf_filter,
         "-c:v",
         encoder,
+        "-pix_fmt",
+        "yuv420p",
         *video_rate_args,
         "-b:v",
         str(video_bits_per_sec),

@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import random
 import socket
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
 from annotated_types import Ge, Gt
+from dotenv import dotenv_values
 from logfire import LevelName
 from pydantic import (
     BaseModel,
@@ -57,14 +57,10 @@ def _get_env_value(*names: str) -> str | None:
 
     env_path = Path(".env")
     if env_path.is_file():
-        try:
-            dotenv_mod = importlib.import_module("dotenv")
-            dotenv_map = dotenv_mod.dotenv_values(env_path)
-            for name in names:
-                if (val := dotenv_map.get(name)) and (stripped := str(val).strip()):
-                    return stripped
-        except ImportError:
-            pass
+        dotenv_map = dotenv_values(env_path)
+        for name in names:
+            if (val := dotenv_map.get(name)) and (stripped := val.strip()):
+                return stripped
     return None
 
 
@@ -100,39 +96,23 @@ def _parse_string_list(val: Any) -> list[str] | Any:
     return val
 
 
-def _parse_search_tools(val: Any) -> list[str] | Any:
-    """Parses and lowercases search tool names prior to Literal validation.
+def _parse_list_items(val: Any, transform: Callable[[str], Any]) -> list[Any] | Any:
+    """Parses a string list and applies an item-level transformation when parsing succeeds.
 
     Args:
         val: Raw input value from environment variable, CLI, or YAML.
+        transform: Callable converting each parsed string item.
 
     Returns:
-        list[str] | Any: Lowercased list of tool names or unparsed raw input.
+        list[Any] | Any: Transformed list of items or unparsed raw input.
     """
     parsed = _parse_string_list(val)
-    if isinstance(parsed, list):
-        return [item.lower() for item in parsed]
-    return parsed
-
-
-def _parse_path_list(val: Any) -> list[Path] | Any:
-    """Parses a list of Paths from a Python list, JSON array, or comma-separated string.
-
-    Args:
-        val: Raw input value from environment variable or YAML.
-
-    Returns:
-        list[Path] | Any: Normalized list of Path objects or unparsed raw input.
-    """
-    raw_list = _parse_string_list(val)
-    if not isinstance(raw_list, list):
-        return raw_list
-    return [Path(p) for p in raw_list]
+    return [transform(item) for item in parsed] if isinstance(parsed, list) else parsed
 
 
 StringList = Annotated[list[str], NoDecode, BeforeValidator(_parse_string_list)]
-SearchToolList = Annotated[list[SearchTool], NoDecode, BeforeValidator(_parse_search_tools)]
-PathList = Annotated[list[Path], NoDecode, BeforeValidator(_parse_path_list)]
+SearchToolList = Annotated[list[SearchTool], NoDecode, BeforeValidator(lambda val: _parse_list_items(val, str.lower))]
+PathList = Annotated[list[Path], NoDecode, BeforeValidator(lambda val: _parse_list_items(val, Path))]
 
 
 class BaseConfigModel(BaseModel):
@@ -355,11 +335,11 @@ class BackoffSettings(BaseConfigModel):
 
 
 class RetrySettings(BaseConfigModel):
-    """Retry parameters for transient API failures, output validation, and cross-run limits."""
+    """Retry parameters for retryable API failures, output validation, and cross-run limits."""
 
     perturn: NonNegativeInt = Field(
         default=5,
-        description="Maximum retries per API turn on transient network, rate-limit, or 5xx errors.",
+        description="Maximum retries per API turn on retryable network, rate-limit, or 5xx errors.",
     )
     validation: NonNegativeInt = Field(
         default=3,
@@ -421,7 +401,7 @@ class SearchSettings(BaseConfigModel):
     )
     retries: NonNegativeInt = Field(
         default=3,
-        description="Maximum retries for search requests on transient errors.",
+        description="Maximum retries for search requests on retryable errors.",
     )
     backoff: BackoffSettings = Field(
         default_factory=lambda: BackoffSettings(

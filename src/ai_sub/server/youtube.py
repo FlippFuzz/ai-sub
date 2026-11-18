@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
-import os
 import random
 import re
 import shutil
@@ -164,7 +163,7 @@ def _is_bot_detection_error(err_msg: str) -> bool:
 
 
 def _check_permanent_video_error(err_msg: str) -> str | None:
-    """Detects whether an error message indicates an unrecoverable video-level error.
+    """Detects whether an error message indicates an unrecoverable or unplayable video-level error.
 
     Args:
         err_msg: Raw error message string.
@@ -188,6 +187,8 @@ def _check_permanent_video_error(err_msg: str) -> str | None:
         return "Deleted / Removed"
     if "sign in to confirm your age" in lower:
         return "Age restricted"
+    if "premieres in" in lower or "live event will begin" in lower:
+        return "Live / Upcoming"
     return None
 
 
@@ -317,9 +318,8 @@ class YouTubeClient:
                 logfire.info(f"Building bgutil-ytdlp-pot-provider server ({target_version or 'latest'})...")
                 shutil.rmtree(build_dir, ignore_errors=True)
                 shutil.rmtree(dist_dir, ignore_errors=True)
-                is_win = os.name == "nt"
-                subprocess.run([npm_bin, "ci"], cwd=server_dir, check=True, capture_output=True, shell=is_win)
-                subprocess.run([npx_bin, "tsc"], cwd=server_dir, check=True, capture_output=True, shell=is_win)
+                subprocess.run([npm_bin, "ci"], cwd=server_dir, check=True, capture_output=True)
+                subprocess.run([npx_bin, "tsc"], cwd=server_dir, check=True, capture_output=True)
                 logfire.info("bgutil-ytdlp-pot-provider built successfully.")
 
             if _has_pot_provider_artifacts(server_dir):
@@ -570,7 +570,7 @@ class YouTubeClient:
     ) -> ScanResult:
         """Fetches metadata for configured YouTube sources using flat extraction with early date cutoff.
 
-        Tracks per-URL deep-scan completion so any source that fails with a transient error
+        Tracks per-URL deep-scan completion so any source that fails with a retryable error
         automatically retries its full history crawl on the next scan without re-crawling
         already-completed sources. Skips members-only ('subscriber_only') videos.
 
@@ -723,7 +723,8 @@ class YouTubeClient:
 
         Raises:
             YouTubeBotDetectionError: If a bot check is detected during download.
-            YouTubeVideoUnavailableError: If the video is deleted, private, members-only, or age/geo-restricted.
+            YouTubeVideoUnavailableError: If the video is deleted, private, members-only, live/upcoming,
+                or age/geo-restricted.
             RuntimeError: If download fails or output file cannot be located.
         """
         destination_dir.mkdir(parents=True, exist_ok=True)
@@ -735,17 +736,28 @@ class YouTubeClient:
         )
         ydl_opts["outtmpl"] = str(destination_dir / f"%(title).{self.config.maxtitlebytes}B [%(id)s].%(ext)s")
 
+        def _filter_unplayable(info_dict: Mapping[str, Any], *, incomplete: bool = False) -> str | None:
+            if incomplete:
+                return None
+            if info_dict.get("availability") == "subscriber_only":
+                raise YouTubeVideoUnavailableError(
+                    f"Video {video_id} is members-only.",
+                    reason="Members only",
+                )
+            if info_dict.get("live_status") in ("is_upcoming", "is_live", "post_live"):
+                raise YouTubeVideoUnavailableError(
+                    f"Video {video_id} is live or upcoming ({info_dict.get('live_status')}).",
+                    reason="Live / Upcoming",
+                )
+            return None
+
+        ydl_opts["match_filter"] = _filter_unplayable
+
         try:
             with YoutubeDL(cast(Any, ydl_opts)) as ydl:
                 info = ydl.extract_info(source_ref, download=True)
                 if not info:
                     raise RuntimeError(f"Could not extract download info for {source_ref}")
-
-                if info.get("availability") == "subscriber_only":
-                    raise YouTubeVideoUnavailableError(
-                        f"Video {video_id} is members-only.",
-                        reason="Members only",
-                    )
 
                 uploader_handle = self.get_uploader_id(info)
                 channel_name = str(info.get("channel") or info.get("uploader") or uploader_handle)

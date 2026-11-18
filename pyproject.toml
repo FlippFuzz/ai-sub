@@ -21,7 +21,7 @@ dependencies = [
     "ddgs",
     "httpx",
     "json_repair",
-    "pyrate-limiter",
+    "pyrate-limiter >= 4.0.0",
     "rich",
     "pyyaml",
 ]

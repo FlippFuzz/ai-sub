@@ -41,8 +41,12 @@ class QuotaExceededError(Exception):
     """Raised when an AI model provider's daily quota limit is exhausted."""
 
 
+class InteractionFailedError(Exception):
+    """Raised when a Gemini interaction terminates in a failed or cancelled state."""
+
+
 def is_retryable_error(e: Exception) -> bool:
-    """Determines if an error is a transient network or server error eligible for retry.
+    """Determines if an error is a retryable network, server, or interaction failure.
 
     Args:
         e: Caught exception.
@@ -57,7 +61,17 @@ def is_retryable_error(e: Exception) -> bool:
     if _is_daily_quota_exceeded(e):
         return False
 
-    if isinstance(e, (TransportError, TimeoutException, ConnectionError, asyncio.TimeoutError, TimeoutError)):
+    if isinstance(
+        e,
+        (
+            InteractionFailedError,
+            TransportError,
+            TimeoutException,
+            ConnectionError,
+            asyncio.TimeoutError,
+            TimeoutError,
+        ),
+    ):
         return True
 
     status_code = (
@@ -180,6 +194,31 @@ def _extract_thought_text(step: Any) -> str | None:
     return None
 
 
+def _format_interaction_errors(interaction: Any) -> str:
+    """Formats error details attached to a failed or cancelled interaction.
+
+    Args:
+        interaction: Interaction response object.
+
+    Returns:
+        str: Combined error description string.
+    """
+    errors = getattr(interaction, "errors", None) or getattr(interaction, "error", None)
+    if not errors:
+        return "No error details provided."
+    items = errors if isinstance(errors, list) else [errors]
+    parts: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            code, msg = item.get("code"), item.get("message")
+        else:
+            code, msg = getattr(item, "code", None), getattr(item, "message", None)
+        text = f"{code}: {msg}" if code and msg else (msg or code or str(item))
+        if text:
+            parts.append(str(text))
+    return "; ".join(parts) or str(errors)
+
+
 def calculate_sha256_hex(file_path: Path) -> str:
     """Calculates the SHA256 hex digest of a file using Python 3.11+ C file_digest.
 
@@ -286,14 +325,14 @@ class GeminiExecutor:
             )
         return self._request_limiters[model_id], self._token_limiters[model_id]
 
-    async def _retry_transient(
+    async def _retry_operation(
         self,
         operation: Callable[[], Awaitable[R]],
         retry: RetrySettings,
         op_label: str,
         model_id: str | None = None,
     ) -> R:
-        """Executes an API operation with exponential backoff retries on transient errors.
+        """Executes an API operation with exponential backoff retries on retryable errors.
 
         Args:
             operation: Zero-argument async callable executing the API request.
@@ -391,7 +430,7 @@ class GeminiExecutor:
 
         Args:
             file_path: Local path to the segment file.
-            retry_settings: Optional retry policy for transient Files API errors. Defaults to None.
+            retry_settings: Optional retry policy for retryable Files API errors. Defaults to None.
 
         Returns:
             types.File: Active remote file handle from the Gemini Files API.
@@ -472,7 +511,7 @@ class GeminiExecutor:
 
                 try:
                     with logfire.span("Uploading {filename} to Gemini Files API", filename=file_path.name):
-                        uploaded = await self._retry_transient(
+                        uploaded = await self._retry_operation(
                             operation=lambda: self._client.aio.files.upload(
                                 file=upload_path,
                                 config=types.UploadFileConfig(display_name=display_name, mime_type=resolved_mime),
@@ -498,7 +537,7 @@ class GeminiExecutor:
                         if not remote_name:
                             raise RuntimeError(f"Could not retrieve file '{file_path.name}' status.")
                         await asyncio.sleep(poll_interval)
-                        uploaded = await self._retry_transient(
+                        uploaded = await self._retry_operation(
                             operation=lambda name=remote_name: self._client.aio.files.get(name=name),
                             retry=retry,
                             op_label=f"poll file '{file_path.name}'",
@@ -585,6 +624,7 @@ class GeminiExecutor:
 
         Raises:
             QuotaExceededError: If daily project quota is exhausted.
+            InteractionFailedError: If the interaction status is 'failed' or 'cancelled'.
         """
         if self._quota_exhausted.get(model_id, False):
             raise QuotaExceededError(f"Daily quota previously exhausted for model '{model_id}'.")
@@ -613,7 +653,13 @@ class GeminiExecutor:
         await req_limiter.try_acquire_async("rpm")
         await tok_limiter.try_acquire_async("tpm", weight=token_weight)
 
-        return await self._client.aio.interactions.create(**kwargs)
+        interaction = await self._client.aio.interactions.create(**kwargs)
+        status = getattr(interaction, "status", None)
+        if status in ("failed", "cancelled"):
+            raise InteractionFailedError(
+                f"Interaction {status} on {model_id}: {_format_interaction_errors(interaction)}"
+            )
+        return interaction
 
     async def _execute_function_calls(
         self,
@@ -754,7 +800,7 @@ class GeminiExecutor:
             T: Parsed and validated Pydantic model instance.
 
         Raises:
-            ValueError: If the model returns empty text content on the final search turn.
+            ValueError: If the interaction status is 'incomplete' or output text is empty.
         """
         interaction_input: Any = initial_input
         previous_interaction_id: str | None = None
@@ -780,7 +826,7 @@ class GeminiExecutor:
             ):
                 current_tools = None if search_turns >= max_search_turns else gemini_tools
 
-                interaction = await self._retry_transient(
+                interaction = await self._retry_operation(
                     operation=lambda: self._create_interaction(
                         model_id=model_id,
                         input_payload=interaction_input,
@@ -796,6 +842,11 @@ class GeminiExecutor:
                     op_label=f"{model_id} search turn {search_turns}",
                     model_id=model_id,
                 )
+
+                if getattr(interaction, "status", None) == "incomplete":
+                    raise ValueError(
+                        f"Model '{model_id}' returned incomplete interaction on search turn {search_turns}."
+                    )
 
                 for step in getattr(interaction, "steps", []) or []:
                     if getattr(step, "type", None) == "thought":

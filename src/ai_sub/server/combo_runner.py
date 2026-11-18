@@ -611,39 +611,6 @@ class ComboRunner:
 
         return self.pipeline.is_done()
 
-    def _seed_resumed_tasks(self, pipeline: Pipeline) -> None:
-        """Seeds completed and exhausted ServerTask records from resumed Pipeline state.
-
-        Args:
-            pipeline: Restored Pipeline instance.
-        """
-        vid = pipeline.video_id
-        if pipeline.summary.response is not None or pipeline.summary.exhausted:
-            sum_status = TaskStatus.COMPLETED if pipeline.summary.response is not None else TaskStatus.FAILED
-            self._upsert_server_task(
-                task_id=f"{self.config.name}::{vid}::summary",
-                task_type=TaskType.SUMMARY,
-                video_id=vid,
-                media_path=pipeline.summary.media_path or pipeline.raw_video_path,
-                status=sum_status,
-            )
-
-        for seg in pipeline.segments:
-            seg_media = seg.media_path or seg.raw_path
-            for task_type, resp, exhausted in (
-                (TaskType.SUBTITLES, seg.subtitles_response, seg.subtitles_exhausted),
-                (TaskType.LYRICS, seg.lyrics_response, seg.lyrics_exhausted),
-            ):
-                if resp is not None or exhausted:
-                    self._upsert_server_task(
-                        task_id=f"{self.config.name}::{vid}::{task_type.value}::{seg.index:03d}",
-                        task_type=task_type,
-                        video_id=vid,
-                        media_path=seg_media,
-                        status=TaskStatus.COMPLETED if resp is not None else TaskStatus.FAILED,
-                        segment_index=seg.index,
-                    )
-
     async def resume_from_disk(self) -> bool:
         """Inspects work/<combo>/ to restore in-progress video directories upon server boot.
 
@@ -743,7 +710,6 @@ class ComboRunner:
             self.preparing_video_info = None
             self._reencode_wake_event.clear()
 
-            self._seed_resumed_tasks(pipeline)
             self.sync_tasks_from_pipeline()
 
             if self.is_video_complete():

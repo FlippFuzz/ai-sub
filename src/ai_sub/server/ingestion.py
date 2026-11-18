@@ -543,9 +543,6 @@ class IngestionManager:
             else:
                 try:
                     raw_path = await self._download_youtube_to_combo_dir(video, runner.work_dir)
-                    video.status = "ready"
-                    video.error_reason = None
-                    video.retry_after = None
                 except YouTubeVideoUnavailableError as e:
                     _cleanup_failed_job_dir(runner.work_dir / video.video_id)
                     if e.reason == "Members only":
@@ -584,6 +581,9 @@ class IngestionManager:
                     source_type=video.source_type,
                     timestamp=video.timestamp,
                 )
+                video.status = "ready"
+                video.error_reason = None
+                video.retry_after = None
                 fed = True
                 return True, True, False
             except Exception as e:

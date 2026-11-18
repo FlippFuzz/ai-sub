@@ -60,7 +60,7 @@ def clean_timestamp_string(ts_str: str) -> str:
     """Extracts a valid timestamp pattern from a potentially noisy LLM string.
 
     Supports both period and comma decimal delimiters (e.g. '01:23.450' and '01:23,450')
-    as well as 'HH:MM:SS:mmm' and 'MM:SS:mmm'.
+    as well as 'HH:MM:SS:mmm', 'MM:SS:mmm', and 3-digit minute stamps (e.g. '105:30').
 
     Args:
         ts_str: Potentially noisy timestamp string.
@@ -72,8 +72,8 @@ def clean_timestamp_string(ts_str: str) -> str:
         return ts_str
     match = re.search(
         r"(\d{1,2}:\d{2}:\d{2}(?:[.,]\d{1,3}|:\d{3})?(?!\d)"
-        r"|\d{1,2}:\d{2}(?:[.,]\d{1,3}|:\d{3}(?!\d))"
-        r"|\d{1,2}:\d{2}(?!\d))",
+        r"|\d{1,3}:\d{2}(?:[.,]\d{1,3}|:\d{3}(?!\d))"
+        r"|\d{1,3}:\d{2}(?!\d))",
         ts_str,
     )
     return match.group(1).replace(",", ".") if match else ts_str
@@ -86,7 +86,7 @@ def parse_timestamp_string_ms(timestamp_string: str) -> int:
     """Parses standard timestamp formats into total milliseconds.
 
     Supports 'MM:SS.mmm', 'HH:MM:SS.mmm', 'HH:MM:SS', 'MM:SS:mmm', 'HH:MM:SS:mmm',
-    'MM:SS', and comma millisecond delimiters (e.g., '01:23,450').
+    'MM:SS', 'SS.mmm', and comma millisecond delimiters (e.g., '01:23,450').
 
     Args:
         timestamp_string: Timestamp string to parse.
@@ -98,60 +98,36 @@ def parse_timestamp_string_ms(timestamp_string: str) -> int:
         ValueError: If the timestamp cannot be parsed into milliseconds.
     """
     ts = timestamp_string.strip().replace(",", ".")
+    has_decimal = "." in ts
+    ms = 0
 
-    if "." in ts:
-        split1 = ts.split(".")
-        if len(split1) != 2:
+    if has_decimal:
+        head, *rest = ts.split(".")
+        if len(rest) != 1:
             raise ValueError(f"Invalid timestamp format: {timestamp_string}")
+        ms = int(rest[0].ljust(3, "0")[:3])
+    else:
+        head = ts
 
-        milliseconds = int(split1[1].ljust(3, "0")[:3])
-        split2 = split1[0].split(":")
+    raw_parts = head.split(":")
+    parts = [int(p) for p in raw_parts]
 
-        if len(split2) == 3:
-            hours = int(split2[0])
-            minutes = int(split2[1])
-            seconds = int(split2[2])
-            return hours * 3600000 + minutes * 60000 + seconds * 1000 + milliseconds
-        elif len(split2) == 2:
-            minutes = int(split2[0])
-            seconds = int(split2[1])
-            return minutes * 60000 + seconds * 1000 + milliseconds
-        elif len(split2) == 1:
-            seconds = int(split2[0])
-            return seconds * 1000 + milliseconds
-        else:
-            raise ValueError(f"Invalid timestamp format: {timestamp_string}")
-
-    colon_count = ts.count(":")
-    if colon_count == 2:
-        split = ts.split(":")
-        if len(split[2]) == 3 or int(split[2]) >= 60:
-            minutes = int(split[0])
-            seconds = int(split[1])
-            milliseconds = int(split[2].ljust(3, "0")[:3])
-            return minutes * 60000 + seconds * 1000 + milliseconds
-        else:
-            hours = int(split[0])
-            minutes = int(split[1])
-            seconds = int(split[2])
-            return hours * 3600000 + minutes * 60000 + seconds * 1000
-
-    elif colon_count == 1:
-        split = ts.split(":")
-        minutes = int(split[0])
-        seconds = int(split[1])
-        return minutes * 60000 + seconds * 1000
-
-    elif colon_count == 3:
-        split = ts.split(":")
-        hours = int(split[0])
-        minutes = int(split[1])
-        seconds = int(split[2])
-        milliseconds = int(split[3].ljust(3, "0")[:3])
-        return hours * 3600000 + minutes * 60000 + seconds * 1000 + milliseconds
-
+    if not has_decimal and len(parts) == 3 and (len(raw_parts[2]) == 3 or parts[2] >= 60):
+        hours, minutes, seconds = 0, parts[0], parts[1]
+        ms = int(raw_parts[2].ljust(3, "0")[:3])
+    elif not has_decimal and len(parts) == 4:
+        hours, minutes, seconds = parts[0], parts[1], parts[2]
+        ms = int(raw_parts[3].ljust(3, "0")[:3])
+    elif len(parts) == 3:
+        hours, minutes, seconds = parts
+    elif len(parts) == 2:
+        hours, minutes, seconds = 0, parts[0], parts[1]
+    elif has_decimal and len(parts) == 1:
+        hours, minutes, seconds = 0, 0, parts[0]
     else:
         raise ValueError(f"Invalid timestamp format: {timestamp_string}")
+
+    return hours * 3600000 + minutes * 60000 + seconds * 1000 + ms
 
 
 def format_ms_timestamp(ms: int) -> str:
