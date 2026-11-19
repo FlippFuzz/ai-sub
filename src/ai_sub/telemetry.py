@@ -115,5 +115,8 @@ def setup_logging(
         distributed_tracing=True,
     )
 
+    # 3. Completely suppress noisy FastAPI instrumentation that is generated even without being explicitly enabled.
+    logfire.suppress_scopes("fastapi")
+
     silent_telemetry_client.instrument_httpx(capture_all=True)
     silent_telemetry_client.instrument_google_genai()

@@ -173,6 +173,10 @@ class FilesSourceConfig(BaseConfigModel):
         default=timedelta(minutes=2),
         description="Background polling interval to discover newly added local media files (seconds if numeric).",
     )
+    maxstembytes: PositiveInt = Field(
+        default=100,
+        description="Maximum UTF-8 byte length for local video filename stems in output folders and SRT filenames.",
+    )
 
 
 class YoutubeSourceConfig(BaseConfigModel):
@@ -209,10 +213,6 @@ class YoutubeSourceConfig(BaseConfigModel):
     channelsfile: Path = Field(
         default=Path("channels.json"),
         description="Path to the YouTube channel mapping JSON cache.",
-    )
-    maxtitlebytes: PositiveInt = Field(
-        default=100,
-        description="Maximum byte length of the video title prefix in downloaded filenames.",
     )
     potdir: Path | None = Field(
         default=Path("bgutil-ytdlp-pot-provider"),

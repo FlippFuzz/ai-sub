@@ -30,6 +30,7 @@ from ai_sub.protocol import TaskType
 from ai_sub.server.models import ServerTask, TaskStatus
 from ai_sub.server.server_config import PipelineConfig
 from ai_sub.shortcode import generate_full_shortcode
+from ai_sub.video import compute_file_id_hash
 
 
 class RunnerStatus(str, Enum):
@@ -106,7 +107,11 @@ class ComboRunner:
         self.reencode_settings = reencode_settings
         self.split_settings = split_settings
         self.retry_settings = retry_settings
-        self.full_shortcode = generate_full_shortcode(config.subtitles.model)
+        self.full_shortcode = generate_full_shortcode(
+            subtitles_model=config.subtitles.model,
+            summary_model=config.summary.model,
+            lyrics_model=config.lyrics.model,
+        )
 
         self.status = RunnerStatus.IDLE
         self.pipeline = None
@@ -290,6 +295,7 @@ class ComboRunner:
         Returns:
             Pipeline: Initialized pipeline instance.
         """
+        media_tag = video_id if source_type == "youtube" else compute_file_id_hash(raw_video_path.name)
         return await Pipeline.create(
             raw_video_path=raw_video_path,
             job_dir=job_dir,
@@ -297,6 +303,8 @@ class ComboRunner:
             uploader=uploader,
             channel_name=channel_name,
             video_id=video_id,
+            media_tag=media_tag,
+            output_stem=video_id,
             summary_config=self._stage_config(TaskType.SUMMARY),
             subtitles_config=self._stage_config(TaskType.SUBTITLES),
             lyrics_config=self._stage_config(TaskType.LYRICS),
@@ -622,7 +630,7 @@ class ComboRunner:
             bool: True if an active video was successfully restored, False otherwise.
         """
         with logfire.span("Disk Resume Check: {combo}", combo=self.config.name) as resume_span:
-            job_dirs = [d for d in self.work_dir.iterdir() if d.is_dir() and d.name != "reencoded"]
+            job_dirs = [d for d in self.work_dir.iterdir() if d.is_dir()]
             if not job_dirs:
                 self.status = RunnerStatus.IDLE
                 self.preparing_video_info = None

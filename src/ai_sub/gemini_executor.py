@@ -33,8 +33,8 @@ from ai_sub.search.search_base import BaseSearchProvider
 T = TypeVar("T", bound=BaseModel)
 R = TypeVar("R")
 
-# Matches segment chunks (local or worker-prefixed) and global summary proxies
-MANAGED_PATTERN = re.compile(r"^(?:.*_)?(part_\d{3,}|summary_proxy)\.[^./]+$")
+# Matches managed segment chunks, re-encoded outputs, and summary proxies
+MANAGED_PATTERN = re.compile(r"^(?:reencoded_)?(?:part_\d{3,}|summary)_[A-Za-z0-9_-]+\.[^./]+$")
 
 
 class QuotaExceededError(Exception):
@@ -95,14 +95,11 @@ def _get_unique_display_name(file_path: Path) -> str:
         file_path: Path to the local file.
 
     Returns:
-        str: Display name formatted as 'workspace/filename.ext' or 'workspace/reencoded/filename.ext'.
+        str: Display name formatted as 'workspace/filename.ext'.
     """
     resolved = file_path.resolve()
     safe_name = urllib.parse.quote(resolved.name, safe=".-_")
     safe_parent = urllib.parse.quote(resolved.parent.name, safe=".-_")
-    if resolved.parent.name == "reencoded":
-        safe_grandparent = urllib.parse.quote(resolved.parent.parent.name, safe=".-_")
-        return f"{safe_grandparent}/reencoded/{safe_name}"
     return f"{safe_parent}/{safe_name}"
 
 

@@ -37,7 +37,7 @@ from ai_sub.pipeline import Pipeline
 from ai_sub.search import BaseSearchProvider, create_search_providers
 from ai_sub.standalone_config import StandaloneSettings
 from ai_sub.telemetry import setup_logging
-from ai_sub.video import init_ffmpeg_engine
+from ai_sub.video import compute_file_id_hash, init_ffmpeg_engine, sanitize_filename
 
 
 class AiSubResult(IntEnum):
@@ -209,6 +209,8 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
             search_settings=settings.ai.search,
             split_settings=settings.split,
             retry_settings=settings.retry,
+            media_tag=compute_file_id_hash(input_video_path.name),
+            output_stem=sanitize_filename(input_video_path.stem),
             user_context=user_context,
             validation_buffer_ms=int(settings.ai.buffer.total_seconds() * 1000),
             summary_enabled=use_summary,

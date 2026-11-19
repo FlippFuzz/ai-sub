@@ -25,7 +25,7 @@ from ai_sub.server.youtube import (
     YouTubeClient,
     YouTubeVideoUnavailableError,
 )
-from ai_sub.video import sanitize_uploader
+from ai_sub.video import sanitize_filename, truncate_utf8_bytes
 
 
 class QueuedVideo(BaseModel):
@@ -224,6 +224,7 @@ class IngestionManager:
             dict[str, DiscoveredVideo]: Map of video ID to discovered file metadata.
         """
         discovered: dict[str, DiscoveredVideo] = {}
+        max_stem_bytes = self.config.files.maxstembytes
 
         for folder in self.config.files.folders:
             if not folder.is_dir():
@@ -232,7 +233,7 @@ class IngestionManager:
                 if not file_path.is_file() or file_path.suffix.lower() not in VALID_VIDEO_EXTENSIONS:
                     continue
 
-                vid = file_path.stem
+                vid = truncate_utf8_bytes(sanitize_filename(file_path.stem), max_stem_bytes)
                 if not is_valid_video_id(vid):
                     logfire.warning(f"Skipping local file with invalid filename stem {vid!r}: {file_path}")
                     continue
@@ -247,13 +248,12 @@ class IngestionManager:
                     continue
 
                 mtime = int(file_path.stat().st_mtime)
-                uploader = sanitize_uploader(file_path.parent.name or "local", fallback="local")
 
                 discovered[vid] = DiscoveredVideo(
                     video_id=vid,
-                    uploader=uploader,
-                    channel_name=uploader,
-                    title=vid,
+                    uploader="local",
+                    channel_name="local",
+                    title=file_path.stem,
                     source_ref=str(resolved_path),
                     timestamp=mtime,
                     local_path=resolved_path,
@@ -306,6 +306,7 @@ class IngestionManager:
                         existing.retry_after = None
                     existing.local_path = item.local_path
                     existing.timestamp = item.timestamp
+                    existing.title = item.title
                     existing.uploader = item.uploader
                     existing.channel_name = item.channel_name
 

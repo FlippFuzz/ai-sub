@@ -513,7 +513,7 @@ class YouTubeClient:
             url_context: Optional channel handle extracted from the configured source URL.
 
         Returns:
-            str: Resolved and sanitized single-component uploader ID (max 20 characters).
+            str: Resolved and sanitized single-component uploader ID (max 50 characters).
         """
         uploader_id = _extract_handle(entry)
         channel_id = entry.get("channel_id")
@@ -735,7 +735,7 @@ class YouTubeClient:
             "bestvideo[width<=360]+bestaudio/best[width<=360]/"
             "bestvideo+bestaudio/best"
         )
-        ydl_opts["outtmpl"] = str(destination_dir / f"%(title).{self.config.maxtitlebytes}B [%(id)s].%(ext)s")
+        ydl_opts["outtmpl"] = str(destination_dir / f"raw_{video_id}.%(ext)s")
 
         def _filter_unplayable(info_dict: Mapping[str, Any], *, incomplete: bool = False) -> str | None:
             if incomplete:
@@ -783,8 +783,8 @@ class YouTubeClient:
                 if downloaded_path is None:
                     matches = [
                         p
-                        for p in destination_dir.glob(f"*{video_id}*.*")
-                        if p.is_file() and not p.name.startswith("part_") and p.suffix.lower() in VALID_VIDEO_EXTENSIONS
+                        for p in destination_dir.glob(f"raw_{video_id}.*")
+                        if p.is_file() and p.suffix.lower() in VALID_VIDEO_EXTENSIONS
                     ]
                     if matches:
                         # Prioritize the largest file (e.g. merged stream over unmerged track)

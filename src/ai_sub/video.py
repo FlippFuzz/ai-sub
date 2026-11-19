@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import os
 import re
@@ -37,6 +38,50 @@ def sanitize_filename(name: str) -> str:
     return cleaned or "video"
 
 
+def truncate_utf8_bytes(text: str, max_bytes: int, fallback: str = "video") -> str:
+    """Truncates a string cleanly on a UTF-8 character boundary to fit within max_bytes.
+
+    Args:
+        text: Input string to truncate.
+        max_bytes: Maximum allowed UTF-8 byte length.
+        fallback: Value returned if truncation yields an empty string. Defaults to 'video'.
+
+    Returns:
+        str: UTF-8 byte-bounded string with trailing spaces/dots stripped.
+
+    Raises:
+        ValueError: If max_bytes is not positive.
+    """
+    if max_bytes <= 0:
+        raise ValueError(f"max_bytes must be positive, got {max_bytes}.")
+    encoded = text.encode("utf-8")
+    if len(encoded) > max_bytes:
+        text = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    cleaned = text.strip(" .")
+    return cleaned or fallback
+
+
+def compute_file_id_hash(filename: str, length: int = 11) -> str:
+    """Computes a compact deterministic lowercase hex digest of a filename.
+
+    Matches the 11-character length of YouTube video IDs by default while remaining
+    case-insensitive and free of delimiter characters across operating systems.
+
+    Args:
+        filename: File name (including extension) to hash.
+        length: Number of hex characters to return (1-64). Defaults to 11.
+
+    Returns:
+        str: Lowercase SHA-256 hex prefix string.
+
+    Raises:
+        ValueError: If length is outside [1, 64].
+    """
+    if not (1 <= length <= 64):
+        raise ValueError(f"Hash length must be between 1 and 64, got {length}.")
+    return hashlib.sha256(filename.encode("utf-8")).hexdigest()[:length]
+
+
 def sanitize_uploader(raw_uploader: str, fallback: str = "unknown") -> str:
     """Normalizes an uploader handle or folder name into a safe single directory component.
 
@@ -45,12 +90,12 @@ def sanitize_uploader(raw_uploader: str, fallback: str = "unknown") -> str:
         fallback: Value returned if the sanitized result is empty or unsafe. Defaults to 'unknown'.
 
     Returns:
-        str: Safe single-component uploader identifier (max 20 characters).
+        str: Safe single-component uploader identifier (max 50 characters).
     """
     stripped = str(raw_uploader).strip().strip("@")
     if not stripped:
         return fallback
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stripped)[:20].strip(" .")
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stripped)[:50].strip(" .")
     if not cleaned or cleaned in (".", ".."):
         return fallback
     return cleaned
@@ -434,8 +479,12 @@ async def is_valid_reencoded_file(
             )
             if avg_fps <= 0:
                 return False
-            effective_tolerance = duration_tolerance_ms + (int(1000 / avg_fps) if avg_fps < 1.0 else 0)
-            return abs(input_duration - output_duration) < effective_tolerance
+            max_overshoot = duration_tolerance_ms + (int(1000 / avg_fps) if avg_fps < 1.0 else 0)
+            max_undershoot = duration_tolerance_ms + (
+                min(int(1000 / avg_fps), input_duration // 2) if avg_fps < 1.0 else 0
+            )
+            diff = output_duration - input_duration
+            return -max_undershoot < diff < max_overshoot
 
         input_duration, output_duration, r_fps, avg_fps = await asyncio.gather(
             get_video_duration_ms(input_path),
@@ -443,43 +492,48 @@ async def is_valid_reencoded_file(
             _probe_stream_fps(output_path, "r_frame_rate"),
             _probe_stream_fps(output_path, "avg_frame_rate"),
         )
-        effective_tolerance = duration_tolerance_ms + (int(1000 / fps) if fps < 1.0 else 0)
-        if abs(input_duration - output_duration) >= effective_tolerance:
+        max_overshoot = duration_tolerance_ms + (int(1000 / fps) if fps < 1.0 else 0)
+        max_undershoot = duration_tolerance_ms + (min(int(1000 / fps), input_duration // 2) if fps < 1.0 else 0)
+        diff = output_duration - input_duration
+        if diff >= max_overshoot or -diff >= max_undershoot:
             return False
 
-        # Validate target FPS against r_frame_rate (constant stream rate) and avg_frame_rate.
-        fps_tol = max(0.005, fps * 0.1)
+        # Validate target FPS against r_frame_rate (constant stream rate) and avg_frame_rate
+        # using purely relative tolerance so ultra-low FPS values (e.g. 0.0001) remain distinct.
+        fps_tol = max(1e-9, fps * 0.1)
         if abs(fps - r_fps) < fps_tol or abs(fps - avg_fps) < fps_tol:
             return True
 
-        # Short tail clips at ultra-low FPS contain few frames; match FFmpeg vf_fps round-to-nearest
-        # bounds tightly so files from a higher fallback FPS tier are not falsely accepted.
+        # Short tail clips at low FPS contain few frames; match FFmpeg vf_fps round-to-nearest
+        # bounds tightly without accepting files whose r_frame_rate belongs to a higher FPS tier.
         duration_s = output_duration / 1000.0
-        if duration_s > 0 and avg_fps > 0 and fps < 1.0 and (fps * duration_s) < 5.0:
-            expected = fps * duration_s
-            actual_frames = round(avg_fps * duration_s)
-            lo = max(1, math.floor(expected + 0.45))
-            hi = max(1, math.floor(expected + 0.55))
-            return lo <= actual_frames <= hi
+        if duration_s > 0 and avg_fps > 0 and fps < 1.0 and 0.45 <= (fps * duration_s) < 5.0:
+            if r_fps <= fps + fps_tol or abs(r_fps - avg_fps) < 1e-6:
+                expected = fps * duration_s
+                actual_frames = round(avg_fps * duration_s)
+                lo = max(1, math.floor(expected + 0.45))
+                hi = max(1, math.floor(expected + 0.55))
+                return lo <= actual_frames <= hi
 
         return False
     except Exception:
         return False
 
 
-def _find_split_segments(output_dir: Path, ext: str) -> list[Path]:
-    """Finds and numerically sorts generated split segments matching 'part_%03d'.
+def _find_split_segments(output_dir: Path, ext: str, media_tag: str) -> list[Path]:
+    """Finds and numerically sorts generated split segments matching 'part_%03d_<media_tag>'.
 
     Args:
         output_dir: Directory containing segment files.
         ext: File extension including leading dot.
+        media_tag: Video ID or filename hash appended to each segment filename.
 
     Returns:
         list[Path]: Segments sorted by ascending numeric chunk index.
     """
     if not output_dir.is_dir():
         return []
-    segment_re = re.compile(rf"^part_(\d{{3,}}){re.escape(ext)}$")
+    segment_re = re.compile(rf"^part_(\d{{3,}})_{re.escape(media_tag)}{re.escape(ext)}$")
     matched: list[tuple[int, Path]] = []
     for entry in output_dir.iterdir():
         if entry.is_file() and (m := segment_re.match(entry.name)):
@@ -493,16 +547,18 @@ async def split_video(
     input_video: Path,
     output_dir: Path,
     split_duration_s: int,
+    media_tag: str,
     duration_tolerance_ms: int = 100,
 ) -> list[Path]:
     """Splits an input video into uniform segments using FFmpeg stream copying.
 
-    Skips splitting if valid segments matching 'part_%03d' and duration already exist.
+    Skips splitting if valid segments matching 'part_%03d_<media_tag>' and duration already exist.
 
     Args:
         input_video: Path to the input video.
         output_dir: Directory where segments will be saved.
         split_duration_s: Target segment length in seconds.
+        media_tag: Video ID or filename hash appended to each segment filename.
         duration_tolerance_ms: Allowed total duration variance in milliseconds.
 
     Returns:
@@ -512,7 +568,7 @@ async def split_video(
         subprocess.CalledProcessError: If FFmpeg segmentation fails.
     """
     ext = input_video.suffix
-    existing_segments = _find_split_segments(output_dir, ext)
+    existing_segments = _find_split_segments(output_dir, ext, media_tag)
 
     if existing_segments:
         try:
@@ -540,7 +596,8 @@ async def split_video(
 
     ffmpeg_bin, _ = ensure_ffmpeg()
     escaped_dir = str(output_dir).replace("%", "%%")
-    full_output_pattern = str(Path(escaped_dir) / f"part_%03d{ext}")
+    safe_tag = media_tag.replace("%", "%%")
+    full_output_pattern = str(Path(escaped_dir) / f"part_%03d_{safe_tag}{ext}")
 
     cmd = [
         ffmpeg_bin,
@@ -571,7 +628,7 @@ async def split_video(
         logfire.exception(f"FFmpeg split failed. Stdout: {e.stdout}, Stderr: {e.stderr}")
         raise
 
-    return _find_split_segments(output_dir, ext)
+    return _find_split_segments(output_dir, ext, media_tag)
 
 
 async def reencode_video(

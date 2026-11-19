@@ -39,6 +39,7 @@ sources:
     folders:
       - "/home/ubuntu/videos/intake"
     interval: 120              # Rescan interval in seconds (2 minutes)
+    maxstembytes: 100          # Maximum UTF-8 byte length for local output folder and SRT stems
 
   # YouTube Feed Intake
   youtube:
@@ -51,7 +52,6 @@ sources:
     channeldelay: 5            # Jittered pause between scraping channels in seconds (0 disables)
 
     channelsfile: "channels.json"
-    maxtitlebytes: 100
     # proxy: "http://127.0.0.1:40000"
     cookiefile: "/home/ubuntu/ai-sub-server/cookie.txt"
 

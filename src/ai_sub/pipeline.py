@@ -32,6 +32,7 @@ from ai_sub.protocol import TaskType
 from ai_sub.shortcode import generate_full_shortcode, generate_model_shortcode
 from ai_sub.telemetry import get_app_version
 from ai_sub.video import (
+    compute_file_id_hash,
     get_keyframe_fps,
     get_video_duration_ms,
     get_video_fps,
@@ -249,6 +250,7 @@ class Pipeline(BaseModel):
     raw_video_path: Path = Field(description="Filesystem path to the raw input video.")
     job_dir: Path = Field(description="Working directory containing state files and segments for this video.")
     video_id: str = Field(description="Unique video identifier.")
+    media_tag: str = Field(description="11-character video ID or filename hash used in intermediate filenames.")
     title: str = Field(description="Display title of the video.")
     uploader: str = Field(description="Channel or uploader identifier.")
     channel_name: str | None = Field(default=None, description="Human-readable channel display name.")
@@ -268,7 +270,7 @@ class Pipeline(BaseModel):
     summary_shortcode: str = Field(description="Model shortcode for summary.")
     subtitles_shortcode: str = Field(description="Model lineage shortcode for subtitles.")
     lyrics_shortcode: str = Field(description="Model lineage shortcode for lyrics.")
-    full_shortcode: str = Field(description="Combined full shortcode for final output.")
+    full_shortcode: str = Field(description="Combined full lineage shortcode for final output.")
 
     reencode_settings: ReencodeSettings = Field(description="Re-encoding configuration settings.")
     search_settings: SearchSettings = Field(description="Search configuration settings.")
@@ -348,6 +350,8 @@ class Pipeline(BaseModel):
         retry_settings: RetrySettings,
         channel_name: str | None = None,
         video_id: str | None = None,
+        media_tag: str | None = None,
+        output_stem: str | None = None,
         source_type: Literal["local", "youtube"] = "local",
         timestamp: int = 0,
         user_context: str | None = None,
@@ -374,6 +378,10 @@ class Pipeline(BaseModel):
             retry_settings: Retry configuration settings.
             channel_name: Human-readable channel display name. Defaults to None.
             video_id: Unique video identifier. Defaults to raw_video_path.stem.
+            media_tag: Compact identifier (YouTube ID or 11-char filename hash) for intermediate files.
+                Defaults to video_id for YouTube or SHA-256 filename hash for local files.
+            output_stem: Base filename stem used for finalized SRT outputs. Defaults to video_id for
+                YouTube or sanitized raw_video_path.stem for local files.
             source_type: Ingestion source type ('local' or 'youtube'). Defaults to 'local'.
             timestamp: Video publication or intake Unix timestamp. Defaults to 0.
             user_context: Background user context string. Defaults to None.
@@ -390,10 +398,11 @@ class Pipeline(BaseModel):
         """
         raw_resolved = raw_video_path.resolve()
         job_dir.mkdir(parents=True, exist_ok=True)
-        (job_dir / "reencoded").mkdir(parents=True, exist_ok=True)
 
         vid = video_id or raw_resolved.stem
-        filename_stem = sanitize_filename(raw_resolved.stem)
+        resolved_tag = media_tag or (vid if source_type == "youtube" else compute_file_id_hash(raw_resolved.name))
+        default_stem = vid if source_type == "youtube" else raw_resolved.stem
+        filename_stem = sanitize_filename(output_stem if output_stem is not None else default_stem)
 
         # 1. Probe raw video duration
         total_duration_ms = await get_video_duration_ms(raw_resolved)
@@ -405,6 +414,7 @@ class Pipeline(BaseModel):
             input_video=raw_resolved,
             output_dir=job_dir,
             split_duration_s=split_duration_s,
+            media_tag=resolved_tag,
             duration_tolerance_ms=split_tolerance_ms,
         )
         if not all_segments:
@@ -447,17 +457,24 @@ class Pipeline(BaseModel):
             )
             current_offset_ms += seg_dur_ms
 
-        # 5. Generate shortcodes
+        # 5. Generate lineage shortcodes
         summary_shortcode = generate_model_shortcode(summary_config.model) if summary_enabled else ""
         subtitles_code = generate_model_shortcode(subtitles_config.model)
         subtitles_shortcode = f"{summary_shortcode}-{subtitles_code}" if summary_enabled else subtitles_code
-        lyrics_shortcode = f"{subtitles_shortcode}-{generate_model_shortcode(lyrics_config.model)}"
-        full_shortcode = generate_full_shortcode(subtitles_config.model)
+        lyrics_shortcode = (
+            f"{subtitles_shortcode}-{generate_model_shortcode(lyrics_config.model)}" if lyrics_enabled else ""
+        )
+        full_shortcode = generate_full_shortcode(
+            subtitles_model=subtitles_config.model,
+            summary_model=summary_config.model if summary_enabled else None,
+            lyrics_model=lyrics_config.model if lyrics_enabled else None,
+        )
 
         instance = cls(
             raw_video_path=raw_resolved,
             job_dir=job_dir,
             video_id=vid,
+            media_tag=resolved_tag,
             title=title,
             uploader=uploader,
             channel_name=channel_name,
@@ -658,7 +675,7 @@ class Pipeline(BaseModel):
                 )
                 self.summary.target_fps = desired_sum_fps
                 if desired_sum_fps is None:
-                    proxy_path = self.job_dir / f"summary_proxy{self.raw_video_path.suffix}"
+                    proxy_path = self.job_dir / f"summary_{self.media_tag}{self.raw_video_path.suffix}"
                     if proxy_path.is_symlink() and not proxy_path.exists():
                         try:
                             proxy_path.unlink()
@@ -682,19 +699,18 @@ class Pipeline(BaseModel):
                 else:
                     self.summary.media_path, self.summary.media_ready = await self._validate_encoded_media(
                         self.raw_video_path,
-                        self.job_dir / "summary_proxy.mp4",
+                        self.job_dir / f"reencoded_summary_{self.media_tag}.mp4",
                         desired_sum_fps,
                         int(sum_cfg.tolerance.total_seconds() * 1000),
                     )
 
         seg_cfg = self.reencode_settings.segment
         seg_tolerance_ms = int(seg_cfg.tolerance.total_seconds() * 1000)
-        reencode_dir = self.job_dir / "reencoded"
         probe_sem = asyncio.Semaphore(8)
 
         async def _check_segment(seg: SegmentState) -> None:
             async with probe_sem:
-                out_p = reencode_dir / f"{seg.raw_path.stem}.mp4"
+                out_p = self.job_dir / f"reencoded_{seg.raw_path.stem}.mp4"
                 if self._is_segment_ai_concluded(seg):
                     seg.media_path = out_p if out_p.is_file() else seg.raw_path
                     seg.media_ready = True
@@ -888,7 +904,7 @@ class Pipeline(BaseModel):
                 ReencodeJob(
                     name="summary_proxy",
                     input_file=self.raw_video_path,
-                    output_file=self.job_dir / "summary_proxy.mp4",
+                    output_file=self.job_dir / f"reencoded_summary_{self.media_tag}.mp4",
                     fps=self.summary.target_fps,
                     height=sum_cfg.height,
                     bitrate=int(sum_cfg.bitrate),
@@ -903,14 +919,13 @@ class Pipeline(BaseModel):
         # 2. Segment re-encode jobs (Priority 2, normal segment index order)
         seg_cfg = self.reencode_settings.segment
         seg_tolerance_ms = int(seg_cfg.tolerance.total_seconds() * 1000)
-        reencode_dir = self.job_dir / "reencoded"
         for seg in self.segments:
             if not self._is_segment_ai_concluded(seg) and not seg.media_ready and seg.target_fps is not None:
                 jobs.append(
                     ReencodeJob(
                         name=f"{seg.raw_path.stem}_reencode",
                         input_file=seg.raw_path,
-                        output_file=reencode_dir / f"{seg.raw_path.stem}.mp4",
+                        output_file=self.job_dir / f"reencoded_{seg.raw_path.stem}.mp4",
                         fps=seg.target_fps,
                         height=seg_cfg.height,
                         bitrate=int(seg_cfg.bitrate),
@@ -1299,16 +1314,16 @@ class Pipeline(BaseModel):
         )
         return {
             "ai": {
-                "model_summary": self.summary_config.model,
+                "model_summary": self.summary_config.model if self.summary_enabled else None,
                 "model_subtitles": self.subtitles_config.model,
-                "model_lyrics": self.lyrics_config.model,
-                "service_tier_summary": self.summary_config.tier,
+                "model_lyrics": self.lyrics_config.model if self.lyrics_enabled else None,
+                "service_tier_summary": self.summary_config.tier if self.summary_enabled else None,
                 "service_tier_subtitles": self.subtitles_config.tier,
-                "service_tier_lyrics": self.lyrics_config.tier,
+                "service_tier_lyrics": self.lyrics_config.tier if self.lyrics_enabled else None,
                 "search": search_dump,
-                "agentic_video_summary": self.summary_config.agentic,
+                "agentic_video_summary": self.summary_config.agentic if self.summary_enabled else False,
                 "agentic_video_subtitles": self.subtitles_config.agentic,
-                "agentic_video_lyrics": self.lyrics_config.agentic,
+                "agentic_video_lyrics": self.lyrics_config.agentic if self.lyrics_enabled else False,
                 "validation_buffer_ms": self.validation_buffer_ms,
             },
             "reencode": self.reencode_settings.model_dump(mode="json"),
@@ -1378,9 +1393,11 @@ class Pipeline(BaseModel):
         metadata = {
             "ai_sub_version": get_app_version(),
             "generated_at": datetime.now().isoformat(),
-            "summary_prompt_version": SUMMARY_PROMPT_VERSION if self.summary.response is not None else None,
+            "summary_prompt_version": (
+                SUMMARY_PROMPT_VERSION if self.summary_enabled and self.summary.response is not None else None
+            ),
             "subtitles_prompt_version": SUBTITLES_PROMPT_VERSION,
-            "lyrics_prompt_version": LYRICS_PROMPT_VERSION,
+            "lyrics_prompt_version": LYRICS_PROMPT_VERSION if self.lyrics_enabled else None,
             "status": status_override or self._derive_status(),
             "settings": self._build_settings_metadata(),
         }

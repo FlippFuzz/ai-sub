@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import shutil
 import stat
 import sys
@@ -17,7 +18,7 @@ from typing import Any
 
 import logfire
 from git import Repo
-from git.exc import GitCommandError, InvalidGitRepositoryError
+from git.exc import GitCommandError, InvalidGitRepositoryError, NoSuchPathError
 
 from ai_sub.config import atomic_write_text
 from ai_sub.server.server_config import GitConfig
@@ -25,6 +26,7 @@ from ai_sub.shortcode import parse_subtitle_track, subtitle_track_sort_key
 
 os.environ["GIT_TERMINAL_PROMPT"] = "0"
 JST = timezone(timedelta(hours=9))
+_CHUNK_SRT_RE = re.compile(r"^part_\d{3,}(?:_|\.)")
 
 
 def _handle_readonly_rmtree(func: Any, path: str, exc_info: Any) -> None:
@@ -37,6 +39,22 @@ def _handle_readonly_rmtree(func: Any, path: str, exc_info: Any) -> None:
     """
     os.chmod(path, stat.S_IWRITE)
     func(path)
+
+
+def _decode_git_stream(stream: Any) -> str:
+    """Decodes a GitPython stdout/stderr attribute into a clean single string.
+
+    Args:
+        stream: Raw bytes, string, or None from a GitCommandError.
+
+    Returns:
+        str: Trimmed text representation or empty string.
+    """
+    if not stream:
+        return ""
+    if isinstance(stream, bytes):
+        return stream.decode("utf-8", errors="replace").strip()
+    return str(stream).strip()
 
 
 class GitSyncManager:
@@ -75,21 +93,40 @@ class GitSyncManager:
 
         self.local_repo_dir = base_work_dir / "git_repo" / repo_name
 
+    def _sanitize_text(self, text: str) -> str:
+        """Masks any configured Personal Access Token inside arbitrary log or error text.
+
+        Args:
+            text: Raw text string.
+
+        Returns:
+            str: Sanitized string safe for logs and exceptions.
+        """
+        if self.config:
+            pat = self.config.get_pat_value().strip()
+            if pat:
+                text = text.replace(pat, "***")
+        return text
+
     def _sanitize_error(self, err: Exception) -> str:
-        """Masks any configured Personal Access Token before logging Git exceptions.
+        """Formats an exception including sanitized Git command stdout/stderr details.
 
         Args:
             err: Raised exception instance.
 
         Returns:
-            str: Sanitized error message string.
+            str: Sanitized diagnostic error string.
         """
-        msg = str(err)
-        if self.config:
-            pat = self.config.get_pat_value().strip()
-            if pat:
-                msg = msg.replace(pat, "***")
-        return msg
+        if isinstance(err, GitCommandError):
+            parts: list[str] = [f"status={err.status}"]
+            if stderr := _decode_git_stream(err.stderr):
+                parts.append(f"stderr={stderr}")
+            if stdout := _decode_git_stream(err.stdout):
+                parts.append(f"stdout={stdout}")
+            if len(parts) == 1:
+                parts.append(str(err))
+            return self._sanitize_text(" | ".join(parts))
+        return self._sanitize_text(str(err))
 
     def _get_authenticated_url(self) -> str:
         """Constructs a Git remote URL with embedded authentication tokens.
@@ -113,6 +150,170 @@ class GitSyncManager:
 
         return raw_url
 
+    def _configure_repo(self, repo: Repo) -> None:
+        """Ensures git author identity and authenticated origin URL are configured.
+
+        Args:
+            repo: Active GitPython Repo instance.
+        """
+        with repo.config_writer() as config:
+            config.set_value("user", "name", "ai-sub-server")
+            config.set_value("user", "email", "server@ai-sub")
+
+        auth_url = self._get_authenticated_url()
+        if auth_url:
+            if "origin" in [r.name for r in repo.remotes]:
+                repo.remotes.origin.set_url(auth_url)
+            else:
+                repo.create_remote("origin", auth_url)
+
+    def _has_head(self, repo: Repo) -> bool:
+        """Checks whether HEAD resolves to a valid commit.
+
+        Args:
+            repo: Active GitPython Repo instance.
+
+        Returns:
+            bool: True if at least one commit exists on HEAD; False on an unborn repository.
+        """
+        try:
+            return bool(repo.head.is_valid())
+        except Exception:
+            return False
+
+    def _remote_branch_exists(self, repo: Repo, branch: str) -> bool:
+        """Checks whether origin/<branch> exists in the local remote-tracking refs.
+
+        Args:
+            repo: Active GitPython Repo instance.
+            branch: Branch name to verify.
+
+        Returns:
+            bool: True if refs/remotes/origin/<branch> exists; False otherwise.
+        """
+        try:
+            repo.git.rev_parse("--verify", f"refs/remotes/origin/{branch}")
+            return True
+        except GitCommandError:
+            return False
+
+    def _ensure_head_on_branch(self, repo: Repo, branch: str) -> None:
+        """Points an unborn HEAD at refs/heads/<branch> or checks out <branch> safely.
+
+        Args:
+            repo: Active GitPython Repo instance.
+            branch: Target branch name.
+        """
+        if not self._has_head(repo):
+            repo.git.symbolic_ref("HEAD", f"refs/heads/{branch}")
+            return
+        try:
+            current = repo.active_branch.name
+        except TypeError:
+            current = ""
+        if current != branch:
+            repo.git.checkout("-B", branch)
+
+    def _has_dirty_worktree(self, repo: Repo) -> bool:
+        """Checks whether any staged, modified, or untracked files exist in the working tree.
+
+        Args:
+            repo: Active GitPython Repo instance.
+
+        Returns:
+            bool: True if git status reports changes; False if working tree is clean.
+        """
+        return bool(repo.git.status("--porcelain").strip())
+
+    def _has_unpushed_commits(self, repo: Repo, branch: str) -> tuple[bool, int]:
+        """Checks whether local HEAD contains commits not yet present on origin/<branch>.
+
+        Args:
+            repo: Active GitPython Repo instance.
+            branch: Target remote branch name.
+
+        Returns:
+            tuple[bool, int]: (has_unpushed_commits, count).
+        """
+        if not self._has_head(repo):
+            return False, 0
+        if not self._remote_branch_exists(repo, branch):
+            count_str = repo.git.rev_list("HEAD", count=True).strip()
+            count = int(count_str) if count_str else 1
+            return count > 0, count
+        count_str = repo.git.rev_list(f"origin/{branch}..HEAD", count=True).strip()
+        count = int(count_str) if count_str else 0
+        return count > 0, count
+
+    def _pull_rebase_with_readme_resolution(self, repo: Repo, branch: str) -> bool:
+        """Pulls and rebases onto origin/<branch>, auto-resolving channel README.md conflicts.
+
+        Args:
+            repo: Active GitPython Repo instance.
+            branch: Target remote branch name.
+
+        Returns:
+            bool: True if pull/rebase completed cleanly.
+
+        Raises:
+            GitCommandError: If pulling fails without starting a rebase.
+            RuntimeError: If a non-README merge conflict forces aborting the rebase.
+        """
+        editor_cmd = f'"{sys.executable}" -c "import sys; sys.exit(0)"'
+        rebase_merge_dir = Path(repo.git_dir) / "rebase-merge"
+        rebase_apply_dir = Path(repo.git_dir) / "rebase-apply"
+
+        try:
+            repo.git.pull("origin", branch, "--rebase")
+            return True
+        except GitCommandError as pull_err:
+            rebase_in_progress = rebase_merge_dir.exists() or rebase_apply_dir.exists()
+            if not rebase_in_progress:
+                logfire.warning(f"Git pull --rebase failed without active rebase: {self._sanitize_error(pull_err)}")
+                raise
+
+            try:
+                while rebase_merge_dir.exists() or rebase_apply_dir.exists():
+                    unmerged_output = repo.git.diff("-z", "--diff-filter=U", "--name-only")
+                    unmerged_files = [f for f in unmerged_output.split("\0") if f]
+
+                    # Resolve conflicts dynamically if the single conflicted file is an uploader README.md
+                    if (
+                        len(unmerged_files) == 1
+                        and unmerged_files[0].endswith("/README.md")
+                        and unmerged_files[0].count("/") == 1
+                    ):
+                        conflicted_readme = unmerged_files[0]
+                        conflicted_uploader = conflicted_readme.split("/")[0]
+                        self._update_channel_readme_sync(conflicted_uploader)
+                        repo.git.add(conflicted_readme)
+                        try:
+                            repo.git.rebase("--continue", env={**os.environ, "GIT_EDITOR": editor_cmd})
+                            logfire.info(f"Continued rebase after resolving {conflicted_readme} conflict.")
+                        except GitCommandError:
+                            if rebase_merge_dir.exists() or rebase_apply_dir.exists():
+                                continue
+                            raise
+                    else:
+                        logfire.warning(
+                            f"Unresolvable non-README conflict encountered ({unmerged_files}). Aborting rebase."
+                        )
+                        repo.git.rebase("--abort")
+                        raise RuntimeError(
+                            f"Git rebase aborted due to unresolvable conflict in files: {unmerged_files}"
+                        ) from pull_err
+
+                logfire.info("Resolved all channel README conflicts and completed rebase.")
+                return True
+            except Exception as rebase_err:
+                if rebase_merge_dir.exists() or rebase_apply_dir.exists():
+                    try:
+                        repo.git.rebase("--abort")
+                    except Exception:
+                        pass
+                logfire.error(f"Failed to resolve git rebase: {self._sanitize_error(rebase_err)}")
+                raise
+
     def _record_completed_cache_entry(
         self,
         uploader: str,
@@ -125,7 +326,7 @@ class GitSyncManager:
         Args:
             uploader: Channel or uploader identifier.
             video_id: Video identifier.
-            full_shortcode: Model shortcode.
+            full_shortcode: Model lineage shortcode.
             clean_meta: Clean video metadata dictionary.
         """
         self._completed_videos.add((uploader, video_id, full_shortcode))
@@ -170,7 +371,7 @@ class GitSyncManager:
                             pass
 
                     for srt in sorted(video_dir.glob("*.srt"), key=lambda p: p.name):
-                        if srt.is_file() and not srt.name.startswith("part_") and ".raw-" not in srt.name:
+                        if srt.is_file() and not _CHUNK_SRT_RE.match(srt.name) and ".raw-" not in srt.name:
                             if srt.stat().st_size > 0:
                                 track_info = parse_subtitle_track(srt)
                                 if track_info.shortcode:
@@ -188,7 +389,11 @@ class GitSyncManager:
         logfire.debug(f"Rebuilt completed subtitles cache: {len(self._completed_videos)} entry(s).")
 
     def _ensure_repo_sync(self) -> None:
-        """Synchronous implementation of cloning or updating the local repository."""
+        """Synchronous implementation of cloning or updating the local repository.
+
+        Raises:
+            RuntimeError: If cloning the remote Git repository fails.
+        """
         if not self.config or self.config.repourl is None:
             self._rebuild_completed_cache_sync()
             return
@@ -198,28 +403,80 @@ class GitSyncManager:
 
         if self.local_repo_dir.exists():
             try:
-                logfire.info(f"Updating existing git repo at {self.local_repo_dir}")
                 repo = Repo(self.local_repo_dir)
-                repo.remotes.origin.set_url(auth_url)
-                repo.remotes.origin.fetch()
-                repo.git.checkout(branch)
-                repo.git.reset("--hard", f"origin/{branch}")
-                repo.git.clean("-fd")
-                self._rebuild_completed_cache_sync()
-                logfire.info(f"Git repo successfully updated to origin/{branch}.")
-                return
-            except (InvalidGitRepositoryError, GitCommandError, AssertionError) as e:
+            except (InvalidGitRepositoryError, NoSuchPathError) as e:
                 logfire.warning(
-                    f"Error updating repo at {self.local_repo_dir}: {self._sanitize_error(e)}. Re-cloning..."
+                    f"Existing directory at {self.local_repo_dir} is not a valid git repo "
+                    f"({self._sanitize_error(e)}). Re-cloning..."
                 )
                 shutil.rmtree(self.local_repo_dir, onerror=_handle_readonly_rmtree)
+            else:
+                logfire.info(f"Updating existing git repo at {self.local_repo_dir}")
+                self._configure_repo(repo)
+                try:
+                    repo.git.fetch("origin", "--prune")
+                except GitCommandError as e:
+                    logfire.error(
+                        f"Git fetch failed at {self.local_repo_dir}: {self._sanitize_error(e)}. "
+                        "Preserving existing local repository."
+                    )
+                    self._rebuild_completed_cache_sync()
+                    return
+
+                if self._remote_branch_exists(repo, branch):
+                    if self._has_dirty_worktree(repo):
+                        logfire.warning("Cleaning leftover uncommitted changes in local git repo before syncing.")
+                        if self._has_head(repo):
+                            repo.git.reset("--hard", "HEAD")
+                        repo.git.clean("-fd")
+
+                    has_unpushed, unpushed_count = self._has_unpushed_commits(repo, branch)
+                    if has_unpushed:
+                        logfire.warning(
+                            f"Preserving {unpushed_count} unpushed local commit(s) on '{branch}'; "
+                            f"rebasing onto origin/{branch}..."
+                        )
+                        self._ensure_head_on_branch(repo, branch)
+                        try:
+                            self._pull_rebase_with_readme_resolution(repo, branch)
+                        except Exception as e:
+                            logfire.error(f"Startup rebase onto origin/{branch} failed: {self._sanitize_error(e)}")
+                    else:
+                        repo.git.checkout("-B", branch, f"origin/{branch}")
+                        repo.git.reset("--hard", f"origin/{branch}")
+                        repo.git.clean("-fd")
+                        logfire.info(f"Git repo successfully updated to origin/{branch}.")
+                else:
+                    self._ensure_head_on_branch(repo, branch)
+                    has_unpushed, unpushed_count = self._has_unpushed_commits(repo, branch)
+                    if has_unpushed:
+                        logfire.info(
+                            f"Remote branch origin/{branch} does not exist yet; "
+                            f"preserving {unpushed_count} local commit(s)."
+                        )
+                    else:
+                        logfire.info(f"Remote repository is empty; initialized unborn branch '{branch}'.")
+
+                self._rebuild_completed_cache_sync()
+                return
 
         self.local_repo_dir.parent.mkdir(parents=True, exist_ok=True)
         logfire.info(f"Cloning {self.config.repourl} to {self.local_repo_dir}")
-        repo = Repo.clone_from(auth_url, self.local_repo_dir)
-        repo.git.checkout(branch)
+        try:
+            repo = Repo.clone_from(auth_url, self.local_repo_dir)
+            self._configure_repo(repo)
+            if self._remote_branch_exists(repo, branch):
+                repo.git.checkout("-B", branch, f"origin/{branch}")
+                logfire.info(f"Git repository successfully cloned on branch '{branch}'.")
+            else:
+                self._ensure_head_on_branch(repo, branch)
+                logfire.info(f"Cloned empty Git repository; initialized unborn branch '{branch}'.")
+        except GitCommandError as e:
+            sanitized = self._sanitize_error(e)
+            logfire.error(f"Failed to clone Git repository '{self.config.repourl}': {sanitized}")
+            raise RuntimeError(f"Git clone failed: {sanitized}") from e
+
         self._rebuild_completed_cache_sync()
-        logfire.info("Git repository successfully cloned.")
 
     async def ensure_repo(self) -> None:
         """Clones or updates the local Git repository checkout under mutex protection."""
@@ -234,7 +491,7 @@ class GitSyncManager:
 
         Args:
             video_id: Video identifier.
-            full_shortcode: Model shortcode (e.g. 'g38f-011019').
+            full_shortcode: Model lineage shortcode (e.g. 'g35l-g4h-g35l-011910').
             uploader: Optional channel or folder uploader handle. Defaults to None.
 
         Returns:
@@ -249,7 +506,7 @@ class GitSyncManager:
 
         Args:
             video_id: Video identifier.
-            full_shortcode: Model shortcode.
+            full_shortcode: Model lineage shortcode.
 
         Returns:
             str | None: Uploader handle if present in repository, None otherwise.
@@ -259,7 +516,8 @@ class GitSyncManager:
     def _discover_video_subtitles(self, video_dir: Path) -> list[dict[str, str]]:
         """Discovers and ranks all finalized and intermediate SRT files relative to the video directory.
 
-        Tracks are pre-sorted descending by quality (refined > raw, model tier, model version, prompt version).
+        Tracks are pre-sorted descending by quality (refined > raw, subtitles model, summary model,
+        lyrics model, and prompt versions).
 
         Args:
             video_dir: Target video directory (uploader/v/<video_id>).
@@ -271,14 +529,14 @@ class GitSyncManager:
 
         # 1. Primary/Finalized SRTs directly in v/<video_id>/
         for srt in video_dir.glob("*.srt"):
-            if srt.is_file() and not srt.name.startswith("part_") and srt.stat().st_size > 0:
+            if srt.is_file() and not _CHUNK_SRT_RE.match(srt.name) and srt.stat().st_size > 0:
                 discovered_paths.append(srt)
 
         # 2. Raw / intermediate SRTs in .int/
         int_base_dir = video_dir / ".int"
         if int_base_dir.is_dir():
             for srt in int_base_dir.glob("**/*.srt"):
-                if srt.is_file() and not srt.name.startswith("part_") and srt.stat().st_size > 0:
+                if srt.is_file() and not _CHUNK_SRT_RE.match(srt.name) and srt.stat().st_size > 0:
                     discovered_paths.append(srt)
 
         # Sort descending from highest to lowest quality
@@ -410,7 +668,9 @@ class GitSyncManager:
                 title_cell = clean_title
 
             if model_label != "-":
-                cell_content = f"{model_label}<br>{version_str}" if version_str else model_label
+                # Use non-breaking hyphens so lineage shortcodes stay on a single line
+                safe_label = model_label.replace("-", "&#8209;")
+                cell_content = f"{safe_label}<br>{version_str}" if version_str else safe_label
                 model_cell = f"[{cell_content}](./v/{encoded_vid})"
             else:
                 model_cell = "-"
@@ -421,6 +681,37 @@ class GitSyncManager:
         readme_path = uploader_dir / "README.md"
         atomic_write_text(readme_path, "\n".join(lines))
         logfire.info(f"Updated channel README at {readme_path.name}")
+
+    def _sync_remote_before_write(self, repo: Repo, branch: str) -> bool:
+        """Pulls any upstream remote updates (e.g. WebUI deletions) before copying new artifacts.
+
+        Args:
+            repo: Active GitPython Repo instance.
+            branch: Configured target branch.
+
+        Returns:
+            bool: True if remote commits were pulled into local history, False otherwise.
+        """
+        if self._has_dirty_worktree(repo):
+            logfire.warning("Found leftover uncommitted changes in local git repo before finalization; resetting.")
+            if self._has_head(repo):
+                repo.git.reset("--hard", "HEAD")
+            repo.git.clean("-fd")
+
+        try:
+            old_head = repo.head.commit.hexsha if self._has_head(repo) else None
+            repo.git.fetch("origin", "--prune")
+            if self._remote_branch_exists(repo, branch):
+                self._ensure_head_on_branch(repo, branch)
+                self._pull_rebase_with_readme_resolution(repo, branch)
+                new_head = repo.head.commit.hexsha if self._has_head(repo) else None
+                return new_head != old_head
+        except Exception as e:
+            logfire.warning(
+                f"Could not sync from origin/{branch} before commit ({self._sanitize_error(e)}). "
+                "Proceeding with local commit."
+            )
+        return False
 
     def _finalize_and_push_sync(
         self,
@@ -436,15 +727,27 @@ class GitSyncManager:
         Args:
             uploader: Channel or uploader identifier.
             video_id: Video identifier.
-            full_shortcode: Model shortcode.
+            full_shortcode: Model lineage shortcode.
             srt_files: List of generated subtitle files to commit.
             yaml_files: List of intermediate YAML state files.
             meta_file: Optional video metadata JSON file. Defaults to None.
 
         Raises:
-            GitCommandError: If git push fails after exhausting all retries.
-            RuntimeError: If git rebase encounters an unresolvable merge conflict.
+            RuntimeError: If git staging, commit, rebase, or push fails after exhausting retries.
         """
+        git_enabled = bool(self.config and self.config.repourl is not None)
+        pulled = False
+        repo: Repo | None = None
+
+        if git_enabled:
+            assert self.config is not None
+            branch = self.config.branch
+            if not (self.local_repo_dir / ".git").exists():
+                self._ensure_repo_sync()
+            repo = Repo(self.local_repo_dir)
+            self._configure_repo(repo)
+            pulled = self._sync_remote_before_write(repo, branch)
+
         uploader_dir = self.local_repo_dir / uploader
         video_dir = uploader_dir / "v" / video_id
         video_dir.mkdir(parents=True, exist_ok=True)
@@ -491,132 +794,69 @@ class GitSyncManager:
 
         self._update_channel_readme_sync(uploader)
 
-        if not self.config or self.config.repourl is None:
+        if not git_enabled or repo is None or self.config is None:
             self._record_completed_cache_entry(uploader, video_id, full_shortcode, clean_meta)
             return
 
-        repo = Repo(self.local_repo_dir)
-        with repo.config_writer() as config:
-            config.set_value("user", "name", "ai-sub-server")
-            config.set_value("user", "email", "server@ai-sub")
-
-        auth_url = self._get_authenticated_url()
-        repo.remotes.origin.set_url(auth_url)
-        repo.git.add(all=True)
-
+        branch = self.config.branch
         try:
-            has_head = repo.head.is_valid()
-        except Exception:
-            has_head = False
+            self._ensure_head_on_branch(repo, branch)
+            repo.git.add(all=True)
 
-        if not has_head or repo.index.diff("HEAD"):
-            commit_msg = f"{video_id}.{full_shortcode} subtitled"
-            repo.index.commit(commit_msg)
-            logfire.info(f"Committed changes: '{commit_msg}'")
-        else:
-            # Check if there are unpublished local commits ahead of remote tracking branch
-            has_unpushed = False
-            unpushed_count = 0
-            try:
-                unpushed_str = repo.git.rev_list(f"origin/{self.config.branch}..HEAD", count=True).strip()
-                unpushed_count = int(unpushed_str)
-                has_unpushed = unpushed_count > 0
-            except Exception:
-                # If origin/branch cannot be resolved or rev-list fails, assume unpublished commit exists
-                has_unpushed = True
-                unpushed_count = 1
-
-            if has_unpushed:
-                logfire.info(
-                    f"No new changes to commit, but found {unpushed_count} unpublished commit(s). Proceeding to push."
-                )
+            if self._has_dirty_worktree(repo):
+                commit_msg = f"{video_id}.{full_shortcode} subtitled"
+                repo.git.commit("-m", commit_msg)
+                commit_sha = repo.head.commit.hexsha[:8]
+                logfire.info(f"Committed changes ({commit_sha}): '{commit_msg}'")
             else:
-                logfire.info("No Git changes to commit.")
-                self._record_completed_cache_entry(uploader, video_id, full_shortcode, clean_meta)
-                return
-
-        # Cross-platform no-op editor command that works on Windows, Linux, and macOS
-        editor_cmd = f'"{sys.executable}" -c "import sys; sys.exit(0)"'
-        rebase_merge_dir = Path(repo.git_dir) / "rebase-merge"
-        rebase_apply_dir = Path(repo.git_dir) / "rebase-apply"
-        pulled = False
+                has_unpushed, unpushed_count = self._has_unpushed_commits(repo, branch)
+                if has_unpushed:
+                    logfire.info(
+                        f"No new working tree changes to commit, but found {unpushed_count} "
+                        "unpublished local commit(s). Proceeding to push."
+                    )
+                else:
+                    logfire.warning(
+                        f"No Git changes detected after staging for {video_id}.{full_shortcode}; skipping push."
+                    )
+                    if pulled:
+                        self._rebuild_completed_cache_sync()
+                    else:
+                        self._record_completed_cache_entry(uploader, video_id, full_shortcode, clean_meta)
+                    return
+        except Exception as e:
+            sanitized = self._sanitize_error(e)
+            logfire.error(f"Git staging/commit failed for {video_id}.{full_shortcode}: {sanitized}")
+            raise RuntimeError(f"Git commit failed: {sanitized}") from e
 
         for attempt in range(5):
             try:
-                repo.git.push("-u", "origin", self.config.branch)
-                logfire.info("Git push succeeded.")
+                repo.git.push("-u", "origin", branch)
+                logfire.info(f"Git push succeeded to origin/{branch}.")
                 if pulled:
                     self._rebuild_completed_cache_sync()
                 else:
                     self._record_completed_cache_entry(uploader, video_id, full_shortcode, clean_meta)
                 break
             except GitCommandError as e:
+                sanitized = self._sanitize_error(e)
                 if attempt >= 4:
-                    logfire.error(f"Git push exhausted retries: {self._sanitize_error(e)}")
-                    raise
+                    logfire.error(f"Git push exhausted retries: {sanitized}")
+                    raise RuntimeError(f"Git push failed after 5 attempts: {sanitized}") from e
 
                 backoff = random.uniform(1.0, 10.0)
                 logfire.warning(
-                    f"Git push failed ({self._sanitize_error(e)}). Retrying in {backoff:.1f}s with pull --rebase..."
+                    f"Git push failed (attempt {attempt + 1}/5: {sanitized}). Retrying in {backoff:.1f}s..."
                 )
                 time.sleep(backoff)
 
                 try:
-                    repo.git.pull("origin", self.config.branch, "--rebase")
-                    pulled = True
-                except GitCommandError as pull_err:
-                    rebase_in_progress = rebase_merge_dir.exists() or rebase_apply_dir.exists()
-
-                    if not rebase_in_progress:
-                        logfire.warning(
-                            f"Git pull --rebase failed without active rebase (retryable network error): "
-                            f"{self._sanitize_error(pull_err)}"
-                        )
-                        continue
-
-                    # A rebase conflict was created; inspect unmerged files and resolve sequentially
-                    try:
-                        while rebase_merge_dir.exists() or rebase_apply_dir.exists():
-                            unmerged_output = repo.git.diff("-z", "--diff-filter=U", "--name-only")
-                            unmerged_files = [f for f in unmerged_output.split("\0") if f]
-
-                            # Resolve conflicts dynamically if the single conflicted file is an uploader README.md
-                            if (
-                                len(unmerged_files) == 1
-                                and unmerged_files[0].endswith("/README.md")
-                                and unmerged_files[0].count("/") == 1
-                            ):
-                                conflicted_readme = unmerged_files[0]
-                                conflicted_uploader = conflicted_readme.split("/")[0]
-                                self._update_channel_readme_sync(conflicted_uploader)
-                                repo.git.add(conflicted_readme)
-                                try:
-                                    repo.git.rebase("--continue", env={**os.environ, "GIT_EDITOR": editor_cmd})
-                                    logfire.info(f"Continued rebase after resolving {conflicted_readme} conflict.")
-                                except GitCommandError:
-                                    # If the next rebase step encounters another conflict, stay in the loop
-                                    if rebase_merge_dir.exists() or rebase_apply_dir.exists():
-                                        continue
-                                    raise
-                            else:
-                                logfire.warning(
-                                    f"Unresolvable non-README conflict encountered ({unmerged_files}). Aborting rebase."
-                                )
-                                repo.git.rebase("--abort")
-                                raise RuntimeError(
-                                    f"Git rebase aborted due to unresolvable conflict in files: {unmerged_files}"
-                                ) from pull_err
-
+                    repo.git.fetch("origin", "--prune")
+                    if self._remote_branch_exists(repo, branch):
+                        self._pull_rebase_with_readme_resolution(repo, branch)
                         pulled = True
-                        logfire.info("Resolved all channel README conflicts and completed rebase.")
-                    except Exception as rebase_err:
-                        if rebase_merge_dir.exists() or rebase_apply_dir.exists():
-                            try:
-                                repo.git.rebase("--abort")
-                            except Exception:
-                                pass
-                        logfire.error(f"Failed to resolve git rebase: {self._sanitize_error(rebase_err)}")
-                        raise
+                except Exception as pull_err:
+                    logfire.warning(f"Git fetch/rebase before push retry failed: {self._sanitize_error(pull_err)}")
 
     async def finalize_and_push(
         self,
@@ -632,7 +872,7 @@ class GitSyncManager:
         Args:
             uploader: Channel or uploader identifier.
             video_id: Video identifier.
-            full_shortcode: Model shortcode.
+            full_shortcode: Model lineage shortcode.
             srt_files: List of generated subtitle files to commit.
             yaml_files: List of intermediate YAML state files.
             meta_file: Optional video metadata JSON file. Defaults to None.
