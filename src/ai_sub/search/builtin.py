@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.search_base import BaseSearchProvider, WebSearchResult
+from ai_sub.search.search_base import BaseSearchProvider
 
 
 class GoogleBuiltinSearchProvider(BaseSearchProvider):
@@ -17,7 +18,7 @@ class GoogleBuiltinSearchProvider(BaseSearchProvider):
         Args:
             settings: Search configuration settings.
         """
-        super().__init__(settings, provider_name="builtin")
+        super().__init__(settings, provider_name="builtin", enable_rate_limit=False)
 
     def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
         """Returns the Interactions API declaration for Gemini native Google Search grounding.
@@ -26,14 +27,3 @@ class GoogleBuiltinSearchProvider(BaseSearchProvider):
             list[Callable[..., Any] | dict[str, Any]]: The Interactions API Google Search tool specification.
         """
         return [{"type": "google_search"}]
-
-    async def search_single(self, query: str) -> list[WebSearchResult]:
-        """Built-in Google search is an LLM grounding tool and does not support standalone Python pre-search.
-
-        Args:
-            query: Search query keywords.
-
-        Returns:
-            list[WebSearchResult]: Always returns an empty list.
-        """
-        return []

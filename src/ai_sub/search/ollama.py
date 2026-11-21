@@ -20,14 +20,6 @@ class OllamaSearchProvider(BaseHttpSearchProvider):
         """
         super().__init__(settings, provider_name="ollama")
 
-    def _get_headers(self) -> dict[str, str]:
-        """Constructs authorization headers for Ollama API requests.
-
-        Returns:
-            dict[str, str]: HTTP request headers.
-        """
-        return self._bearer_headers()
-
     def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
         """Returns tool callables for Gemini model registration.
 

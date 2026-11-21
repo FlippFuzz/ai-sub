@@ -34,7 +34,7 @@ from ai_sub.jobs import (
     WorkerContext,
 )
 from ai_sub.pipeline import Pipeline
-from ai_sub.search import BaseSearchProvider, create_search_providers
+from ai_sub.search import BaseSearchProvider, create_search_providers, order_lyrics_providers
 from ai_sub.standalone_config import StandaloneSettings
 from ai_sub.telemetry import setup_logging
 from ai_sub.video import compute_file_id_hash, init_ffmpeg_engine, sanitize_filename
@@ -144,19 +144,21 @@ async def _run_job(
                 return job, await job.execute(), None
 
         if isinstance(job, SummaryJob):
-            sem, providers, fallback_media = summary_sem, web_search_providers, pipeline.summary.media_path
+            sem, providers = summary_sem, web_search_providers
         elif isinstance(job, SubtitlesJob):
-            sem, providers, fallback_media = subtitles_sem, [], pipeline.raw_video_path
+            sem, providers = subtitles_sem, []
         elif isinstance(job, LyricsJob):
-            sem, providers, fallback_media = lyrics_sem, lyrics_search_providers, pipeline.raw_video_path
+            sem, providers = lyrics_sem, lyrics_search_providers
         else:
             return job, None, ValueError(f"Unknown job type: {type(job)}")
 
         async with sem:
             ctx = WorkerContext(
                 executor=executor,
-                media_path=job.media_path or fallback_media or pipeline.raw_video_path,
+                media_path=pipeline.get_job_media_path(job),
                 search_providers=providers,
+                retry_settings=pipeline.retry_settings,
+                validation_buffer_ms=pipeline.validation_buffer_ms,
             )
             return job, await job.execute(ctx), None
 
@@ -228,9 +230,7 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
                 web_search_providers = [p for p in configured if p.provider_name != "lrclib"]
 
                 if use_lyrics:
-                    # Keep lrclib first so lyrics pre-fetch and tools prioritize official lyrics
-                    lrclib_providers = [p for p in configured if p.provider_name == "lrclib"]
-                    lyrics_search_providers = [*lrclib_providers, *web_search_providers]
+                    lyrics_search_providers = order_lyrics_providers(configured)
 
             executor = GeminiExecutor(settings.ai, settings.retry)
             stack.push_async_callback(executor.aclose)
@@ -252,12 +252,11 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
             )
 
             total_chunks = len(pipeline.segments)
+            segment_reencode_active = any(seg.target_fps is not None for seg in pipeline.segments)
             with progress:
                 summary_tid: TaskID | None = progress.add_task("[yellow]Summary", total=1) if use_summary else None
                 reencode_tid: TaskID | None = (
-                    progress.add_task("[cyan]Re-encoding", total=total_chunks)
-                    if settings.reencode.segment.threshold > 0
-                    else None
+                    progress.add_task("[cyan]Re-encoding", total=total_chunks) if segment_reencode_active else None
                 )
                 subtitles_tid: TaskID = progress.add_task("[green]Subtitles", total=total_chunks)
                 lyrics_tid: TaskID | None = (
@@ -270,6 +269,50 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
                 blocked_this_run: set[JobKey] = set()
                 exhausted_models: set[str] = set()
 
+                async def _handle_job_outcome(
+                    job: BaseJob,
+                    result: Any,
+                    exc: Exception | None,
+                ) -> str | None:
+                    if exc is None:
+                        pipeline.complete_job(job, result)
+                        return None
+
+                    if isinstance(exc, QuotaExceededError):
+                        job_model = _job_model(job)
+                        model_label = job_model or "unknown"
+                        logfire.warning(
+                            f"Daily quota reached for '{job.name}' ({model_label}): {exc}. "
+                            "Skipping remaining jobs for this model without consuming run attempts."
+                        )
+                        if job_model:
+                            exhausted_models.add(job_model)
+                            return job_model
+                        return None
+
+                    if isinstance(job, ReencodeJob):
+                        logfire.warning(f"Re-encode failed for '{job.name}': {exc}")
+                        outcome = await pipeline.record_job_failure(job)
+                        if outcome.action != "retry":
+                            blocked_this_run.add(_get_job_key(job))
+                    elif is_retryable_error(exc):
+                        logfire.warning(
+                            f"Job '{job.name}' failed with retryable error: {exc}. "
+                            "Skipping for this run without consuming run attempts."
+                        )
+                        blocked_this_run.add(_get_job_key(job))
+                    else:
+                        logfire.error(f"Job '{job.name}' failed with non-retryable error: {exc}")
+                        outcome = await pipeline.record_job_failure(job)
+
+                        # Defer retries and newly triggered fallback re-encodes to subsequent invocations
+                        blocked_this_run.add(_get_job_key(job))
+                        if outcome.action == "fallback_reencode":
+                            seg_idx = getattr(job, "segment_index", None)
+                            blocked_this_run.add(("ReencodeJob", seg_idx))
+
+                    return None
+
                 async def _drain_tasks(
                     tasks_to_drain: list[asyncio.Task[tuple[BaseJob, Any, Exception | None]]],
                 ) -> None:
@@ -279,8 +322,7 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
                     for res in drain_results:
                         if isinstance(res, tuple):
                             drained_job, drained_out, drained_exc = res
-                            if drained_exc is None:
-                                pipeline.complete_job(drained_job, drained_out)
+                            await _handle_job_outcome(drained_job, drained_out, drained_exc)
                     _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
 
                 # Consumer loop pulling ready DAG jobs directly from the pipeline
@@ -292,10 +334,6 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
                             continue
                         if job_model and job_model in exhausted_models:
                             continue
-
-                        if isinstance(job, ReencodeJob) and not job.is_summary_proxy and reencode_tid is None:
-                            reencode_tid = progress.add_task("[cyan]Re-encoding", total=total_chunks)
-                            _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
 
                         task = asyncio.create_task(
                             _run_job(
@@ -328,42 +366,8 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
                             continue
 
                         job, result, exc = completed_task.result()
-
-                        if exc is not None:
-                            if isinstance(exc, QuotaExceededError):
-                                job_model = _job_model(job)
-                                model_label = job_model or "unknown"
-                                logfire.warning(
-                                    f"Daily quota reached for '{job.name}' ({model_label}): {exc}. "
-                                    "Skipping remaining jobs for this model without consuming run attempts."
-                                )
-                                if job_model:
-                                    exhausted_models.add(job_model)
-                                    newly_exhausted.add(job_model)
-                                continue
-
-                            if isinstance(job, ReencodeJob):
-                                logfire.warning(f"Re-encode failed for '{job.name}': {exc}")
-                                outcome = await pipeline.record_job_failure(job)
-                                if outcome.action != "retry":
-                                    blocked_this_run.add(_get_job_key(job))
-                            elif is_retryable_error(exc):
-                                logfire.warning(
-                                    f"Job '{job.name}' failed with retryable error: {exc}. "
-                                    "Skipping for this run without consuming run attempts."
-                                )
-                                blocked_this_run.add(_get_job_key(job))
-                            else:
-                                logfire.error(f"Job '{job.name}' failed with non-retryable error: {exc}")
-                                outcome = await pipeline.record_job_failure(job)
-
-                                # Defer retries and newly triggered fallback re-encodes to subsequent invocations
-                                blocked_this_run.add(_get_job_key(job))
-                                if outcome.action == "fallback_reencode":
-                                    seg_idx = getattr(job, "segment_index", None)
-                                    blocked_this_run.add(("ReencodeJob", seg_idx))
-                        else:
-                            pipeline.complete_job(job, result)
+                        if exhausted_model := await _handle_job_outcome(job, result, exc):
+                            newly_exhausted.add(exhausted_model)
 
                         _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
 

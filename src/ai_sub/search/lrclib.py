@@ -5,10 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from pydantic import HttpUrl
-
 from ai_sub.config import SearchSettings
-from ai_sub.search.search_base import BaseHttpSearchProvider, WebSearchResult, normalize_query
+from ai_sub.search.search_base import BaseHttpSearchProvider, normalize_query
 from ai_sub.telemetry import get_app_version
 
 
@@ -59,7 +57,11 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
         Returns:
             list[dict[str, Any]]: Matching track entries containing track_name, artist_name, and plain_lyrics.
         """
-        params: dict[str, str] = {"track_name": track_title.strip()}
+        clean_title = track_title.strip() if track_title else ""
+        if not clean_title:
+            return []
+
+        params: dict[str, str] = {"track_name": clean_title}
         if artist_name and artist_name.strip():
             params["artist_name"] = artist_name.strip()
 
@@ -89,42 +91,17 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
                 fallback_res = await self._request(
                     "GET",
                     "https://lrclib.net/api/search",
-                    params={"q": track_title.strip()},
+                    params={"q": clean_title},
                 )
                 results = _extract(fallback_res.json())
             return results
 
-        cache_key = f"lrclib:{normalize_query(track_title)}:{normalize_query(artist_name or '')}"
+        cache_key = f"lrclib:{normalize_query(clean_title)}:{normalize_query(artist_name or '')}"
         return await self._cached_search(
             cache_key=cache_key,
             span_template="lrclib_search: {title=}, {artist=}",
             fetcher=_fetch,
             cache_empty=True,
-            title=track_title,
+            title=clean_title,
             artist=artist_name or "",
         )
-
-    async def search_single(self, query: str) -> list[WebSearchResult]:
-        """Performs a lyrics search query returning normalized search results.
-
-        Args:
-            query: Song title or lyrics query keywords.
-
-        Returns:
-            list[WebSearchResult]: Formatted search result items containing song lyrics.
-        """
-        raw = await self.search_lrclib_lyrics_database(track_title=query)
-        results: list[WebSearchResult] = []
-        for item in raw:
-            track = item.get("track_name") or "Unknown Track"
-            artist = item.get("artist_name") or "Unknown Artist"
-            lyrics = item.get("plain_lyrics") or ""
-            if lyrics:
-                results.append(
-                    WebSearchResult(
-                        title=f"{track} - {artist}",
-                        url=HttpUrl("https://lrclib.net"),
-                        content=lyrics,
-                    )
-                )
-        return results

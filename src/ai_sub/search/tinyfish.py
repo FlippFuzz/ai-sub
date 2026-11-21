@@ -64,7 +64,8 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
 
         async def _fetch() -> list[WebSearchResult]:
             response = await self._request("GET", "https://api.search.tinyfish.ai", params=params)
-            raw_results = response.json().get("results", [])
+            payload = response.json() or {}
+            raw_results = payload.get("results") or []
             return self._to_web_results(
                 (item.get("title"), item.get("url"), item.get("snippet")) for item in raw_results
             )
@@ -121,7 +122,18 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
         Returns:
             list[dict[str, Any]]: List of extracted web pages containing markdown text, title, url, and language.
         """
-        valid_urls = [u for u in urls if u and u.startswith(("http://", "https://"))][:10]
+        valid_urls: list[str] = []
+        seen_urls: set[str] = set()
+        for raw_url in urls:
+            if not raw_url:
+                continue
+            cleaned = raw_url.strip()
+            if cleaned.lower().startswith(("http://", "https://")) and cleaned not in seen_urls:
+                seen_urls.add(cleaned)
+                valid_urls.append(cleaned)
+                if len(valid_urls) >= 10:
+                    break
+
         if not valid_urls:
             return []
 
@@ -129,7 +141,8 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
 
         async def _fetch() -> list[dict[str, Any]]:
             response = await self._request("POST", "https://api.fetch.tinyfish.ai", json=payload)
-            raw_results = response.json().get("results", [])
+            data = response.json() or {}
+            raw_results = data.get("results") or []
 
             max_len = self.settings.maxlength * 2
             return [

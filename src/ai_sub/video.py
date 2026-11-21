@@ -340,7 +340,8 @@ async def _probe_stream_fps(video_path: Path, entry: str) -> float:
             str(video_path),
         ]
         stdout = await _run_ffmpeg(cmd)
-        num, den = map(int, stdout.strip().split("/"))
+        first_line = next((line.strip() for line in stdout.splitlines() if line.strip()), "")
+        num, den = map(int, first_line.split("/"))
         return num / den
     except (subprocess.CalledProcessError, ValueError, ZeroDivisionError) as e:
         logfire.exception(f"Could not determine {entry} for {video_path.name}")
@@ -484,7 +485,7 @@ async def is_valid_reencoded_file(
                 min(int(1000 / avg_fps), input_duration // 2) if avg_fps < 1.0 else 0
             )
             diff = output_duration - input_duration
-            return -max_undershoot < diff < max_overshoot
+            return -max_undershoot <= diff <= max_overshoot
 
         input_duration, output_duration, r_fps, avg_fps = await asyncio.gather(
             get_video_duration_ms(input_path),
@@ -495,20 +496,20 @@ async def is_valid_reencoded_file(
         max_overshoot = duration_tolerance_ms + (int(1000 / fps) if fps < 1.0 else 0)
         max_undershoot = duration_tolerance_ms + (min(int(1000 / fps), input_duration // 2) if fps < 1.0 else 0)
         diff = output_duration - input_duration
-        if diff >= max_overshoot or -diff >= max_undershoot:
+        if diff > max_overshoot or -diff > max_undershoot:
             return False
 
         # Validate target FPS against r_frame_rate (constant stream rate) and avg_frame_rate
-        # using purely relative tolerance so ultra-low FPS values (e.g. 0.0001) remain distinct.
-        fps_tol = max(1e-9, fps * 0.1)
+        # using a tight relative tolerance so closely spaced fallback FPS tiers remain distinct.
+        fps_tol = max(1e-9, fps * 0.02)
         if abs(fps - r_fps) < fps_tol or abs(fps - avg_fps) < fps_tol:
             return True
 
-        # Short tail clips at low FPS contain few frames; match FFmpeg vf_fps round-to-nearest
-        # bounds tightly without accepting files whose r_frame_rate belongs to a higher FPS tier.
+        # Short tail clips emit few frames (including 1 frame when expected < 0.45);
+        # match FFmpeg vf_fps round-to-nearest bounds without accepting higher-FPS tier files.
         duration_s = output_duration / 1000.0
-        if duration_s > 0 and avg_fps > 0 and fps < 1.0 and 0.45 <= (fps * duration_s) < 5.0:
-            if r_fps <= fps + fps_tol or abs(r_fps - avg_fps) < 1e-6:
+        if duration_s > 0 and avg_fps > 0 and 0 < (fps * duration_s) < 5.0:
+            if r_fps <= fps + fps_tol or abs(r_fps - avg_fps) < max(1e-6, avg_fps * 1e-3):
                 expected = fps * duration_s
                 actual_frames = round(avg_fps * duration_s)
                 lo = max(1, math.floor(expected + 0.45))
@@ -577,7 +578,7 @@ async def split_video(
             total_segment_duration = sum(durations)
             threshold = duration_tolerance_ms * len(existing_segments)
 
-            if abs(input_duration - total_segment_duration) < threshold:
+            if abs(input_duration - total_segment_duration) <= threshold:
                 logfire.info(f"Reusing {len(existing_segments)} existing valid segments for {input_video.name}.")
                 return existing_segments
 

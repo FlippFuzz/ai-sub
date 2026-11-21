@@ -20,14 +20,6 @@ class LangsearchSearchProvider(BaseHttpSearchProvider):
         """
         super().__init__(settings, provider_name="langsearch")
 
-    def _get_headers(self) -> dict[str, str]:
-        """Constructs authorization headers for Langsearch API requests.
-
-        Returns:
-            dict[str, str]: HTTP request headers.
-        """
-        return self._bearer_headers()
-
     def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
         """Returns tool callables for Gemini model registration.
 
@@ -52,7 +44,10 @@ class LangsearchSearchProvider(BaseHttpSearchProvider):
             "freshness": "noLimit",
         }
         response = await self._request("POST", "https://api.langsearch.com/v1/web-search", json=payload)
-        pages = response.json().get("data", {}).get("webPages", {}).get("value", [])
+        root = response.json() or {}
+        data = root.get("data") or {}
+        web_pages = data.get("webPages") or {}
+        pages = web_pages.get("value") or []
         return self._to_web_results(
             (item.get("name"), item.get("url"), item.get("text") or item.get("summary")) for item in pages
         )

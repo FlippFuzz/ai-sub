@@ -112,6 +112,29 @@ class WorkerSettings(YamlFileSettings):
         return parts[0], parts[1]
 
     @model_validator(mode="after")
+    def _validate_serverauth(self) -> Self:
+        """Validates Basic Auth credentials format when provided.
+
+        Returns:
+            Self: The validated instance.
+
+        Raises:
+            ValueError: If serverauth is non-empty and not in 'username:password' format.
+        """
+        if self.serverauth is not None:
+            if not self.serverauth.strip():
+                self.serverauth = None
+            else:
+                if ":" not in self.serverauth:
+                    raise ValueError("serverauth must be in 'username:password' format.")
+                username, password = self.serverauth.split(":", 1)
+                if not username or not password:
+                    raise ValueError(
+                        "serverauth must contain non-empty username and password in 'username:password' format."
+                    )
+        return self
+
+    @model_validator(mode="after")
     def _validate_api_keys(self) -> Self:
         """Ensures required Gemini and search API keys are configured.
 

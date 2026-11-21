@@ -50,6 +50,26 @@ class StandaloneAiSettings(AiSettings):
         description="Musical lyrics refinement model configuration.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _apply_stage_agentic_defaults(cls, val: Any) -> Any:
+        """Defaults summary and lyrics agentic to True when omitted in dict inputs.
+
+        Args:
+            val: Raw AI settings dictionary before validation.
+
+        Returns:
+            Any: Normalized dictionary with stage-appropriate agentic defaults.
+        """
+        if not isinstance(val, dict):
+            return val
+        updated = dict(val)
+        for stage in ("summary", "lyrics"):
+            stage_val = updated.get(stage)
+            if isinstance(stage_val, dict) and "agentic" not in stage_val:
+                updated[stage] = {**stage_val, "agentic": True}
+        return updated
+
 
 class ConcurrencySettings(BaseConfigModel):
     """Concurrency settings controlling parallel worker tasks in standalone mode."""

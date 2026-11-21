@@ -22,7 +22,7 @@ import json_repair
 import logfire
 from google import genai
 from google.genai import types
-from httpx import TimeoutException, TransportError
+from httpx2 import TimeoutException, TransportError
 from pydantic import BaseModel, ValidationError
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
@@ -43,6 +43,50 @@ class QuotaExceededError(Exception):
 
 class InteractionFailedError(Exception):
     """Raised when a Gemini interaction terminates in a failed or cancelled state."""
+
+
+def _extract_status_code(e: Exception) -> int | None:
+    """Extracts an HTTP status code from an exception if available.
+
+    Args:
+        e: Caught exception.
+
+    Returns:
+        int | None: HTTP status code integer or None.
+    """
+    status_code = (
+        getattr(e, "code", None)
+        or getattr(e, "status_code", None)
+        or getattr(getattr(e, "response", None), "status_code", None)
+    )
+    if isinstance(status_code, int):
+        return status_code
+    if not isinstance(e, (ValidationError, ValueError, TypeError, KeyError, InteractionFailedError)):
+        if match := re.search(r"\b(408|429|500|502|503|504)\b", str(e)):
+            return int(match.group(1))
+    return None
+
+
+def _classify_api_outcome(err: Exception, quota_err: bool, status_code: int | None) -> str:
+    """Classifies a failed Gemini API attempt into a canonical outcome tag.
+
+    Args:
+        err: Raised exception.
+        quota_err: Whether daily project quota was exhausted.
+        status_code: Extracted HTTP status code if available.
+
+    Returns:
+        str: Canonical outcome string for telemetry grouping.
+    """
+    if quota_err:
+        return "quota_exceeded"
+    if isinstance(err, InteractionFailedError):
+        return "interaction_failed"
+    if isinstance(err, (TimeoutException, asyncio.TimeoutError, TimeoutError)) or status_code == 408:
+        return "timeout"
+    if status_code is not None:
+        return "http_error"
+    return "error"
 
 
 def is_retryable_error(e: Exception) -> bool:
@@ -74,17 +118,11 @@ def is_retryable_error(e: Exception) -> bool:
     ):
         return True
 
-    status_code = (
-        getattr(e, "code", None)
-        or getattr(e, "status_code", None)
-        or getattr(getattr(e, "response", None), "status_code", None)
-    )
-    if isinstance(status_code, int):
+    status_code = _extract_status_code(e)
+    if status_code is not None:
         return status_code in (408, 429, 500, 502, 503, 504)
 
     err_str = str(e).lower()
-    if re.search(r"\b(408|500|502|503|504)\b", err_str):
-        return True
     return any(term in err_str for term in ("connection", "timeout", "temporarily unavailable"))
 
 
@@ -324,7 +362,7 @@ class GeminiExecutor:
 
     async def _retry_operation(
         self,
-        operation: Callable[[], Awaitable[R]],
+        operation: Callable[[int, int], Awaitable[R]],
         retry: RetrySettings,
         op_label: str,
         model_id: str | None = None,
@@ -332,7 +370,7 @@ class GeminiExecutor:
         """Executes an API operation with exponential backoff retries on retryable errors.
 
         Args:
-            operation: Zero-argument async callable executing the API request.
+            operation: Async callable receiving (attempt_number, max_attempts) and executing the request.
             retry: Effective retry policy.
             op_label: Descriptive operation label for log messages.
             model_id: Optional model ID to mark quota-exhausted on daily quota errors. Defaults to None.
@@ -347,7 +385,7 @@ class GeminiExecutor:
         max_attempts = retry.perturn + 1
         for attempt in range(max_attempts):
             try:
-                return await operation()
+                return await operation(attempt + 1, max_attempts)
             except QuotaExceededError:
                 raise
             except Exception as err:
@@ -509,7 +547,7 @@ class GeminiExecutor:
                 try:
                     with logfire.span("Uploading {filename} to Gemini Files API", filename=file_path.name):
                         uploaded = await self._retry_operation(
-                            operation=lambda: self._client.aio.files.upload(
+                            operation=lambda _a, _m: self._client.aio.files.upload(
                                 file=upload_path,
                                 config=types.UploadFileConfig(display_name=display_name, mime_type=resolved_mime),
                             ),
@@ -535,7 +573,7 @@ class GeminiExecutor:
                             raise RuntimeError(f"Could not retrieve file '{file_path.name}' status.")
                         await asyncio.sleep(poll_interval)
                         uploaded = await self._retry_operation(
-                            operation=lambda name=remote_name: self._client.aio.files.get(name=name),
+                            operation=lambda _a, _m, name=remote_name: self._client.aio.files.get(name=name),
                             retry=retry,
                             op_label=f"poll file '{file_path.name}'",
                         )
@@ -602,6 +640,9 @@ class GeminiExecutor:
         generation_config: dict[str, Any],
         service_tier: ServiceTier | None,
         token_weight: int,
+        task_label: str = "Generation",
+        attempt: int = 1,
+        max_attempts: int = 1,
     ) -> Any:
         """Executes a single search turn call to Gemini Interactions API with rate limiter acquisition.
 
@@ -615,6 +656,9 @@ class GeminiExecutor:
             generation_config: Generation configuration settings.
             service_tier: Optional Gemini service tier.
             token_weight: Token weight for rate limiter acquisition.
+            task_label: Task category label for telemetry attribution. Defaults to 'Generation'.
+            attempt: 1-based retry attempt index. Defaults to 1.
+            max_attempts: Maximum attempts configured for this turn. Defaults to 1.
 
         Returns:
             Any: Interaction response object returned by the Gemini API.
@@ -647,16 +691,48 @@ class GeminiExecutor:
         if service_tier is not None:
             kwargs["service_tier"] = service_tier
 
-        await req_limiter.try_acquire_async("rpm")
+        # Acquire token budget before request slot so a long TPM wait does not hold and expire an RPM slot
+        # early before the HTTP request actually fires. Full video tokens are conservatively charged on
+        # every API turn (including continuations and retries) to protect daily free-tier request quotas.
         await tok_limiter.try_acquire_async("tpm", weight=token_weight)
+        await req_limiter.try_acquire_async("rpm")
 
-        interaction = await self._client.aio.interactions.create(**kwargs)
-        status = getattr(interaction, "status", None)
-        if status in ("failed", "cancelled"):
-            raise InteractionFailedError(
-                f"Interaction {status} on {model_id}: {_format_interaction_errors(interaction)}"
-            )
-        return interaction
+        raised_err: Exception | None = None
+        with logfire.span(
+            "Gemini API: {model_id} ({attempt}/{max_attempts})",
+            model_id=model_id,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            task=task_label,
+            service_tier=service_tier or "default",
+            _level="debug",
+        ) as api_span:
+            try:
+                interaction = await self._client.aio.interactions.create(**kwargs)
+                status = getattr(interaction, "status", None)
+                if status in ("failed", "cancelled"):
+                    raise InteractionFailedError(
+                        f"Interaction {status} on {model_id}: {_format_interaction_errors(interaction)}"
+                    )
+                api_span.set_attribute("outcome", "success")
+                api_span.set_attribute("status_code", 200)
+                api_span.set_attribute("is_retryable", False)
+                return interaction
+            except Exception as err:
+                status_code = _extract_status_code(err)
+                quota_err = _is_daily_quota_exceeded(err)
+                retryable = False if quota_err else is_retryable_error(err)
+                api_span.set_attribute("outcome", _classify_api_outcome(err, quota_err, status_code))
+                if status_code is not None:
+                    api_span.set_attribute("status_code", status_code)
+                api_span.set_attribute("error_type", type(err).__name__)
+                api_span.set_attribute("is_retryable", retryable)
+                api_span.set_level("warning" if (retryable or quota_err) else "error")
+                api_span.record_exception(err)
+                raised_err = err
+
+        assert raised_err is not None
+        raise raised_err
 
     async def _execute_function_calls(
         self,
@@ -802,7 +878,8 @@ class GeminiExecutor:
             T: Parsed and validated Pydantic model instance.
 
         Raises:
-            ValueError: If the interaction status is 'incomplete' or output text is empty.
+            ValueError: If the interaction is incomplete, emits unknown/disallowed tool calls,
+                or produces empty text output.
         """
         interaction_input: Any = initial_input
         previous_interaction_id: str | None = None
@@ -829,7 +906,7 @@ class GeminiExecutor:
                 current_tools = None if search_turns >= max_search_turns else gemini_tools
 
                 interaction = await self._retry_operation(
-                    operation=lambda: self._create_interaction(
+                    operation=lambda attempt_num, max_attempts: self._create_interaction(
                         model_id=model_id,
                         input_payload=interaction_input,
                         previous_interaction_id=previous_interaction_id,
@@ -839,6 +916,9 @@ class GeminiExecutor:
                         generation_config=generation_config,
                         service_tier=service_tier,
                         token_weight=token_weight,
+                        task_label=label,
+                        attempt=attempt_num,
+                        max_attempts=max_attempts,
                     ),
                     retry=retry,
                     op_label=f"{model_id} search turn {search_turns}",
@@ -850,26 +930,39 @@ class GeminiExecutor:
                         f"Model '{model_id}' returned incomplete interaction on search turn {search_turns}."
                     )
 
-                for step in getattr(interaction, "steps", []) or []:
+                steps = getattr(interaction, "steps", []) or []
+                for step in steps:
                     if getattr(step, "type", None) == "thought":
                         if thought_text := _extract_thought_text(step):
                             accumulated_thoughts.append(thought_text)
 
-                function_call_steps = [
-                    s
-                    for s in getattr(interaction, "steps", []) or []
-                    if getattr(s, "type", None) == "function_call" and getattr(s, "name", None) in dispatch_map
+                all_function_calls = [s for s in steps if getattr(s, "type", None) == "function_call"]
+                unknown_tools = [
+                    str(getattr(s, "name", None) or "<unnamed>")
+                    for s in all_function_calls
+                    if getattr(s, "name", None) not in dispatch_map
                 ]
+                if unknown_tools:
+                    raise ValueError(
+                        f"Model '{model_id}' called unknown or disallowed tool(s) "
+                        f"{unknown_tools} on search turn {search_turns}."
+                    )
 
-                if function_call_steps and search_turns < max_search_turns and dispatch_map:
+                if all_function_calls and search_turns < max_search_turns and dispatch_map:
                     search_turns += 1
-                    interaction_input = await self._execute_function_calls(function_call_steps, dispatch_map)
+                    interaction_input = await self._execute_function_calls(all_function_calls, dispatch_map)
                     raw_id = getattr(interaction, "id", None)
                     previous_interaction_id = raw_id if isinstance(raw_id, str) else None
                     continue
 
                 text_content = self._extract_interaction_text(interaction)
                 if not text_content:
+                    if all_function_calls:
+                        called = [str(getattr(s, "name", None) or "<unnamed>") for s in all_function_calls]
+                        raise ValueError(
+                            f"Model '{model_id}' attempted tool call(s) {called} after reaching "
+                            f"max search turns ({max_search_turns})."
+                        )
                     raise ValueError(f"Model '{model_id}' returned empty output on search turn {search_turns}.")
 
                 return self._parse_and_validate_structured_output(

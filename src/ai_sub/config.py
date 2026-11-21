@@ -7,7 +7,7 @@ import os
 import random
 import socket
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from contextvars import ContextVar
 from datetime import timedelta
 from pathlib import Path
@@ -40,6 +40,12 @@ ServiceTier = Literal["standard", "flex", "priority"]
 SearchTool = Literal["builtin", "duckduckgo", "ollama", "langsearch", "tinyfish", "lrclib"]
 
 _YAML_PATH: ContextVar[Path | None] = ContextVar("_yaml_path", default=None)
+
+_SEARCH_PROVIDER_KEY_FIELDS: dict[str, tuple[str, str]] = {
+    "tinyfish": ("tinyfishkey", "TINYFISH_API_KEY"),
+    "langsearch": ("langsearchkey", "LANGSEARCH_API_KEY"),
+    "ollama": ("ollamakey", "OLLAMA_API_KEY"),
+}
 
 
 def _get_env_value(*names: str) -> str | None:
@@ -319,6 +325,22 @@ class BackoffSettings(BaseConfigModel):
         description="Maximum backoff wait duration (seconds if numeric).",
     )
 
+    @model_validator(mode="after")
+    def _validate_wait_bounds(self) -> Self:
+        """Ensures minimum backoff wait does not exceed maximum backoff wait.
+
+        Returns:
+            Self: Validated instance.
+
+        Raises:
+            ValueError: If minwait exceeds maxwait.
+        """
+        if self.minwait > self.maxwait:
+            raise ValueError(
+                f"Backoff 'minwait' ({self.minwait}) must be less than or equal to 'maxwait' ({self.maxwait})."
+            )
+        return self
+
     def compute_delay(self, attempt: int, retry_after: float | None = None) -> float:
         """Computes jittered exponential backoff delay in seconds for a retry attempt.
 
@@ -418,12 +440,9 @@ class SearchSettings(BaseConfigModel):
         Returns:
             Self: Validated instance.
         """
-        if self.tinyfishkey is None and (val := _get_env_value("TINYFISH_API_KEY")):
-            self.tinyfishkey = SecretStr(val)
-        if self.langsearchkey is None and (val := _get_env_value("LANGSEARCH_API_KEY")):
-            self.langsearchkey = SecretStr(val)
-        if self.ollamakey is None and (val := _get_env_value("OLLAMA_API_KEY")):
-            self.ollamakey = SecretStr(val)
+        for field_name, env_name in _SEARCH_PROVIDER_KEY_FIELDS.values():
+            if getattr(self, field_name) is None and (val := _get_env_value(env_name)):
+                setattr(self, field_name, SecretStr(val))
         return self
 
     def get_key_for_provider(self, provider_name: str) -> SecretStr | None:
@@ -435,34 +454,28 @@ class SearchSettings(BaseConfigModel):
         Returns:
             SecretStr | None: The resolved API key or None if not set.
         """
-        p = provider_name.strip().lower()
-        if p == "tinyfish":
-            return self.tinyfishkey
-        if p == "langsearch":
-            return self.langsearchkey
-        if p == "ollama":
-            return self.ollamakey
-        return None
+        entry = _SEARCH_PROVIDER_KEY_FIELDS.get(provider_name.strip().lower())
+        return getattr(self, entry[0]) if entry is not None else None
 
-    def validate_required_keys(self, tools: Sequence[str] | None = None, env_prefix: str = "AISUB") -> None:
+    def validate_required_keys(self, env_prefix: str = "AISUB") -> None:
         """Ensures API keys are present for configured search providers that require authentication.
 
         Args:
-            tools: Optional subset of tool names to validate. Defaults to self.tools.
             env_prefix: Environment variable prefix for error messages (e.g. 'AISUB' or 'AISUBWORKER').
 
         Raises:
             ValueError: If a required search API key is missing or blank.
         """
-        for tool in tools if tools is not None else self.tools:
+        for tool in self.tools:
             clean = tool.strip().lower()
-            if clean in ("ollama", "langsearch", "tinyfish"):
+            if clean in _SEARCH_PROVIDER_KEY_FIELDS:
                 key = self.get_key_for_provider(clean)
                 if key is None or not key.get_secret_value().strip():
+                    field_name, env_name = _SEARCH_PROVIDER_KEY_FIELDS[clean]
                     raise ValueError(
-                        f"A search API key must be provided for '{clean}' via 'ai.search.{clean}key', "
-                        f"'{env_prefix}_AI_SEARCH_{clean.upper()}KEY', or the "
-                        f"{clean.upper()}_API_KEY environment variable."
+                        f"A search API key must be provided for '{clean}' via 'ai.search.{field_name}', "
+                        f"'{env_prefix}_AI_SEARCH_{field_name.upper()}', or the "
+                        f"{env_name} environment variable."
                     )
 
 

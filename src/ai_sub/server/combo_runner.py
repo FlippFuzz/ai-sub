@@ -16,17 +16,13 @@ import logfire
 from ai_sub.config import (
     ReencodeSettings,
     RetrySettings,
-    SearchSettings,
     SplittingSettings,
     StageExecutionConfig,
     atomic_write_text,
 )
-from ai_sub.jobs.lyrics import LyricsJob
+from ai_sub.jobs.job_base import AiJob, TaskType
 from ai_sub.jobs.reencode import ReencodeJob
-from ai_sub.jobs.subtitles import SubtitlesJob
-from ai_sub.jobs.summary import SummaryJob
 from ai_sub.pipeline import FailureOutcome, Pipeline
-from ai_sub.protocol import TaskType
 from ai_sub.server.models import ServerTask, TaskStatus
 from ai_sub.server.server_config import PipelineConfig
 from ai_sub.shortcode import generate_full_shortcode
@@ -63,7 +59,8 @@ class ComboRunner:
     pipeline: Pipeline | None
     preparing_video_info: dict[str, Any] | None
     tasks: dict[str, ServerTask]
-    active_segment_reencodes: int
+    active_summary_reencode: bool
+    active_reencode_segments: set[int]
     _reencode_task: asyncio.Task[None] | None
     _reencode_wake_event: asyncio.Event
 
@@ -117,7 +114,8 @@ class ComboRunner:
         self.pipeline = None
         self.preparing_video_info = None
         self.tasks = {}
-        self.active_segment_reencodes = 0
+        self.active_summary_reencode = False
+        self.active_reencode_segments = set()
         self._reencode_task = None
         self._reencode_wake_event = asyncio.Event()
 
@@ -192,6 +190,27 @@ class ComboRunner:
         if task_type == TaskType.SUBTITLES:
             return []
         return [str(t) for t in self.config.searchtools]
+
+    def _format_task_id(
+        self,
+        task_type: TaskType,
+        video_id: str,
+        segment_index: int | None = None,
+    ) -> str:
+        """Formats a unique server task ID for a pipeline stage or segment.
+
+        Args:
+            task_type: AI task type.
+            video_id: Active video identifier.
+            segment_index: Zero-based segment index for segment stages. Defaults to None.
+
+        Returns:
+            str: Canonical task ID string.
+        """
+        if task_type == TaskType.SUMMARY:
+            return f"{self.config.name}::{video_id}::summary"
+        assert segment_index is not None
+        return f"{self.config.name}::{video_id}::{task_type.value}::{segment_index:03d}"
 
     def _build_user_context(
         self,
@@ -309,7 +328,7 @@ class ComboRunner:
             subtitles_config=self._stage_config(TaskType.SUBTITLES),
             lyrics_config=self._stage_config(TaskType.LYRICS),
             reencode_settings=self.reencode_settings,
-            search_settings=SearchSettings(tools=self.config.searchtools),
+            search_tools=[str(t) for t in self.config.searchtools],
             split_settings=self.split_settings,
             retry_settings=self.retry_settings,
             source_type=source_type,
@@ -327,11 +346,10 @@ class ComboRunner:
         """
         outcome = await pipeline.fail_reencode(job)
         if outcome.action == "exhausted" and self.pipeline is pipeline:
-            vid = pipeline.video_id
             if job.is_summary_proxy:
-                task_id = f"{self.config.name}::{vid}::summary"
+                task_id: str | None = self._format_task_id(TaskType.SUMMARY, pipeline.video_id)
             elif job.segment_index is not None:
-                task_id = f"{self.config.name}::{vid}::subtitles::{job.segment_index:03d}"
+                task_id = self._format_task_id(TaskType.SUBTITLES, pipeline.video_id, job.segment_index)
             else:
                 task_id = None
 
@@ -352,13 +370,17 @@ class ComboRunner:
         """
         try:
             async with self.reencode_semaphore:
-                if not job.is_summary_proxy:
-                    self.active_segment_reencodes += 1
+                if job.is_summary_proxy:
+                    self.active_summary_reencode = True
+                elif job.segment_index is not None:
+                    self.active_reencode_segments.add(job.segment_index)
                 try:
                     out_path = await job.execute()
                 finally:
-                    if not job.is_summary_proxy:
-                        self.active_segment_reencodes = max(0, self.active_segment_reencodes - 1)
+                    if job.is_summary_proxy:
+                        self.active_summary_reencode = False
+                    elif job.segment_index is not None:
+                        self.active_reencode_segments.discard(job.segment_index)
 
             async with self.coordinator_lock:
                 if self.pipeline is pipeline:
@@ -443,32 +465,19 @@ class ComboRunner:
             return
 
         for job in pipeline.get_pending_jobs():
-            if isinstance(job, ReencodeJob):
+            if not isinstance(job, AiJob):
                 continue
 
-            if isinstance(job, SummaryJob):
-                task_id = f"{self.config.name}::{pipeline.video_id}::summary"
-                media = job.media_path or pipeline.summary.media_path or pipeline.raw_video_path
-                self._upsert_server_task(
-                    task_id=task_id,
-                    task_type=TaskType.SUMMARY,
-                    video_id=pipeline.video_id,
-                    media_path=media,
-                )
-            elif isinstance(job, (SubtitlesJob, LyricsJob)):
-                idx = job.segment_index
-                assert idx is not None
-                task_type = TaskType.SUBTITLES if isinstance(job, SubtitlesJob) else TaskType.LYRICS
-                task_id = f"{self.config.name}::{pipeline.video_id}::{task_type.value}::{idx:03d}"
-                seg = pipeline.segments[idx]
-                media = job.media_path or seg.media_path or seg.raw_path
-                self._upsert_server_task(
-                    task_id=task_id,
-                    task_type=task_type,
-                    video_id=pipeline.video_id,
-                    media_path=media,
-                    segment_index=idx,
-                )
+            media = pipeline.get_job_media_path(job)
+            task_id = self._format_task_id(job.task_type, pipeline.video_id, job.segment_index)
+
+            self._upsert_server_task(
+                task_id=task_id,
+                task_type=job.task_type,
+                video_id=pipeline.video_id,
+                media_path=media,
+                segment_index=job.segment_index,
+            )
 
     async def prepare_and_set_video(
         self,
@@ -530,11 +539,13 @@ class ComboRunner:
                 "source_type": source_type,
                 "timestamp": timestamp,
             }
-            atomic_write_text(meta_file, json.dumps(meta_data, indent=2, ensure_ascii=False))
+            await asyncio.to_thread(atomic_write_text, meta_file, json.dumps(meta_data, indent=2, ensure_ascii=False))
 
             async with self.coordinator_lock:
                 self.pipeline = pipeline
                 self.tasks.clear()
+                self.active_summary_reencode = False
+                self.active_reencode_segments.clear()
                 self.preparing_video_info = None
                 self.status = RunnerStatus.PROCESSING
                 self._reencode_wake_event.clear()
@@ -573,11 +584,16 @@ class ComboRunner:
             if pipeline.is_done():
                 self._reencode_wake_event.set()
 
-    async def on_task_failed(self, task_id: str) -> FailureOutcome:
+    async def on_task_failed(
+        self,
+        task_id: str,
+        fallback_base_fps: float | None = None,
+    ) -> FailureOutcome:
         """Handles a non-retryable task failure, transitioning pipeline state or triggering FPS fallback.
 
         Args:
             task_id: Unique task identifier.
+            fallback_base_fps: Optional pre-probed base FPS for tier-0 keyframes fallback. Defaults to None.
 
         Returns:
             FailureOutcome: Resulting state transition from Pipeline.record_failure().
@@ -590,6 +606,7 @@ class ComboRunner:
         outcome = await pipeline.record_failure(
             task_type=task.task_type,
             segment_index=task.segment_index,
+            fallback_base_fps=fallback_base_fps,
         )
 
         if outcome.action == "retry":
@@ -650,7 +667,7 @@ class ComboRunner:
                 meta_file = d / "video_meta.json"
                 if not meta_file.is_file():
                     logfire.info(f"Purging stale folder without metadata: {d.name} in {self.config.name}")
-                    shutil.rmtree(d, ignore_errors=True)
+                    await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
                     continue
 
                 try:
@@ -660,12 +677,12 @@ class ComboRunner:
                     raw_path = Path(raw_path_str) if raw_path_str else None
                     if not raw_path or not raw_path.is_file():
                         logfire.warning(f"Purging job folder with missing raw video: {d.name} in {self.config.name}")
-                        shutil.rmtree(d, ignore_errors=True)
+                        await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
                         continue
                     valid_candidates.append((d, meta, raw_path))
                 except Exception as e:
                     logfire.warning(f"Purging job folder with corrupt metadata: {d.name} ({e})")
-                    shutil.rmtree(d, ignore_errors=True)
+                    await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
 
             valid_candidates.sort(key=lambda item: _get_mtime(item[0]), reverse=True)
 
@@ -711,10 +728,12 @@ class ComboRunner:
             for cand_dir, _, _ in valid_candidates:
                 if cand_dir != job_dir and cand_dir not in failed_resume_dirs:
                     logfire.info(f"Purging older job folder: {cand_dir.name} in {self.config.name}")
-                    shutil.rmtree(cand_dir, ignore_errors=True)
+                    await asyncio.to_thread(shutil.rmtree, cand_dir, ignore_errors=True)
 
             self.pipeline = pipeline
             self.tasks.clear()
+            self.active_summary_reencode = False
+            self.active_reencode_segments.clear()
             self.preparing_video_info = None
             self._reencode_wake_event.clear()
 
@@ -741,6 +760,24 @@ class ComboRunner:
                 pass
         self._reencode_task = None
 
+    def detach_active_state(self, purge_disk: bool = True) -> Path | None:
+        """Clears active in-memory pipeline state synchronously and returns any directory to purge.
+
+        Args:
+            purge_disk: Whether the active job directory should be purged by the caller. Defaults to True.
+
+        Returns:
+            Path | None: Job directory path to delete asynchronously, or None.
+        """
+        purge_dir = self.pipeline.job_dir if (purge_disk and self.pipeline is not None) else None
+        self.pipeline = None
+        self.preparing_video_info = None
+        self.tasks.clear()
+        self.active_summary_reencode = False
+        self.active_reencode_segments.clear()
+        self._reencode_wake_event.clear()
+        return purge_dir
+
     async def clear_active_video(self, purge_disk: bool = True) -> None:
         """Clears the active video state for this runner, optionally purging working directory files.
 
@@ -749,18 +786,13 @@ class ComboRunner:
         """
         with logfire.span("Clear Active Video: {combo}", combo=self.config.name) as clear_span:
             await self.stop_background_tasks()
-
-            purged_path = None
-            if purge_disk and self.pipeline and self.pipeline.job_dir.exists():
-                purged_path = str(self.pipeline.job_dir)
+            purge_dir = self.detach_active_state(purge_disk=purge_disk)
+            purged_path = str(purge_dir) if purge_dir is not None and purge_dir.exists() else None
+            if purge_dir is not None and purge_dir.exists():
                 try:
-                    shutil.rmtree(self.pipeline.job_dir)
+                    await asyncio.to_thread(shutil.rmtree, purge_dir)
                 except OSError as e:
-                    logfire.warning(f"Could not purge job directory {self.pipeline.job_dir.name}: {e}")
+                    logfire.warning(f"Could not purge job directory {purge_dir.name}: {e}")
 
             clear_span.set_attribute("purged_directory", purged_path or "none")
-            self.pipeline = None
-            self.preparing_video_info = None
-            self.tasks.clear()
-            self._reencode_wake_event.clear()
             self.status = RunnerStatus.IDLE

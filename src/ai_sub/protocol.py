@@ -3,22 +3,15 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_sub.config import RetrySettings, ServiceTier
-from ai_sub.jobs.subtitles import DetectedMusicalPerformance, Subtitles
-from ai_sub.jobs.summary import SummaryAiResponse
-
-
-class TaskType(str, Enum):
-    """Types of distributed tasks executed by workers."""
-
-    SUMMARY = "summary"
-    SUBTITLES = "subtitles"
-    LYRICS = "lyrics"
+from ai_sub.jobs.job_base import TaskType
+from ai_sub.jobs.lyrics import LyricsJob
+from ai_sub.jobs.subtitles import DetectedMusicalPerformance, Subtitles, SubtitlesJob
+from ai_sub.jobs.summary import SummaryAiResponse, SummaryJob
 
 
 class TaskClaimRequest(BaseModel):
@@ -85,6 +78,46 @@ class TaskClaimResponse(BaseModel):
         default_factory=RetrySettings,
         description="Task execution retry and backoff policy configured by the server.",
     )
+
+    def to_job(self) -> SummaryJob | SubtitlesJob | LyricsJob:
+        """Constructs the typed AI job instance corresponding to this claimed task.
+
+        Returns:
+            SummaryJob | SubtitlesJob | LyricsJob: Configured job ready for execution.
+
+        Raises:
+            ValueError: If task_type is unknown or a lyrics task lacks draft_subtitles.
+        """
+        common: dict[str, Any] = {
+            "video_duration_ms": self.video_duration_ms,
+            "user_context": self.user_context,
+            "model_name": self.model,
+            "service_tier": self.service_tier,
+            "agentic_video": self.agentic_video,
+        }
+        if self.task_type == TaskType.SUMMARY:
+            return SummaryJob(name="summary", **common)
+        if self.task_type == TaskType.SUBTITLES:
+            return SubtitlesJob(
+                name=self.task_id,
+                segment_offset_ms=self.segment_offset_ms,
+                global_summary=self.global_summary,
+                **common,
+            )
+        if self.task_type == TaskType.LYRICS:
+            if not self.draft_subtitles:
+                raise ValueError(
+                    f"Lyrics task '{self.task_id}' rejected: missing draft_subtitles required for refinement."
+                )
+            return LyricsJob(
+                name=self.task_id,
+                segment_offset_ms=self.segment_offset_ms,
+                draft_subtitles=self.draft_subtitles,
+                detected_performances=self.detected_performances,
+                global_summary=self.global_summary,
+                **common,
+            )
+        raise ValueError(f"Unknown task type: '{self.task_type}'")
 
 
 class TaskHeartbeatRequest(BaseModel):

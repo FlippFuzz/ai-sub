@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import logfire
-from httpx import AsyncClient, HTTPError, Response
+from httpx2 import AsyncClient, HTTPError, Response
 
 from ai_sub.protocol import (
     TaskClaimRequest,
@@ -23,6 +23,20 @@ from ai_sub.telemetry import get_app_version
 
 class VersionMismatchError(Exception):
     """Raised when server rejects task claim due to an ai-sub package version mismatch."""
+
+
+def _task_url(task_id: str, action: str) -> str:
+    """Builds an encoded task endpoint path for a given task ID and action.
+
+    Args:
+        task_id: Unique task identifier.
+        action: Endpoint action suffix (e.g. 'heartbeat', 'complete', 'fail').
+
+    Returns:
+        str: URL-safe task endpoint path.
+    """
+    encoded_task_id = urllib.parse.quote(task_id, safe=":")
+    return f"/api/v1/tasks/{encoded_task_id}/{action}"
 
 
 class WorkerClient:
@@ -115,11 +129,10 @@ class WorkerClient:
         Returns:
             bool | None: True if acknowledged; False if lease expired; None if a retryable transport error occurred.
         """
-        encoded_task_id = urllib.parse.quote(task_id, safe=":")
         req = TaskHeartbeatRequest(worker_id=worker_id)
         try:
             resp: Response = await self.client.post(
-                f"/api/v1/tasks/{encoded_task_id}/heartbeat",
+                _task_url(task_id, "heartbeat"),
                 json=req.model_dump(mode="json"),
             )
             if resp.status_code == 200:
@@ -171,13 +184,13 @@ class WorkerClient:
         Returns:
             bool: True if completion was accepted; False otherwise.
         """
-        encoded_task_id = urllib.parse.quote(task_id, safe=":")
+        endpoint = _task_url(task_id, "complete")
         req = TaskCompleteRequest(worker_id=worker_id, result=result)
 
         for attempt in range(3):
             try:
                 resp: Response = await self.client.post(
-                    f"/api/v1/tasks/{encoded_task_id}/complete",
+                    endpoint,
                     json=req.model_dump(mode="json"),
                 )
                 if resp.status_code == 200:
@@ -221,7 +234,6 @@ class WorkerClient:
         Returns:
             bool: True if failure was acknowledged; False otherwise.
         """
-        encoded_task_id = urllib.parse.quote(task_id, safe=":")
         req = TaskFailRequest(
             worker_id=worker_id,
             reason=reason,
@@ -230,7 +242,7 @@ class WorkerClient:
         )
         try:
             resp: Response = await self.client.post(
-                f"/api/v1/tasks/{encoded_task_id}/fail",
+                _task_url(task_id, "fail"),
                 json=req.model_dump(mode="json"),
             )
             return resp.status_code == 200

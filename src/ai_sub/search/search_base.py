@@ -15,7 +15,7 @@ from fractions import Fraction
 from typing import Any, LiteralString, Self, TypeVar
 
 import logfire
-from httpx import AsyncClient, HTTPStatusError, Response, TimeoutException, TransportError
+from httpx2 import AsyncClient, HTTPStatusError, Response, TimeoutException, TransportError
 from pydantic import BaseModel, Field, HttpUrl, SecretStr
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
@@ -25,7 +25,7 @@ T = TypeVar("T")
 
 
 class _BoundedCache(OrderedDict[str, Any]):
-    """Thread-safe bounded in-memory cache with FIFO eviction."""
+    """Single-event-loop bounded in-memory cache with FIFO eviction."""
 
     max_size: int
 
@@ -113,20 +113,27 @@ class BaseSearchProvider(ABC):
 
     settings: SearchSettings
     provider_name: str
-    _cache: _BoundedCache
-    _limiter: Limiter
+    _cache: _BoundedCache | None
+    _limiter: Limiter | None
 
-    def __init__(self, settings: SearchSettings, provider_name: str) -> None:
+    def __init__(
+        self,
+        settings: SearchSettings,
+        provider_name: str,
+        enable_rate_limit: bool = True,
+    ) -> None:
         """Initializes the search provider.
 
         Args:
             settings: Search configuration settings.
             provider_name: Identifier name of the provider.
+            enable_rate_limit: Whether to allocate local QPS rate-limiting and cache structures.
+                Set to False for server-side tool specs such as Gemini built-in Google Search.
         """
         self.settings = settings
         self.provider_name = provider_name
-        self._cache = _BoundedCache(max_size=1000)
-        self._limiter = self._create_rate_limiter()
+        self._cache = _BoundedCache(max_size=1000) if enable_rate_limit else None
+        self._limiter = self._create_rate_limiter() if enable_rate_limit else None
 
     def _create_rate_limiter(self) -> Limiter:
         """Creates an in-memory QPS rate limiter preserving fractional rates from search settings.
@@ -169,7 +176,8 @@ class BaseSearchProvider(ABC):
             exc_val: Exception value if raised.
             exc_tb: Traceback if raised.
         """
-        self._limiter.close()
+        if self._limiter is not None:
+            self._limiter.close()
 
     @abstractmethod
     def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
@@ -229,7 +237,8 @@ class BaseSearchProvider(ABC):
         """
         max_attempts = self.settings.retries + 1
         for attempt in range(max_attempts):
-            await self._limiter.try_acquire_async(self.provider_name, blocking=True)
+            if self._limiter is not None:
+                await self._limiter.try_acquire_async(self.provider_name, blocking=True)
             try:
                 return await operation()
             except Exception as e:
@@ -267,18 +276,20 @@ class BaseSearchProvider(ABC):
         Returns:
             Any: Cached or newly fetched results.
         """
-        if cache_key in self._cache:
-            logfire.debug(
-                "Using cached {provider} result for {cache_key=}",
-                provider=self.provider_name,
-                cache_key=cache_key,
-            )
-            return self._cache[cache_key]
+        with logfire.span(span_template, **span_attrs) as span:
+            if self._cache is not None and cache_key in self._cache:
+                span.set_attribute("cached", True)
+                logfire.debug(
+                    "Using cached {provider} result for {cache_key=}",
+                    provider=self.provider_name,
+                    cache_key=cache_key,
+                )
+                return self._cache[cache_key]
 
-        with logfire.span(span_template, **span_attrs):
+            span.set_attribute("cached", False)
             results = await fetcher()
 
-        if results or cache_empty:
+        if self._cache is not None and (results or cache_empty):
             self._cache[cache_key] = results
         return results
 
@@ -318,8 +329,8 @@ class BaseSearchProvider(ABC):
     ) -> list[dict[str, Any]]:
         """Gathers search results for multiple queries concurrently into standardized query-result dicts.
 
-        Individual query failures are isolated per item so successful results in the same
-        batch are still returned immediately.
+        Deduplicates equivalent queries within the same batch before scheduling so concurrent
+        coros do not race past the cache. Individual query failures are isolated per item.
 
         Args:
             queries: A list of search query strings to execute concurrently.
@@ -329,9 +340,20 @@ class BaseSearchProvider(ABC):
         Returns:
             list[dict[str, Any]]: List of serialized WebQueryResult dictionaries.
         """
-        clean_queries = [q.strip() for q in queries if q and q.strip()]
-        if max_queries is not None:
-            clean_queries = clean_queries[:max_queries]
+        clean_queries: list[str] = []
+        seen_keys: set[str] = set()
+        for raw_q in queries:
+            q = raw_q.strip() if raw_q else ""
+            if not q:
+                continue
+            dedup_key = normalize_query(q) or q.casefold()
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+            clean_queries.append(q)
+            if max_queries is not None and len(clean_queries) >= max_queries:
+                break
+
         if not clean_queries:
             return []
 
@@ -394,14 +416,15 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
             raise ValueError(f"{self.provider_name.capitalize()} API key is required but not configured.")
         return {"Authorization": f"Bearer {key.get_secret_value()}"}
 
-    @abstractmethod
     def _get_headers(self) -> dict[str, str]:
         """Constructs provider-specific HTTP headers including authorization.
+
+        Defaults to Bearer authorization headers when an API key is required.
 
         Returns:
             dict[str, str]: Header key-value mapping.
         """
-        ...
+        return self._bearer_headers() if self.requires_api_key else {}
 
     async def __aenter__(self) -> Self:
         """Initializes the authenticated HTTP client session.
@@ -465,7 +488,7 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
 
         def _is_retryable(e: Exception) -> bool:
             if isinstance(e, HTTPStatusError):
-                return e.response.status_code in (429, 500, 502, 503, 504)
+                return e.response.status_code in (408, 429, 500, 502, 503, 504)
             return isinstance(e, (TransportError, TimeoutException, ConnectionError, asyncio.TimeoutError))
 
         def _get_retry_after(e: Exception) -> float | None:

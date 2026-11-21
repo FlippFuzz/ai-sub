@@ -21,6 +21,7 @@ from ai_sub.jobs.job_base import (
     AiJob,
     CleanTimestamp,
     Prompt,
+    TaskType,
     WorkerContext,
     build_user_prompt,
     parse_timestamp_string_ms,
@@ -221,10 +222,18 @@ class BaseSubtitleAiResponse(BaseModel):
             en_text = item.english.strip()
             og_text = item.original.strip()
 
-            en_norm = en_text.casefold().translate(translator)
-            og_norm = og_text.casefold().translate(translator)
+            if not og_text and not en_text:
+                continue
 
-            text = og_text if en_norm == og_norm else f"{og_text}\n{en_text}"
+            if not og_text:
+                text = en_text
+            elif not en_text:
+                text = og_text
+            else:
+                en_norm = en_text.casefold().translate(translator)
+                og_norm = og_text.casefold().translate(translator)
+                text = og_text if en_norm == og_norm else f"{og_text}\n{en_text}"
+
             subs.append(SSAEvent(start=start, end=end, text=text))
 
         return subs
@@ -289,15 +298,12 @@ class BaseSubtitleJob(AiJob):
         default=None,
         description="Optional global summary context from phase 1.",
     )
-    response: BaseSubtitleAiResponse | None = Field(
-        default=None,
-        description="Structured subtitle response once generated.",
-    )
 
 
 class SubtitlesJob(BaseSubtitleJob):
     """Job container holding generated subtitle state for a video segment."""
 
+    task_type: ClassVar[TaskType] = TaskType.SUBTITLES
     prompt_version_field: ClassVar[str] = "subtitles_prompt_version"
     prompt_version: ClassVar[int] = SUBTITLES_PROMPT_VERSION
 
@@ -329,5 +335,4 @@ class SubtitlesJob(BaseSubtitleJob):
             ctx=ctx,
             prompt=prompt,
             response_type=SubtitlesAiResponse,
-            task_label="subtitles",
         )

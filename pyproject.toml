@@ -17,9 +17,10 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "google-genai >= 3.0.0",
-    "logfire[google-genai, httpx]",
+    "logfire[google-genai, httpx] >= 4.39.0",
+    "opentelemetry-instrumentation-httpx >= 0.65b0",
     "ddgs",
-    "httpx",
+    "httpx2",
     "json_repair",
     "pyrate-limiter >= 4.0.0",
     "rich",
@@ -67,3 +68,8 @@ fixable = ["ALL"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+ignore = ["work/"]

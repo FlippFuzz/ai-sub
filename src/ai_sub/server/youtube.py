@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import threading
+import urllib.parse
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,13 @@ from ai_sub.server.server_config import YoutubeSourceConfig
 from ai_sub.video import ensure_ffmpeg, sanitize_uploader
 
 VALID_VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".flv", ".ts"}
+
+_AVAILABILITY_REASONS = {
+    "subscriber_only": "Members only",
+    "private": "Private video",
+    "premium_only": "Premium only",
+    "needs_auth": "Age / Auth restricted",
+}
 
 
 class YouTubeBotDetectionError(Exception):
@@ -103,7 +111,8 @@ def _extract_handle(entry: Mapping[str, Any]) -> str | None:
     """
     for key in ("uploader_url", "channel_url"):
         if url_val := entry.get(key):
-            if match := re.search(r"/(@[\w.-]+)", str(url_val)):
+            decoded_url = urllib.parse.unquote(str(url_val))
+            if match := re.search(r"/(@[\w.-]+)", decoded_url):
                 return match.group(1)
 
     if uploader_id := entry.get("uploader_id"):
@@ -265,9 +274,10 @@ class YouTubeClient:
         Returns:
             Path | None: Server home directory if built and valid, None otherwise.
         """
+        node_bin = shutil.which("node")
         npm_bin = shutil.which("npm")
         npx_bin = shutil.which("npx")
-        if not (npm_bin and npx_bin):
+        if not (node_bin and npm_bin and npx_bin):
             logfire.warning("Node.js, npm, or npx not found in PATH. Skipping PO token provider.")
             return None
 
@@ -446,11 +456,12 @@ class YouTubeClient:
 
         with self._channel_lock:
             existing = self._channel_map.root.get(c_str)
-            if not existing or timestamp > existing.timestamp or u_str != existing.uploader_id:
+            effective_ts = max(timestamp, existing.timestamp) if existing else timestamp
+            if not existing or effective_ts > existing.timestamp or u_str != existing.uploader_id:
                 self._channel_map.root[c_str] = ChannelInfo(
                     uploader_id=u_str,
                     channel_name=str(channel_name) if channel_name else (existing.channel_name if existing else None),
-                    timestamp=timestamp,
+                    timestamp=effective_ts,
                 )
                 self._save_channel_map_locked()
 
@@ -573,7 +584,8 @@ class YouTubeClient:
 
         Tracks per-URL deep-scan completion so any source that fails with a retryable error
         automatically retries its full history crawl on the next scan without re-crawling
-        already-completed sources. Skips members-only ('subscriber_only') videos.
+        already-completed sources. Skips non-VOD entries (upcoming, live, post-live, members-only)
+        using an allowlist for ready availability and live status.
 
         Args:
             deep_scan: If True, forces full channel history crawl across all sources.
@@ -604,11 +616,12 @@ class YouTubeClient:
             if clean_url.endswith("/shorts"):
                 continue
 
+            decoded_url = urllib.parse.unquote(clean_url)
             url_handle: str | None = None
-            if match := re.search(r"/(@[\w.-]+)", clean_url):
+            if match := re.search(r"/(@[\w.-]+)", decoded_url):
                 url_handle = match.group(1)
 
-            if re.match(r"^https?://(www\.)?youtube\.com/(@[\w.-]+|channel/UC[\w-]+)$", clean_url):
+            if re.match(r"^https?://(www\.)?youtube\.com/(@[\w.-]+|channel/UC[\w-]+)$", decoded_url):
                 target_items.extend([(f"{clean_url}/videos", url_handle), (f"{clean_url}/streams", url_handle)])
             else:
                 target_items.append((clean_url, url_handle))
@@ -656,15 +669,18 @@ class YouTubeClient:
                                 vid = entry.get("id")
                                 if not vid or len(vid) != 11:
                                     continue
-                                if entry.get("availability") == "subscriber_only":
+                                availability = entry.get("availability")
+                                if availability == "subscriber_only":
                                     members_only_ids.add(vid)
+                                    continue
+                                if availability not in (None, "public", "unlisted"):
                                     continue
                                 if vid in skip_ids:
                                     continue
                                 title = str(entry.get("title") or "Unknown")
                                 if title in ["[Deleted video]", "[Private video]", "[Unavailable video]"]:
                                     continue
-                                if entry.get("live_status") in ("is_upcoming", "is_live", "post_live"):
+                                if entry.get("live_status") not in (None, "not_live", "was_live"):
                                     if is_single_video:
                                         skipped_live_single = True
                                     continue
@@ -725,7 +741,7 @@ class YouTubeClient:
         Raises:
             YouTubeBotDetectionError: If a bot check is detected during download.
             YouTubeVideoUnavailableError: If the video is deleted, private, members-only, live/upcoming,
-                or age/geo-restricted.
+                post-live processing, or age/geo-restricted.
             RuntimeError: If download fails or output file cannot be located.
         """
         destination_dir.mkdir(parents=True, exist_ok=True)
@@ -740,15 +756,19 @@ class YouTubeClient:
         def _filter_unplayable(info_dict: Mapping[str, Any], *, incomplete: bool = False) -> str | None:
             if incomplete:
                 return None
-            if info_dict.get("availability") == "subscriber_only":
+            availability = info_dict.get("availability")
+            if availability not in (None, "public", "unlisted"):
+                reason = _AVAILABILITY_REASONS.get(str(availability), f"Unavailable ({availability})")
                 raise YouTubeVideoUnavailableError(
-                    f"Video {video_id} is members-only.",
-                    reason="Members only",
+                    f"Video {video_id} is unavailable (availability={availability}).",
+                    reason=reason,
                 )
-            if info_dict.get("live_status") in ("is_upcoming", "is_live", "post_live"):
+            live_status = info_dict.get("live_status")
+            if live_status not in (None, "not_live", "was_live"):
+                reason = "Post-live processing" if live_status == "post_live" else "Live / Upcoming"
                 raise YouTubeVideoUnavailableError(
-                    f"Video {video_id} is live or upcoming ({info_dict.get('live_status')}).",
-                    reason="Live / Upcoming",
+                    f"Video {video_id} is not ready for VOD download (live_status={live_status}).",
+                    reason=reason,
                 )
             return None
 

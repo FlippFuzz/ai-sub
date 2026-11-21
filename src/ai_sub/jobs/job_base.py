@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Self, TypeVar
 
@@ -29,6 +30,14 @@ if TYPE_CHECKING:
     from ai_sub.search.search_base import BaseSearchProvider
 
 T = TypeVar("T", bound=BaseModel)
+
+
+class TaskType(str, Enum):
+    """Types of distributed AI tasks executed locally or by remote workers."""
+
+    SUMMARY = "summary"
+    SUBTITLES = "subtitles"
+    LYRICS = "lyrics"
 
 
 class _YamlDumper(yaml.SafeDumper):
@@ -132,18 +141,25 @@ def parse_timestamp_string_ms(timestamp_string: str) -> int:
     return hours * 3600000 + minutes * 60000 + seconds * 1000 + ms
 
 
-def format_ms_timestamp(ms: int) -> str:
-    """Formats a duration in milliseconds to an 'MM:SS.mmm' string.
+def format_ms_timestamp(ms: int, include_hours: bool = False) -> str:
+    """Formats a duration in milliseconds to 'MM:SS.mmm' or 'HH:MM:SS.mmm'.
 
     Args:
         ms: Milliseconds to format.
+        include_hours: When True and duration is at least 1 hour, formats as 'HH:MM:SS.mmm'.
+            Defaults to False.
 
     Returns:
         str: Formatted timestamp string.
     """
-    minutes, ms = divmod(ms, 60000)
-    seconds, ms = divmod(ms, 1000)
-    return f"{minutes:02d}:{seconds:02d}.{ms:03d}"
+    if include_hours and ms >= 3_600_000:
+        hours, rem = divmod(ms, 3_600_000)
+        minutes, rem = divmod(rem, 60_000)
+        seconds, millis = divmod(rem, 1000)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
+    minutes, rem = divmod(ms, 60_000)
+    seconds, millis = divmod(rem, 1000)
+    return f"{minutes:02d}:{seconds:02d}.{millis:03d}"
 
 
 def validate_duration_bound(
@@ -259,8 +275,8 @@ def build_user_prompt(
     append_xml_section(parts, "task", *task_lines)
 
     if segment_duration_ms > 0:
-        start_tc = format_ms_timestamp(segment_offset_ms)
-        end_tc = format_ms_timestamp(segment_offset_ms + segment_duration_ms)
+        start_tc = format_ms_timestamp(segment_offset_ms, include_hours=True)
+        end_tc = format_ms_timestamp(segment_offset_ms + segment_duration_ms, include_hours=True)
         window_lines = [f"This video segment covers {start_tc} to {end_tc} of the full video."]
         if include_local_timecode_note:
             window_lines.extend(
@@ -304,6 +320,8 @@ class WorkerContext:
     executor: GeminiExecutor
     media_path: Path
     search_providers: list[BaseSearchProvider] = field(default_factory=list)
+    retry_settings: RetrySettings | None = None
+    validation_buffer_ms: int = 2000
 
 
 class BaseJob(BaseModel):
@@ -333,21 +351,6 @@ class AiJob(BaseJob):
         default=None,
         description="Resolved user-supplied context string applied during execution.",
     )
-    media_path: Path | None = Field(
-        default=None,
-        description="Local media path bound to this AI job.",
-        exclude=True,
-    )
-    retry_settings: RetrySettings | None = Field(
-        default=None,
-        description="Optional task-specific retry settings.",
-        exclude=True,
-    )
-    validation_buffer_ms: NonNegativeInt = Field(
-        default=2000,
-        description="Allowed timestamp overflow tolerance in milliseconds.",
-        exclude=True,
-    )
     segment_index: int | None = Field(
         default=None,
         description="Segment index if applicable.",
@@ -373,6 +376,7 @@ class AiJob(BaseJob):
         description="Whether this job has permanently exhausted all retries and fallback FPS tiers.",
     )
 
+    task_type: ClassVar[TaskType]
     prompt_version_field: ClassVar[str] = ""
     prompt_version: ClassVar[int] = 0
 
@@ -381,17 +385,17 @@ class AiJob(BaseJob):
         ctx: WorkerContext,
         prompt: Prompt,
         response_type: type[T],
-        task_label: str,
+        task_label: str | None = None,
         tools: Sequence[Callable[..., Any] | dict[str, Any] | BaseSearchProvider] | None = None,
         validation_context: dict[str, Any] | None = None,
     ) -> T:
-        """Executes structured Gemini inference using this job's execution settings.
+        """Executes structured Gemini inference using this job's execution settings and runtime context.
 
         Args:
-            ctx: Worker runtime context containing executor and search providers.
+            ctx: Worker runtime context containing executor, media path, retry policy, and search providers.
             prompt: System and user prompt pair.
             response_type: Expected Pydantic response schema.
-            task_label: Telemetry span label for the task.
+            task_label: Optional telemetry span label (defaults to task_type value). Defaults to None.
             tools: Optional tool callables or search providers. Defaults to None.
             validation_context: Optional extra context passed to Pydantic validation. Defaults to None.
 
@@ -400,16 +404,16 @@ class AiJob(BaseJob):
         """
         return await ctx.executor.run_structured(
             prompt=prompt,
-            media_path=self.media_path or ctx.media_path,
+            media_path=ctx.media_path,
             video_duration_ms=self.video_duration_ms,
             response_type=response_type,
             model_name=self.model_name,
             service_tier=self.service_tier,
             tools=tools,
             agentic_video=self.agentic_video,
-            task_label=task_label,
-            retry_settings=self.retry_settings,
-            validation_buffer_ms=self.validation_buffer_ms,
+            task_label=task_label or self.task_type.value,
+            retry_settings=ctx.retry_settings,
+            validation_buffer_ms=ctx.validation_buffer_ms,
             validation_context=validation_context,
         )
 
@@ -427,6 +431,9 @@ class AiJob(BaseJob):
     def load(cls, save_path: Path, validation_buffer_ms: int = 0) -> Self | None:
         """Loads and validates a saved YAML state file.
 
+        Checks prompt version before Pydantic validation so schema evolutions across prompt
+        bumps log a clean version mismatch instead of spurious validation errors.
+
         Args:
             save_path: State file path.
             validation_buffer_ms: Duration tolerance in milliseconds.
@@ -437,30 +444,35 @@ class AiJob(BaseJob):
         if not save_path.is_file():
             return None
 
-        with open(save_path, "r", encoding="utf-8") as f:
-            try:
+        try:
+            with open(save_path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
-                if not isinstance(data, dict):
-                    logfire.warning(f"Corrupt YAML in {save_path.name}. Re-processing.")
-                    return None
-                job = cls.model_validate(
-                    data,
-                    context={
-                        "video_duration_ms": data.get("video_duration_ms"),
-                        "validation_buffer_ms": validation_buffer_ms,
-                    },
-                )
-            except (yaml.YAMLError, ValidationError) as e:
-                logfire.warning(f"Validation failed for {save_path.name}: {e}. Re-processing.")
-                return None
+        except yaml.YAMLError as e:
+            logfire.warning(f"Validation failed for {save_path.name}: {e}. Re-processing.")
+            return None
+
+        if not isinstance(data, dict):
+            logfire.warning(f"Corrupt YAML in {save_path.name}. Re-processing.")
+            return None
 
         if cls.prompt_version_field and cls.prompt_version:
-            file_version = getattr(job, cls.prompt_version_field, None)
-            if file_version != cls.prompt_version:
+            file_version = data.get(cls.prompt_version_field)
+            if isinstance(file_version, bool) or file_version != cls.prompt_version:
+                job_name = data.get("name") or save_path.stem
                 logfire.info(
-                    f"Prompt version mismatch for {job.name} "
+                    f"Prompt version mismatch for {job_name} "
                     f"(file: v{file_version}, current: v{cls.prompt_version}). Re-processing."
                 )
                 return None
 
-        return job
+        try:
+            return cls.model_validate(
+                data,
+                context={
+                    "video_duration_ms": data.get("video_duration_ms"),
+                    "validation_buffer_ms": validation_buffer_ms,
+                },
+            )
+        except ValidationError as e:
+            logfire.warning(f"Validation failed for {save_path.name}: {e}. Re-processing.")
+            return None

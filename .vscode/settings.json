@@ -1,5 +1,5 @@
 {
-  // Enable formatting on save for all languages (or specifically for Python)
+  // Enable formatting on save for all languages
   "editor.formatOnSave": true,
 
   // Set Ruff as the default formatter for Python files
@@ -8,13 +8,13 @@
     "editor.formatOnSave": true
   },
 
-  // Optional: Enable auto-fixable linting problems on save (like organizing imports)
+  // Enable auto-fixable linting problems on save (like organizing imports)
   "editor.codeActionsOnSave": {
     "source.organizeImports.ruff": "explicit",
     "source.fixAll": "explicit"
   },
 
-  // Ignore bgutil-ytdlp-pot-provider in work directory
-  "python.analysis.ignore": ["work/"],
+  // VS Code-only Pylance UI settings
+  "python.analysis.diagnosticMode": "workspace",
   "python.analysis.autoImportCompletions": true
 }

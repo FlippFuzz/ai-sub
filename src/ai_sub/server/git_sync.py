@@ -6,7 +6,6 @@ import asyncio
 import json
 import os
 import random
-import re
 import shutil
 import stat
 import sys
@@ -26,7 +25,7 @@ from ai_sub.shortcode import parse_subtitle_track, subtitle_track_sort_key
 
 os.environ["GIT_TERMINAL_PROMPT"] = "0"
 JST = timezone(timedelta(hours=9))
-_CHUNK_SRT_RE = re.compile(r"^part_\d{3,}(?:_|\.)")
+_MAX_REBASE_STEPS = 50
 
 
 def _handle_readonly_rmtree(func: Any, path: str, exc_info: Any) -> None:
@@ -64,8 +63,7 @@ class GitSyncManager:
     local_repo_dir: Path
     player_base_url: str
     _lock: asyncio.Lock
-    _completed_videos: set[tuple[str, str, str]]
-    _yt_completed_uploaders: dict[tuple[str, str], str]
+    _completed: dict[tuple[str, str], dict[str, bool]]
 
     def __init__(self, config: GitConfig | None, base_work_dir: Path) -> None:
         """Initializes the Git synchronization manager.
@@ -76,8 +74,7 @@ class GitSyncManager:
         """
         self.config = config
         self._lock = asyncio.Lock()
-        self._completed_videos = set()
-        self._yt_completed_uploaders = {}
+        self._completed = {}
         repo_name = "subtitles-archive"
 
         if config and config.repourl is not None:
@@ -257,11 +254,20 @@ class GitSyncManager:
 
         Raises:
             GitCommandError: If pulling fails without starting a rebase.
-            RuntimeError: If a non-README merge conflict forces aborting the rebase.
+            RuntimeError: If rebase fails to advance, exceeds max steps, or hits a non-README conflict.
         """
         editor_cmd = f'"{sys.executable}" -c "import sys; sys.exit(0)"'
         rebase_merge_dir = Path(repo.git_dir) / "rebase-merge"
         rebase_apply_dir = Path(repo.git_dir) / "rebase-apply"
+
+        def _rebase_marker() -> str | None:
+            for marker_file in (rebase_merge_dir / "msgnum", rebase_apply_dir / "next"):
+                if marker_file.is_file():
+                    try:
+                        return f"{marker_file.parent.name}:{marker_file.read_text(encoding='utf-8').strip()}"
+                    except OSError:
+                        pass
+            return None
 
         try:
             repo.git.pull("origin", branch, "--rebase")
@@ -273,7 +279,15 @@ class GitSyncManager:
                 raise
 
             try:
+                steps = 0
                 while rebase_merge_dir.exists() or rebase_apply_dir.exists():
+                    steps += 1
+                    if steps > _MAX_REBASE_STEPS:
+                        repo.git.rebase("--abort")
+                        raise RuntimeError(
+                            f"Git rebase aborted after exceeding {_MAX_REBASE_STEPS} conflict resolution steps."
+                        ) from pull_err
+
                     unmerged_output = repo.git.diff("-z", "--diff-filter=U", "--name-only")
                     unmerged_files = [f for f in unmerged_output.split("\0") if f]
 
@@ -287,13 +301,18 @@ class GitSyncManager:
                         conflicted_uploader = conflicted_readme.split("/")[0]
                         self._update_channel_readme_sync(conflicted_uploader)
                         repo.git.add(conflicted_readme)
+                        prev_marker = _rebase_marker()
                         try:
                             repo.git.rebase("--continue", env={**os.environ, "GIT_EDITOR": editor_cmd})
                             logfire.info(f"Continued rebase after resolving {conflicted_readme} conflict.")
-                        except GitCommandError:
+                        except GitCommandError as cont_err:
                             if rebase_merge_dir.exists() or rebase_apply_dir.exists():
-                                continue
-                            raise
+                                new_marker = _rebase_marker()
+                                if new_marker is not None and new_marker != prev_marker:
+                                    continue
+                            raise RuntimeError(
+                                f"Git rebase --continue failed: {self._sanitize_error(cont_err)}"
+                            ) from cont_err
                     else:
                         logfire.warning(
                             f"Unresolvable non-README conflict encountered ({unmerged_files}). Aborting rebase."
@@ -329,21 +348,14 @@ class GitSyncManager:
             full_shortcode: Model lineage shortcode.
             clean_meta: Clean video metadata dictionary.
         """
-        self._completed_videos.add((uploader, video_id, full_shortcode))
-        # Record to YouTube uploader reverse-lookup only for genuine YouTube source videos,
-        # retaining the lexicographically smallest uploader to match cache rebuilding order
-        if clean_meta.get("source_type") == "youtube":
-            yt_key = (video_id, full_shortcode)
-            if yt_key not in self._yt_completed_uploaders or uploader < self._yt_completed_uploaders[yt_key]:
-                self._yt_completed_uploaders[yt_key] = uploader
+        is_yt = clean_meta.get("source_type") == "youtube"
+        self._completed.setdefault((video_id, full_shortcode), {})[uploader] = is_yt
 
     def _rebuild_completed_cache_sync(self) -> None:
         """Scans the local repository directory to rebuild the in-memory completed subtitles cache."""
-        completed: set[tuple[str, str, str]] = set()
-        yt_uploaders: dict[tuple[str, str], str] = {}
+        completed: dict[tuple[str, str], dict[str, bool]] = {}
         if not self.local_repo_dir.is_dir():
-            self._completed_videos = completed
-            self._yt_completed_uploaders = yt_uploaders
+            self._completed = completed
             return
 
         try:
@@ -371,22 +383,16 @@ class GitSyncManager:
                             pass
 
                     for srt in sorted(video_dir.glob("*.srt"), key=lambda p: p.name):
-                        if srt.is_file() and not _CHUNK_SRT_RE.match(srt.name) and ".raw-" not in srt.name:
-                            if srt.stat().st_size > 0:
-                                track_info = parse_subtitle_track(srt)
-                                if track_info.shortcode:
-                                    completed.add((uploader, video_id, track_info.shortcode))
-                                    if is_yt:
-                                        key = (video_id, track_info.shortcode)
-                                        # Deterministic selection: keep the first alphabetically sorted uploader
-                                        if key not in yt_uploaders:
-                                            yt_uploaders[key] = uploader
+                        if srt.is_file() and srt.stat().st_size > 0:
+                            track_info = parse_subtitle_track(srt)
+                            if track_info.shortcode and track_info.is_refined:
+                                completed.setdefault((video_id, track_info.shortcode), {})[uploader] = is_yt
         except Exception as e:
             logfire.warning(f"Error rebuilding completed subtitles cache: {e}")
 
-        self._completed_videos = completed
-        self._yt_completed_uploaders = yt_uploaders
-        logfire.debug(f"Rebuilt completed subtitles cache: {len(self._completed_videos)} entry(s).")
+        self._completed = completed
+        total_entries = sum(len(uploaders) for uploaders in completed.values())
+        logfire.debug(f"Rebuilt completed subtitles cache: {total_entries} entry(s).")
 
     def _ensure_repo_sync(self) -> None:
         """Synchronous implementation of cloning or updating the local repository.
@@ -497,12 +503,15 @@ class GitSyncManager:
         Returns:
             bool: True if completed subtitles exist; False otherwise.
         """
+        uploaders = self._completed.get((video_id, full_shortcode))
+        if not uploaders:
+            return False
         if uploader and uploader.lower() != "youtube":
-            return (uploader, video_id, full_shortcode) in self._completed_videos
-        return (video_id, full_shortcode) in self._yt_completed_uploaders
+            return uploader in uploaders
+        return any(uploaders.values())
 
     def get_completed_uploader(self, video_id: str, full_shortcode: str) -> str | None:
-        """Retrieves the uploader handle for a completed video ID if known in the repository cache.
+        """Retrieves the uploader handle for a completed YouTube video ID if known in the repository cache.
 
         Args:
             video_id: Video identifier.
@@ -511,7 +520,11 @@ class GitSyncManager:
         Returns:
             str | None: Uploader handle if present in repository, None otherwise.
         """
-        return self._yt_completed_uploaders.get((video_id, full_shortcode))
+        uploaders = self._completed.get((video_id, full_shortcode))
+        if not uploaders:
+            return None
+        yt_uploaders = [u for u, is_yt in uploaders.items() if is_yt]
+        return min(yt_uploaders) if yt_uploaders else None
 
     def _discover_video_subtitles(self, video_dir: Path) -> list[dict[str, str]]:
         """Discovers and ranks all finalized and intermediate SRT files relative to the video directory.
@@ -529,14 +542,14 @@ class GitSyncManager:
 
         # 1. Primary/Finalized SRTs directly in v/<video_id>/
         for srt in video_dir.glob("*.srt"):
-            if srt.is_file() and not _CHUNK_SRT_RE.match(srt.name) and srt.stat().st_size > 0:
+            if srt.is_file() and srt.stat().st_size > 0:
                 discovered_paths.append(srt)
 
         # 2. Raw / intermediate SRTs in .int/
         int_base_dir = video_dir / ".int"
         if int_base_dir.is_dir():
             for srt in int_base_dir.glob("**/*.srt"):
-                if srt.is_file() and not _CHUNK_SRT_RE.match(srt.name) and srt.stat().st_size > 0:
+                if srt.is_file() and srt.stat().st_size > 0:
                     discovered_paths.append(srt)
 
         # Sort descending from highest to lowest quality
@@ -649,7 +662,16 @@ class GitSyncManager:
         encoded_uploader = urllib.parse.quote(uploader, safe="")
 
         for item in entries:
-            clean_title = (item["title"] or item["video_id"]).replace("|", "\\|").replace("\n", " ").strip()
+            clean_title = (
+                (item["title"] or item["video_id"])
+                .replace("\\", "\\\\")
+                .replace("[", "\\[")
+                .replace("]", "\\]")
+                .replace("|", "\\|")
+                .replace("\n", " ")
+                .replace("\r", " ")
+                .strip()
+            )
             vid = item["video_id"]
             encoded_vid = urllib.parse.quote(vid, safe="")
             model_label = item["best_model_label"]
@@ -755,8 +777,9 @@ class GitSyncManager:
         int_dir = video_dir / ".int" / full_shortcode
         int_dir.mkdir(parents=True, exist_ok=True)
 
+        raw_suffix = f".raw-{full_shortcode}.srt"
         for sf in srt_files:
-            target_srt = int_dir / sf.name if ".raw-" in sf.name else video_dir / sf.name
+            target_srt = int_dir / sf.name if sf.name.endswith(raw_suffix) else video_dir / sf.name
             shutil.copy2(sf, target_srt)
             logfire.info(f"Copied finalized subtitles to {target_srt}")
 

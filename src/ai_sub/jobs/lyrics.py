@@ -8,7 +8,7 @@ from typing import ClassVar, Self
 import logfire
 from pydantic import Field, ValidationInfo, model_validator
 
-from ai_sub.jobs.job_base import Prompt, WorkerContext, build_user_prompt
+from ai_sub.jobs.job_base import Prompt, TaskType, WorkerContext, build_user_prompt
 from ai_sub.jobs.subtitles import (
     BaseSubtitleAiResponse,
     BaseSubtitleJob,
@@ -95,43 +95,55 @@ async def prefetch_lyrics(
         elif p.provider_name not in ("builtin", "lrclib") and web_provider is None:
             web_provider = p
 
+    seen_tracks: set[tuple[str, str]] = set()
     for perf in performances:
         if not perf.title or not perf.title.strip():
             continue
 
         clean_title = perf.title.strip()
         clean_artist = perf.artist.strip() if perf.artist else None
-        logfire.info(f"Pre-fetching lyrics for: '{clean_title}' by '{clean_artist or 'Unknown'}'")
+        track_key = (clean_title.casefold(), (clean_artist or "").casefold())
+        if track_key in seen_tracks:
+            continue
+        seen_tracks.add(track_key)
 
-        perf_found = False
-        if lrclib_provider is not None:
-            try:
-                lrclib_results = await lrclib_provider.search_lrclib_lyrics_database(
-                    track_title=clean_title,
-                    artist_name=clean_artist,
-                )
-                if lrclib_results:
-                    best = lrclib_results[0]
-                    results_parts.append(
-                        f"Official Lyrics for '{best.get('track_name')}' by {best.get('artist_name')}:\n"
-                        f"{best.get('plain_lyrics')}"
+        artist_label = clean_artist or "Unknown"
+
+        with logfire.span(
+            "Pre-fetching lyrics for: '{title}' by '{artist}'",
+            title=clean_title,
+            artist=artist_label,
+        ):
+            perf_found = False
+            if lrclib_provider is not None:
+                try:
+                    lrclib_results = await lrclib_provider.search_lrclib_lyrics_database(
+                        track_title=clean_title,
+                        artist_name=clean_artist,
                     )
-                    perf_found = True
-            except Exception as e:
-                logfire.warning(f"LRCLIB pre-fetch error for '{clean_title}': {e}")
+                    if lrclib_results:
+                        entries = [
+                            f"Official Lyrics for '{item.get('track_name')}' by {item.get('artist_name')}:\n"
+                            f"{item.get('plain_lyrics')}"
+                            for item in lrclib_results
+                        ]
+                        results_parts.append("\n---\n".join(entries))
+                        perf_found = True
+                except Exception as e:
+                    logfire.warning(f"LRCLIB pre-fetch error for '{clean_title}': {e}")
 
-        if not perf_found and web_provider is not None:
-            try:
-                query_parts = [clean_title]
-                if clean_artist:
-                    query_parts.append(clean_artist)
-                query_parts.append("lyrics")
-                search_res = await web_provider.search_single(" ".join(query_parts))
-                if search_res:
-                    snippets = "\n---\n".join(f"[{r.title}]: {r.content}" for r in search_res[:2])
-                    results_parts.append(f"Web Search Results for '{clean_title}':\n{snippets}")
-            except Exception as e:
-                logfire.debug(f"Web search pre-fetch error for '{clean_title}': {e}")
+            if not perf_found and web_provider is not None:
+                try:
+                    query_parts = [clean_title]
+                    if clean_artist:
+                        query_parts.append(clean_artist)
+                    query_parts.append("lyrics")
+                    search_res = await web_provider.search_single(" ".join(query_parts))
+                    if search_res:
+                        snippets = "\n---\n".join(f"[{r.title}]: {r.content}" for r in search_res[:2])
+                        results_parts.append(f"Web Search Results for '{clean_title}':\n{snippets}")
+                except Exception as e:
+                    logfire.debug(f"Web search pre-fetch error for '{clean_title}': {e}")
 
     return "\n\n".join(results_parts)
 
@@ -212,6 +224,7 @@ class LyricsAiResponse(BaseSubtitleAiResponse):
 class LyricsJob(BaseSubtitleJob):
     """Job container holding refined subtitles for a segment with musical performance."""
 
+    task_type: ClassVar[TaskType] = TaskType.LYRICS
     prompt_version_field: ClassVar[str] = "lyrics_prompt_version"
     prompt_version: ClassVar[int] = LYRICS_PROMPT_VERSION
 
@@ -280,7 +293,6 @@ class LyricsJob(BaseSubtitleJob):
             ctx=ctx,
             prompt=prompt,
             response_type=LyricsAiResponse,
-            task_label="lyrics",
             tools=ctx.search_providers,
             validation_context={"require_subtitles": bool(self.draft_subtitles)},
         )

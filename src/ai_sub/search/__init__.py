@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable, Sequence
 
 from ai_sub.config import SearchSettings
 from ai_sub.search.builtin import GoogleBuiltinSearchProvider
@@ -78,6 +78,20 @@ def create_search_providers(
     return providers
 
 
+def order_lyrics_providers(providers: Sequence[BaseSearchProvider]) -> list[BaseSearchProvider]:
+    """Orders search providers for lyrics refinement so LRCLIB precedes general web search.
+
+    Args:
+        providers: Configured search providers.
+
+    Returns:
+        list[BaseSearchProvider]: Providers ordered with LRCLIB entries first.
+    """
+    lrclib = [p for p in providers if p.provider_name == "lrclib"]
+    others = [p for p in providers if p.provider_name != "lrclib"]
+    return [*lrclib, *others]
+
+
 __all__ = [
     "BaseHttpSearchProvider",
     "BaseSearchProvider",
@@ -92,5 +106,6 @@ __all__ = [
     "create_search_provider",
     "create_search_providers",
     "normalize_query",
+    "order_lyrics_providers",
     "parse_retry_after",
 ]

@@ -241,10 +241,10 @@ Add scheduled runs:
 
 ```cron
 # Every 4 hours: Run up to 15 tasks using only gemini-3.5-flash-lite (max 3 hours = 10800s)
-7 1,5,9,13,17 * * * cd /home/ubuntu/ai-sub-worker && AISUBWORKER_MODELS='gemini-3.5-flash-lite' AISUBWORKER_MAXTASKS=15 AISUBWORKER_MAXDURATION=10800 ./worker.sh > /tmp/ai-sub-worker-35fl.log 2>&1
+7 1,5,9,13,17 * * * cd /home/ubuntu/ai-sub-worker && AISUBWORKER_MODELS='gemini-3.5-flash-lite' AISUBWORKER_MAXTASKS=15 AISUBWORKER_MAXDURATION=PT3H ./worker.sh > /tmp/ai-sub-worker-35fl.log 2>&1
 
 # Daily at 21:00 UTC: Offer all models during peak availability windows
-7 21 * * * cd /home/ubuntu/ai-sub-worker && AISUBWORKER_MAXTASKS=50 AISUBWORKER_MAXDURATION=10800 ./worker.sh > /tmp/ai-sub-worker-all.log 2>&1
+7 21 * * * cd /home/ubuntu/ai-sub-worker && AISUBWORKER_MAXTASKS=50 AISUBWORKER_MAXDURATION=PT3H ./worker.sh > /tmp/ai-sub-worker-all.log 2>&1
 ```
 
 ### Worker Operational Behavior

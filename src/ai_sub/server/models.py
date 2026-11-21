@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -61,80 +62,63 @@ class ServerTask(BaseModel):
         Returns:
             TaskClaimResponse: Formatted response model.
         """
+        common: dict[str, Any] = {
+            "task_id": self.task_id,
+            "task_type": self.task_type,
+            "pipeline_name": self.pipeline_name,
+            "video_id": self.video_id,
+            "model": self.model,
+            "media_url": media_url,
+            "user_context": pipeline.user_context,
+            "search_tools": search_tools,
+            "validation_buffer": validation_buffer,
+            "retry": retry,
+        }
+
         if self.task_type == TaskType.SUMMARY:
             return TaskClaimResponse(
-                task_id=self.task_id,
-                task_type=self.task_type,
-                pipeline_name=self.pipeline_name,
-                video_id=self.video_id,
-                model=self.model,
-                media_url=media_url,
                 video_duration_ms=pipeline.duration_ms,
-                segment_offset_ms=0,
-                user_context=pipeline.user_context,
-                search_tools=search_tools,
                 agentic_video=pipeline.summary_config.agentic,
                 service_tier=pipeline.summary_config.tier,
-                validation_buffer=validation_buffer,
-                retry=retry,
+                **common,
             )
 
         assert self.segment_index is not None
         seg = pipeline.segments[self.segment_index]
+        common["video_duration_ms"] = seg.duration_ms
+        common["segment_offset_ms"] = seg.offset_ms
+        common["global_summary"] = pipeline.summary.response
 
         if self.task_type == TaskType.SUBTITLES:
             return TaskClaimResponse(
-                task_id=self.task_id,
-                task_type=self.task_type,
-                pipeline_name=self.pipeline_name,
-                video_id=self.video_id,
-                model=self.model,
-                media_url=media_url,
-                video_duration_ms=seg.duration_ms,
-                segment_offset_ms=seg.offset_ms,
-                user_context=pipeline.user_context,
-                global_summary=pipeline.summary.response,
-                search_tools=search_tools,
                 agentic_video=pipeline.subtitles_config.agentic,
                 service_tier=pipeline.subtitles_config.tier,
-                validation_buffer=validation_buffer,
-                retry=retry,
+                **common,
             )
 
         sub_resp = seg.subtitles_response
         return TaskClaimResponse(
-            task_id=self.task_id,
-            task_type=self.task_type,
-            pipeline_name=self.pipeline_name,
-            video_id=self.video_id,
-            model=self.model,
-            media_url=media_url,
-            video_duration_ms=seg.duration_ms,
-            segment_offset_ms=seg.offset_ms,
-            user_context=pipeline.user_context,
-            global_summary=pipeline.summary.response,
             draft_subtitles=sub_resp.subtitles if sub_resp else [],
             detected_performances=sub_resp.detected_musical_performances if sub_resp else [],
-            search_tools=search_tools,
             agentic_video=pipeline.lyrics_config.agentic,
             service_tier=pipeline.lyrics_config.tier,
-            validation_buffer=validation_buffer,
-            retry=retry,
+            **common,
         )
 
 
 class ActivityEvent(BaseModel):
     """Log record of worker task events for dashboard observability."""
 
+    event_id: str = Field(
+        default_factory=lambda: uuid.uuid4().hex[:12],
+        description="Unique identifier for this activity event.",
+    )
     timestamp: float = Field(description="Unix timestamp of the event.")
-    time_str: str = Field(description="Human-readable event time string (HH:MM:SS).")
-    event_type: Literal["complete", "fail", "timeout"] = Field(description="Event classification.")
+    event_type: Literal["complete", "retry", "fail", "timeout"] = Field(description="Event classification.")
     task_id: str = Field(description="Task identifier.")
-    pipeline: str = Field(description="Pipeline name.")
     worker_id: str = Field(description="Worker identifier.")
-    model: str = Field(description="Target model.")
     video_id: str | None = Field(default=None, description="Video identifier associated with this task.")
-    duration_s: float | None = Field(default=None, description="Execution duration in seconds if complete.")
+    duration_s: float | None = Field(default=None, description="Execution duration in seconds if available.")
     detail: str | None = Field(default=None, description="Optional extra detail or error string.")
     logfire_query: str | None = Field(
         default=None,

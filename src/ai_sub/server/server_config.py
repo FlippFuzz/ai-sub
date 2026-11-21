@@ -118,6 +118,24 @@ class PipelineConfig(BaseConfigModel):
                 updated[stage] = {**stage_val, "agentic": True}
         return updated
 
+    @model_validator(mode="after")
+    def _validate_name(self) -> Self:
+        """Ensures the pipeline name is non-empty and safe for directory paths and task IDs.
+
+        Returns:
+            Self: Validated instance.
+
+        Raises:
+            ValueError: If name is blank, contains path separators, or contains '::'.
+        """
+        cleaned = self.name.strip()
+        if not cleaned or cleaned in (".", "..") or any(sep in cleaned for sep in ("/", "\\", "::")):
+            raise ValueError(
+                f"Pipeline name '{self.name}' must be non-empty and cannot contain '/', '\\', '..', or '::'."
+            )
+        self.name = cleaned
+        return self
+
 
 class GitConfig(BaseConfigModel):
     """Git repository synchronization settings."""
@@ -285,3 +303,20 @@ class ServerSettings(YamlFileSettings):
     retry: RetrySettings = Field(default_factory=RetrySettings)
     log: LoggingSettings = Field(default_factory=LoggingSettings)
     pipelines: list[PipelineConfig] = Field(default_factory=_get_default_pipelines)
+
+    @model_validator(mode="after")
+    def _validate_unique_pipeline_names(self) -> Self:
+        """Ensures configured pipeline names are unique across all runners.
+
+        Returns:
+            Self: Validated instance.
+
+        Raises:
+            ValueError: If duplicate pipeline names are configured.
+        """
+        seen: set[str] = set()
+        for pipe in self.pipelines:
+            if pipe.name in seen:
+                raise ValueError(f"Duplicate pipeline name '{pipe.name}' configured in server pipelines.")
+            seen.add(pipe.name)
+        return self

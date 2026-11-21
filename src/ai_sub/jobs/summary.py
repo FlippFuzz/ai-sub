@@ -8,7 +8,7 @@ from typing import ClassVar
 from pydantic import BaseModel, Field
 from pydantic.json_schema import SkipJsonSchema
 
-from ai_sub.jobs.job_base import AiJob, CleanTimestamp, Prompt, WorkerContext, build_user_prompt
+from ai_sub.jobs.job_base import AiJob, CleanTimestamp, Prompt, TaskType, WorkerContext, build_user_prompt
 
 SUMMARY_PROMPT_VERSION = 1
 
@@ -166,6 +166,7 @@ class SummaryAiResponse(BaseModel):
 class SummaryJob(AiJob):
     """Job container holding global summary state for an entire video."""
 
+    task_type: ClassVar[TaskType] = TaskType.SUMMARY
     prompt_version_field: ClassVar[str] = "summary_prompt_version"
     prompt_version: ClassVar[int] = SUMMARY_PROMPT_VERSION
 
@@ -199,6 +200,5 @@ class SummaryJob(AiJob):
             ctx=ctx,
             prompt=get_summary_prompt(user_context=self.user_context),
             response_type=SummaryAiResponse,
-            task_label="summary",
             tools=ctx.search_providers,
         )

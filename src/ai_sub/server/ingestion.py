@@ -10,7 +10,7 @@ from time import monotonic
 from typing import Any, Literal
 
 import logfire
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from ai_sub.server.combo_runner import ComboRunner
 from ai_sub.server.coordinator import ComboRunnersCoordinator, is_valid_video_id
@@ -28,18 +28,10 @@ from ai_sub.server.youtube import (
 from ai_sub.video import sanitize_filename, truncate_utf8_bytes
 
 
-class QueuedVideo(BaseModel):
+class QueuedVideo(DiscoveredVideo):
     """Metadata and operational queue state for a video discovered from local files or YouTube feeds."""
 
-    video_id: str = Field(description="Unique video identifier.")
-    uploader: str = Field(description="Channel or uploader handle identifier.")
-    channel_name: str | None = Field(default=None, description="Human-readable channel display name.")
-    title: str = Field(description="Video title.")
     source_type: Literal["local", "youtube"] = Field(description="Ingestion source type.")
-    source_ref: str = Field(description="Filesystem path or YouTube URL.")
-    timestamp: int = Field(default=0, description="Upload or file modification Unix timestamp.")
-    local_path: Path | None = Field(default=None, description="Path to local file if available.")
-
     status: Literal["ready", "failed", "unplayable"] = Field(
         default="ready",
         description="Current operational queue status.",
@@ -51,10 +43,6 @@ class QueuedVideo(BaseModel):
     retry_after: float | None = Field(
         default=None,
         description="Monotonic timestamp when this video becomes eligible to be retried.",
-    )
-    failure_count: int = Field(
-        default=0,
-        description="Total failed download attempts for this video.",
     )
 
 
@@ -286,16 +274,7 @@ class IngestionManager:
 
             for vid, item in discovered.items():
                 if vid not in self.local_videos:
-                    self.local_videos[vid] = QueuedVideo(
-                        video_id=item.video_id,
-                        uploader=item.uploader,
-                        channel_name=item.channel_name,
-                        title=item.title,
-                        source_type="local",
-                        source_ref=item.source_ref,
-                        timestamp=item.timestamp,
-                        local_path=item.local_path,
-                    )
+                    self.local_videos[vid] = QueuedVideo.model_validate({**item.model_dump(), "source_type": "local"})
                 else:
                     existing = self.local_videos[vid]
                     if existing.timestamp != item.timestamp or existing.local_path != item.local_path:
@@ -359,14 +338,8 @@ class IngestionManager:
                 if item.video_id in self._ignored_youtube_ids:
                     continue
                 if item.video_id not in self.youtube_videos:
-                    self.youtube_videos[item.video_id] = QueuedVideo(
-                        video_id=item.video_id,
-                        uploader=item.uploader,
-                        channel_name=item.channel_name,
-                        title=item.title,
-                        source_type="youtube",
-                        source_ref=item.source_ref,
-                        timestamp=item.timestamp,
+                    self.youtube_videos[item.video_id] = QueuedVideo.model_validate(
+                        {**item.model_dump(), "source_type": "youtube"}
                     )
                     discovered_new += 1
                 else:
@@ -460,12 +433,10 @@ class IngestionManager:
                 if abort_reason is not None:
                     status_val = "failed"
                     error_reason = abort_reason
-                    retry_after = None
                     retry_in_s = None
                 else:
                     status_val = v.status
                     error_reason = v.error_reason
-                    retry_after = v.retry_after
                     retry_in_s = max(0, int(v.retry_after - now)) if v.retry_after and v.retry_after > now else None
 
                 outstanding.append(
@@ -478,9 +449,7 @@ class IngestionManager:
                         "timestamp": v.timestamp,
                         "status": status_val,
                         "error_reason": error_reason,
-                        "retry_after": retry_after,
                         "retry_in_s": retry_in_s,
-                        "failure_count": v.failure_count,
                     }
                 )
 
@@ -550,11 +519,13 @@ class IngestionManager:
                         self._ignored_youtube_ids.add(video.video_id)
                         self.youtube_videos.pop(video.video_id, None)
                         logfire.info(f"Ignoring members-only video '{video.title}' ({video.video_id}).")
+                    elif e.reason == "Post-live processing":
+                        self.youtube_videos.pop(video.video_id, None)
+                        logfire.info(f"Ignoring post-live video '{video.title}' ({video.video_id}) until next scan.")
                     else:
                         video.status = "unplayable"
                         video.error_reason = e.reason
                         video.retry_after = now + (24 * 3600)
-                        video.failure_count += 1
                         logfire.warning(f"Video '{video.title}' is unplayable ({e.reason}). Retrying in 24h.")
                     return False, False, False
                 except YouTubeBotDetectionError as e:
@@ -566,9 +537,12 @@ class IngestionManager:
                     video.status = "failed"
                     video.error_reason = "Download failed"
                     video.retry_after = now + (30 * 60)
-                    video.failure_count += 1
                     logfire.warning(f"Download failed for '{video.title}': {e}")
                     return False, False, True
+
+            if self._stopped:
+                _cleanup_failed_job_dir(runner.work_dir / video.video_id)
+                return False, True, False
 
             try:
                 logfire.info(f"Feeding '{runner.config.name}' with '{video.title}' ({video.video_id}).")

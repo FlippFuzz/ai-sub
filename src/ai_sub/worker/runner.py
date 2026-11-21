@@ -11,17 +11,13 @@ from time import monotonic
 from typing import Any, TypeVar
 
 import logfire
-from httpx import HTTPStatusError
+from httpx2 import HTTPStatusError
 
 from ai_sub.gemini_executor import GeminiExecutor, QuotaExceededError, is_retryable_error
-from ai_sub.jobs import (
-    LyricsJob,
-    SubtitlesJob,
-    SummaryJob,
-    WorkerContext,
-)
-from ai_sub.protocol import TaskClaimResponse, TaskType
-from ai_sub.search import BaseSearchProvider, create_search_providers
+from ai_sub.jobs import WorkerContext
+from ai_sub.jobs.job_base import TaskType
+from ai_sub.protocol import TaskClaimResponse
+from ai_sub.search import BaseSearchProvider, create_search_providers, order_lyrics_providers
 from ai_sub.video import sanitize_filename
 from ai_sub.worker.client import VersionMismatchError, WorkerClient
 from ai_sub.worker.worker_config import WorkerSettings
@@ -179,8 +175,9 @@ class WorkerRunner:
         with logfire.span("Heartbeats", task_id=task_id, _level="debug"):
             while not stop_event.is_set():
                 try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=interval)
-                except asyncio.TimeoutError:
+                    async with asyncio.timeout(interval):
+                        await stop_event.wait()
+                except TimeoutError:
                     if not stop_event.is_set():
                         hb_num += 1
                         with logfire.span("Heartbeat Ping #{num}", num=hb_num, task_id=task_id, _level="debug"):
@@ -205,6 +202,7 @@ class WorkerRunner:
     async def _execute_task(
         self,
         task: TaskClaimResponse,
+        slot_id: int,
         executor: GeminiExecutor,
         search_providers: list[BaseSearchProvider],
         lease_revoked: asyncio.Event,
@@ -214,6 +212,7 @@ class WorkerRunner:
 
         Args:
             task: Assigned task details from the server including retry policy.
+            slot_id: Per-model worker slot index isolating concurrent downloads.
             executor: Configured GeminiExecutor instance.
             search_providers: Active search provider instances.
             lease_revoked: Event signaling whether the server revoked the task lease.
@@ -221,16 +220,18 @@ class WorkerRunner:
 
         Returns:
             dict[str, Any]: Validated output data dictionary.
-
-        Raises:
-            ValueError: If task type is unknown or structured input is invalid.
         """
         raw_name = Path(urllib.parse.unquote(task.media_url)).name
         if not Path(raw_name).suffix:
             raw_name = f"{raw_name}.mp4"
         safe_name = sanitize_filename(raw_name)
 
-        chunk_dir = self.settings.workdir / sanitize_filename(task.pipeline_name) / sanitize_filename(task.video_id)
+        chunk_dir = (
+            self.settings.workdir
+            / sanitize_filename(task.pipeline_name)
+            / sanitize_filename(task.video_id)
+            / f"slot_{slot_id}"
+        )
         chunk_path = chunk_dir / safe_name
 
         try:
@@ -244,61 +245,17 @@ class WorkerRunner:
                 )
 
             active_tools = [p for p in search_providers if p.provider_name in task.search_tools]
+            if task.task_type == TaskType.LYRICS:
+                active_tools = order_lyrics_providers(active_tools)
+
             ctx = WorkerContext(
                 executor=executor,
                 media_path=chunk_path,
                 search_providers=active_tools,
+                retry_settings=task.retry,
+                validation_buffer_ms=int(task.validation_buffer.total_seconds() * 1000),
             )
-            validation_buffer_ms = int(task.validation_buffer.total_seconds() * 1000)
-
-            if task.task_type == TaskType.SUMMARY:
-                job = SummaryJob(
-                    name="summary",
-                    video_duration_ms=task.video_duration_ms,
-                    user_context=task.user_context,
-                    media_path=chunk_path,
-                    model_name=task.model,
-                    service_tier=task.service_tier,
-                    agentic_video=task.agentic_video,
-                    retry_settings=task.retry,
-                    validation_buffer_ms=validation_buffer_ms,
-                )
-            elif task.task_type == TaskType.SUBTITLES:
-                job = SubtitlesJob(
-                    name=task.task_id,
-                    video_duration_ms=task.video_duration_ms,
-                    segment_offset_ms=task.segment_offset_ms,
-                    global_summary=task.global_summary,
-                    user_context=task.user_context,
-                    media_path=chunk_path,
-                    model_name=task.model,
-                    service_tier=task.service_tier,
-                    agentic_video=task.agentic_video,
-                    retry_settings=task.retry,
-                    validation_buffer_ms=validation_buffer_ms,
-                )
-            elif task.task_type == TaskType.LYRICS:
-                if not task.draft_subtitles:
-                    raise ValueError(
-                        f"Lyrics task '{task.task_id}' rejected: missing draft_subtitles required for refinement."
-                    )
-                job = LyricsJob(
-                    name=task.task_id,
-                    video_duration_ms=task.video_duration_ms,
-                    segment_offset_ms=task.segment_offset_ms,
-                    draft_subtitles=task.draft_subtitles,
-                    detected_performances=task.detected_performances,
-                    global_summary=task.global_summary,
-                    user_context=task.user_context,
-                    media_path=chunk_path,
-                    model_name=task.model,
-                    service_tier=task.service_tier,
-                    agentic_video=task.agentic_video,
-                    retry_settings=task.retry,
-                    validation_buffer_ms=validation_buffer_ms,
-                )
-            else:
-                raise ValueError(f"Unknown task type: '{task.task_type}'")
+            job = task.to_job()
 
             res = await _run_cancellable(
                 coro=job.execute(ctx),
@@ -379,6 +336,7 @@ class WorkerRunner:
                 try:
                     result_dict = await self._execute_task(
                         task=claim,
+                        slot_id=slot_id,
                         executor=executor,
                         search_providers=search_providers,
                         lease_revoked=lease_revoked,
@@ -397,10 +355,14 @@ class WorkerRunner:
                     )
                 finally:
                     stop_heartbeat.set()
+                    if not heartbeat_task.done():
+                        heartbeat_task.cancel()
                     try:
                         await heartbeat_task
                     except asyncio.CancelledError:
-                        pass
+                        current = asyncio.current_task()
+                        if current is not None and current.cancelling():
+                            raise
 
                 if accepted:
                     async with self._cond:
@@ -429,20 +391,24 @@ class WorkerRunner:
                 current = asyncio.current_task()
                 if current is not None and current.cancelling():
                     raise
-                logfire.warning(
-                    f"[{slot_label}] Task '{claim.task_id}' was cancelled (lease revoked by server or slot draining)."
-                )
+                if lease_revoked.is_set():
+                    logfire.warning(f"[{slot_label}] Task '{claim.task_id}' lease was revoked by server.")
+                else:
+                    logfire.warning(
+                        f"[{slot_label}] Task '{claim.task_id}' cancelled unexpectedly; reporting retryable failure."
+                    )
+                    await self.client.fail_task(
+                        task_id=claim.task_id,
+                        worker_id=self.settings.id,
+                        reason="[RETRYABLE_ERROR] Unexpected internal task cancellation",
+                        error_message="Unexpected internal task cancellation",
+                        is_retryable=True,
+                    )
 
             except QuotaExceededError as e:
                 logfire.warning(f"[{slot_label}] Daily quota reached for model '{claim.model}': {e}")
-                err_msg = str(e).strip() or "Daily quota limit reached"
-                await self.client.fail_task(
-                    task_id=claim.task_id,
-                    worker_id=self.settings.id,
-                    reason=f"QUOTA_EXHAUSTED: {err_msg}",
-                    error_message=err_msg,
-                    is_retryable=True,
-                )
+                # Mark model exhausted before releasing the lease on the server so sibling slots
+                # cannot race to re-claim another task for the exhausted model.
                 async with self._cond:
                     self._exhausted_models.add(model)
                     if self._all_models_finished():
@@ -451,6 +417,14 @@ class WorkerRunner:
                         )
                         self._shutdown = True
                     self._cond.notify_all()
+                err_msg = str(e).strip() or "Daily quota limit reached"
+                await self.client.fail_task(
+                    task_id=claim.task_id,
+                    worker_id=self.settings.id,
+                    reason=f"QUOTA_EXHAUSTED: {err_msg}",
+                    error_message=err_msg,
+                    is_retryable=True,
+                )
 
             except Exception as e:
                 is_retryable = is_retryable_error(e)
