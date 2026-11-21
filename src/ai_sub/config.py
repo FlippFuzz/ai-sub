@@ -575,6 +575,43 @@ class StageExecutionConfig(BaseConfigModel):
     )
 
 
+class StageModelsMixin(BaseConfigModel):
+    """Shared per-stage model defaults and agentic fallback validator."""
+
+    summary: StageExecutionConfig = Field(
+        default_factory=lambda: StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
+        description="Model, tier, and agentic settings for whole-video summary.",
+    )
+    subtitles: StageExecutionConfig = Field(
+        default_factory=lambda: StageExecutionConfig(model="gemini-3.8-flash", agentic=False),
+        description="Model, tier, and agentic settings for subtitle transcription.",
+    )
+    lyrics: StageExecutionConfig = Field(
+        default_factory=lambda: StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
+        description="Model, tier, and agentic settings for lyrics refinement.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _apply_stage_agentic_defaults(cls, val: Any) -> Any:
+        """Defaults summary and lyrics agentic to True when omitted in dict inputs.
+
+        Args:
+            val: Raw stage model settings dictionary before validation.
+
+        Returns:
+            Any: Normalized dictionary with stage-appropriate agentic defaults.
+        """
+        if not isinstance(val, dict):
+            return val
+        updated = dict(val)
+        for stage in ("summary", "lyrics"):
+            stage_val = updated.get(stage)
+            if isinstance(stage_val, dict) and "agentic" not in stage_val:
+                updated[stage] = {**stage_val, "agentic": True}
+        return updated
+
+
 class AiSettings(BaseConfigModel):
     """Configuration for the Google Gemini execution engine, rate limits, storage, and search."""
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -13,7 +14,7 @@ from ai_sub.config import SearchSettings
 from ai_sub.search.search_base import BaseSearchProvider, WebSearchResult
 
 
-def _fetch_ddgs(query: str, max_results: int = 10) -> list[dict[str, Any]]:
+def _fetch_ddgs(query: str, max_results: int = 10, timeout: int = 5) -> list[dict[str, Any]]:
     """Executes a synchronous DuckDuckGo search query.
 
     Treats normal empty-result errors from ddgs as an empty list to match HTTP search providers,
@@ -22,6 +23,7 @@ def _fetch_ddgs(query: str, max_results: int = 10) -> list[dict[str, Any]]:
     Args:
         query: Search query string.
         max_results: Maximum results to retrieve. Defaults to 10.
+        timeout: HTTP request timeout in seconds. Defaults to 5.
 
     Returns:
         list[dict[str, Any]]: Raw response dictionaries, or an empty list if no results are found.
@@ -29,7 +31,7 @@ def _fetch_ddgs(query: str, max_results: int = 10) -> list[dict[str, Any]]:
     Raises:
         DDGSException: If DuckDuckGo encounters rate-limiting, a timeout, or a backend error.
     """
-    with DDGS() as ddgs:
+    with DDGS(timeout=timeout) as ddgs:
         try:
             return list(ddgs.text(query, max_results=max_results))
         except DDGSException as e:
@@ -62,9 +64,10 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
         def _is_retryable(e: Exception) -> bool:
             return isinstance(e, (DDGSException, ConnectionError, asyncio.TimeoutError, OSError))
 
+        timeout_s = max(1, math.ceil(self.settings.timeout.total_seconds()))
         raw_results = await self._execute_with_retry(
             action_desc=f"DuckDuckGo search for '{query}'",
-            operation=lambda: asyncio.to_thread(_fetch_ddgs, query, 10),
+            operation=lambda: asyncio.to_thread(_fetch_ddgs, query, 10, timeout_s),
             is_retryable=_is_retryable,
         )
         return self._to_web_results((item.get("title"), item.get("href"), item.get("body")) for item in raw_results)

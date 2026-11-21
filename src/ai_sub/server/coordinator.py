@@ -64,6 +64,30 @@ def _release_task_lease(task: ServerTask) -> None:
     task.last_heartbeat = None
 
 
+def _build_completion_detail(task_type: TaskType, result: dict[str, Any]) -> str | None:
+    """Builds a concise activity detail summary from a completed task result payload.
+
+    Args:
+        task_type: Completed AI task category.
+        result: Validated AI result dictionary.
+
+    Returns:
+        str | None: Human-readable completion summary, or None.
+    """
+    if task_type == TaskType.SUMMARY:
+        ch_len = len(result.get("chapters", []))
+        ent_len = len(result.get("entities", []))
+        return f"Summary: {ch_len} chapters, {ent_len} entities extracted"
+    if task_type == TaskType.SUBTITLES:
+        sub_len = len(result.get("subs", result.get("subtitles", [])))
+        music_len = len(result.get("detected_musical_performances", []))
+        return f"Subtitles: {sub_len} lines transcribed ({music_len} songs detected)"
+    if task_type == TaskType.LYRICS:
+        lyr_len = len(result.get("subs", result.get("subtitles", [])))
+        return f"Lyrics: {lyr_len} lines refined"
+    return None
+
+
 def _get_summary_status(pipe: Pipeline, is_claimed: bool, is_encoding: bool) -> str:
     """Computes the dashboard display status for the whole-video summary stage.
 
@@ -426,6 +450,37 @@ class ComboRunnersCoordinator:
                 return runner, task
         return None
 
+    def _get_claimed_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        action: str,
+    ) -> tuple[ComboRunner, ServerTask] | None:
+        """Locates a task and verifies that it is actively claimed by the specified worker.
+
+        Args:
+            task_id: Unique task identifier.
+            worker_id: Worker identifier asserting lease ownership.
+            action: Operation label used in rejection warning logs.
+
+        Returns:
+            tuple[ComboRunner, ServerTask] | None: (runner, task) if validly claimed, else None.
+        """
+        found = self._find_task(task_id)
+        if not found:
+            logfire.warning(f"{action} rejected for task '{task_id}' from worker '{worker_id}': task not found.")
+            return None
+
+        runner, task = found
+        if task.status != TaskStatus.CLAIMED or task.worker_id != worker_id:
+            logfire.warning(
+                f"{action} rejected for task '{task_id}': status={task.status.value}, "
+                f"assigned_worker={task.worker_id}, requesting_worker={worker_id}"
+            )
+            return None
+
+        return runner, task
+
     def schedule_finalize_check(self) -> None:
         """Schedules a coalesced asynchronous completion check across all runners."""
         if self._stopping:
@@ -733,21 +788,12 @@ class ComboRunnersCoordinator:
         """
         now = time()
         async with self._lock:
-            found = self._find_task(task_id)
-            if not found:
-                logfire.warning(f"Heartbeat rejected: task '{task_id}' not found.")
+            claimed = self._get_claimed_task(task_id, worker_id, action="Heartbeat")
+            if not claimed:
                 return False
-
-            _, task = found
-            if task.status == TaskStatus.CLAIMED and task.worker_id == worker_id:
-                task.last_heartbeat = now
-                return True
-
-            logfire.warning(
-                f"Heartbeat rejected for '{task_id}': status={task.status.value}, "
-                f"assigned_worker={task.worker_id}, requesting_worker={worker_id}"
-            )
-            return False
+            _, task = claimed
+            task.last_heartbeat = now
+            return True
 
     async def _fail_task_locked(
         self,
@@ -876,6 +922,9 @@ class ComboRunnersCoordinator:
     ) -> bool:
         """Records task completion and hands the result to the runner.
 
+        Any keyframe probing triggered by server-side validation failures runs outside
+        self._lock so FFprobe never blocks concurrent worker heartbeats or task claims.
+
         Args:
             task_id: Unique task identifier.
             worker_id: Worker completing the task.
@@ -884,17 +933,15 @@ class ComboRunnersCoordinator:
         Returns:
             bool: True if completion was accepted, False otherwise.
         """
+        probe_paths: tuple[Path, Path | None] | None = None
+        val_error_msg: str | None = None
+
         async with self._lock:
-            found = self._find_task(task_id)
-            if not found:
-                logfire.warning(f"Task '{task_id}' completion from worker '{worker_id}' was rejected.")
+            claimed = self._get_claimed_task(task_id, worker_id, action="Completion")
+            if not claimed:
                 return False
 
-            runner, task = found
-            if task.status != TaskStatus.CLAIMED or task.worker_id != worker_id:
-                logfire.warning(f"Task '{task_id}' completion from worker '{worker_id}' was rejected.")
-                return False
-
+            runner, task = claimed
             with logfire.span("Process Complete Task: {task_id}", task_id=task_id, worker_id=worker_id) as comp_span:
                 duration = time() - (task.claimed_at or time())
                 try:
@@ -903,39 +950,53 @@ class ComboRunnersCoordinator:
                     logfire.warning(f"Task '{task_id}' validation failed: {val_err}. Routing to fail.")
                     comp_span.set_attribute("result", "validation_failed")
                     comp_span.set_attribute("error", str(val_err))
-                    await self._fail_task_locked(
+                    val_error_msg = f"Server validation error: {val_err}"
+                    probe_paths = (
+                        runner.pipeline.get_fallback_probe_paths(task.task_type, task.segment_index)
+                        if runner.pipeline is not None
+                        else None
+                    )
+                    if probe_paths is None:
+                        await self._fail_task_locked(
+                            task=task,
+                            worker_id=worker_id,
+                            reason="EXECUTION_ERROR",
+                            error_message=val_error_msg,
+                            is_retryable=False,
+                        )
+                        return False
+                    # Refresh heartbeat so the lease sweeper does not reclaim the task while probing off-lock
+                    task.last_heartbeat = time()
+                else:
+                    self._log_activity(
+                        event_type="complete",
                         task=task,
                         worker_id=worker_id,
-                        reason="EXECUTION_ERROR",
-                        error_message=f"Server validation error: {val_err}",
-                        is_retryable=False,
+                        duration_s=duration,
+                        detail=_build_completion_detail(task.task_type, result),
                     )
-                    return False
+                    comp_span.set_attribute("result", "accepted")
+                    comp_span.set_attribute("duration_s", round(duration, 1))
+                    logfire.info(f"Task '{task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
+                    return True
 
-                detail = None
-                if task.task_type == TaskType.SUMMARY:
-                    ch_len = len(result.get("chapters", []))
-                    ent_len = len(result.get("entities", []))
-                    detail = f"Summary: {ch_len} chapters, {ent_len} entities extracted"
-                elif task.task_type == TaskType.SUBTITLES:
-                    sub_len = len(result.get("subs", result.get("subtitles", [])))
-                    music_len = len(result.get("detected_musical_performances", []))
-                    detail = f"Subtitles: {sub_len} lines transcribed ({music_len} songs detected)"
-                elif task.task_type == TaskType.LYRICS:
-                    lyr_len = len(result.get("subs", result.get("subtitles", [])))
-                    detail = f"Lyrics: {lyr_len} lines refined"
+        assert probe_paths is not None and val_error_msg is not None
+        fallback_base_fps = await probe_keyframe_base_fps(*probe_paths)
 
-                self._log_activity(
-                    event_type="complete",
-                    task=task,
-                    worker_id=worker_id,
-                    duration_s=duration,
-                    detail=detail,
-                )
-                comp_span.set_attribute("result", "accepted")
-                comp_span.set_attribute("duration_s", round(duration, 1))
-                logfire.info(f"Task '{task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
-                return True
+        async with self._lock:
+            claimed = self._get_claimed_task(task_id, worker_id, action="Validation failure")
+            if not claimed:
+                return False
+            _, task = claimed
+            await self._fail_task_locked(
+                task=task,
+                worker_id=worker_id,
+                reason="EXECUTION_ERROR",
+                error_message=val_error_msg,
+                is_retryable=False,
+                fallback_base_fps=fallback_base_fps,
+            )
+            return False
 
     async def fail_task(
         self,
@@ -961,16 +1022,11 @@ class ComboRunnersCoordinator:
             bool: True if failure was recorded, False otherwise.
         """
         async with self._lock:
-            found = self._find_task(task_id)
-            if not found:
-                logfire.warning(f"Task '{task_id}' failure report from worker '{worker_id}' was rejected (not found).")
+            claimed = self._get_claimed_task(task_id, worker_id, action="Failure report")
+            if not claimed:
                 return False
 
-            runner, task = found
-            if task.status != TaskStatus.CLAIMED or task.worker_id != worker_id:
-                logfire.warning(f"Task '{task_id}' failure report from worker '{worker_id}' was rejected (not found).")
-                return False
-
+            runner, task = claimed
             probe_paths = (
                 runner.pipeline.get_fallback_probe_paths(task.task_type, task.segment_index)
                 if not is_retryable and runner.pipeline is not None
@@ -985,20 +1041,17 @@ class ComboRunnersCoordinator:
                     is_retryable=is_retryable,
                     fallback_base_fps=None,
                 )
+            # Refresh heartbeat so the lease sweeper does not reclaim the task while probing off-lock
+            task.last_heartbeat = time()
 
         fallback_base_fps = await probe_keyframe_base_fps(*probe_paths)
 
         async with self._lock:
-            found = self._find_task(task_id)
-            if not found:
-                logfire.warning(f"Task '{task_id}' failure report from worker '{worker_id}' was rejected (not found).")
+            claimed = self._get_claimed_task(task_id, worker_id, action="Failure report")
+            if not claimed:
                 return False
 
-            _, task = found
-            if task.status != TaskStatus.CLAIMED or task.worker_id != worker_id:
-                logfire.warning(f"Task '{task_id}' failure report from worker '{worker_id}' was rejected (not found).")
-                return False
-
+            _, task = claimed
             return await self._record_fail_with_span(
                 task=task,
                 worker_id=worker_id,

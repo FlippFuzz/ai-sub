@@ -312,6 +312,35 @@ async def get_video_duration_ms(video_path: Path) -> int:
         raise RuntimeError(f"Could not determine duration for video file: {video_path.name}") from e
 
 
+async def _run_ffprobe_video_entry(video_path: Path, entry: str, *extra_args: str) -> str:
+    """Queries a single video stream field via ffprobe and returns its first non-empty line.
+
+    Args:
+        video_path: Path to the target media file.
+        entry: FFprobe stream entry name (e.g. 'avg_frame_rate', 'nb_read_frames').
+        *extra_args: Optional additional ffprobe flags placed before '-select_streams'.
+
+    Returns:
+        str: First non-empty trimmed output line from ffprobe.
+    """
+    _, ffprobe_bin = ensure_ffmpeg()
+    cmd = [
+        ffprobe_bin,
+        "-v",
+        "error",
+        *extra_args,
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        f"stream={entry}",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    stdout = await _run_ffmpeg(cmd)
+    return next((line.strip() for line in stdout.splitlines() if line.strip()), "")
+
+
 async def _probe_stream_fps(video_path: Path, entry: str) -> float:
     """Probes a framerate stream entry (e.g., 'r_frame_rate' or 'avg_frame_rate') using ffprobe.
 
@@ -325,22 +354,8 @@ async def _probe_stream_fps(video_path: Path, entry: str) -> float:
     Raises:
         RuntimeError: If the framerate cannot be determined.
     """
-    _, ffprobe_bin = ensure_ffmpeg()
     try:
-        cmd = [
-            ffprobe_bin,
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            f"stream={entry}",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(video_path),
-        ]
-        stdout = await _run_ffmpeg(cmd)
-        first_line = next((line.strip() for line in stdout.splitlines() if line.strip()), "")
+        first_line = await _run_ffprobe_video_entry(video_path, entry)
         num, den = map(int, first_line.split("/"))
         return num / den
     except (subprocess.CalledProcessError, ValueError, ZeroDivisionError) as e:
@@ -372,29 +387,18 @@ async def get_keyframe_fps(video_path: Path) -> float:
     Raises:
         RuntimeError: If keyframe count or duration cannot be probed.
     """
-    _, ffprobe_bin = ensure_ffmpeg()
     duration_ms = await get_video_duration_ms(video_path)
     if duration_ms <= 0:
         raise RuntimeError(f"Invalid video duration ({duration_ms}ms) for {video_path.name}")
 
-    cmd = [
-        ffprobe_bin,
-        "-v",
-        "error",
-        "-skip_frame",
-        "nokey",
-        "-count_frames",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=nb_read_frames",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(video_path),
-    ]
     try:
-        stdout = await _run_ffmpeg(cmd)
-        first_line = next((line.strip() for line in stdout.splitlines() if line.strip()), "")
+        first_line = await _run_ffprobe_video_entry(
+            video_path,
+            "nb_read_frames",
+            "-skip_frame",
+            "nokey",
+            "-count_frames",
+        )
         keyframe_count = int(first_line)
     except (subprocess.CalledProcessError, ValueError) as e:
         logfire.exception(f"Could not determine keyframe rate for {video_path.name}")
@@ -444,6 +448,30 @@ async def get_working_encoder() -> str:
     return "libx264"
 
 
+def _check_reencoded_duration(
+    input_duration_ms: int,
+    output_duration_ms: int,
+    fps: float,
+    duration_tolerance_ms: int,
+) -> bool:
+    """Checks whether re-encoded output duration falls within FPS-adjusted tolerance bounds.
+
+    Args:
+        input_duration_ms: Source video duration in milliseconds.
+        output_duration_ms: Candidate re-encoded video duration in milliseconds.
+        fps: Effective framerate in frames per second.
+        duration_tolerance_ms: Base allowed duration variance in milliseconds.
+
+    Returns:
+        bool: True if output duration is within allowed overshoot and undershoot bounds.
+    """
+    frame_slack = int(1000 / fps) if fps < 1.0 else 0
+    max_overshoot = duration_tolerance_ms + frame_slack
+    max_undershoot = duration_tolerance_ms + min(frame_slack, input_duration_ms // 2)
+    diff = output_duration_ms - input_duration_ms
+    return -max_undershoot <= diff <= max_overshoot
+
+
 async def is_valid_reencoded_file(
     input_path: Path,
     output_path: Path,
@@ -478,14 +506,12 @@ async def is_valid_reencoded_file(
                 get_video_duration_ms(output_path),
                 _probe_stream_fps(output_path, "avg_frame_rate"),
             )
-            if avg_fps <= 0:
-                return False
-            max_overshoot = duration_tolerance_ms + (int(1000 / avg_fps) if avg_fps < 1.0 else 0)
-            max_undershoot = duration_tolerance_ms + (
-                min(int(1000 / avg_fps), input_duration // 2) if avg_fps < 1.0 else 0
+            return avg_fps > 0 and _check_reencoded_duration(
+                input_duration,
+                output_duration,
+                avg_fps,
+                duration_tolerance_ms,
             )
-            diff = output_duration - input_duration
-            return -max_undershoot <= diff <= max_overshoot
 
         input_duration, output_duration, r_fps, avg_fps = await asyncio.gather(
             get_video_duration_ms(input_path),
@@ -493,10 +519,7 @@ async def is_valid_reencoded_file(
             _probe_stream_fps(output_path, "r_frame_rate"),
             _probe_stream_fps(output_path, "avg_frame_rate"),
         )
-        max_overshoot = duration_tolerance_ms + (int(1000 / fps) if fps < 1.0 else 0)
-        max_undershoot = duration_tolerance_ms + (min(int(1000 / fps), input_duration // 2) if fps < 1.0 else 0)
-        diff = output_duration - input_duration
-        if diff > max_overshoot or -diff > max_undershoot:
+        if not _check_reencoded_duration(input_duration, output_duration, fps, duration_tolerance_ms):
             return False
 
         # Validate target FPS against r_frame_rate (constant stream rate) and avg_frame_rate

@@ -49,6 +49,7 @@ class AiSubResult(IntEnum):
 
 
 JobKey = tuple[str, int | None]
+JobTask = asyncio.Task[tuple[BaseJob, Any, Exception | None]]
 
 
 def _get_job_key(job: BaseJob) -> JobKey:
@@ -265,7 +266,8 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
 
                 _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
 
-                in_flight: dict[JobKey, tuple[asyncio.Task[tuple[BaseJob, Any, Exception | None]], str | None]] = {}
+                in_flight: dict[JobTask, tuple[JobKey, str | None]] = {}
+                active_keys: set[JobKey] = set()
                 blocked_this_run: set[JobKey] = set()
                 exhausted_models: set[str] = set()
 
@@ -313,9 +315,7 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
 
                     return None
 
-                async def _drain_tasks(
-                    tasks_to_drain: list[asyncio.Task[tuple[BaseJob, Any, Exception | None]]],
-                ) -> None:
+                async def _drain_tasks(tasks_to_drain: list[JobTask]) -> None:
                     if not tasks_to_drain:
                         return
                     drain_results = await asyncio.gather(*tasks_to_drain, return_exceptions=True)
@@ -330,7 +330,7 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
                     for job in pipeline.get_pending_jobs():
                         job_key = _get_job_key(job)
                         job_model = _job_model(job)
-                        if job_key in in_flight or job_key in blocked_this_run:
+                        if job_key in active_keys or job_key in blocked_this_run:
                             continue
                         if job_model and job_model in exhausted_models:
                             continue
@@ -348,19 +348,18 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
                                 lyrics_sem=lyrics_sem,
                             )
                         )
-                        in_flight[job_key] = (task, job_model)
+                        in_flight[task] = (job_key, job_model)
+                        active_keys.add(job_key)
 
                     if not in_flight:
                         break
 
-                    tasks_only = [entry[0] for entry in in_flight.values()]
-                    done, _ = await asyncio.wait(tasks_only, return_when=asyncio.FIRST_COMPLETED)
+                    done, _ = await asyncio.wait(list(in_flight), return_when=asyncio.FIRST_COMPLETED)
                     newly_exhausted: set[str] = set()
 
                     for completed_task in done:
-                        job_key = next((k for k, (t, _) in in_flight.items() if t is completed_task), None)
-                        if job_key is not None:
-                            del in_flight[job_key]
+                        if popped := in_flight.pop(completed_task, None):
+                            active_keys.discard(popped[0])
 
                         if completed_task.cancelled():
                             continue
@@ -372,23 +371,23 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
                         _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
 
                     if pipeline.summary_aborted:
-                        for pending_task, _ in in_flight.values():
+                        for pending_task in in_flight:
                             pending_task.cancel()
-                        await asyncio.gather(*(t for t, _ in in_flight.values()), return_exceptions=True)
+                        await asyncio.gather(*in_flight, return_exceptions=True)
                         in_flight.clear()
+                        active_keys.clear()
                         break
 
                     if newly_exhausted:
-                        to_cancel = [k for k, (_, model) in in_flight.items() if model in newly_exhausted]
-                        cancelled_tasks: list[asyncio.Task[tuple[BaseJob, Any, Exception | None]]] = []
-                        for k in to_cancel:
-                            pending_task, _ = in_flight.pop(k)
+                        cancelled_tasks = [t for t, (_, model) in in_flight.items() if model in newly_exhausted]
+                        for pending_task in cancelled_tasks:
+                            job_key, _ = in_flight.pop(pending_task)
+                            active_keys.discard(job_key)
                             if not pending_task.done():
                                 pending_task.cancel()
-                            cancelled_tasks.append(pending_task)
                         await _drain_tasks(cancelled_tasks)
 
-                await _drain_tasks([t for t, _ in in_flight.values()])
+                await _drain_tasks(list(in_flight))
 
         if pipeline.summary_aborted:
             logfire.error("Whole-video summary failed across all fallback FPS tiers. Aborting without generating SRT.")

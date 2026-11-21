@@ -101,7 +101,6 @@ class LrclibSearchProvider(BaseHttpSearchProvider):
             cache_key=cache_key,
             span_template="lrclib_search: {title=}, {artist=}",
             fetcher=_fetch,
-            cache_empty=True,
             title=clean_title,
             artist=artist_name or "",
         )

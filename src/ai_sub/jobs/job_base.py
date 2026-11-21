@@ -385,7 +385,6 @@ class AiJob(BaseJob):
         ctx: WorkerContext,
         prompt: Prompt,
         response_type: type[T],
-        task_label: str | None = None,
         tools: Sequence[Callable[..., Any] | dict[str, Any] | BaseSearchProvider] | None = None,
         validation_context: dict[str, Any] | None = None,
     ) -> T:
@@ -395,7 +394,6 @@ class AiJob(BaseJob):
             ctx: Worker runtime context containing executor, media path, retry policy, and search providers.
             prompt: System and user prompt pair.
             response_type: Expected Pydantic response schema.
-            task_label: Optional telemetry span label (defaults to task_type value). Defaults to None.
             tools: Optional tool callables or search providers. Defaults to None.
             validation_context: Optional extra context passed to Pydantic validation. Defaults to None.
 
@@ -411,7 +409,7 @@ class AiJob(BaseJob):
             service_tier=self.service_tier,
             tools=tools,
             agentic_video=self.agentic_video,
-            task_label=task_label or self.task_type.value,
+            task_label=self.task_type.value,
             retry_settings=ctx.retry_settings,
             validation_buffer_ms=ctx.validation_buffer_ms,
             validation_context=validation_context,

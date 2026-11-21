@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path
-from typing import Annotated, Any, Self
+from typing import Annotated, Self
 
 from annotated_types import Ge, Gt
 from pydantic import Field, HttpUrl, PositiveInt, SecretStr, model_validator
@@ -20,6 +20,7 @@ from ai_sub.config import (
     SearchToolList,
     SplittingSettings,
     StageExecutionConfig,
+    StageModelsMixin,
     StringList,
     YamlFileSettings,
 )
@@ -77,46 +78,14 @@ class ServerReencodeSettings(ReencodeSettings):
     )
 
 
-class PipelineConfig(BaseConfigModel):
+class PipelineConfig(StageModelsMixin):
     """Configuration for an independent model processing pipeline."""
 
     name: str = Field(description="Unique identifier for the pipeline (e.g. 'combo_38f').")
-    summary: StageExecutionConfig = Field(
-        default_factory=lambda: StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
-        description="Model, tier, and agentic settings for whole-video summary.",
-    )
-    subtitles: StageExecutionConfig = Field(
-        default_factory=lambda: StageExecutionConfig(model="gemini-3.8-flash", agentic=False),
-        description="Model, tier, and agentic settings for subtitle transcription.",
-    )
-    lyrics: StageExecutionConfig = Field(
-        default_factory=lambda: StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
-        description="Model, tier, and agentic settings for lyrics refinement.",
-    )
     searchtools: SearchToolList = Field(
         default_factory=_default_pipeline_search_tools,
         description="Search tools required for this pipeline.",
     )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _apply_stage_agentic_defaults(cls, val: Any) -> Any:
-        """Defaults summary and lyrics agentic to True when omitted in pipeline YAML entries.
-
-        Args:
-            val: Raw pipeline dictionary before validation.
-
-        Returns:
-            Any: Normalized dictionary with stage-appropriate agentic defaults.
-        """
-        if not isinstance(val, dict):
-            return val
-        updated = dict(val)
-        for stage in ("summary", "lyrics"):
-            stage_val = updated.get(stage)
-            if isinstance(stage_val, dict) and "agentic" not in stage_val:
-                updated[stage] = {**stage_val, "agentic": True}
-        return updated
 
     @model_validator(mode="after")
     def _validate_name(self) -> Self:

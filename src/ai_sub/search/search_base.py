@@ -261,16 +261,14 @@ class BaseSearchProvider(ABC):
         cache_key: str,
         span_template: LiteralString,
         fetcher: Callable[[], Awaitable[Any]],
-        cache_empty: bool = False,
         **span_attrs: Any,
     ) -> Any:
-        """Executes an async lookup with bounded caching and Logfire span tracing.
+        """Executes an async lookup with bounded non-empty caching and Logfire span tracing.
 
         Args:
             cache_key: Normalized key for cache lookup and storage.
             span_template: Static Logfire span template string.
             fetcher: Zero-argument async callable returning search results.
-            cache_empty: Whether to store empty result lists in cache. Defaults to False.
             **span_attrs: Span attributes passed to Logfire.
 
         Returns:
@@ -289,7 +287,7 @@ class BaseSearchProvider(ABC):
             span.set_attribute("cached", False)
             results = await fetcher()
 
-        if self._cache is not None and (results or cache_empty):
+        if self._cache is not None and results:
             self._cache[cache_key] = results
         return results
 

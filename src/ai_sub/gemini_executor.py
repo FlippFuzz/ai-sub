@@ -598,6 +598,7 @@ class GeminiExecutor:
 
         dispatch_map: dict[str, Callable[..., Any]] = {}
         interaction_tools: list[dict[str, Any]] = []
+        # FunctionDeclaration.from_callable is typed against BaseApiClient and is needed for use_json_schema=True.
         api_client = self._client._api_client
 
         items: list[Callable[..., Any] | dict[str, Any]] = []
@@ -805,7 +806,7 @@ class GeminiExecutor:
         accumulated_thoughts: list[str],
         validation_context: dict[str, Any] | None = None,
     ) -> T:
-        """Parses output text into the target Pydantic schema, applying json_repair fallback if needed.
+        """Parses output text into the target Pydantic schema, applying json_repair only on JSON decode errors.
 
         Args:
             text_content: Raw text returned by the model.
@@ -825,10 +826,11 @@ class GeminiExecutor:
         }
 
         try:
-            output = response_type.model_validate_json(text_content, context=merged_context)
-        except Exception:
-            repaired = json_repair.loads(text_content)
-            output = response_type.model_validate(repaired, context=merged_context)
+            parsed = json.loads(text_content)
+        except json.JSONDecodeError:
+            parsed = json_repair.loads(text_content)
+
+        output = response_type.model_validate(parsed, context=merged_context)
 
         if hasattr(output, "thoughts") and accumulated_thoughts:
             setattr(output, "thoughts", accumulated_thoughts)

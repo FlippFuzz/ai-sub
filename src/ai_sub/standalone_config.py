@@ -17,7 +17,7 @@ from ai_sub.config import (
     ReencodeSettings,
     RetrySettings,
     SplittingSettings,
-    StageExecutionConfig,
+    StageModelsMixin,
 )
 
 
@@ -30,45 +30,13 @@ class StandaloneLoggingSettings(LoggingSettings):
     )
 
 
-class StandaloneAiSettings(AiSettings):
+class StandaloneAiSettings(AiSettings, StageModelsMixin):
     """AI engine settings extended with validation buffer and per-stage model, tier, and agentic options."""
 
     buffer: Annotated[timedelta, Ge(timedelta(0))] = Field(
         default=timedelta(seconds=2),
         description="Allowed tolerance buffer for subtitle timestamps exceeding segment duration (seconds if numeric).",
     )
-    summary: StageExecutionConfig = Field(
-        default_factory=lambda: StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
-        description="Whole-video summary model configuration.",
-    )
-    subtitles: StageExecutionConfig = Field(
-        default_factory=lambda: StageExecutionConfig(model="gemini-3.8-flash", agentic=False),
-        description="Subtitle transcription model configuration.",
-    )
-    lyrics: StageExecutionConfig = Field(
-        default_factory=lambda: StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
-        description="Musical lyrics refinement model configuration.",
-    )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _apply_stage_agentic_defaults(cls, val: Any) -> Any:
-        """Defaults summary and lyrics agentic to True when omitted in dict inputs.
-
-        Args:
-            val: Raw AI settings dictionary before validation.
-
-        Returns:
-            Any: Normalized dictionary with stage-appropriate agentic defaults.
-        """
-        if not isinstance(val, dict):
-            return val
-        updated = dict(val)
-        for stage in ("summary", "lyrics"):
-            stage_val = updated.get(stage)
-            if isinstance(stage_val, dict) and "agentic" not in stage_val:
-                updated[stage] = {**stage_val, "agentic": True}
-        return updated
 
 
 class ConcurrencySettings(BaseConfigModel):

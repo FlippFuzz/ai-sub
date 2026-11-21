@@ -74,7 +74,6 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
             cache_key=f"search:{normalize_query(query)}:{purpose}:{language}",
             span_template="tinyfish_search: {query=}",
             fetcher=_fetch,
-            cache_empty=True,
             query=query,
             purpose=purpose,
             language=language or "auto",
@@ -159,7 +158,6 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
             cache_key=f"fetch:{','.join(sorted(valid_urls))}:{purpose}",
             span_template="tinyfish_fetch: {urls=}",
             fetcher=_fetch,
-            cache_empty=True,
             urls=valid_urls,
             purpose=purpose,
         )
