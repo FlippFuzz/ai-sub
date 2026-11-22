@@ -6,7 +6,7 @@ import hashlib
 import socket
 from datetime import timedelta
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Any, Self
 
 from annotated_types import Ge, Gt
 from pydantic import Field, HttpUrl, NonNegativeInt, PositiveInt, model_validator
@@ -15,6 +15,8 @@ from pydantic_settings import SettingsConfigDict
 from ai_sub.config import (
     AiSettings,
     LoggingSettings,
+    SearchSettings,
+    SearchTool,
     StringList,
     YamlFileSettings,
 )
@@ -27,6 +29,45 @@ def _default_worker_id() -> str:
         str: Hexadecimal SHA-256 digest of the hostname.
     """
     return hashlib.sha256(socket.gethostname().encode("utf-8")).hexdigest()
+
+
+def _default_worker_search_tools() -> list[SearchTool]:
+    """Returns default search tools configured on worker nodes.
+
+    Returns:
+        list[SearchTool]: Default worker search tools list.
+    """
+    return ["tinyfish", "lrclib"]
+
+
+class WorkerAiSettings(AiSettings):
+    """Worker AI engine settings defaulting search tools to Tinyfish and LRCLIB."""
+
+    search: SearchSettings = Field(
+        default_factory=lambda: SearchSettings(tools=_default_worker_search_tools()),
+        description="Web search configuration for lyrics and metadata retrieval.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_worker_search_defaults(cls, val: Any) -> Any:
+        """Preserves worker default search tools when search is null or partial.
+
+        Args:
+            val: Raw input dictionary before validation.
+
+        Returns:
+            Any: Input dictionary with worker default search tools merged.
+        """
+        if not isinstance(val, dict) or "search" not in val:
+            return val
+        updated = dict(val)
+        raw_search = updated["search"]
+        if raw_search is None:
+            updated.pop("search")
+        elif isinstance(raw_search, dict):
+            updated["search"] = {"tools": _default_worker_search_tools(), **raw_search}
+        return updated
 
 
 class WorkerSettings(YamlFileSettings):
@@ -60,14 +101,15 @@ class WorkerSettings(YamlFileSettings):
     )
     models: StringList = Field(
         default_factory=lambda: [
+            "gemini-4-hydrogen",
             "gemini-3.8-flash",
             "gemini-3.6-flash",
             "gemini-3.5-flash-lite",
         ],
         description="List of Gemini models offered by this worker.",
     )
-    ai: AiSettings = Field(
-        default_factory=AiSettings,
+    ai: WorkerAiSettings = Field(
+        default_factory=WorkerAiSettings,
         description="AI engine quotas, storage, and search settings.",
     )
     log: LoggingSettings = Field(

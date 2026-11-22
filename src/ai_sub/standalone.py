@@ -319,75 +319,81 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
                     if not tasks_to_drain:
                         return
                     drain_results = await asyncio.gather(*tasks_to_drain, return_exceptions=True)
-                    for res in drain_results:
+                    for task_obj, res in zip(tasks_to_drain, drain_results, strict=True):
+                        if popped := in_flight.pop(task_obj, None):
+                            active_keys.discard(popped[0])
                         if isinstance(res, tuple):
                             drained_job, drained_out, drained_exc = res
                             await _handle_job_outcome(drained_job, drained_out, drained_exc)
                     _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
 
-                # Consumer loop pulling ready DAG jobs directly from the pipeline
-                while not pipeline.is_done():
-                    for job in pipeline.get_pending_jobs():
-                        job_key = _get_job_key(job)
-                        job_model = _job_model(job)
-                        if job_key in active_keys or job_key in blocked_this_run:
-                            continue
-                        if job_model and job_model in exhausted_models:
-                            continue
+                try:
+                    # Consumer loop pulling ready DAG jobs directly from the pipeline
+                    while not pipeline.is_done():
+                        for job in pipeline.get_pending_jobs():
+                            job_key = _get_job_key(job)
+                            job_model = _job_model(job)
+                            if job_key in active_keys or job_key in blocked_this_run:
+                                continue
+                            if job_model and job_model in exhausted_models:
+                                continue
 
-                        task = asyncio.create_task(
-                            _run_job(
-                                job=job,
-                                pipeline=pipeline,
-                                executor=executor,
-                                web_search_providers=web_search_providers,
-                                lyrics_search_providers=lyrics_search_providers,
-                                reencode_sem=reencode_sem,
-                                summary_sem=summary_sem,
-                                subtitles_sem=subtitles_sem,
-                                lyrics_sem=lyrics_sem,
+                            task = asyncio.create_task(
+                                _run_job(
+                                    job=job,
+                                    pipeline=pipeline,
+                                    executor=executor,
+                                    web_search_providers=web_search_providers,
+                                    lyrics_search_providers=lyrics_search_providers,
+                                    reencode_sem=reencode_sem,
+                                    summary_sem=summary_sem,
+                                    subtitles_sem=subtitles_sem,
+                                    lyrics_sem=lyrics_sem,
+                                )
                             )
-                        )
-                        in_flight[task] = (job_key, job_model)
-                        active_keys.add(job_key)
+                            in_flight[task] = (job_key, job_model)
+                            active_keys.add(job_key)
 
-                    if not in_flight:
-                        break
+                        if not in_flight:
+                            break
 
-                    done, _ = await asyncio.wait(list(in_flight), return_when=asyncio.FIRST_COMPLETED)
-                    newly_exhausted: set[str] = set()
+                        done, _ = await asyncio.wait(list(in_flight), return_when=asyncio.FIRST_COMPLETED)
+                        newly_exhausted: set[str] = set()
 
-                    for completed_task in done:
-                        if popped := in_flight.pop(completed_task, None):
-                            active_keys.discard(popped[0])
+                        for completed_task in done:
+                            if popped := in_flight.pop(completed_task, None):
+                                active_keys.discard(popped[0])
 
-                        if completed_task.cancelled():
-                            continue
+                            if completed_task.cancelled():
+                                continue
 
-                        job, result, exc = completed_task.result()
-                        if exhausted_model := await _handle_job_outcome(job, result, exc):
-                            newly_exhausted.add(exhausted_model)
+                            job, result, exc = completed_task.result()
+                            if exhausted_model := await _handle_job_outcome(job, result, exc):
+                                newly_exhausted.add(exhausted_model)
 
-                        _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
+                            _sync_progress(progress, pipeline, summary_tid, reencode_tid, subtitles_tid, lyrics_tid)
 
-                    if pipeline.summary_aborted:
-                        for pending_task in in_flight:
-                            pending_task.cancel()
-                        await asyncio.gather(*in_flight, return_exceptions=True)
-                        in_flight.clear()
-                        active_keys.clear()
-                        break
+                        if pipeline.summary_aborted:
+                            break
 
-                    if newly_exhausted:
-                        cancelled_tasks = [t for t, (_, model) in in_flight.items() if model in newly_exhausted]
-                        for pending_task in cancelled_tasks:
-                            job_key, _ = in_flight.pop(pending_task)
-                            active_keys.discard(job_key)
+                        if newly_exhausted:
+                            cancelled_tasks = [t for t, (_, model) in in_flight.items() if model in newly_exhausted]
+                            for pending_task in cancelled_tasks:
+                                if not pending_task.done():
+                                    pending_task.cancel()
+                            await _drain_tasks(cancelled_tasks)
+
+                    if not pipeline.summary_aborted:
+                        await _drain_tasks(list(in_flight))
+                finally:
+                    if in_flight:
+                        remaining_tasks = list(in_flight)
+                        for pending_task in remaining_tasks:
                             if not pending_task.done():
                                 pending_task.cancel()
-                        await _drain_tasks(cancelled_tasks)
-
-                await _drain_tasks(list(in_flight))
+                        await asyncio.gather(*remaining_tasks, return_exceptions=True)
+                        in_flight.clear()
+                        active_keys.clear()
 
         if pipeline.summary_aborted:
             logfire.error("Whole-video summary failed across all fallback FPS tiers. Aborting without generating SRT.")

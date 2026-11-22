@@ -13,6 +13,7 @@ from time import monotonic, time
 from typing import Any, Literal
 
 import logfire
+from pydantic import ValidationError
 
 from ai_sub.pipeline import Pipeline, SegmentState, probe_keyframe_base_fps
 from ai_sub.protocol import (
@@ -20,7 +21,7 @@ from ai_sub.protocol import (
     TaskType,
 )
 from ai_sub.server.combo_runner import ComboRunner, RunnerStatus
-from ai_sub.server.git_sync import GitSyncManager
+from ai_sub.server.git_sync import GitSyncManager, redact_url_credentials
 from ai_sub.server.models import ActivityEvent, ServerTask, TaskStatus
 from ai_sub.server.server_config import ServerSettings
 from ai_sub.telemetry import get_app_version
@@ -62,6 +63,23 @@ def _release_task_lease(task: ServerTask) -> None:
     task.worker_id = None
     task.claimed_at = None
     task.last_heartbeat = None
+
+
+def _get_stage_tier(pipeline: Pipeline, task: ServerTask) -> int | None:
+    """Returns the current fallback FPS tier for the unit associated with a server task.
+
+    Args:
+        pipeline: Active Pipeline instance.
+        task: Server task belonging to the pipeline.
+
+    Returns:
+        int | None: Active fallback_tier, or None if unavailable.
+    """
+    if task.task_type == TaskType.SUMMARY:
+        return pipeline.summary.fallback_tier
+    if task.segment_index is not None and 0 <= task.segment_index < len(pipeline.segments):
+        return pipeline.segments[task.segment_index].fallback_tier
+    return None
 
 
 def _build_completion_detail(task_type: TaskType, result: dict[str, Any]) -> str | None:
@@ -455,6 +473,7 @@ class ComboRunnersCoordinator:
         task_id: str,
         worker_id: str,
         action: str,
+        expected_generation: int | None = None,
     ) -> tuple[ComboRunner, ServerTask] | None:
         """Locates a task and verifies that it is actively claimed by the specified worker.
 
@@ -462,6 +481,7 @@ class ComboRunnersCoordinator:
             task_id: Unique task identifier.
             worker_id: Worker identifier asserting lease ownership.
             action: Operation label used in rejection warning logs.
+            expected_generation: Optional lease generation that must still match. Defaults to None.
 
         Returns:
             tuple[ComboRunner, ServerTask] | None: (runner, task) if validly claimed, else None.
@@ -476,6 +496,13 @@ class ComboRunnersCoordinator:
             logfire.warning(
                 f"{action} rejected for task '{task_id}': status={task.status.value}, "
                 f"assigned_worker={task.worker_id}, requesting_worker={worker_id}"
+            )
+            return None
+
+        if expected_generation is not None and task.claim_generation != expected_generation:
+            logfire.warning(
+                f"{action} rejected for task '{task_id}': claim generation changed "
+                f"(expected={expected_generation}, current={task.claim_generation})."
             )
             return None
 
@@ -740,6 +767,7 @@ class ComboRunnersCoordinator:
                         task.worker_id = worker_id
                         task.claimed_at = now
                         task.last_heartbeat = now
+                        task.claim_generation += 1
 
                         with logfire.span(
                             "Server Task Claimed: {task_id}",
@@ -920,10 +948,11 @@ class ComboRunnersCoordinator:
         worker_id: str,
         result: dict[str, Any],
     ) -> bool:
-        """Records task completion and hands the result to the runner.
+        """Records task completion and persists the result to disk.
 
-        Any keyframe probing triggered by server-side validation failures runs outside
-        self._lock so FFprobe never blocks concurrent worker heartbeats or task claims.
+        Checkpoint persistence errors (OSError) propagate without failing or revoking the lease so
+        workers can retry submission without rerunning inference. Keyframe probing triggered by
+        validation failures runs outside self._lock and revalidates claim generation and tier.
 
         Args:
             task_id: Unique task identifier.
@@ -932,9 +961,14 @@ class ComboRunnersCoordinator:
 
         Returns:
             bool: True if completion was accepted, False otherwise.
+
+        Raises:
+            OSError: If saving the durable YAML checkpoint fails on disk.
         """
         probe_paths: tuple[Path, Path | None] | None = None
         val_error_msg: str | None = None
+        expected_generation: int | None = None
+        expected_tier: int | None = None
 
         async with self._lock:
             claimed = self._get_claimed_task(task_id, worker_id, action="Completion")
@@ -946,16 +980,19 @@ class ComboRunnersCoordinator:
                 duration = time() - (task.claimed_at or time())
                 try:
                     runner.on_task_completed(task_id, result)
-                except Exception as val_err:
+                except OSError as io_err:
+                    task.last_heartbeat = time()
+                    comp_span.set_attribute("result", "persistence_error")
+                    comp_span.set_attribute("error", str(io_err))
+                    logfire.error(f"Checkpoint write failed for task '{task_id}': {io_err}")
+                    raise
+                except (ValidationError, ValueError, TypeError) as val_err:
                     logfire.warning(f"Task '{task_id}' validation failed: {val_err}. Routing to fail.")
                     comp_span.set_attribute("result", "validation_failed")
                     comp_span.set_attribute("error", str(val_err))
                     val_error_msg = f"Server validation error: {val_err}"
-                    probe_paths = (
-                        runner.pipeline.get_fallback_probe_paths(task.task_type, task.segment_index)
-                        if runner.pipeline is not None
-                        else None
-                    )
+                    if runner.pipeline is not None:
+                        probe_paths = runner.pipeline.get_fallback_probe_paths(task.task_type, task.segment_index)
                     if probe_paths is None:
                         await self._fail_task_locked(
                             task=task,
@@ -965,6 +1002,9 @@ class ComboRunnersCoordinator:
                             is_retryable=False,
                         )
                         return False
+                    expected_generation = task.claim_generation
+                    assert runner.pipeline is not None
+                    expected_tier = _get_stage_tier(runner.pipeline, task)
                     # Refresh heartbeat so the lease sweeper does not reclaim the task while probing off-lock
                     task.last_heartbeat = time()
                 else:
@@ -984,10 +1024,18 @@ class ComboRunnersCoordinator:
         fallback_base_fps = await probe_keyframe_base_fps(*probe_paths)
 
         async with self._lock:
-            claimed = self._get_claimed_task(task_id, worker_id, action="Validation failure")
+            claimed = self._get_claimed_task(
+                task_id,
+                worker_id,
+                action="Validation failure",
+                expected_generation=expected_generation,
+            )
             if not claimed:
                 return False
-            _, task = claimed
+            runner, task = claimed
+            if runner.pipeline is None or _get_stage_tier(runner.pipeline, task) != expected_tier:
+                logfire.warning(f"Discarding stale validation failure probe for '{task_id}': stage tier changed.")
+                return False
             await self._fail_task_locked(
                 task=task,
                 worker_id=worker_id,
@@ -1008,8 +1056,8 @@ class ComboRunnersCoordinator:
     ) -> bool:
         """Handles task failure, releasing the lease or marking permanently failed.
 
-        Any keyframe probing needed for tier-0 fallback is executed outside self._lock
-        so FFprobe never blocks concurrent worker heartbeats or task claims.
+        Any keyframe probing needed for tier-0 fallback is executed outside self._lock and
+        revalidates claim generation and tier before applying the outcome.
 
         Args:
             task_id: Unique task identifier.
@@ -1041,17 +1089,29 @@ class ComboRunnersCoordinator:
                     is_retryable=is_retryable,
                     fallback_base_fps=None,
                 )
+            expected_generation = task.claim_generation
+            assert runner.pipeline is not None
+            expected_tier = _get_stage_tier(runner.pipeline, task)
             # Refresh heartbeat so the lease sweeper does not reclaim the task while probing off-lock
             task.last_heartbeat = time()
 
         fallback_base_fps = await probe_keyframe_base_fps(*probe_paths)
 
         async with self._lock:
-            claimed = self._get_claimed_task(task_id, worker_id, action="Failure report")
+            claimed = self._get_claimed_task(
+                task_id,
+                worker_id,
+                action="Failure report",
+                expected_generation=expected_generation,
+            )
             if not claimed:
                 return False
 
-            _, task = claimed
+            runner, task = claimed
+            if runner.pipeline is None or _get_stage_tier(runner.pipeline, task) != expected_tier:
+                logfire.warning(f"Discarding stale failure probe for '{task_id}': stage tier changed.")
+                return False
+
             return await self._record_fail_with_span(
                 task=task,
                 worker_id=worker_id,
@@ -1234,14 +1294,7 @@ class ComboRunnersCoordinator:
         """
         if not self.git_sync.config or self.git_sync.config.repourl is None:
             return None
-        raw_url = str(self.git_sync.config.repourl)
-        parsed = urllib.parse.urlsplit(raw_url)
-        if parsed.username or parsed.password:
-            host = parsed.hostname or ""
-            if parsed.port:
-                host = f"{host}:{parsed.port}"
-            return urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
-        return raw_url
+        return redact_url_credentials(str(self.git_sync.config.repourl))
 
     def get_dashboard_data(
         self,

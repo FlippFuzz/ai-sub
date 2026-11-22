@@ -99,25 +99,17 @@ log:
 
 # Active Pipeline Combinations
 pipelines:
-  - name: "combo_38f"
+  - name: "combo_40f"
     summary:
       model: "gemini-3.5-flash-lite"
       # agentic: true
     subtitles:
-      model: "gemini-3.8-flash"
+      model: "gemini-4-hydrogen"
       # agentic: false
     lyrics:
       model: "gemini-3.5-flash-lite"
       # agentic: true
     # searchtools: ["tinyfish", "lrclib"]
-
-  - name: "combo_36f"
-    summary:
-      model: "gemini-3.5-flash-lite"
-    subtitles:
-      model: "gemini-3.6-flash"
-    lyrics:
-      model: "gemini-3.5-flash-lite"
 
   - name: "combo_35l"
     summary:

@@ -119,6 +119,18 @@ class ComboRunner:
         self._reencode_task = None
         self._reencode_wake_event = asyncio.Event()
 
+    def get_job_dir(self, source_type: Literal["local", "youtube"], video_id: str) -> Path:
+        """Returns the source-scoped working directory for a video inside this runner.
+
+        Args:
+            source_type: Ingestion source type ('local' or 'youtube').
+            video_id: Unique video identifier.
+
+        Returns:
+            Path: Working directory path under work/<combo>/<source_type>/<video_id>.
+        """
+        return self.work_dir / source_type / video_id
+
     def is_idle(self) -> bool:
         """Checks if the runner is idle and ready to accept a new video.
 
@@ -507,7 +519,7 @@ class ComboRunner:
             channel_name=channel_name,
             source_type=source_type,
         )
-        job_dir = self.work_dir / video_id
+        job_dir = self.get_job_dir(source_type, video_id)
         job_dir.mkdir(parents=True, exist_ok=True)
         user_context = self._build_user_context(title, uploader, channel_name, source_type)
 
@@ -637,7 +649,7 @@ class ComboRunner:
         return self.pipeline.is_done()
 
     async def resume_from_disk(self) -> bool:
-        """Inspects work/<combo>/ to restore in-progress video directories upon server boot.
+        """Inspects work/<combo>/{local,youtube}/ to restore in-progress video directories upon server boot.
 
         Selects the newest valid job directory with ground-truth metadata and existing media,
         while purging invalid folders and deferring removal of older directories until
@@ -647,7 +659,15 @@ class ComboRunner:
             bool: True if an active video was successfully restored, False otherwise.
         """
         with logfire.span("Disk Resume Check: {combo}", combo=self.config.name) as resume_span:
-            job_dirs = [d for d in self.work_dir.iterdir() if d.is_dir()]
+            job_dirs: list[tuple[Literal["local", "youtube"], Path]] = []
+            for stype in ("local", "youtube"):
+                source_dir = self.work_dir / stype
+                if not source_dir.is_dir():
+                    continue
+                for d in source_dir.iterdir():
+                    if d.is_dir():
+                        job_dirs.append((stype, d))
+
             if not job_dirs:
                 self.status = RunnerStatus.IDLE
                 self.preparing_video_info = None
@@ -663,25 +683,61 @@ class ComboRunner:
                     return 0.0
 
             valid_candidates: list[tuple[Path, dict[str, Any], Path]] = []
-            for d in job_dirs:
+            for folder_source_type, d in job_dirs:
                 meta_file = d / "video_meta.json"
                 if not meta_file.is_file():
-                    logfire.info(f"Purging stale folder without metadata: {d.name} in {self.config.name}")
+                    logfire.info(
+                        f"Purging stale folder without metadata: {folder_source_type}/{d.name} in {self.config.name}"
+                    )
                     await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
                     continue
 
                 try:
                     with open(meta_file, "r", encoding="utf-8") as f:
                         meta = json.load(f)
-                    raw_path_str = str(meta.get("raw_path", ""))
-                    raw_path = Path(raw_path_str) if raw_path_str else None
-                    if not raw_path or not raw_path.is_file():
-                        logfire.warning(f"Purging job folder with missing raw video: {d.name} in {self.config.name}")
+                    if not isinstance(meta, dict):
+                        logfire.warning(f"Purging job folder with invalid metadata: {folder_source_type}/{d.name}")
                         await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
                         continue
-                    valid_candidates.append((d, meta, raw_path))
+
+                    raw_path_str = str(meta.get("raw_path") or "")
+                    raw_path = Path(raw_path_str) if raw_path_str else None
+                    if not raw_path or not raw_path.is_file():
+                        logfire.warning(
+                            f"Purging job folder with missing raw video: {folder_source_type}/{d.name} "
+                            f"in {self.config.name}"
+                        )
+                        await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
+                        continue
+
+                    raw_ts = meta.get("timestamp", 0)
+                    if isinstance(raw_ts, bool):
+                        logfire.warning(f"Purging job folder with invalid timestamp: {folder_source_type}/{d.name}")
+                        await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
+                        continue
+                    timestamp = int(raw_ts)
+
+                    source_type = meta.get("source_type", folder_source_type)
+                    if source_type not in ("local", "youtube"):
+                        logfire.warning(
+                            f"Purging job folder with invalid source_type {source_type!r}: "
+                            f"{folder_source_type}/{d.name}"
+                        )
+                        await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
+                        continue
+
+                    channel_raw = meta.get("channel_name")
+                    parsed_meta = {
+                        "video_id": str(meta.get("video_id") or d.name),
+                        "uploader": str(meta.get("uploader") or "unknown"),
+                        "channel_name": str(channel_raw) if channel_raw is not None else None,
+                        "title": str(meta.get("title") or d.name),
+                        "source_type": source_type,
+                        "timestamp": timestamp,
+                    }
+                    valid_candidates.append((d, parsed_meta, raw_path))
                 except Exception as e:
-                    logfire.warning(f"Purging job folder with corrupt metadata: {d.name} ({e})")
+                    logfire.warning(f"Purging job folder with corrupt metadata: {folder_source_type}/{d.name} ({e})")
                     await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
 
             valid_candidates.sort(key=lambda item: _get_mtime(item[0]), reverse=True)
@@ -690,12 +746,12 @@ class ComboRunner:
             failed_resume_dirs: set[Path] = set()
 
             for job_dir, meta, raw_path in valid_candidates:
-                video_id = str(meta.get("video_id", job_dir.name))
-                uploader = str(meta.get("uploader", "unknown"))
-                channel_name = meta.get("channel_name")
-                title = str(meta.get("title", job_dir.name))
-                source_type = meta.get("source_type", "youtube")
-                timestamp = int(meta.get("timestamp", 0))
+                video_id = meta["video_id"]
+                uploader = meta["uploader"]
+                channel_name = meta["channel_name"]
+                title = meta["title"]
+                source_type = meta["source_type"]
+                timestamp = meta["timestamp"]
                 user_context = self._build_user_context(title, uploader, channel_name, source_type)
 
                 try:
@@ -727,7 +783,9 @@ class ComboRunner:
             pipeline, job_dir = resumed
             for cand_dir, _, _ in valid_candidates:
                 if cand_dir != job_dir and cand_dir not in failed_resume_dirs:
-                    logfire.info(f"Purging older job folder: {cand_dir.name} in {self.config.name}")
+                    logfire.info(
+                        f"Purging older job folder: {cand_dir.parent.name}/{cand_dir.name} in {self.config.name}"
+                    )
                     await asyncio.to_thread(shutil.rmtree, cand_dir, ignore_errors=True)
 
             self.pipeline = pipeline

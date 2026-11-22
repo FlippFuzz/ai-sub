@@ -42,7 +42,7 @@ Engine settings are shared across standalone (`ai-sub`) and workers (`ai-sub-wor
 | `--ai.summary.model <model>`    | `AISUB_AI_SUMMARY_MODEL`     | Gemini model for whole-video summary and knowledge indexing. | `gemini-3.5-flash-lite` |
 | `--ai.summary.tier <tier>`      | `AISUB_AI_SUMMARY_TIER`      | Google Gemini service tier (`standard`, `flex`, `priority`). | _None_                  |
 | `--ai.summary.agentic <bool>`   | `AISUB_AI_SUMMARY_AGENTIC`   | Whether to enable agentic video understanding for summary.   | `True`                  |
-| `--ai.subtitles.model <model>`  | `AISUB_AI_SUBTITLES_MODEL`   | Gemini model for audio-visual subtitle transcription.        | `gemini-3.8-flash`      |
+| `--ai.subtitles.model <model>`  | `AISUB_AI_SUBTITLES_MODEL`   | Gemini model for audio-visual subtitle transcription.        | `gemini-4-hydrogen`     |
 | `--ai.subtitles.tier <tier>`    | `AISUB_AI_SUBTITLES_TIER`    | Google Gemini service tier for subtitle generation.          | _None_                  |
 | `--ai.subtitles.agentic <bool>` | `AISUB_AI_SUBTITLES_AGENTIC` | Whether to enable agentic video understanding for subtitles. | `False`                 |
 | `--ai.lyrics.model <model>`     | `AISUB_AI_LYRICS_MODEL`      | Gemini model for musical lyrics refinement.                  | `gemini-3.5-flash-lite` |

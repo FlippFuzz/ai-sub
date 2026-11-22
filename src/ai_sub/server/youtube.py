@@ -71,6 +71,7 @@ class ScanResult(BaseModel):
 
     videos: list[DiscoveredVideo] = Field(default_factory=list)
     members_only_ids: set[str] = Field(default_factory=set)
+    completed_urls: dict[str, int] = Field(default_factory=dict)
 
 
 class DownloadedVideo(BaseModel):
@@ -229,6 +230,7 @@ class YouTubeClient:
     base_work_dir: Path
     mapping_file: Path
     _channel_map: ChannelMap
+    _channel_map_dirty: bool
     _channel_lock: threading.Lock
     _pot_server_dir: Path | None
     _base_ydl_opts: dict[str, Any]
@@ -245,6 +247,7 @@ class YouTubeClient:
         self.config = config
         self.base_work_dir = base_work_dir
         self._channel_lock = threading.Lock()
+        self._channel_map_dirty = False
         self._source_last_scan_ts = {}
         self._deep_scanned_urls = set()
 
@@ -267,6 +270,8 @@ class YouTubeClient:
 
     def _ensure_pot_provider(self, pot_dir: Path) -> Path | None:
         """Clones, syncs tags, and compiles bgutil-ytdlp-pot-provider once at startup.
+
+        Leaves existing non-empty non-git directories intact rather than overwriting them.
 
         Args:
             pot_dir: Directory where the PO token provider repository is located.
@@ -293,11 +298,20 @@ class YouTubeClient:
         try:
             repo: Repo | None = None
             if pot_dir.exists():
+                if not pot_dir.is_dir():
+                    logfire.error(
+                        f"Configured potdir '{pot_dir}' exists and is not a directory. Disabling PO token provider."
+                    )
+                    return None
                 try:
                     repo = Repo(pot_dir)
                 except (InvalidGitRepositoryError, NoSuchPathError):
-                    logfire.warning(f"Existing directory at {pot_dir} is not a valid git repository. Re-cloning...")
-                    shutil.rmtree(pot_dir, ignore_errors=True)
+                    if any(pot_dir.iterdir()):
+                        logfire.error(
+                            f"Configured potdir '{pot_dir}' is non-empty and not a valid git repository. "
+                            "Leaving existing files intact and disabling PO token provider."
+                        )
+                        return None
                     repo = None
 
             if repo is None:
@@ -428,7 +442,9 @@ class YouTubeClient:
         try:
             content = json.dumps(self._channel_map.model_dump(), indent=2, sort_keys=True, ensure_ascii=False)
             atomic_write_text(self.mapping_file, content)
+            self._channel_map_dirty = False
         except Exception as e:
+            self._channel_map_dirty = True
             logfire.warning(f"Failed to save channel mapping file {self.mapping_file.name}: {e}")
 
     def _record_channel_mapping(
@@ -438,7 +454,7 @@ class YouTubeClient:
         channel_name: str | None,
         timestamp: int = 0,
     ) -> None:
-        """Records a new or updated channel mapping and saves to disk under lock if changed.
+        """Records a new or updated channel mapping and saves to disk under lock if dirty or changed.
 
         Args:
             channel_id: Unique YouTube channel ID (e.g. 'UC...').
@@ -457,12 +473,15 @@ class YouTubeClient:
         with self._channel_lock:
             existing = self._channel_map.root.get(c_str)
             effective_ts = max(timestamp, existing.timestamp) if existing else timestamp
-            if not existing or effective_ts > existing.timestamp or u_str != existing.uploader_id:
+            changed = not existing or effective_ts > existing.timestamp or u_str != existing.uploader_id
+            if changed:
                 self._channel_map.root[c_str] = ChannelInfo(
                     uploader_id=u_str,
                     channel_name=str(channel_name) if channel_name else (existing.channel_name if existing else None),
                     timestamp=effective_ts,
                 )
+                self._channel_map_dirty = True
+            if changed or self._channel_map_dirty:
                 self._save_channel_map_locked()
 
     def _lookup_youtube_handle(self, video_id: str | None, channel_id: str | None = None) -> str | None:
@@ -575,6 +594,17 @@ class YouTubeClient:
         # 6. Generic fallback
         return "youtube"
 
+    def commit_scan_state(self, completed_urls: Mapping[str, int]) -> None:
+        """Persists scanned URL completion timestamps after ingestion integrates discoveries.
+
+        Args:
+            completed_urls: Mapping of cleanly scanned source URLs to Unix scan timestamps.
+        """
+        for url, scan_ts in completed_urls.items():
+            self._deep_scanned_urls.add(url)
+            prev_ts = self._source_last_scan_ts.get(url, 0)
+            self._source_last_scan_ts[url] = max(prev_ts, scan_ts)
+
     def scan_sources(
         self,
         deep_scan: bool = False,
@@ -582,17 +612,16 @@ class YouTubeClient:
     ) -> ScanResult:
         """Fetches metadata for configured YouTube sources using flat extraction with early date cutoff.
 
-        Tracks per-URL deep-scan completion so any source that fails with a retryable error
-        automatically retries its full history crawl on the next scan without re-crawling
-        already-completed sources. Skips non-VOD entries (upcoming, live, post-live, members-only)
-        using an allowlist for ready availability and live status.
+        Does not mutate per-URL scan history directly; returns completed_urls so ingestion commits
+        scan progress only after discoveries are accepted.
 
         Args:
             deep_scan: If True, forces full channel history crawl across all sources.
-            ignored_ids: Optional set of video IDs already ignored (e.g. members-only) to skip.
+            ignored_ids: Optional set of video IDs confirmed members-only on download to skip unless
+                explicitly listed as public or unlisted.
 
         Returns:
-            ScanResult: Discovered public/unlisted videos and newly spotted members-only video IDs.
+            ScanResult: Discovered public/unlisted videos, members-only IDs, and completed URL timestamps.
 
         Raises:
             YouTubeBotDetectionError: If a bot check or HTTP 429 block is triggered.
@@ -628,6 +657,7 @@ class YouTubeClient:
 
         discovered: list[DiscoveredVideo] = []
         members_only_ids: set[str] = set()
+        completed_urls: dict[str, int] = {}
 
         with logfire.span("Scanning YouTube Sources", deep_scan=deep_scan, total_sources=len(target_items)):
             with YoutubeDL(cast(Any, ydl_opts)) as ydl:
@@ -653,8 +683,7 @@ class YouTubeClient:
                             result = ydl.extract_info(url, download=False)
                             if not result:
                                 url_span.set_attribute("result", "empty")
-                                self._deep_scanned_urls.add(url)
-                                self._source_last_scan_ts[url] = now_ts
+                                completed_urls[url] = now_ts
                                 continue
 
                             entries_raw = result.get("entries")
@@ -675,7 +704,7 @@ class YouTubeClient:
                                     continue
                                 if availability not in (None, "public", "unlisted"):
                                     continue
-                                if vid in skip_ids:
+                                if vid in skip_ids and availability is None:
                                     continue
                                 title = str(entry.get("title") or "Unknown")
                                 if title in ["[Deleted video]", "[Private video]", "[Unavailable video]"]:
@@ -713,8 +742,7 @@ class YouTubeClient:
 
                             url_span.set_attribute("discovered_count", url_discovered_count)
                             if not skipped_live_single:
-                                self._deep_scanned_urls.add(url)
-                                self._source_last_scan_ts[url] = now_ts
+                                completed_urls[url] = now_ts
                         except YouTubeBotDetectionError:
                             url_span.set_attribute("error", "bot_detection")
                             raise
@@ -725,7 +753,11 @@ class YouTubeClient:
                             if _is_bot_detection_error(err_msg):
                                 raise YouTubeBotDetectionError(f"Bot detection scanning source {url}") from e
 
-        return ScanResult(videos=discovered, members_only_ids=members_only_ids)
+        return ScanResult(
+            videos=discovered,
+            members_only_ids=members_only_ids,
+            completed_urls=completed_urls,
+        )
 
     def download_video(self, video_id: str, source_ref: str, destination_dir: Path) -> DownloadedVideo:
         """Downloads a video stream and extracts authoritative metadata.

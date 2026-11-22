@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 import os
 import re
@@ -15,6 +16,8 @@ from typing import Literal
 
 import logfire
 import static_ffmpeg
+
+from ai_sub.config import atomic_write_text
 
 _FFMPEG_INITIALIZED: bool = False
 _FFMPEG_PATH: str = "ffmpeg"
@@ -263,7 +266,9 @@ async def _run_ffmpeg(cmd: list[str]) -> str:
 
 
 async def _get_vfr_flag() -> str:
-    """Detects whether the installed FFmpeg binary uses '-fps_mode' (5.0+) or legacy '-vsync'.
+    """Detects whether the installed FFmpeg binary supports '-fps_mode' (5.1+) or legacy '-vsync'.
+
+    Uses '-h full' because '-fps_mode' is an advanced option omitted from basic '-h' output.
 
     Returns:
         str: Supported FFmpeg flag ('-fps_mode' or '-vsync').
@@ -274,8 +279,8 @@ async def _get_vfr_flag() -> str:
 
     ffmpeg_bin, _ = ensure_ffmpeg()
     try:
-        help_out = await _run_ffmpeg([ffmpeg_bin, "-h"])
-        _VFR_FLAG = "-fps_mode" if "-fps_mode" in help_out else "-vsync"
+        help_out = await _run_ffmpeg([ffmpeg_bin, "-h", "full"])
+        _VFR_FLAG = "-fps_mode" if re.search(r"(?:^|\s)-fps_mode\b", help_out) else "-vsync"
     except Exception:
         _VFR_FLAG = "-fps_mode"
     return _VFR_FLAG
@@ -566,6 +571,48 @@ def _find_split_segments(output_dir: Path, ext: str, media_tag: str) -> list[Pat
     return [path for _, path in matched]
 
 
+def _segments_match_split_duration(
+    durations_ms: list[int],
+    split_duration_s: int,
+    duration_tolerance_ms: int,
+    split_meta_path: Path,
+) -> bool:
+    """Verifies that cached segments align with the requested split_duration_s.
+
+    Prefers the recorded split metadata sidecar when present; otherwise checks non-final segment
+    durations to reject segments generated under a markedly different split duration.
+
+    Args:
+        durations_ms: Probed segment durations in milliseconds.
+        split_duration_s: Requested target segment duration in seconds.
+        duration_tolerance_ms: Allowed per-segment duration tolerance in milliseconds.
+        split_meta_path: Path to the split configuration sidecar file.
+
+    Returns:
+        bool: True if existing segments match the split configuration.
+    """
+    if split_meta_path.is_file():
+        try:
+            meta = json.loads(split_meta_path.read_text(encoding="utf-8"))
+            if isinstance(meta, dict) and meta.get("split_duration_s") == split_duration_s:
+                return True
+            return False
+        except Exception:
+            return False
+
+    split_ms = split_duration_s * 1000
+    if len(durations_ms) > 1:
+        non_final = durations_ms[:-1]
+        if max(non_final) > max(split_ms * 1.5, split_ms + duration_tolerance_ms):
+            return False
+        if (sum(non_final) / len(non_final)) < split_ms * 0.5:
+            return False
+    elif durations_ms and durations_ms[0] > max(split_ms * 1.5, split_ms + duration_tolerance_ms):
+        return False
+
+    return True
+
+
 @logfire.instrument("Splitting video into segments")
 async def split_video(
     input_video: Path,
@@ -576,7 +623,8 @@ async def split_video(
 ) -> list[Path]:
     """Splits an input video into uniform segments using FFmpeg stream copying.
 
-    Skips splitting if valid segments matching 'part_%03d_<media_tag>' and duration already exist.
+    Skips splitting if valid segments matching 'part_%03d_<media_tag>', split duration, and total
+    duration already exist.
 
     Args:
         input_video: Path to the input video.
@@ -593,6 +641,7 @@ async def split_video(
     """
     ext = input_video.suffix
     existing_segments = _find_split_segments(output_dir, ext, media_tag)
+    split_meta_path = output_dir / f".split_{media_tag}.json"
 
     if existing_segments:
         try:
@@ -601,13 +650,14 @@ async def split_video(
             total_segment_duration = sum(durations)
             threshold = duration_tolerance_ms * len(existing_segments)
 
-            if abs(input_duration - total_segment_duration) <= threshold:
+            if abs(input_duration - total_segment_duration) <= threshold and _segments_match_split_duration(
+                durations, split_duration_s, duration_tolerance_ms, split_meta_path
+            ):
                 logfire.info(f"Reusing {len(existing_segments)} existing valid segments for {input_video.name}.")
                 return existing_segments
 
             logfire.warning(
-                f"Re-splitting {input_video.name}: existing duration ({total_segment_duration}ms) "
-                f"mismatches input ({input_duration}ms)."
+                f"Re-splitting {input_video.name}: existing segments do not match current duration or split config."
             )
         except Exception:
             logfire.warning(f"Re-splitting {input_video.name}: existing segments verification failed.")
@@ -617,6 +667,7 @@ async def split_video(
                 segment.unlink()
             except OSError:
                 pass
+        split_meta_path.unlink(missing_ok=True)
 
     ffmpeg_bin, _ = ensure_ffmpeg()
     escaped_dir = str(output_dir).replace("%", "%%")
@@ -652,7 +703,10 @@ async def split_video(
         logfire.exception(f"FFmpeg split failed. Stdout: {e.stdout}, Stderr: {e.stderr}")
         raise
 
-    return _find_split_segments(output_dir, ext, media_tag)
+    segments = _find_split_segments(output_dir, ext, media_tag)
+    if segments:
+        atomic_write_text(split_meta_path, json.dumps({"split_duration_s": split_duration_s}))
+    return segments
 
 
 async def reencode_video(

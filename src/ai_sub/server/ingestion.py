@@ -80,7 +80,8 @@ class IngestionManager:
     youtube_client: YouTubeClient
     local_videos: dict[str, QueuedVideo]
     youtube_videos: dict[str, QueuedVideo]
-    _ignored_youtube_ids: set[str]
+    _scan_members_only_ids: set[str]
+    _download_members_only_ids: set[str]
     _aborted_videos: dict[tuple[str, str], str]
     _youtube_cooldown_until: float
     _youtube_cooldown_reason: str | None
@@ -119,7 +120,8 @@ class IngestionManager:
         self.youtube_client = YouTubeClient(config.youtube, base_work_dir)
         self.local_videos = {}
         self.youtube_videos = {}
-        self._ignored_youtube_ids = set()
+        self._scan_members_only_ids = set()
+        self._download_members_only_ids = set()
         self._aborted_videos = {}
         self._youtube_cooldown_until = 0.0
         self._youtube_cooldown_reason = None
@@ -218,24 +220,27 @@ class IngestionManager:
             if not folder.is_dir():
                 continue
             for file_path in sorted(folder.rglob("*")):
-                if not file_path.is_file() or file_path.suffix.lower() not in VALID_VIDEO_EXTENSIONS:
-                    continue
+                try:
+                    if not file_path.is_file() or file_path.suffix.lower() not in VALID_VIDEO_EXTENSIONS:
+                        continue
 
-                vid = truncate_utf8_bytes(sanitize_filename(file_path.stem), max_stem_bytes)
-                if not is_valid_video_id(vid):
-                    logfire.warning(f"Skipping local file with invalid filename stem {vid!r}: {file_path}")
-                    continue
+                    vid = truncate_utf8_bytes(sanitize_filename(file_path.stem), max_stem_bytes)
+                    if not is_valid_video_id(vid):
+                        logfire.warning(f"Skipping local file with invalid filename stem {vid!r}: {file_path}")
+                        continue
 
-                resolved_path = file_path.resolve()
-                if vid in discovered:
-                    if discovered[vid].local_path != resolved_path:
-                        logfire.warning(
-                            f"Skipping duplicate local video ID '{vid}' at {resolved_path} "
-                            f"(already mapped to {discovered[vid].local_path})."
-                        )
-                    continue
+                    resolved_path = file_path.resolve()
+                    if vid in discovered:
+                        if discovered[vid].local_path != resolved_path:
+                            logfire.warning(
+                                f"Skipping duplicate local video ID '{vid}' at {resolved_path} "
+                                f"(already mapped to {discovered[vid].local_path})."
+                            )
+                        continue
 
-                mtime = int(file_path.stat().st_mtime)
+                    mtime = int(resolved_path.stat().st_mtime)
+                except FileNotFoundError:
+                    continue
 
                 discovered[vid] = DiscoveredVideo(
                     video_id=vid,
@@ -254,10 +259,10 @@ class IngestionManager:
 
         Args:
             deep_scan: If True, crawls full channel history; if False, uses per-URL deep-scan state.
-            ignored_ids: Snapshot of ignored YouTube video IDs to skip.
+            ignored_ids: Snapshot of download-confirmed members-only video IDs to skip.
 
         Returns:
-            ScanResult: Discovered YouTube videos and any newly spotted members-only IDs.
+            ScanResult: Discovered YouTube videos, members-only IDs, and completed URL timestamps.
         """
         if not self.config.youtube.urls or self._is_youtube_in_cooldown():
             return ScanResult()
@@ -318,7 +323,7 @@ class IngestionManager:
             return list(self.youtube_videos.values())
 
         async with self._scan_lock:
-            ignored_snapshot = frozenset(self._ignored_youtube_ids)
+            ignored_snapshot = frozenset(self._download_members_only_ids)
             try:
                 scan_result = await asyncio.to_thread(self._scan_youtube_sources, deep_scan, ignored_snapshot)
             except YouTubeBotDetectionError as e:
@@ -329,14 +334,17 @@ class IngestionManager:
                 return list(self.youtube_videos.values())
 
             if scan_result.members_only_ids:
-                self._ignored_youtube_ids.update(scan_result.members_only_ids)
+                self._scan_members_only_ids.update(scan_result.members_only_ids)
                 for ignored_vid in scan_result.members_only_ids:
                     self.youtube_videos.pop(ignored_vid, None)
 
             discovered_new = 0
             for item in scan_result.videos:
-                if item.video_id in self._ignored_youtube_ids:
+                if item.video_id in scan_result.members_only_ids:
                     continue
+                self._scan_members_only_ids.discard(item.video_id)
+                self._download_members_only_ids.discard(item.video_id)
+
                 if item.video_id not in self.youtube_videos:
                     self.youtube_videos[item.video_id] = QueuedVideo.model_validate(
                         {**item.model_dump(), "source_type": "youtube"}
@@ -353,23 +361,24 @@ class IngestionManager:
                     if item.channel_name and existing.channel_name != item.channel_name:
                         existing.channel_name = item.channel_name
 
+            self.youtube_client.commit_scan_state(scan_result.completed_urls)
+
             logfire.info(
                 f"YouTube scan complete: {len(self.youtube_videos)} metadata entry(s) tracked in memory "
                 f"({discovered_new} newly discovered)."
             )
             return list(self.youtube_videos.values())
 
-    async def _download_youtube_to_combo_dir(self, video: QueuedVideo, combo_work_dir: Path) -> Path:
-        """Downloads a video stream into the combination directory and updates authoritative metadata.
+    async def _download_youtube_to_combo_dir(self, video: QueuedVideo, job_dir: Path) -> Path:
+        """Downloads a video stream into the target job directory and updates authoritative metadata.
 
         Args:
             video: Discovered video metadata.
-            combo_work_dir: Working directory of the target combination runner.
+            job_dir: Source-scoped working directory for this video.
 
         Returns:
             Path: Filesystem path to the downloaded media file.
         """
-        job_dir = combo_work_dir / video.video_id
         job_dir.mkdir(parents=True, exist_ok=True)
 
         def _do_download() -> DownloadedVideo:
@@ -422,10 +431,18 @@ class IngestionManager:
         now = monotonic()
 
         for v in candidates:
-            if runner.pipeline and runner.pipeline.video_id == v.video_id:
+            if (
+                runner.pipeline
+                and runner.pipeline.video_id == v.video_id
+                and runner.pipeline.source_type == v.source_type
+            ):
                 continue
 
-            if runner.preparing_video_info and runner.preparing_video_info.get("video_id") == v.video_id:
+            if (
+                runner.preparing_video_info
+                and runner.preparing_video_info.get("video_id") == v.video_id
+                and runner.preparing_video_info.get("source_type") == v.source_type
+            ):
                 continue
 
             if not self._is_completed_for_runner(v, runner.full_shortcode):
@@ -471,14 +488,12 @@ class IngestionManager:
         self,
         runner: ComboRunner,
         video: QueuedVideo,
-        now: float,
     ) -> tuple[bool, bool, bool]:
         """Attempts to acquire an idle runner, fetch/verify media, and prepare its pipeline.
 
         Args:
             runner: Target combination runner.
             video: Candidate queued video.
-            now: Current monotonic timestamp.
 
         Returns:
             tuple[bool, bool, bool]: (fed_successfully, stop_loop_for_runner, is_download_failure).
@@ -491,7 +506,7 @@ class IngestionManager:
         if video.source_type == "local" and (not video.local_path or not video.local_path.is_file()):
             video.status = "failed"
             video.error_reason = "File missing from disk"
-            video.retry_after = now + 120
+            video.retry_after = monotonic() + 120
             return False, False, False
 
         acquired = await self.coordinator.acquire_idle_runner(
@@ -505,6 +520,7 @@ class IngestionManager:
         if not acquired:
             return False, True, False
 
+        job_dir = runner.get_job_dir(video.source_type, video.video_id)
         fed = False
         try:
             if video.source_type == "local":
@@ -512,11 +528,11 @@ class IngestionManager:
                 raw_path = video.local_path
             else:
                 try:
-                    raw_path = await self._download_youtube_to_combo_dir(video, runner.work_dir)
+                    raw_path = await self._download_youtube_to_combo_dir(video, job_dir)
                 except YouTubeVideoUnavailableError as e:
-                    _cleanup_failed_job_dir(runner.work_dir / video.video_id)
+                    _cleanup_failed_job_dir(job_dir)
                     if e.reason == "Members only":
-                        self._ignored_youtube_ids.add(video.video_id)
+                        self._download_members_only_ids.add(video.video_id)
                         self.youtube_videos.pop(video.video_id, None)
                         logfire.info(f"Ignoring members-only video '{video.title}' ({video.video_id}).")
                     elif e.reason == "Post-live processing":
@@ -525,23 +541,23 @@ class IngestionManager:
                     else:
                         video.status = "unplayable"
                         video.error_reason = e.reason
-                        video.retry_after = now + (24 * 3600)
+                        video.retry_after = monotonic() + (24 * 3600)
                         logfire.warning(f"Video '{video.title}' is unplayable ({e.reason}). Retrying in 24h.")
                     return False, False, False
                 except YouTubeBotDetectionError as e:
-                    _cleanup_failed_job_dir(runner.work_dir / video.video_id)
+                    _cleanup_failed_job_dir(job_dir)
                     self._trigger_youtube_cooldown(reason=str(e))
                     return False, True, False
                 except Exception as e:
-                    _cleanup_failed_job_dir(runner.work_dir / video.video_id)
+                    _cleanup_failed_job_dir(job_dir)
                     video.status = "failed"
                     video.error_reason = "Download failed"
-                    video.retry_after = now + (30 * 60)
+                    video.retry_after = monotonic() + (30 * 60)
                     logfire.warning(f"Download failed for '{video.title}': {e}")
                     return False, False, True
 
             if self._stopped:
-                _cleanup_failed_job_dir(runner.work_dir / video.video_id)
+                _cleanup_failed_job_dir(job_dir)
                 return False, True, False
 
             try:
@@ -561,13 +577,13 @@ class IngestionManager:
                 fed = True
                 return True, True, False
             except Exception as e:
-                _cleanup_failed_job_dir(runner.work_dir / video.video_id)
+                _cleanup_failed_job_dir(job_dir)
                 logfire.warning(
                     f"Failed to prepare {video.source_type} video '{video.title}' for '{runner.config.name}': {e}"
                 )
                 video.status = "failed"
                 video.error_reason = f"Preparation error: {e}"
-                video.retry_after = now + 120
+                video.retry_after = monotonic() + 120
                 return False, False, False
         finally:
             if not fed:
@@ -605,8 +621,8 @@ class IngestionManager:
                     else:
                         eligible.append(v)
 
-                def _feed_sort_key(v: QueuedVideo) -> tuple[int, int, str]:
-                    has_dir = 1 if (runner.work_dir / v.video_id).is_dir() else 0
+                def _feed_sort_key(v: QueuedVideo, target_runner: ComboRunner = runner) -> tuple[int, int, str]:
+                    has_dir = 1 if target_runner.get_job_dir(v.source_type, v.video_id).is_dir() else 0
                     return (has_dir, v.timestamp, v.title.lower())
 
                 eligible.sort(key=_feed_sort_key, reverse=True)
@@ -642,8 +658,25 @@ class IngestionManager:
                 for video in eligible:
                     if self._stopped:
                         return
+                    if not runner.is_idle():
+                        break
 
-                    fed, stop_runner, is_dl_failure = await self._try_feed_runner(runner, video, now)
+                    if video.source_type == "youtube":
+                        if self._is_youtube_in_cooldown():
+                            continue
+                        if self.youtube_videos.get(video.video_id) is not video:
+                            continue
+                    elif self.local_videos.get(video.video_id) is not video:
+                        continue
+
+                    if (runner.config.name, video.video_id) in self._aborted_videos:
+                        continue
+                    if self._is_completed_for_runner(video, runner.full_shortcode):
+                        continue
+                    if video.retry_after is not None and monotonic() < video.retry_after:
+                        continue
+
+                    fed, stop_runner, is_dl_failure = await self._try_feed_runner(runner, video)
                     if is_dl_failure:
                         consecutive_download_failures += 1
                         if consecutive_download_failures >= max_failures:

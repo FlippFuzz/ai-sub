@@ -81,7 +81,7 @@ class ServerReencodeSettings(ReencodeSettings):
 class PipelineConfig(StageModelsMixin):
     """Configuration for an independent model processing pipeline."""
 
-    name: str = Field(description="Unique identifier for the pipeline (e.g. 'combo_38f').")
+    name: str = Field(description="Unique identifier for the pipeline (e.g. 'combo_40f').")
     searchtools: SearchToolList = Field(
         default_factory=_default_pipeline_search_tools,
         description="Search tools required for this pipeline.",
@@ -223,22 +223,16 @@ class SourcesConfig(BaseConfigModel):
 
 
 def _get_default_pipelines() -> list[PipelineConfig]:
-    """Generates the three standard default combination pipelines.
+    """Generates the two standard default combination pipelines.
 
     Returns:
         list[PipelineConfig]: Standard default pipelines.
     """
     return [
         PipelineConfig(
-            name="combo_38f",
+            name="combo_40f",
             summary=StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
-            subtitles=StageExecutionConfig(model="gemini-3.8-flash", agentic=False),
-            lyrics=StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
-        ),
-        PipelineConfig(
-            name="combo_36f",
-            summary=StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
-            subtitles=StageExecutionConfig(model="gemini-3.6-flash", agentic=False),
+            subtitles=StageExecutionConfig(model="gemini-4-hydrogen", agentic=False),
             lyrics=StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
         ),
         PipelineConfig(

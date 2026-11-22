@@ -41,6 +41,10 @@ class ServerTask(BaseModel):
     worker_id: str | None = Field(default=None, description="Identifier of the worker holding the lease.")
     claimed_at: float | None = Field(default=None, description="Timestamp when task was claimed.")
     last_heartbeat: float | None = Field(default=None, description="Timestamp of the most recent worker heartbeat.")
+    claim_generation: int = Field(
+        default=0,
+        description="Monotonic claim generation counter incremented each time this task is leased.",
+    )
 
     def to_claim_response(
         self,

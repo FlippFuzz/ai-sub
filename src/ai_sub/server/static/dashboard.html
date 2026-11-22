@@ -508,6 +508,7 @@
     <div id="tab-content"></div>
 
     <script>
+      const FETCH_TIMEOUT_MS = 15000
       const MATRIX_LEGEND = [
         ["chunk-pending", "Pending"],
         ["badge-encoding", "Encoding"],
@@ -516,7 +517,7 @@
         ["chunk-lyrics_pending", "Lyrics Queued"],
         ["badge-lyrics_running", "Lyrics"],
         ["badge-done", "Done"],
-        ["badge-draft_fallback", "Draft Fallback"],
+        ["badge-draft_fallback", "Lyrics Failed"],
         ["badge-failed", "Failed"],
       ]
       const CHUNK_CLASSES = {
@@ -566,6 +567,9 @@
 
       const isSafeHttpUrl = (url) =>
         typeof url === "string" && /^https?:\/\//i.test(url.trim())
+
+      const getActivityEventId = (a, idx) =>
+        a.event_id || `${a.task_id}::${a.timestamp}::${idx}`
 
       function formatDuration(sec) {
         if (sec == null || sec <= 0) return "0s"
@@ -854,8 +858,13 @@
             : seg.lyrics_line_count != null
               ? `Completed (${seg.lyrics_line_count} line${seg.lyrics_line_count === 1 ? "" : "s"})`
               : seg.lyrics_status === "draft_fallback"
-                ? "Exhausted (using draft subtitles)"
+                ? "Exhausted (error in refined SRT, raw SRT available)"
                 : titleCase(seg.lyrics_status)
+
+        const matrixStatusLabel =
+          seg.matrix_status === "draft_fallback"
+            ? "Lyrics Failed"
+            : titleCase(seg.matrix_status)
 
         const showLyrAttempts =
           !["waiting", "skipped", "disabled"].includes(seg.lyrics_status) ||
@@ -881,7 +890,7 @@
             <div class="inspector-head">
               <div style="display:flex; flex-wrap:wrap; align-items:center; gap:8px;">
                 <b class="mono" style="font-size:13px;">Chunk #${label}</b>
-                ${badge(seg.matrix_status, titleCase(seg.matrix_status))}
+                ${badge(seg.matrix_status, matrixStatusLabel)}
                 <span class="mono muted">${esc(windowText)}</span>
               </div>
               <div style="display:flex; align-items:center; gap:6px;">
@@ -971,7 +980,7 @@
             )
           if (lyr.failed > 0)
             lyrParts.push(
-              `<span style="color:#fcd34d;">${lyr.failed} using draft</span>`,
+              `<span style="color:#fcd34d;">${lyr.failed} failed (raw available)</span>`,
             )
           lyrHtml = lyrParts.join(" · ")
         }
@@ -1139,9 +1148,9 @@
         const pipelines = currentData.pipelines
         const validEventIds = new Set()
         for (const p of pipelines) {
-          for (const a of p.recent_activity || []) {
-            if (a.event_id) validEventIds.add(a.event_id)
-          }
+          ;(p.recent_activity || []).forEach((a, idx) => {
+            validEventIds.add(getActivityEventId(a, idx))
+          })
         }
         for (const eid of expandedActivityIds) {
           if (!validEventIds.has(eid)) expandedActivityIds.delete(eid)
@@ -1220,7 +1229,7 @@
         const activityTable =
           (pipe.recent_activity || [])
             .map((a, idx) => {
-              const eid = a.event_id || `${a.task_id}::${a.timestamp}::${idx}`
+              const eid = getActivityEventId(a, idx)
               const parts = a.task_id.split("::")
               const cleanTask =
                 parts.length > 2
@@ -1292,8 +1301,15 @@
         if (isFetching) return
         isFetching = true
         lastFetchAttempt = Date.now()
+        const controller = new AbortController()
+        const abortTimer = setTimeout(
+          () => controller.abort(),
+          FETCH_TIMEOUT_MS,
+        )
         try {
-          const res = await fetch("/api/v1/dashboard/data")
+          const res = await fetch("/api/v1/dashboard/data", {
+            signal: controller.signal,
+          })
           if (!res.ok) return
           currentData = await res.json()
           lastSuccessTime = Date.now()
@@ -1302,6 +1318,7 @@
         } catch (err) {
           console.error(err)
         } finally {
+          clearTimeout(abortTimer)
           isFetching = false
           scheduleRefresh()
         }

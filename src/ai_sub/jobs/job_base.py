@@ -199,12 +199,13 @@ def _clean_context_item(data: Any) -> Any:
         Any: JSON-safe cleaned representation.
     """
     if hasattr(data, "model_dump"):
-        return data.model_dump(
+        dumped = data.model_dump(
             mode="json",
             exclude={"thoughts": True, "user_context": True},
             exclude_none=True,
             by_alias=True,
         )
+        return _clean_context_item(dumped)
     if isinstance(data, dict):
         return {
             k: _clean_context_item(v)
@@ -338,7 +339,11 @@ class AiJob(BaseJob):
     """Base class for AI-executed jobs with YAML persistence and prompt version validation."""
 
     video_duration_ms: PositiveInt = Field(description="Media duration in milliseconds.")
-    model_name: str = Field(default="gemini-3.8-flash", description="Gemini model identifier.")
+    media_tag: str | None = Field(
+        default=None,
+        description="Source media identifier tag used to scope saved checkpoints.",
+    )
+    model_name: str = Field(default="gemini-4-hydrogen", description="Gemini model identifier.")
     service_tier: ServiceTier | None = Field(
         default=None,
         description="Optional Google Gemini service tier override.",
@@ -463,11 +468,25 @@ class AiJob(BaseJob):
                 )
                 return None
 
+        raw_duration = data.get("video_duration_ms")
+        context_duration: int | None = None
+        if isinstance(raw_duration, int) and not isinstance(raw_duration, bool) and raw_duration > 0:
+            context_duration = raw_duration
+        elif isinstance(raw_duration, str):
+            stripped = raw_duration.strip()
+            if stripped:
+                try:
+                    parsed = int(stripped)
+                    if parsed > 0:
+                        context_duration = parsed
+                except ValueError:
+                    pass
+
         try:
             return cls.model_validate(
                 data,
                 context={
-                    "video_duration_ms": data.get("video_duration_ms"),
+                    "video_duration_ms": context_duration,
                     "validation_buffer_ms": validation_buffer_ms,
                 },
             )

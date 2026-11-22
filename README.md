@@ -172,10 +172,10 @@ ai-sub --contextfile "notes.txt" "video.mp4"
 Inside the temporary directory (`tmp_<video_name>`), AI Sub generates standalone state files (`.yaml`) and intermediate media chunks (`part_000_<hash>.mp4`, `summary_<hash>.mp4`) tracking the progress of each video chunk and global summary:
 
 - `summary.<summary_code>.yaml`: Caches the global video summary and metadata (e.g., `summary.g35l.yaml`).
-- `part_<index>_<hash>.subtitles.<subtitles_lineage>.yaml`: Caches raw segment dialogue transcription, timing, and active fallback FPS tier (e.g., `part_000_a1b2c3d4e5f.subtitles.g35l-g38f.yaml`, or `part_000_a1b2c3d4e5f.subtitles.g38f.yaml` when summary is disabled).
-- `part_<index>_<hash>.lyrics.<lyrics_lineage>.yaml`: Caches refined song lyrics and translations when musical performances are detected (e.g., `part_000_a1b2c3d4e5f.lyrics.g35l-g38f-g35l.yaml`).
+- `part_<index>.subtitles.<subtitles_lineage>.yaml`: Caches raw segment dialogue transcription, timing, and active fallback FPS tier (e.g., `part_000.subtitles.g35l-g4h.yaml`, or `part_000.subtitles.g4h.yaml` when summary is disabled).
+- `part_<index>.lyrics.<lyrics_lineage>.yaml`: Caches refined song lyrics and translations when musical performances are detected (e.g., `part_000.lyrics.g35l-g4h-g35l.yaml`).
 
-You can re-run `ai-sub` as many times as needed—completed units are skipped automatically while incomplete units are retried. State files from mismatched prompt versions (or stale upstream outputs) are automatically rejected and overwritten. After `retry.maxruns` (default `3`) non-retryable failures at a tier, the unit automatically steps down to a lower FPS fallback tier on the next run (up to `fallback.attempts` tiers, dividing FPS by `fallback.multiplier` each step) before stopping. Delete a specific `.yaml` state file to force regeneration of that unit.
+You can re-run `ai-sub` as many times as needed—completed units are skipped automatically while incomplete units are retried. State files from mismatched prompt versions (or stale upstream outputs) are automatically rejected and overwritten. After `retry.maxruns` (default `3`) non-retryable failures at a tier, the unit automatically steps down to a lower FPS fallback tier on the next run before stopping. Summary and segment fallback settings are controlled separately: `reencode.summary.fallback.attempts` and `reencode.summary.fallback.multiplier` govern the whole-video summary proxy, while `reencode.segment.fallback.attempts` and `reencode.segment.fallback.multiplier` govern individual video chunks (each tier divides FPS by the stage's `multiplier`, up to `attempts` tiers). Delete a specific `.yaml` state file to force regeneration of that unit.
 
 ---
 

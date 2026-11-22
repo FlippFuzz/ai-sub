@@ -121,6 +121,29 @@ SearchToolList = Annotated[list[SearchTool], NoDecode, BeforeValidator(lambda va
 PathList = Annotated[list[Path], NoDecode, BeforeValidator(lambda val: _parse_list_items(val, Path))]
 
 
+def _merge_section_defaults(val: Any, section_defaults: dict[str, dict[str, Any]]) -> Any:
+    """Strips None section entries and merges partial dicts with section-specific defaults.
+
+    Args:
+        val: Raw input mapping before Pydantic validation.
+        section_defaults: Mapping of field names to section-specific default dictionaries.
+
+    Returns:
+        Any: Normalized dictionary with section-specific defaults preserved, or original input.
+    """
+    if not isinstance(val, dict):
+        return val
+    updated = dict(val)
+    for field_name, defaults in section_defaults.items():
+        if field_name in updated:
+            raw_section = updated[field_name]
+            if raw_section is None:
+                updated.pop(field_name)
+            elif isinstance(raw_section, dict):
+                updated[field_name] = {**defaults, **raw_section}
+    return updated
+
+
 class BaseConfigModel(BaseModel):
     """Shared base model for nested configuration sections."""
 
@@ -433,6 +456,27 @@ class SearchSettings(BaseConfigModel):
         description="Exponential backoff settings for search retries.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_backoff_defaults(cls, val: Any) -> Any:
+        """Preserves search-specific backoff defaults when backoff is null or partial.
+
+        Args:
+            val: Raw input dictionary before validation.
+
+        Returns:
+            Any: Input dictionary with search backoff defaults merged.
+        """
+        return _merge_section_defaults(
+            val,
+            {
+                "backoff": {
+                    "minwait": timedelta(seconds=5),
+                    "maxwait": timedelta(seconds=60),
+                }
+            },
+        )
+
     @model_validator(mode="after")
     def _apply_env_fallbacks(self) -> Self:
         """Populates unprefixed standard search API keys from environment variables or .env when unset.
@@ -543,6 +587,25 @@ class ReencodeSettings(BaseConfigModel):
         description="Re-encoding rules for individual video chunk segments.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_stage_defaults(cls, val: Any) -> Any:
+        """Preserves stage-specific re-encode defaults when summary or segment is null or partial.
+
+        Args:
+            val: Raw input dictionary before validation.
+
+        Returns:
+            Any: Input dictionary with stage-specific re-encode defaults merged.
+        """
+        return _merge_section_defaults(
+            val,
+            {
+                "summary": {"threshold": ByteSize(300_000_000), "fps": "keyframes"},
+                "segment": {"threshold": ByteSize(0), "fps": 1.0},
+            },
+        )
+
 
 class SplittingSettings(BaseConfigModel):
     """Configuration for splitting input videos into uniform segments."""
@@ -564,7 +627,7 @@ class SplittingSettings(BaseConfigModel):
 class StageExecutionConfig(BaseConfigModel):
     """Per-stage model, tier, and agentic execution configuration."""
 
-    model: str = Field(description="Gemini model identifier (e.g. 'gemini-3.8-flash').")
+    model: str = Field(description="Gemini model identifier (e.g. 'gemini-4-hydrogen').")
     tier: ServiceTier | None = Field(
         default=None,
         description="Optional Google Gemini service tier.",
@@ -583,7 +646,7 @@ class StageModelsMixin(BaseConfigModel):
         description="Model, tier, and agentic settings for whole-video summary.",
     )
     subtitles: StageExecutionConfig = Field(
-        default_factory=lambda: StageExecutionConfig(model="gemini-3.8-flash", agentic=False),
+        default_factory=lambda: StageExecutionConfig(model="gemini-4-hydrogen", agentic=False),
         description="Model, tier, and agentic settings for subtitle transcription.",
     )
     lyrics: StageExecutionConfig = Field(

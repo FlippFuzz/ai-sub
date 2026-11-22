@@ -6,14 +6,15 @@ import asyncio
 import json
 import os
 import random
+import re
 import shutil
-import stat
 import sys
 import time
 import urllib.parse
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import logfire
 from git import Repo
@@ -27,20 +28,30 @@ os.environ["GIT_TERMINAL_PROMPT"] = "0"
 JST = timezone(timedelta(hours=9))
 _MAX_REBASE_STEPS = 50
 
+_T = TypeVar("_T")
 _CompletedCache = dict[tuple[str, str], dict[str, bool]]
-_CacheUpdate = _CompletedCache | tuple[str, str, str, bool]
+_CacheUpdate = _CompletedCache | tuple[str, str, str, bool] | None
 
 
-def _handle_readonly_rmtree(func: Any, path: str, exc_info: Any) -> None:
-    """Helper to remove read-only files during directory cleanup.
+def redact_url_credentials(url: str) -> str:
+    """Masks userinfo credentials embedded in an HTTP/HTTPS URL while preserving host and path.
 
     Args:
-        func: The function that failed (e.g. os.unlink).
-        path: Path to the read-only file.
-        exc_info: Exception information tuple.
+        url: Raw URL string.
+
+    Returns:
+        str: URL string without embedded username or password.
     """
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return re.sub(r"(https?://)[^/@\s]+@", r"\1***:***@", url)
+    if parsed.username is not None or parsed.password is not None:
+        host = parsed.hostname or ""
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        return urllib.parse.urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
+    return url
 
 
 def _decode_git_stream(stream: Any) -> str:
@@ -67,6 +78,7 @@ class GitSyncManager:
     player_base_url: str
     _lock: asyncio.Lock
     _completed: _CompletedCache
+    _pending_cache_rescan: bool
 
     def __init__(self, config: GitConfig | None, base_work_dir: Path) -> None:
         """Initializes the Git synchronization manager.
@@ -78,6 +90,7 @@ class GitSyncManager:
         self.config = config
         self._lock = asyncio.Lock()
         self._completed = {}
+        self._pending_cache_rescan = False
         repo_name = "subtitles-archive"
 
         if config and config.repourl is not None:
@@ -94,7 +107,7 @@ class GitSyncManager:
         self.local_repo_dir = base_work_dir / "git_repo" / repo_name
 
     def _sanitize_text(self, text: str) -> str:
-        """Masks any configured Personal Access Token inside arbitrary log or error text.
+        """Masks any configured Personal Access Token and URL userinfo inside log or error text.
 
         Args:
             text: Raw text string.
@@ -106,7 +119,7 @@ class GitSyncManager:
             pat = self.config.get_pat_value().strip()
             if pat:
                 text = text.replace(pat, "***")
-        return text
+        return re.sub(r"(https?://)[^/@\s]+@", r"\1***:***@", text)
 
     def _sanitize_error(self, err: Exception) -> str:
         """Formats an exception including sanitized Git command stdout/stderr details.
@@ -197,8 +210,26 @@ class GitSyncManager:
         except GitCommandError:
             return False
 
+    def _local_branch_exists(self, repo: Repo, branch: str) -> bool:
+        """Checks whether refs/heads/<branch> already exists locally.
+
+        Args:
+            repo: Active GitPython Repo instance.
+            branch: Branch name to verify.
+
+        Returns:
+            bool: True if the local branch exists; False otherwise.
+        """
+        try:
+            repo.git.rev_parse("--verify", f"refs/heads/{branch}")
+            return True
+        except GitCommandError:
+            return False
+
     def _ensure_head_on_branch(self, repo: Repo, branch: str) -> None:
-        """Points an unborn HEAD at refs/heads/<branch> or checks out <branch> safely.
+        """Points an unborn HEAD at <branch>, checks out an existing <branch>, or creates it if absent.
+
+        Never overwrites an existing branch tip with 'checkout -B'.
 
         Args:
             repo: Active GitPython Repo instance.
@@ -212,7 +243,10 @@ class GitSyncManager:
         except TypeError:
             current = ""
         if current != branch:
-            repo.git.checkout("-B", branch)
+            if self._local_branch_exists(repo, branch):
+                repo.git.checkout(branch)
+            else:
+                repo.git.checkout("-b", branch)
 
     def _has_dirty_worktree(self, repo: Repo) -> bool:
         """Checks whether any staged, modified, or untracked files exist in the working tree.
@@ -226,12 +260,19 @@ class GitSyncManager:
         return bool(repo.git.status("--porcelain").strip())
 
     def _reset_dirty_worktree(self, repo: Repo, warning_message: str) -> None:
-        """Discards uncommitted working tree changes if the repository is dirty.
+        """Aborts any interrupted rebase and discards uncommitted working tree changes.
 
         Args:
             repo: Active GitPython Repo instance.
-            warning_message: Diagnostic warning logged when dirty files are found.
+            warning_message: Diagnostic warning logged when dirty state is found.
         """
+        git_dir = Path(repo.git_dir)
+        if (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists():
+            logfire.warning(warning_message)
+            try:
+                repo.git.rebase("--abort")
+            except GitCommandError:
+                pass
         if self._has_dirty_worktree(repo):
             logfire.warning(warning_message)
             if self._has_head(repo):
@@ -353,20 +394,58 @@ class GitSyncManager:
         """Applies a thread-produced completed-cache update strictly on the event loop.
 
         Args:
-            update: Either a full scanned cache dictionary or a single
-                (video_id, full_shortcode, uploader, is_youtube) tuple.
+            update: Full scanned cache dictionary, single entry tuple, or None if scan failed.
         """
+        if update is None:
+            self._pending_cache_rescan = True
+            return
         if isinstance(update, dict):
             self._completed = update
+            self._pending_cache_rescan = False
         else:
             video_id, full_shortcode, uploader, is_yt = update
             self._completed.setdefault((video_id, full_shortcode), {})[uploader] = is_yt
 
-    def _scan_completed_cache_sync(self) -> _CompletedCache:
+    async def _run_locked_thread(
+        self,
+        fn: Callable[..., _T],
+        *args: Any,
+        on_result: Callable[[_T], None] | None = None,
+    ) -> _T:
+        """Executes a blocking Git operation on a thread while holding _lock until the thread finishes.
+
+        Args:
+            fn: Synchronous callable to run in a worker thread.
+            *args: Positional arguments forwarded to fn.
+            on_result: Optional event-loop callback invoked when fn completes successfully.
+
+        Returns:
+            _T: Return value of fn.
+
+        Raises:
+            asyncio.CancelledError: If the caller was cancelled while awaiting thread completion.
+        """
+        async with self._lock:
+            fut = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+            cancelled = False
+            while not fut.done():
+                try:
+                    await asyncio.shield(fut)
+                except asyncio.CancelledError:
+                    cancelled = True
+            result = fut.result()
+            if on_result is not None:
+                on_result(result)
+            if cancelled:
+                raise asyncio.CancelledError
+            return result
+
+    def _scan_completed_cache_sync(self) -> _CompletedCache | None:
         """Scans the local repository directory and returns a fresh completed subtitles mapping.
 
         Returns:
-            _CompletedCache: Newly constructed cache mapping (video_id, shortcode) to uploader flags.
+            _CompletedCache | None: Completed cache mapping, or None if a scan-level error prevented
+            completing the full tree walk.
         """
         completed: _CompletedCache = {}
         if not self.local_repo_dir.is_dir():
@@ -397,41 +476,52 @@ class GitSyncManager:
                             pass
 
                     for srt in sorted(video_dir.glob("*.srt"), key=lambda p: p.name):
-                        if srt.is_file() and srt.stat().st_size > 0:
-                            track_info = parse_subtitle_track(srt)
-                            if track_info.shortcode and track_info.is_refined:
-                                completed.setdefault((video_id, track_info.shortcode), {})[uploader] = is_yt
+                        try:
+                            if not srt.is_file() or srt.stat().st_size <= 0:
+                                continue
+                        except OSError:
+                            continue
+                        track_info = parse_subtitle_track(srt)
+                        if track_info.shortcode and track_info.is_refined:
+                            completed.setdefault((video_id, track_info.shortcode), {})[uploader] = is_yt
         except Exception as e:
-            logfire.warning(f"Error rebuilding completed subtitles cache: {e}")
+            logfire.warning(f"Error rebuilding completed subtitles cache (retaining previous index): {e}")
+            return None
 
         total_entries = sum(len(uploaders) for uploaders in completed.values())
         logfire.debug(f"Rebuilt completed subtitles cache: {total_entries} entry(s).")
         return completed
 
-    def _ensure_repo_sync(self) -> _CompletedCache:
+    def _ensure_repo_sync(self) -> _CompletedCache | None:
         """Synchronous implementation of cloning or updating the local repository.
 
         Returns:
-            _CompletedCache: Freshly scanned completed subtitles cache.
+            _CompletedCache | None: Freshly scanned completed subtitles cache, or None on scan failure.
 
         Raises:
-            RuntimeError: If cloning the remote Git repository fails.
+            RuntimeError: If local_repo_dir is a non-empty non-Git directory or cloning fails.
         """
         if not self.config or self.config.repourl is None:
             return self._scan_completed_cache_sync()
 
         auth_url = self._get_authenticated_url()
+        safe_url = redact_url_credentials(str(self.config.repourl))
         branch = self.config.branch
 
         if self.local_repo_dir.exists():
             try:
                 repo = Repo(self.local_repo_dir)
             except (InvalidGitRepositoryError, NoSuchPathError) as e:
-                logfire.warning(
-                    f"Existing directory at {self.local_repo_dir} is not a valid git repo "
-                    f"({self._sanitize_error(e)}). Re-cloning..."
-                )
-                shutil.rmtree(self.local_repo_dir, onerror=_handle_readonly_rmtree)
+                if any(self.local_repo_dir.iterdir()):
+                    msg = (
+                        f"Existing directory at {self.local_repo_dir} is non-empty and not a valid git repository "
+                        f"({self._sanitize_error(e)}). Refusing to delete existing archive; "
+                        "please migrate or remove it manually."
+                    )
+                    logfire.error(msg)
+                    raise RuntimeError(msg) from e
+                logfire.info(f"Removing empty non-git directory at {self.local_repo_dir} before cloning.")
+                self.local_repo_dir.rmdir()
             else:
                 logfire.info(f"Updating existing git repo at {self.local_repo_dir}")
                 self._configure_repo(repo)
@@ -449,14 +539,13 @@ class GitSyncManager:
                         repo,
                         "Cleaning leftover uncommitted changes in local git repo before syncing.",
                     )
-
+                    self._ensure_head_on_branch(repo, branch)
                     has_unpushed, unpushed_count = self._has_unpushed_commits(repo, branch)
                     if has_unpushed:
                         logfire.warning(
                             f"Preserving {unpushed_count} unpushed local commit(s) on '{branch}'; "
                             f"rebasing onto origin/{branch}..."
                         )
-                        self._ensure_head_on_branch(repo, branch)
                         try:
                             self._pull_rebase_with_readme_resolution(repo, branch)
                         except Exception as e:
@@ -480,7 +569,7 @@ class GitSyncManager:
                 return self._scan_completed_cache_sync()
 
         self.local_repo_dir.parent.mkdir(parents=True, exist_ok=True)
-        logfire.info(f"Cloning {self.config.repourl} to {self.local_repo_dir}")
+        logfire.info(f"Cloning {safe_url} to {self.local_repo_dir}")
         try:
             repo = Repo.clone_from(auth_url, self.local_repo_dir)
             self._configure_repo(repo)
@@ -492,7 +581,7 @@ class GitSyncManager:
                 logfire.info(f"Cloned empty Git repository; initialized unborn branch '{branch}'.")
         except GitCommandError as e:
             sanitized = self._sanitize_error(e)
-            logfire.error(f"Failed to clone Git repository '{self.config.repourl}': {sanitized}")
+            logfire.error(f"Failed to clone Git repository '{safe_url}': {sanitized}")
             raise RuntimeError(f"Git clone failed: {sanitized}") from e
 
         return self._scan_completed_cache_sync()
@@ -500,10 +589,9 @@ class GitSyncManager:
     async def ensure_repo(self) -> None:
         """Clones or updates the local Git repository checkout under mutex protection."""
         if not self.config or self.config.repourl is None:
-            self._completed = await asyncio.to_thread(self._scan_completed_cache_sync)
+            await self._run_locked_thread(self._scan_completed_cache_sync, on_result=self._apply_cache_update)
             return
-        async with self._lock:
-            self._completed = await asyncio.to_thread(self._ensure_repo_sync)
+        await self._run_locked_thread(self._ensure_repo_sync, on_result=self._apply_cache_update)
 
     def is_video_completed(self, video_id: str, full_shortcode: str, uploader: str | None = None) -> bool:
         """Checks if completed subtitles for a video exist in the repository cache.
@@ -519,6 +607,8 @@ class GitSyncManager:
         uploaders = self._completed.get((video_id, full_shortcode))
         if not uploaders:
             return False
+        if uploader == "local":
+            return uploaders.get(uploader) is False
         if uploader and uploader.lower() != "youtube":
             return uploader in uploaders
         return any(uploaders.values())
@@ -767,23 +857,25 @@ class GitSyncManager:
             meta_file: Optional video metadata JSON file. Defaults to None.
 
         Returns:
-            _CacheUpdate: Completed cache delta or full scan dictionary to apply on the event loop.
+            _CacheUpdate: Completed cache delta, full scan dictionary, or None if rescan failed.
 
         Raises:
             RuntimeError: If git staging, commit, rebase, or push fails after exhausting retries.
         """
         git_enabled = bool(self.config and self.config.repourl is not None)
-        pulled = False
         repo: Repo | None = None
 
         if git_enabled:
             assert self.config is not None
             branch = self.config.branch
             if not (self.local_repo_dir / ".git").exists():
-                self._ensure_repo_sync()
+                initial_cache = self._ensure_repo_sync()
+                if initial_cache is None:
+                    self._pending_cache_rescan = True
             repo = Repo(self.local_repo_dir)
             self._configure_repo(repo)
-            pulled = self._sync_remote_before_write(repo, branch)
+            if self._sync_remote_before_write(repo, branch):
+                self._pending_cache_rescan = True
 
         uploader_dir = self.local_repo_dir / uploader
         video_dir = uploader_dir / "v" / video_id
@@ -835,7 +927,7 @@ class GitSyncManager:
         single_entry: _CacheUpdate = (video_id, full_shortcode, uploader, is_yt)
 
         if not git_enabled or repo is None or self.config is None:
-            return single_entry
+            return self._scan_completed_cache_sync() if self._pending_cache_rescan else single_entry
 
         branch = self.config.branch
         try:
@@ -858,7 +950,7 @@ class GitSyncManager:
                     logfire.warning(
                         f"No Git changes detected after staging for {video_id}.{full_shortcode}; skipping push."
                     )
-                    return self._scan_completed_cache_sync() if pulled else single_entry
+                    return self._scan_completed_cache_sync() if self._pending_cache_rescan else single_entry
         except Exception as e:
             sanitized = self._sanitize_error(e)
             logfire.error(f"Git staging/commit failed for {video_id}.{full_shortcode}: {sanitized}")
@@ -868,7 +960,7 @@ class GitSyncManager:
             try:
                 repo.git.push("-u", "origin", branch)
                 logfire.info(f"Git push succeeded to origin/{branch}.")
-                return self._scan_completed_cache_sync() if pulled else single_entry
+                return self._scan_completed_cache_sync() if self._pending_cache_rescan else single_entry
             except GitCommandError as e:
                 sanitized = self._sanitize_error(e)
                 if attempt >= 4:
@@ -884,8 +976,11 @@ class GitSyncManager:
                 try:
                     repo.git.fetch("origin", "--prune")
                     if self._remote_branch_exists(repo, branch):
+                        old_head = repo.head.commit.hexsha if self._has_head(repo) else None
                         self._pull_rebase_with_readme_resolution(repo, branch)
-                        pulled = True
+                        new_head = repo.head.commit.hexsha if self._has_head(repo) else None
+                        if new_head != old_head:
+                            self._pending_cache_rescan = True
                 except Exception as pull_err:
                     logfire.warning(f"Git fetch/rebase before push retry failed: {self._sanitize_error(pull_err)}")
 
@@ -910,14 +1005,13 @@ class GitSyncManager:
             yaml_files: List of intermediate YAML state files.
             meta_file: Optional video metadata JSON file. Defaults to None.
         """
-        async with self._lock:
-            cache_update = await asyncio.to_thread(
-                self._finalize_and_push_sync,
-                uploader,
-                video_id,
-                full_shortcode,
-                srt_files,
-                yaml_files,
-                meta_file,
-            )
-            self._apply_cache_update(cache_update)
+        await self._run_locked_thread(
+            self._finalize_and_push_sync,
+            uploader,
+            video_id,
+            full_shortcode,
+            srt_files,
+            yaml_files,
+            meta_file,
+            on_result=self._apply_cache_update,
+        )

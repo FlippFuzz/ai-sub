@@ -22,7 +22,9 @@ from ai_sub.config import (
     SplittingSettings,
     StageExecutionConfig,
     StageReencodeSettings,
+    atomic_write_text,
 )
+from ai_sub.gemini_executor import calculate_sha256_hex
 from ai_sub.jobs.job_base import AiJob, BaseJob, TaskType
 from ai_sub.jobs.lyrics import LYRICS_PROMPT_VERSION, LyricsAiResponse, LyricsJob
 from ai_sub.jobs.reencode import ReencodeJob
@@ -151,6 +153,7 @@ def _append_segment_events(
     target: SSAFile,
     resp: SubtitlesAiResponse | LyricsAiResponse | None,
     seg: SegmentState,
+    error_text: str = "Error processing subtitles for this segment.",
 ) -> None:
     """Appends time-shifted subtitle events for a segment, or an error placeholder if missing.
 
@@ -158,6 +161,7 @@ def _append_segment_events(
         target: Destination SSAFile accumulating stitched subtitle events.
         resp: Completed subtitle or lyrics response, or None if unavailable.
         seg: Segment metadata providing offset and duration.
+        error_text: Placeholder text when resp is None.
     """
     if resp is not None:
         seg_subs = resp.get_ssafile()
@@ -168,7 +172,7 @@ def _append_segment_events(
             SSAEvent(
                 start=seg.offset_ms,
                 end=seg.offset_ms + seg.duration_ms,
-                text="Error processing subtitles for this segment.",
+                text=error_text,
             )
         )
 
@@ -416,7 +420,7 @@ class Pipeline(BaseModel):
 
         Raises:
             RuntimeError: If no video segments could be created.
-            ValueError: If split offset exceeds the total video duration.
+            ValueError: If split offset exceeds or equals the total video duration.
         """
         raw_resolved = raw_video_path.resolve()
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -426,8 +430,14 @@ class Pipeline(BaseModel):
         default_stem = vid if source_type == "youtube" else raw_resolved.stem
         filename_stem = sanitize_filename(output_stem if output_stem is not None else default_stem)
 
-        # 1. Probe raw video duration
+        # 1. Probe raw video duration and validate split offset before splitting
         total_duration_ms = await get_video_duration_ms(raw_resolved)
+        start_offset_s = int(split_settings.offset.total_seconds())
+        if start_offset_s * 1000 >= total_duration_ms:
+            raise ValueError(
+                f"split.offset ({start_offset_s}s) exceeds or equals total "
+                f"video duration ({total_duration_ms / 1000:.1f}s)."
+            )
 
         # 2. Split video into uniform segments
         split_duration_s = max(1, int(split_settings.duration.total_seconds()))
@@ -446,14 +456,13 @@ class Pipeline(BaseModel):
 
         # 3. Deliberately round split.offset down to whole segment chunks (no mid-file trimming)
         # so stream-copied chunks remain aligned with uniform part_%03d segment indices.
-        start_offset_s = int(split_settings.offset.total_seconds())
         if start_offset_s > 0:
             skip_count = start_offset_s // split_duration_s
             remainder_s = start_offset_s % split_duration_s
             if skip_count >= len(all_segments):
                 raise ValueError(
-                    f"split.offset ({start_offset_s}s) exceeds or equals total "
-                    f"video duration ({total_duration_ms / 1000:.1f}s)."
+                    f"split.offset ({start_offset_s}s) skips all {len(all_segments)} segment(s) "
+                    f"for video duration ({total_duration_ms / 1000:.1f}s)."
                 )
             if remainder_s > 0:
                 logfire.info(
@@ -542,6 +551,17 @@ class Pipeline(BaseModel):
         await instance._prepare_media_states()
         return instance
 
+    def _segment_yaml_stem(self, seg: SegmentState) -> str:
+        """Returns the segment YAML checkpoint stem without the video media tag suffix.
+
+        Args:
+            seg: Target segment state.
+
+        Returns:
+            str: Segment prefix (e.g. 'part_000').
+        """
+        return seg.raw_path.stem.removesuffix(f"_{self.media_tag}")
+
     def _restore_failure_state(
         self,
         job: AiJob,
@@ -567,7 +587,7 @@ class Pipeline(BaseModel):
 
         Deliberately preserves existing checkpoints when only `user_context` or `agentic_video`
         changes between runs; invalidation is scoped to prompt versions, stage model names,
-        and upstream stage outputs.
+        source video identity/duration, segment boundaries, and upstream stage outputs.
         """
         summary_fallbacks = self.reencode_settings.summary.fallback.attempts
         segment_fallbacks = self.reencode_settings.segment.fallback.attempts
@@ -580,6 +600,11 @@ class Pipeline(BaseModel):
                     f"Model mismatch for summary (file: {loaded_summary.model_name}, "
                     f"current: {self.summary_config.model}). Re-processing."
                 )
+                loaded_summary = None
+            elif loaded_summary and (
+                loaded_summary.media_tag != self.media_tag or loaded_summary.video_duration_ms != self.duration_ms
+            ):
+                logfire.info(f"Source video mismatch for summary checkpoint ({summary_file.name}). Re-processing.")
                 loaded_summary = None
 
             if loaded_summary:
@@ -606,18 +631,26 @@ class Pipeline(BaseModel):
         expected_summary_dump = _content_dump(self.summary.response) if self.summary_enabled else None
 
         for seg in self.segments:
-            sub_file = self.job_dir / f"{seg.raw_path.stem}.subtitles.{self.subtitles_shortcode}.yaml"
+            yaml_stem = self._segment_yaml_stem(seg)
+            sub_file = self.job_dir / f"{yaml_stem}.subtitles.{self.subtitles_shortcode}.yaml"
             loaded_sub = SubtitlesJob.load(sub_file, self.validation_buffer_ms)
             if not loaded_sub:
                 continue
             if loaded_sub.model_name != self.subtitles_config.model:
                 logfire.info(
-                    f"Model mismatch for {seg.raw_path.stem} subtitles "
+                    f"Model mismatch for {yaml_stem} subtitles "
                     f"(file: {loaded_sub.model_name}, current: {self.subtitles_config.model}). Re-processing."
                 )
                 continue
+            if (
+                loaded_sub.media_tag != self.media_tag
+                or loaded_sub.video_duration_ms != seg.duration_ms
+                or loaded_sub.segment_offset_ms != seg.offset_ms
+            ):
+                logfire.info(f"Segment boundary or source mismatch for {yaml_stem} subtitles. Re-processing.")
+                continue
             if self.summary_enabled and _content_dump(loaded_sub.global_summary) != expected_summary_dump:
-                logfire.info(f"Upstream summary changed for {seg.raw_path.stem}. Re-processing subtitles.")
+                logfire.info(f"Upstream summary changed for {yaml_stem}. Re-processing subtitles.")
                 continue
 
             seg.subtitles_total_attempts = loaded_sub.total_attempts
@@ -628,24 +661,29 @@ class Pipeline(BaseModel):
                 seg.target_fps = loaded_sub.target_fps
 
                 if self.segment_needs_lyrics(seg):
-                    lyr_file = self.job_dir / f"{seg.raw_path.stem}.lyrics.{self.lyrics_shortcode}.yaml"
+                    lyr_file = self.job_dir / f"{yaml_stem}.lyrics.{self.lyrics_shortcode}.yaml"
                     loaded_lyr = LyricsJob.load(lyr_file, self.validation_buffer_ms)
                     if not loaded_lyr:
                         continue
                     if loaded_lyr.model_name != self.lyrics_config.model:
                         logfire.info(
-                            f"Model mismatch for {seg.raw_path.stem} lyrics "
+                            f"Model mismatch for {yaml_stem} lyrics "
                             f"(file: {loaded_lyr.model_name}, current: {self.lyrics_config.model}). Re-processing."
                         )
+                        continue
+                    if (
+                        loaded_lyr.media_tag != self.media_tag
+                        or loaded_lyr.video_duration_ms != seg.duration_ms
+                        or loaded_lyr.segment_offset_ms != seg.offset_ms
+                    ):
+                        logfire.info(f"Segment boundary or source mismatch for {yaml_stem} lyrics. Re-processing.")
                         continue
                     if (
                         loaded_lyr.draft_subtitles != loaded_sub.response.subtitles
                         or loaded_lyr.detected_performances != loaded_sub.response.detected_musical_performances
                         or (self.summary_enabled and _content_dump(loaded_lyr.global_summary) != expected_summary_dump)
                     ):
-                        logfire.info(
-                            f"Upstream subtitles or summary changed for {seg.raw_path.stem}. Re-processing lyrics."
-                        )
+                        logfire.info(f"Upstream subtitles or summary changed for {yaml_stem}. Re-processing lyrics.")
                         continue
 
                     seg.lyrics_total_attempts = loaded_lyr.total_attempts
@@ -674,31 +712,53 @@ class Pipeline(BaseModel):
         """
         return self.segment_subtitles_concluded(seg) and self.segment_lyrics_concluded(seg)
 
-    def _link_raw_summary_proxy(self) -> Path:
-        """Links or copies the raw video to a managed 'summary_<tag>' path for Gemini Files cleanup.
+    async def _link_raw_summary_proxy(self) -> Path:
+        """Links or copies the raw video to a managed 'summary_<tag>' path, verifying file identity.
 
         Returns:
-            Path: Path to the linked or copied summary proxy file.
+            Path: Path to the validated linked or copied summary proxy file.
         """
         proxy_path = self.job_dir / f"summary_{self.media_tag}{self.raw_video_path.suffix}"
+        sidecar_path = proxy_path.with_name(f".{proxy_path.name}.sha256")
+
         if proxy_path.is_symlink() and not proxy_path.exists():
+            proxy_path.unlink(missing_ok=True)
+        elif proxy_path.is_file():
+            is_same = False
             try:
-                proxy_path.unlink()
+                is_same = os.path.samefile(proxy_path, self.raw_video_path)
             except OSError:
-                pass
-        elif proxy_path.is_file() and proxy_path.stat().st_size != self.raw_video_path.stat().st_size:
-            try:
-                proxy_path.unlink()
-            except OSError:
-                pass
-        if not proxy_path.is_file():
-            try:
-                os.link(self.raw_video_path, proxy_path)
-            except OSError:
+                is_same = False
+
+            if is_same:
+                sidecar_path.unlink(missing_ok=True)
+                return proxy_path
+
+            if sidecar_path.is_file() and proxy_path.stat().st_size == self.raw_video_path.stat().st_size:
                 try:
-                    os.symlink(self.raw_video_path, proxy_path)
+                    recorded_hash = sidecar_path.read_text(encoding="utf-8").strip()
+                    raw_hash, proxy_hash = await asyncio.gather(
+                        asyncio.to_thread(calculate_sha256_hex, self.raw_video_path),
+                        asyncio.to_thread(calculate_sha256_hex, proxy_path),
+                    )
+                    if recorded_hash and recorded_hash == raw_hash and proxy_hash == raw_hash:
+                        return proxy_path
                 except OSError:
-                    shutil.copyfile(self.raw_video_path, proxy_path)
+                    pass
+
+            proxy_path.unlink(missing_ok=True)
+            sidecar_path.unlink(missing_ok=True)
+
+        try:
+            os.link(self.raw_video_path, proxy_path)
+        except OSError:
+            try:
+                os.symlink(self.raw_video_path, proxy_path)
+            except OSError:
+                raw_hash = await asyncio.to_thread(calculate_sha256_hex, self.raw_video_path)
+                await asyncio.to_thread(shutil.copyfile, self.raw_video_path, proxy_path)
+                atomic_write_text(sidecar_path, raw_hash)
+
         return proxy_path
 
     async def _validate_encoded_media(
@@ -743,7 +803,7 @@ class Pipeline(BaseModel):
                 )
                 self.summary.target_fps = desired_sum_fps
                 if desired_sum_fps is None:
-                    self.summary.media_path = self._link_raw_summary_proxy()
+                    self.summary.media_path = await self._link_raw_summary_proxy()
                     self.summary.media_ready = True
                 else:
                     self.summary.media_path, self.summary.media_ready = await self._validate_encoded_media(
@@ -912,6 +972,7 @@ class Pipeline(BaseModel):
             return SummaryJob(
                 name="summary",
                 video_duration_ms=self.duration_ms,
+                media_tag=self.media_tag,
                 user_context=self.user_context,
                 model_name=self.summary_config.model,
                 service_tier=self.summary_config.tier,
@@ -926,8 +987,9 @@ class Pipeline(BaseModel):
 
         assert seg is not None
         common_seg: dict[str, Any] = {
-            "name": seg.raw_path.stem,
+            "name": self._segment_yaml_stem(seg),
             "video_duration_ms": seg.duration_ms,
+            "media_tag": self.media_tag,
             "segment_offset_ms": seg.offset_ms,
             "global_summary": self.summary.response,
             "user_context": self.user_context,
@@ -1009,7 +1071,7 @@ class Pipeline(BaseModel):
             if not self._is_segment_ai_concluded(seg) and not seg.media_ready and seg.target_fps is not None:
                 jobs.append(
                     ReencodeJob(
-                        name=f"{seg.raw_path.stem}_reencode",
+                        name=f"{self._segment_yaml_stem(seg)}_reencode",
                         input_file=seg.raw_path,
                         output_file=self.job_dir / f"reencoded_{seg.raw_path.stem}.mp4",
                         fps=seg.target_fps,
@@ -1055,10 +1117,11 @@ class Pipeline(BaseModel):
             return
 
         assert seg is not None
+        yaml_stem = self._segment_yaml_stem(seg)
         if task_type == TaskType.SUBTITLES:
-            job.save(self.job_dir / f"{seg.raw_path.stem}.subtitles.{self.subtitles_shortcode}.yaml")
+            job.save(self.job_dir / f"{yaml_stem}.subtitles.{self.subtitles_shortcode}.yaml")
         elif task_type == TaskType.LYRICS:
-            job.save(self.job_dir / f"{seg.raw_path.stem}.lyrics.{self.lyrics_shortcode}.yaml")
+            job.save(self.job_dir / f"{yaml_stem}.lyrics.{self.lyrics_shortcode}.yaml")
 
     async def _advance_or_exhaust_stage(
         self,
@@ -1091,7 +1154,7 @@ class Pipeline(BaseModel):
             cfg = self.reencode_settings.segment
             source_path = seg.raw_path
             tier_attempts = seg.subtitles_tier_attempts
-            label = f"Subtitles for '{seg.raw_path.stem}'"
+            label = f"Subtitles for '{self._segment_yaml_stem(seg)}'"
 
         current_tier = media_state.fallback_tier
         current_target = media_state.target_fps
@@ -1197,7 +1260,7 @@ class Pipeline(BaseModel):
             return FailureOutcome(action="ignored")
 
         if job.fallback_tier == 0:
-            media_state.media_path = self._link_raw_summary_proxy() if job.is_summary_proxy else job.input_file
+            media_state.media_path = await self._link_raw_summary_proxy() if job.is_summary_proxy else job.input_file
             media_state.media_ready = True
             media_state.target_fps = None
             return FailureOutcome(action="retry")
@@ -1210,7 +1273,10 @@ class Pipeline(BaseModel):
         result_data: Any,
         segment_index: int | None = None,
     ) -> None:
-        """Validates AI output, persists YAML checkpoints, and advances unit state.
+        """Validates AI output, persists YAML checkpoints atomically, and advances unit state.
+
+        Restores previous in-memory fields if saving the checkpoint fails so state remains
+        consistent and completion stays retryable.
 
         Args:
             task_type: Completed AI stage type (SUMMARY, SUBTITLES, or LYRICS).
@@ -1229,10 +1295,15 @@ class Pipeline(BaseModel):
                 if isinstance(result_data, SummaryAiResponse)
                 else SummaryAiResponse.model_validate(result_data, context=val_ctx)
             )
+            prev = (self.summary.response, self.summary.exhausted, self.summary.total_attempts)
             self.summary.response = resp
             self.summary.exhausted = False
             self.summary.total_attempts += 1
-            self._save_checkpoint(TaskType.SUMMARY)
+            try:
+                self._save_checkpoint(TaskType.SUMMARY)
+            except Exception:
+                self.summary.response, self.summary.exhausted, self.summary.total_attempts = prev
+                raise
             return
 
         if segment_index is None:
@@ -1242,14 +1313,20 @@ class Pipeline(BaseModel):
         val_ctx["video_duration_ms"] = seg.duration_ms
 
         if task_type == TaskType.SUBTITLES:
-            seg.subtitles_response = (
+            sub_resp = (
                 result_data
                 if isinstance(result_data, SubtitlesAiResponse)
                 else SubtitlesAiResponse.model_validate(result_data, context=val_ctx)
             )
+            prev_sub = (seg.subtitles_response, seg.subtitles_exhausted, seg.subtitles_total_attempts)
+            seg.subtitles_response = sub_resp
             seg.subtitles_exhausted = False
             seg.subtitles_total_attempts += 1
-            self._save_checkpoint(TaskType.SUBTITLES, seg)
+            try:
+                self._save_checkpoint(TaskType.SUBTITLES, seg)
+            except Exception:
+                seg.subtitles_response, seg.subtitles_exhausted, seg.subtitles_total_attempts = prev_sub
+                raise
         elif task_type == TaskType.LYRICS:
             require_subtitles = bool(seg.subtitles_response and seg.subtitles_response.subtitles)
             val_ctx["require_subtitles"] = require_subtitles
@@ -1260,10 +1337,15 @@ class Pipeline(BaseModel):
             )
             if require_subtitles and not lyr_resp.subtitles:
                 raise ValueError("Refined lyrics output cannot be empty when draft subtitles exist.")
+            prev_lyr = (seg.lyrics_response, seg.lyrics_exhausted, seg.lyrics_total_attempts)
             seg.lyrics_response = lyr_resp
             seg.lyrics_exhausted = False
             seg.lyrics_total_attempts += 1
-            self._save_checkpoint(TaskType.LYRICS, seg)
+            try:
+                self._save_checkpoint(TaskType.LYRICS, seg)
+            except Exception:
+                seg.lyrics_response, seg.lyrics_exhausted, seg.lyrics_total_attempts = prev_lyr
+                raise
 
     def complete_job(self, job: BaseJob, result_data: Any) -> None:
         """Completes a typed Job instance returned by get_pending_jobs().
@@ -1337,8 +1419,8 @@ class Pipeline(BaseModel):
                 seg.lyrics_exhausted = True
                 self._save_checkpoint(TaskType.LYRICS, seg)
                 logfire.error(
-                    f"Lyrics for '{seg.raw_path.stem}' exhausted all {max_runs} run(s); "
-                    "falling back to draft subtitles."
+                    f"Lyrics for '{self._segment_yaml_stem(seg)}' exhausted all {max_runs} run(s); "
+                    "emitting error in refined SRT while preserving raw subtitles."
                 )
                 return FailureOutcome(
                     action="exhausted",
@@ -1441,8 +1523,9 @@ class Pipeline(BaseModel):
     ) -> list[Path]:
         """Stitches all segment responses into synchronized SRT files with timeline offset shifting.
 
-        When lyrics refinement is required but fails or is unavailable, the primary output
-        falls back to the completed draft subtitles rather than emitting an error placeholder.
+        When lyrics refinement is required but fails or is unavailable, the refined output emits
+        an error placeholder for affected segments while still writing the raw subtitle track so
+        users can switch tracks in the player.
 
         Args:
             output_primary_path: Destination path for primary SRT file. Defaults to auto-generated path in job_dir.
@@ -1472,21 +1555,27 @@ class Pipeline(BaseModel):
 
         all_subs = SSAFile()
         raw_subs = SSAFile() if raw_path is not None else None
-        lyrics_refined_any = False
+        lyrics_needed_any = False
 
         for seg in self.segments:
             sub_resp = seg.subtitles_response
             lyr_resp = seg.lyrics_response
             lyrics_required = self.segment_needs_lyrics(seg)
 
-            active_resp: SubtitlesAiResponse | LyricsAiResponse | None = None
-            if lyrics_required and lyr_resp is not None and lyr_resp.subtitles:
-                active_resp = lyr_resp
-                lyrics_refined_any = True
-            elif sub_resp is not None:
-                active_resp = sub_resp
+            if lyrics_required:
+                lyrics_needed_any = True
+                active_resp: SubtitlesAiResponse | LyricsAiResponse | None = (
+                    lyr_resp if (lyr_resp is not None and lyr_resp.subtitles) else None
+                )
+                _append_segment_events(
+                    all_subs,
+                    active_resp,
+                    seg,
+                    error_text="Error refining lyrics for this segment.",
+                )
+            else:
+                _append_segment_events(all_subs, sub_resp, seg)
 
-            _append_segment_events(all_subs, active_resp, seg)
             if raw_subs is not None:
                 _append_segment_events(raw_subs, sub_resp, seg)
 
@@ -1508,7 +1597,7 @@ class Pipeline(BaseModel):
         all_subs.save(str(primary_path))
         generated_files.append(primary_path)
 
-        if lyrics_refined_any and raw_subs is not None and raw_path is not None:
+        if lyrics_needed_any and raw_subs is not None and raw_path is not None:
             _apply_metadata_header(raw_subs, metadata)
             raw_path.parent.mkdir(parents=True, exist_ok=True)
             raw_subs.save(str(raw_path))

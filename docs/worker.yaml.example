@@ -9,7 +9,7 @@ serverauth: "worker_user:your_secure_password"
 # id: "test-worker-1"          # Defaults to SHA-256 hash of hostname if omitted
 
 # Concurrency & Work Limits
-concurrency: 2                 # Concurrent task slots per model (e.g. 2 slots x 3 models = 6 total)
+concurrency: 2                 # Concurrent task slots per model (e.g. 2 slots x 4 models = 8 total)
 idletimeout: 900               # Seconds all slots must remain idle before exiting (0 exits immediately)
 pollinterval: 180              # Seconds between poll attempts when a slot has no tasks
 maxduration: 0                 # Exit after N seconds, draining active tasks (0 disables)
@@ -18,6 +18,7 @@ heartbeatinterval: 30          # Seconds between lease heartbeat pings
 
 # Gemini Models Supported by This Worker
 models:
+  - "gemini-4-hydrogen"
   - "gemini-3.8-flash"
   - "gemini-3.6-flash"
   - "gemini-3.5-flash-lite"
