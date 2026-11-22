@@ -360,10 +360,6 @@ class AiJob(BaseJob):
         default=None,
         description="Segment index if applicable.",
     )
-    total_attempts: NonNegativeInt = Field(
-        default=0,
-        description="Cumulative processing attempts recorded across all executions and FPS tiers.",
-    )
     fallback_tier: NonNegativeInt = Field(
         default=0,
         description="Fallback re-encoding tier index (0 = initial run, 1+ = fallback FPS tier).",

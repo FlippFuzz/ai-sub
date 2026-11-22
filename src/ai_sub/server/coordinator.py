@@ -29,6 +29,18 @@ from ai_sub.telemetry import get_app_version
 _PUSH_RETRY_COOLDOWN_S = 60.0
 
 
+def _escape_sql_literal(value: str) -> str:
+    """Escapes single quotes for SQL string literals.
+
+    Args:
+        value: Raw string value.
+
+    Returns:
+        str: SQL-escaped string content without surrounding quotes.
+    """
+    return value.replace("'", "''")
+
+
 def _format_logfire_query(task: ServerTask) -> str:
     """Formats the Logfire search query for a server task using its unique task ID.
 
@@ -38,8 +50,40 @@ def _format_logfire_query(task: ServerTask) -> str:
     Returns:
         str: Formatted Logfire search query string.
     """
-    escaped = task.task_id.replace("'", "''")
-    return f"attributes->>'task_id' = '{escaped}'"
+    return f"attributes->>'task_id' = '{_escape_sql_literal(task.task_id)}'"
+
+
+def _format_chunk_logfire_query(*tasks: ServerTask | None) -> str | None:
+    """Formats a Logfire search query matching all existing tasks for a chunk.
+
+    Args:
+        *tasks: Candidate ServerTask instances associated with the chunk.
+
+    Returns:
+        str | None: Formatted Logfire search query string, or None if no tasks exist.
+    """
+    existing = [t for t in tasks if t is not None]
+    if not existing:
+        return None
+    if len(existing) == 1:
+        return _format_logfire_query(existing[0])
+    quoted = ", ".join(f"'{_escape_sql_literal(t.task_id)}'" for t in existing)
+    return f"attributes->>'task_id' IN ({quoted})"
+
+
+def _plural(count: int, singular: str, plural: str | None = None) -> str:
+    """Formats a count with singular or plural noun inflection.
+
+    Args:
+        count: Numeric count.
+        singular: Singular noun form.
+        plural: Optional irregular plural form (defaults to '<singular>s').
+
+    Returns:
+        str: Formatted '<count> <noun>' string.
+    """
+    word = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {word}"
 
 
 def is_valid_video_id(video_id: str) -> bool:
@@ -95,14 +139,14 @@ def _build_completion_detail(task_type: TaskType, result: dict[str, Any]) -> str
     if task_type == TaskType.SUMMARY:
         ch_len = len(result.get("chapters", []))
         ent_len = len(result.get("entities", []))
-        return f"Summary: {ch_len} chapters, {ent_len} entities extracted"
+        return f"Summary: {_plural(ch_len, 'chapter')}, {_plural(ent_len, 'entity', 'entities')} extracted"
     if task_type == TaskType.SUBTITLES:
         sub_len = len(result.get("subs", result.get("subtitles", [])))
         music_len = len(result.get("detected_musical_performances", []))
-        return f"Subtitles: {sub_len} lines transcribed ({music_len} songs detected)"
+        return f"Subtitles: {_plural(sub_len, 'line')} transcribed ({_plural(music_len, 'song')} detected)"
     if task_type == TaskType.LYRICS:
         lyr_len = len(result.get("subs", result.get("subtitles", [])))
-        return f"Lyrics: {lyr_len} lines refined"
+        return f"Lyrics: {_plural(lyr_len, 'line')} refined"
     return None
 
 
@@ -224,7 +268,6 @@ def _build_segment_info(
     sub_claimed = sub_task is not None and sub_task.status == TaskStatus.CLAIMED
     lyr_claimed = lyr_task is not None and lyr_task.status == TaskStatus.CLAIMED
     active_task = sub_task if sub_claimed else (lyr_task if lyr_claimed else None)
-    relevant_task = active_task or lyr_task or sub_task
 
     matrix_status, sub_status, lyr_status = _get_segment_statuses(
         pipe=pipe,
@@ -261,18 +304,16 @@ def _build_segment_info(
         "max_fallback_tiers": max_segment_fallbacks,
         "subtitles_status": sub_status,
         "subtitles_tier_attempts": seg.subtitles_tier_attempts,
-        "subtitles_total_attempts": seg.subtitles_total_attempts,
         "subtitles_line_count": sub_line_count,
         "detected_songs": detected_songs,
         "lyrics_status": lyr_status,
         "lyrics_tier_attempts": seg.lyrics_tier_attempts,
-        "lyrics_total_attempts": seg.lyrics_total_attempts,
         "lyrics_line_count": lyr_line_count,
         "max_runs": max_runs,
         "active_task_type": active_task.task_type.value if active_task else None,
         "active_worker_id": active_task.worker_id if active_task else None,
         "active_elapsed_s": int(now - active_task.claimed_at) if active_task and active_task.claimed_at else None,
-        "logfire_query": _format_logfire_query(relevant_task) if relevant_task else None,
+        "logfire_query": _format_chunk_logfire_query(sub_task, lyr_task),
     }
 
 
@@ -942,6 +983,93 @@ class ComboRunnersCoordinator:
             fail_span.set_attribute("result", task.status.value)
             return success
 
+    @staticmethod
+    def _prepare_probe_context(
+        runner: ComboRunner,
+        task: ServerTask,
+    ) -> tuple[tuple[Path, Path | None], int, int | None] | None:
+        """Captures off-lock probe paths, claim generation, and stage tier while refreshing heartbeat.
+
+        Args:
+            runner: Owning ComboRunner instance.
+            task: Claimed ServerTask instance.
+
+        Returns:
+            tuple[tuple[Path, Path | None], int, int | None] | None:
+                (probe_paths, claim_generation, current_tier) if probing is needed, else None.
+        """
+        if runner.pipeline is None:
+            return None
+        probe_paths = runner.pipeline.get_fallback_probe_paths(task.task_type, task.segment_index)
+        if probe_paths is None:
+            return None
+        expected_tier = _get_stage_tier(runner.pipeline, task)
+        # Refresh heartbeat so the lease sweeper does not reclaim the task while probing off-lock
+        task.last_heartbeat = time()
+        return probe_paths, task.claim_generation, expected_tier
+
+    async def _fail_task_with_probe(
+        self,
+        task_id: str,
+        worker_id: str,
+        action: str,
+        reason: str,
+        error_message: str | None,
+        is_retryable: bool,
+        probe_ctx: tuple[tuple[Path, Path | None], int, int | None],
+        with_span: bool,
+    ) -> bool:
+        """Probes keyframe FPS off-lock, re-verifies lease ownership, and records task failure.
+
+        Args:
+            task_id: Unique task identifier.
+            worker_id: Worker reporting the failure.
+            action: Operation label for stale-probe rejection logs.
+            reason: Error code or exception description.
+            error_message: Optional error details.
+            is_retryable: Whether failure is retryable.
+            probe_ctx: Tuple of (probe_paths, expected_generation, expected_tier).
+            with_span: Whether to wrap failure recording in a Logfire span.
+
+        Returns:
+            bool: True if failure was recorded, False if the lease or tier became stale while probing.
+        """
+        probe_paths, expected_generation, expected_tier = probe_ctx
+        fallback_base_fps = await probe_keyframe_base_fps(*probe_paths)
+
+        async with self._lock:
+            claimed = self._get_claimed_task(
+                task_id,
+                worker_id,
+                action=action,
+                expected_generation=expected_generation,
+            )
+            if not claimed:
+                return False
+
+            runner, task = claimed
+            if runner.pipeline is None or _get_stage_tier(runner.pipeline, task) != expected_tier:
+                logfire.warning(f"Discarding stale {action.lower()} probe for '{task_id}': stage tier changed.")
+                return False
+
+            if with_span:
+                return await self._record_fail_with_span(
+                    task=task,
+                    worker_id=worker_id,
+                    reason=reason,
+                    error_message=error_message,
+                    is_retryable=is_retryable,
+                    fallback_base_fps=fallback_base_fps,
+                )
+            return await self._fail_task_locked(
+                task=task,
+                worker_id=worker_id,
+                reason=reason,
+                error_message=error_message,
+                is_retryable=is_retryable,
+                fallback_base_fps=fallback_base_fps,
+            )
+
     async def complete_task(
         self,
         task_id: str,
@@ -965,10 +1093,8 @@ class ComboRunnersCoordinator:
         Raises:
             OSError: If saving the durable YAML checkpoint fails on disk.
         """
-        probe_paths: tuple[Path, Path | None] | None = None
+        probe_ctx: tuple[tuple[Path, Path | None], int, int | None] | None = None
         val_error_msg: str | None = None
-        expected_generation: int | None = None
-        expected_tier: int | None = None
 
         async with self._lock:
             claimed = self._get_claimed_task(task_id, worker_id, action="Completion")
@@ -991,9 +1117,8 @@ class ComboRunnersCoordinator:
                     comp_span.set_attribute("result", "validation_failed")
                     comp_span.set_attribute("error", str(val_err))
                     val_error_msg = f"Server validation error: {val_err}"
-                    if runner.pipeline is not None:
-                        probe_paths = runner.pipeline.get_fallback_probe_paths(task.task_type, task.segment_index)
-                    if probe_paths is None:
+                    probe_ctx = self._prepare_probe_context(runner, task)
+                    if probe_ctx is None:
                         await self._fail_task_locked(
                             task=task,
                             worker_id=worker_id,
@@ -1002,11 +1127,6 @@ class ComboRunnersCoordinator:
                             is_retryable=False,
                         )
                         return False
-                    expected_generation = task.claim_generation
-                    assert runner.pipeline is not None
-                    expected_tier = _get_stage_tier(runner.pipeline, task)
-                    # Refresh heartbeat so the lease sweeper does not reclaim the task while probing off-lock
-                    task.last_heartbeat = time()
                 else:
                     self._log_activity(
                         event_type="complete",
@@ -1020,31 +1140,18 @@ class ComboRunnersCoordinator:
                     logfire.info(f"Task '{task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
                     return True
 
-        assert probe_paths is not None and val_error_msg is not None
-        fallback_base_fps = await probe_keyframe_base_fps(*probe_paths)
-
-        async with self._lock:
-            claimed = self._get_claimed_task(
-                task_id,
-                worker_id,
-                action="Validation failure",
-                expected_generation=expected_generation,
-            )
-            if not claimed:
-                return False
-            runner, task = claimed
-            if runner.pipeline is None or _get_stage_tier(runner.pipeline, task) != expected_tier:
-                logfire.warning(f"Discarding stale validation failure probe for '{task_id}': stage tier changed.")
-                return False
-            await self._fail_task_locked(
-                task=task,
-                worker_id=worker_id,
-                reason="EXECUTION_ERROR",
-                error_message=val_error_msg,
-                is_retryable=False,
-                fallback_base_fps=fallback_base_fps,
-            )
-            return False
+        assert probe_ctx is not None and val_error_msg is not None
+        await self._fail_task_with_probe(
+            task_id=task_id,
+            worker_id=worker_id,
+            action="Validation failure",
+            reason="EXECUTION_ERROR",
+            error_message=val_error_msg,
+            is_retryable=False,
+            probe_ctx=probe_ctx,
+            with_span=False,
+        )
+        return False
 
     async def fail_task(
         self,
@@ -1075,12 +1182,8 @@ class ComboRunnersCoordinator:
                 return False
 
             runner, task = claimed
-            probe_paths = (
-                runner.pipeline.get_fallback_probe_paths(task.task_type, task.segment_index)
-                if not is_retryable and runner.pipeline is not None
-                else None
-            )
-            if probe_paths is None:
+            probe_ctx = self._prepare_probe_context(runner, task) if not is_retryable else None
+            if probe_ctx is None:
                 return await self._record_fail_with_span(
                     task=task,
                     worker_id=worker_id,
@@ -1089,37 +1192,17 @@ class ComboRunnersCoordinator:
                     is_retryable=is_retryable,
                     fallback_base_fps=None,
                 )
-            expected_generation = task.claim_generation
-            assert runner.pipeline is not None
-            expected_tier = _get_stage_tier(runner.pipeline, task)
-            # Refresh heartbeat so the lease sweeper does not reclaim the task while probing off-lock
-            task.last_heartbeat = time()
 
-        fallback_base_fps = await probe_keyframe_base_fps(*probe_paths)
-
-        async with self._lock:
-            claimed = self._get_claimed_task(
-                task_id,
-                worker_id,
-                action="Failure report",
-                expected_generation=expected_generation,
-            )
-            if not claimed:
-                return False
-
-            runner, task = claimed
-            if runner.pipeline is None or _get_stage_tier(runner.pipeline, task) != expected_tier:
-                logfire.warning(f"Discarding stale failure probe for '{task_id}': stage tier changed.")
-                return False
-
-            return await self._record_fail_with_span(
-                task=task,
-                worker_id=worker_id,
-                reason=reason,
-                error_message=error_message,
-                is_retryable=is_retryable,
-                fallback_base_fps=fallback_base_fps,
-            )
+        return await self._fail_task_with_probe(
+            task_id=task_id,
+            worker_id=worker_id,
+            action="Failure report",
+            reason=reason,
+            error_message=error_message,
+            is_retryable=is_retryable,
+            probe_ctx=probe_ctx,
+            with_span=True,
+        )
 
     def get_task_media_path(self, task_id: str) -> Path | None:
         """Retrieves the local media file path for an active task.

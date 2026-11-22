@@ -131,9 +131,9 @@
         border: 1px solid rgba(234, 179, 8, 0.55);
       }
       .badge-encoding {
-        background: rgba(6, 182, 212, 0.25);
-        color: #67e8f9;
-        border: 1px solid rgba(6, 182, 212, 0.55);
+        background: rgba(99, 102, 241, 0.25);
+        color: #a5b4fc;
+        border: 1px solid rgba(99, 102, 241, 0.55);
       }
       .badge-pending,
       .badge-idle,
@@ -269,26 +269,6 @@
         border-left: 3px solid var(--amber);
         color: #fcd34d;
       }
-      .detail-query-bar {
-        margin-top: 10px;
-        padding-top: 10px;
-        border-top: 1px solid rgba(255, 255, 255, 0.08);
-        display: flex;
-        flex-wrap: wrap;
-        align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-        font-size: 11px;
-        color: var(--muted);
-      }
-      .detail-query-code {
-        color: #7dd3fc;
-        background: #0b1120;
-        padding: 4px 8px;
-        border-radius: 4px;
-        border: 1px solid var(--border);
-        word-break: break-all;
-      }
       .video-title-link {
         color: inherit;
         text-decoration: none;
@@ -412,9 +392,9 @@
         border: 1px solid #64748b;
       }
       .chunk-lyrics_pending {
-        background: rgba(168, 85, 247, 0.16);
-        color: #d8b4fe;
-        border: 1px dashed rgba(168, 85, 247, 0.65);
+        background: rgba(236, 72, 153, 0.18);
+        color: #f9a8d4;
+        border: 1px dashed rgba(236, 72, 153, 0.65);
       }
       .fallback-dot {
         position: absolute;
@@ -571,6 +551,12 @@
       const getActivityEventId = (a, idx) =>
         a.event_id || `${a.task_id}::${a.timestamp}::${idx}`
 
+      const resolveAttempt = (isActiveOrDone, tierAttempts, maxRuns) =>
+        Math.min(
+          maxRuns,
+          Math.max(0, isActiveOrDone ? tierAttempts + 1 : tierAttempts),
+        )
+
       function formatDuration(sec) {
         if (sec == null || sec <= 0) return "0s"
         const sNum = Math.floor(Number(sec))
@@ -580,6 +566,16 @@
         if (h > 0) return `${h}h ${m}m ${s}s`
         if (m > 0) return `${m}m ${s}s`
         return `${s}s`
+      }
+
+      function formatTimestamp(sec, includeHours = false) {
+        const total = Math.max(0, Math.floor(Number(sec) || 0))
+        const h = Math.floor(total / 3600)
+        const m = Math.floor((total % 3600) / 60)
+        const s = total % 60
+        const pad = (n) => String(n).padStart(2, "0")
+        if (includeHours || h > 0) return `${pad(h)}:${pad(m)}:${pad(s)}`
+        return `${pad(m)}:${pad(s)}`
       }
 
       function formatActivityDuration(sec) {
@@ -627,9 +623,13 @@
           : inner
       }
 
-      const queryButton = (query, label = "Copy Query 📋") =>
+      const queryButton = (
+        query,
+        label = "Copy Query 📋",
+        title = "Click to copy Logfire query",
+      ) =>
         query
-          ? `<button type="button" class="btn btn-sm mono" data-query="${esc(query)}" onclick="copyQueryFromData(this)">${esc(label)}</button>`
+          ? `<button type="button" class="btn btn-sm mono" data-query="${esc(query)}" onclick="copyQueryFromData(this)" title="${esc(title)}">${esc(label)}</button>`
           : ""
 
       function syncUrlState() {
@@ -829,16 +829,11 @@
 
       function renderChunkInspector(pipeName, seg) {
         const startS = Math.floor((seg.offset_ms || 0) / 1000)
-        const durS = Math.floor((seg.duration_ms || 0) / 1000)
-        const windowText = `${formatDuration(startS)} – ${formatDuration(startS + durS)} (${formatDuration(durS)})`
+        const endS = startS + Math.floor((seg.duration_ms || 0) / 1000)
+        const useHours = endS >= 3600
+        const windowText = `${formatTimestamp(startS, useHours)} – ${formatTimestamp(endS, useHours)}`
 
         const fpsText = formatFps(seg.target_fps)
-        const encodingTier =
-          seg.fallback_tier > 0
-            ? `Fallback Tier ${seg.fallback_tier}/${seg.max_fallback_tiers} (${fpsText})`
-            : seg.target_fps == null
-              ? fpsText
-              : `Base (${fpsText})`
         const mediaState = seg.is_encoding
           ? "Compressing locally"
           : seg.media_ready
@@ -851,6 +846,12 @@
             : seg.subtitles_line_count != null
               ? `Completed (${seg.subtitles_line_count} line${seg.subtitles_line_count === 1 ? "" : "s"})`
               : titleCase(seg.subtitles_status)
+
+        const subAttempt = resolveAttempt(
+          ["completed", "in_progress"].includes(seg.subtitles_status),
+          seg.subtitles_tier_attempts,
+          seg.max_runs,
+        )
 
         const lyrDetail =
           seg.active_task_type === "lyrics" && seg.active_worker_id
@@ -868,7 +869,12 @@
 
         const showLyrAttempts =
           !["waiting", "skipped", "disabled"].includes(seg.lyrics_status) ||
-          seg.lyrics_total_attempts > 0
+          seg.lyrics_tier_attempts > 0
+        const lyrAttempt = resolveAttempt(
+          ["completed", "in_progress"].includes(seg.lyrics_status),
+          seg.lyrics_tier_attempts,
+          seg.max_runs,
+        )
 
         const songsHtml =
           seg.subtitles_line_count == null
@@ -894,25 +900,25 @@
                 <span class="mono muted">${esc(windowText)}</span>
               </div>
               <div style="display:flex; align-items:center; gap:6px;">
-                ${queryButton(seg.logfire_query)}
+                ${queryButton(seg.logfire_query, "Copy Chunk Query 📋", "Click to copy Logfire query for this chunk")}
                 <button type="button" class="btn btn-sm" data-pipeline="${esc(pipeName)}" onclick="closeInspector(this)" title="Close chunk details">✕</button>
               </div>
             </div>
             <div class="inspector-grid">
               <div>
                 <div class="section-kicker">Encoding &amp; Media</div>
-                <div>${esc(encodingTier)}</div>
+                <div>${esc(fpsText)}</div>
                 <div class="muted" style="font-size:12px;">Media: ${esc(mediaState)}</div>
               </div>
               <div>
                 <div class="section-kicker">Subtitles Stage</div>
                 <div>${esc(subDetail)}</div>
-                <div class="muted" style="font-size:12px;">Tier failures: ${seg.subtitles_tier_attempts}/${seg.max_runs} · Total attempts: ${seg.subtitles_total_attempts}</div>
+                <div class="muted" style="font-size:12px;">Fallback: Tier ${seg.fallback_tier}/${seg.max_fallback_tiers} · Attempt ${subAttempt}/${seg.max_runs}</div>
               </div>
               <div>
                 <div class="section-kicker">Lyrics Stage</div>
                 <div>${esc(lyrDetail)}</div>
-                ${showLyrAttempts ? `<div class="muted" style="font-size:12px;">Failures: ${seg.lyrics_tier_attempts}/${seg.max_runs}${seg.lyrics_total_attempts ? ` · Total attempts: ${seg.lyrics_total_attempts}` : ""}</div>` : ""}
+                ${showLyrAttempts ? `<div class="muted" style="font-size:12px;">Attempt ${lyrAttempt}/${seg.max_runs}</div>` : ""}
               </div>
               <div>
                 <div class="section-kicker">Detected Singing</div>
@@ -934,24 +940,29 @@
         } = pipe.stages
 
         const sumFps = formatFps(sum.target_fps)
-        const sumTier =
-          sum.fallback_tier > 0
-            ? `Tier ${sum.fallback_tier}/${sum.max_fallback_tiers} · ${sumFps}`
-            : sumFps
+        const sumAttempt = resolveAttempt(
+          sum.done > 0 || sum.in_progress > 0,
+          sum.tier_attempts,
+          sum.max_runs,
+        )
+        const sumFallbackMeta = `Fallback: Tier ${sum.fallback_tier}/${sum.max_fallback_tiers} · Attempt ${sumAttempt}/${sum.max_runs}`
 
-        let sumText = `Waiting for worker · ${sumTier}${sum.tier_attempts > 0 ? ` · Failed ${sum.tier_attempts}/${sum.max_runs}` : ""}`
+        let sumText = `Waiting for worker · ${sumFps} · ${sumFallbackMeta}`
         if (!sum.enabled) sumText = "Disabled"
         else if (sum.done > 0 && sum.preview)
-          sumText = `${sumTier} · ${sum.preview.chapters.length} chapters · ${sum.preview.entities.length} entities · ${sum.preview.domain_glossary.length} glossary`
-        else if (sum.exhausted) sumText = `Failed across all tiers · ${sumTier}`
+          sumText = `${sumFps} · ${sumFallbackMeta} · ${sum.preview.chapters.length} chapters · ${sum.preview.entities.length} entities · ${sum.preview.domain_glossary.length} glossary`
+        else if (sum.done > 0) sumText = `${sumFps} · ${sumFallbackMeta}`
+        else if (sum.exhausted)
+          sumText = `Failed across all tiers · ${sumFps} · ${sumFallbackMeta}`
         else if (sum.in_progress > 0)
-          sumText = `Worker ${sum.worker_id} (${formatDuration(sum.elapsed_s)}) · ${sumTier} · Attempt ${sum.tier_attempts + 1}/${sum.max_runs}`
-        else if (sum.is_encoding) sumText = `Compressing proxy · ${sumTier}`
+          sumText = `Worker ${sum.worker_id} (${formatDuration(sum.elapsed_s)}) · ${sumFps} · ${sumFallbackMeta}`
+        else if (sum.is_encoding)
+          sumText = `Compressing proxy · ${sumFps} · ${sumFallbackMeta}`
 
         const encParts = [pct(reenc.done, reenc.total, "ready")]
         if (reenc.in_progress > 0)
           encParts.push(
-            `<span style="color:#67e8f9;">${reenc.in_progress} encoding</span>`,
+            `<span style="color:#a5b4fc;">${reenc.in_progress} encoding</span>`,
           )
         if (reenc.fallback_count > 0)
           encParts.push(
@@ -1054,7 +1065,7 @@
                 ${badge(sum.status, titleCase(sum.status))}
                 <span class="muted" style="font-size:12px;">${esc(sumText)}</span>
                 ${sum.done > 0 && sum.preview ? `<button type="button" class="btn btn-sm" data-pipeline="${esc(pipe.name)}" onclick="toggleSummaryDrawer(this)">${isDrawerOpen ? "Hide Summary" : "View Summary"}</button>` : ""}
-                ${sum.in_progress > 0 ? queryButton(sum.logfire_query, "Query 📋") : ""}
+                ${sum.in_progress > 0 ? queryButton(sum.logfire_query, "Query 📋", "Click to copy Logfire query for summary") : ""}
               </div>
               <div class="stage-line"><span class="stage-label">2. Encoding</span><span style="font-size:12px;">${encParts.join(" · ")}</span></div>
               <div class="stage-line"><span class="stage-label">3. Subtitles</span><span style="font-size:12px;">${subParts.join(" · ")}</span></div>
@@ -1066,7 +1077,7 @@
             <div style="margin-bottom: 14px;">
               <div style="display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px; font-size:12px; color:var(--muted);">
                 <b style="color:var(--text);">Chunk Matrix (${segments.length})</b>
-                <span>Tap a chunk to inspect encoding FPS &amp; attempts</span>
+                <span>Tap chunk to inspect details</span>
               </div>
               <div class="chunk-matrix">${tilesHtml}</div>
               <div class="matrix-legend">${legendHtml}</div>
@@ -1226,6 +1237,15 @@
             .join("") ||
           `<tr><td colspan="6" class="muted">${esc(emptyQueueMsg)}</td></tr>`
 
+        const videoMetaById = {}
+        for (const item of [
+          pipe.active_video,
+          pipe.preparing_video,
+          ...qItems,
+        ]) {
+          if (item?.video_id) videoMetaById[item.video_id] = item
+        }
+
         const activityTable =
           (pipe.recent_activity || [])
             .map((a, idx) => {
@@ -1235,8 +1255,19 @@
                 parts.length > 2
                   ? parts.slice(2).join(" ")
                   : parts[1] || a.task_id
+              const vid = a.video_id || parts[1] || ""
+              const vidMeta = vid ? videoMetaById[vid] : null
+              const vidTitleAttr = vidMeta?.title
+                ? ` title="${esc(vidMeta.title)}"`
+                : ""
+              const vidHtml = !vid
+                ? "-"
+                : vidMeta?.source_type === "youtube"
+                  ? `<a href="https://youtu.be/${encodeURIComponent(vid)}" target="_blank" rel="noopener noreferrer" class="video-title-link"${vidTitleAttr}>${esc(vid)}</a>`
+                  : `<span${vidTitleAttr}>${esc(vid)}</span>`
+
               const durText = formatActivityDuration(a.duration_s)
-              const hasDetail = Boolean(a.detail || a.logfire_query)
+              const hasDetail = Boolean(a.detail)
               const evBadge = a.logfire_query
                 ? `<span class="badge badge-${esc(a.event_type)} badge-clickable" data-query="${esc(a.logfire_query)}" onclick="copyQueryFromData(this)" title="Click to copy Logfire query">${esc(a.event_type + durText)} 📋</span>`
                 : badge(a.event_type, a.event_type + durText)
@@ -1251,14 +1282,14 @@
                 <tr>
                   <td class="mono" style="white-space:nowrap;">${esc(formatLocalDateTime(a.timestamp))}</td>
                   <td class="mono"><b>${esc(a.worker_id)}</b></td>
-                  <td class="mono">${esc(a.video_id || parts[1] || "-")}</td>
+                  <td class="mono">${vidHtml}</td>
                   <td class="mono">${esc(cleanTask)}</td>
                   <td>${evBadge}</td>
                   <td>${hasDetail ? `<button type="button" class="btn btn-sm" data-event-id="${esc(eid)}" onclick="toggleActivityDetail(this)">Details</button>` : "-"}</td>
                 </tr>
                 ${
                   hasDetail
-                    ? `<tr class="detail-row" id="detail-${esc(eid)}" style="display:${expandedActivityIds.has(eid) ? "table-row" : "none"};"><td colspan="6"><div class="detail-box ${boxCls}"><div>${esc(a.detail || "No details recorded.")}</div>${a.logfire_query ? `<div class="detail-query-bar"><div>Logfire Query: <code class="detail-query-code">${esc(a.logfire_query)}</code></div>${queryButton(a.logfire_query, "Copy Query")}</div>` : ""}</div></td></tr>`
+                    ? `<tr class="detail-row" id="detail-${esc(eid)}" style="display:${expandedActivityIds.has(eid) ? "table-row" : "none"};"><td colspan="6"><div class="detail-box ${boxCls}"><div>${esc(a.detail)}</div></div></td></tr>`
                     : ""
                 }
               `

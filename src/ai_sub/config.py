@@ -657,20 +657,24 @@ class StageModelsMixin(BaseConfigModel):
     @model_validator(mode="before")
     @classmethod
     def _apply_stage_agentic_defaults(cls, val: Any) -> Any:
-        """Defaults summary and lyrics agentic to True when omitted in dict inputs.
+        """Strips null stage entries and defaults summary and lyrics agentic to True when omitted.
 
         Args:
             val: Raw stage model settings dictionary before validation.
 
         Returns:
-            Any: Normalized dictionary with stage-appropriate agentic defaults.
+            Any: Normalized dictionary with null stages stripped and stage-appropriate agentic defaults.
         """
         if not isinstance(val, dict):
             return val
         updated = dict(val)
-        for stage in ("summary", "lyrics"):
-            stage_val = updated.get(stage)
-            if isinstance(stage_val, dict) and "agentic" not in stage_val:
+        for stage in ("summary", "subtitles", "lyrics"):
+            if stage not in updated:
+                continue
+            stage_val = updated[stage]
+            if stage_val is None:
+                updated.pop(stage)
+            elif stage in ("summary", "lyrics") and isinstance(stage_val, dict) and "agentic" not in stage_val:
                 updated[stage] = {**stage_val, "agentic": True}
         return updated
 

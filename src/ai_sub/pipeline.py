@@ -71,7 +71,6 @@ class SummaryState(MediaStageState):
     """Per-unit execution and media state for the Phase 1 whole-video summary."""
 
     tier_attempts: NonNegativeInt = Field(default=0, description="Non-retryable failures at the current FPS tier.")
-    total_attempts: NonNegativeInt = Field(default=0, description="Cumulative attempts across all executions.")
     response: SummaryAiResponse | None = Field(default=None, description="Completed summary response.")
     exhausted: bool = Field(default=False, description="Whether summary exhausted all retries and fallback tiers.")
 
@@ -88,10 +87,6 @@ class SegmentState(MediaStageState):
         default=0,
         description="Non-retryable subtitle failures at the current FPS tier.",
     )
-    subtitles_total_attempts: NonNegativeInt = Field(
-        default=0,
-        description="Cumulative subtitle attempts across all executions.",
-    )
     subtitles_response: SubtitlesAiResponse | None = Field(default=None, description="Completed subtitles response.")
     subtitles_exhausted: bool = Field(
         default=False,
@@ -99,7 +94,6 @@ class SegmentState(MediaStageState):
     )
 
     lyrics_tier_attempts: NonNegativeInt = Field(default=0, description="Non-retryable lyrics failures.")
-    lyrics_total_attempts: NonNegativeInt = Field(default=0, description="Cumulative lyrics attempts.")
     lyrics_response: LyricsAiResponse | None = Field(default=None, description="Completed lyrics response.")
     lyrics_exhausted: bool = Field(default=False, description="Whether lyrics exhausted retries.")
 
@@ -582,6 +576,41 @@ class Pipeline(BaseModel):
         )
         return job.fallback_tier, job.tier_attempts, job.target_fps, was_exhausted
 
+    def _checkpoint_matches(
+        self,
+        job: AiJob | None,
+        label: str,
+        expected_model: str,
+        expected_duration_ms: int,
+        expected_offset_ms: int | None = None,
+    ) -> bool:
+        """Validates that a loaded YAML checkpoint matches the current model and media bounds.
+
+        Args:
+            job: Loaded checkpoint job instance, or None.
+            label: Human-readable stage label for mismatch logs.
+            expected_model: Configured Gemini model identifier for this stage.
+            expected_duration_ms: Expected media or segment duration in milliseconds.
+            expected_offset_ms: Expected segment start offset in milliseconds, if applicable. Defaults to None.
+
+        Returns:
+            bool: True if checkpoint exists and matches model and media bounds.
+        """
+        if job is None:
+            return False
+        if job.model_name != expected_model:
+            logfire.info(
+                f"Model mismatch for {label} (file: {job.model_name}, current: {expected_model}). Re-processing."
+            )
+            return False
+        if job.media_tag != self.media_tag or job.video_duration_ms != expected_duration_ms:
+            logfire.info(f"Source media mismatch for {label} checkpoint. Re-processing.")
+            return False
+        if expected_offset_ms is not None and getattr(job, "segment_offset_ms", None) != expected_offset_ms:
+            logfire.info(f"Segment boundary mismatch for {label} checkpoint. Re-processing.")
+            return False
+        return True
+
     def _discover_on_disk_state(self) -> None:
         """Inspects job_dir for existing valid YAML checkpoints and restores unit states.
 
@@ -595,20 +624,8 @@ class Pipeline(BaseModel):
         if self.summary_enabled:
             summary_file = self.job_dir / f"summary.{self.summary_shortcode}.yaml"
             loaded_summary = SummaryJob.load(summary_file, self.validation_buffer_ms)
-            if loaded_summary and loaded_summary.model_name != self.summary_config.model:
-                logfire.info(
-                    f"Model mismatch for summary (file: {loaded_summary.model_name}, "
-                    f"current: {self.summary_config.model}). Re-processing."
-                )
-                loaded_summary = None
-            elif loaded_summary and (
-                loaded_summary.media_tag != self.media_tag or loaded_summary.video_duration_ms != self.duration_ms
-            ):
-                logfire.info(f"Source video mismatch for summary checkpoint ({summary_file.name}). Re-processing.")
-                loaded_summary = None
-
-            if loaded_summary:
-                self.summary.total_attempts = loaded_summary.total_attempts
+            if self._checkpoint_matches(loaded_summary, "summary", self.summary_config.model, self.duration_ms):
+                assert loaded_summary is not None
                 if loaded_summary.response is not None:
                     self.summary.response = loaded_summary.response
                     self.summary.tier_attempts = loaded_summary.tier_attempts
@@ -634,26 +651,19 @@ class Pipeline(BaseModel):
             yaml_stem = self._segment_yaml_stem(seg)
             sub_file = self.job_dir / f"{yaml_stem}.subtitles.{self.subtitles_shortcode}.yaml"
             loaded_sub = SubtitlesJob.load(sub_file, self.validation_buffer_ms)
-            if not loaded_sub:
-                continue
-            if loaded_sub.model_name != self.subtitles_config.model:
-                logfire.info(
-                    f"Model mismatch for {yaml_stem} subtitles "
-                    f"(file: {loaded_sub.model_name}, current: {self.subtitles_config.model}). Re-processing."
-                )
-                continue
-            if (
-                loaded_sub.media_tag != self.media_tag
-                or loaded_sub.video_duration_ms != seg.duration_ms
-                or loaded_sub.segment_offset_ms != seg.offset_ms
+            if not self._checkpoint_matches(
+                loaded_sub,
+                f"{yaml_stem} subtitles",
+                self.subtitles_config.model,
+                seg.duration_ms,
+                seg.offset_ms,
             ):
-                logfire.info(f"Segment boundary or source mismatch for {yaml_stem} subtitles. Re-processing.")
                 continue
+            assert loaded_sub is not None
             if self.summary_enabled and _content_dump(loaded_sub.global_summary) != expected_summary_dump:
                 logfire.info(f"Upstream summary changed for {yaml_stem}. Re-processing subtitles.")
                 continue
 
-            seg.subtitles_total_attempts = loaded_sub.total_attempts
             if loaded_sub.response is not None:
                 seg.subtitles_response = loaded_sub.response
                 seg.subtitles_tier_attempts = loaded_sub.tier_attempts
@@ -663,21 +673,15 @@ class Pipeline(BaseModel):
                 if self.segment_needs_lyrics(seg):
                     lyr_file = self.job_dir / f"{yaml_stem}.lyrics.{self.lyrics_shortcode}.yaml"
                     loaded_lyr = LyricsJob.load(lyr_file, self.validation_buffer_ms)
-                    if not loaded_lyr:
-                        continue
-                    if loaded_lyr.model_name != self.lyrics_config.model:
-                        logfire.info(
-                            f"Model mismatch for {yaml_stem} lyrics "
-                            f"(file: {loaded_lyr.model_name}, current: {self.lyrics_config.model}). Re-processing."
-                        )
-                        continue
-                    if (
-                        loaded_lyr.media_tag != self.media_tag
-                        or loaded_lyr.video_duration_ms != seg.duration_ms
-                        or loaded_lyr.segment_offset_ms != seg.offset_ms
+                    if not self._checkpoint_matches(
+                        loaded_lyr,
+                        f"{yaml_stem} lyrics",
+                        self.lyrics_config.model,
+                        seg.duration_ms,
+                        seg.offset_ms,
                     ):
-                        logfire.info(f"Segment boundary or source mismatch for {yaml_stem} lyrics. Re-processing.")
                         continue
+                    assert loaded_lyr is not None
                     if (
                         loaded_lyr.draft_subtitles != loaded_sub.response.subtitles
                         or loaded_lyr.detected_performances != loaded_sub.response.detected_musical_performances
@@ -686,7 +690,6 @@ class Pipeline(BaseModel):
                         logfire.info(f"Upstream subtitles or summary changed for {yaml_stem}. Re-processing lyrics.")
                         continue
 
-                    seg.lyrics_total_attempts = loaded_lyr.total_attempts
                     if loaded_lyr.response is not None:
                         seg.lyrics_response = loaded_lyr.response
                         seg.lyrics_tier_attempts = loaded_lyr.tier_attempts
@@ -977,7 +980,6 @@ class Pipeline(BaseModel):
                 model_name=self.summary_config.model,
                 service_tier=self.summary_config.tier,
                 agentic_video=self.summary_config.agentic,
-                total_attempts=self.summary.total_attempts,
                 tier_attempts=self.summary.tier_attempts,
                 fallback_tier=self.summary.fallback_tier,
                 target_fps=self.summary.target_fps,
@@ -1003,7 +1005,6 @@ class Pipeline(BaseModel):
                 model_name=self.subtitles_config.model,
                 service_tier=self.subtitles_config.tier,
                 agentic_video=self.subtitles_config.agentic,
-                total_attempts=seg.subtitles_total_attempts,
                 tier_attempts=seg.subtitles_tier_attempts,
                 exhausted=seg.subtitles_exhausted,
                 response=seg.subtitles_response,
@@ -1017,7 +1018,6 @@ class Pipeline(BaseModel):
             model_name=self.lyrics_config.model,
             service_tier=self.lyrics_config.tier,
             agentic_video=self.lyrics_config.agentic,
-            total_attempts=seg.lyrics_total_attempts,
             tier_attempts=seg.lyrics_tier_attempts,
             exhausted=seg.lyrics_exhausted,
             response=seg.lyrics_response,
@@ -1295,14 +1295,13 @@ class Pipeline(BaseModel):
                 if isinstance(result_data, SummaryAiResponse)
                 else SummaryAiResponse.model_validate(result_data, context=val_ctx)
             )
-            prev = (self.summary.response, self.summary.exhausted, self.summary.total_attempts)
+            prev = (self.summary.response, self.summary.exhausted)
             self.summary.response = resp
             self.summary.exhausted = False
-            self.summary.total_attempts += 1
             try:
                 self._save_checkpoint(TaskType.SUMMARY)
             except Exception:
-                self.summary.response, self.summary.exhausted, self.summary.total_attempts = prev
+                self.summary.response, self.summary.exhausted = prev
                 raise
             return
 
@@ -1318,14 +1317,13 @@ class Pipeline(BaseModel):
                 if isinstance(result_data, SubtitlesAiResponse)
                 else SubtitlesAiResponse.model_validate(result_data, context=val_ctx)
             )
-            prev_sub = (seg.subtitles_response, seg.subtitles_exhausted, seg.subtitles_total_attempts)
+            prev_sub = (seg.subtitles_response, seg.subtitles_exhausted)
             seg.subtitles_response = sub_resp
             seg.subtitles_exhausted = False
-            seg.subtitles_total_attempts += 1
             try:
                 self._save_checkpoint(TaskType.SUBTITLES, seg)
             except Exception:
-                seg.subtitles_response, seg.subtitles_exhausted, seg.subtitles_total_attempts = prev_sub
+                seg.subtitles_response, seg.subtitles_exhausted = prev_sub
                 raise
         elif task_type == TaskType.LYRICS:
             require_subtitles = bool(seg.subtitles_response and seg.subtitles_response.subtitles)
@@ -1337,14 +1335,13 @@ class Pipeline(BaseModel):
             )
             if require_subtitles and not lyr_resp.subtitles:
                 raise ValueError("Refined lyrics output cannot be empty when draft subtitles exist.")
-            prev_lyr = (seg.lyrics_response, seg.lyrics_exhausted, seg.lyrics_total_attempts)
+            prev_lyr = (seg.lyrics_response, seg.lyrics_exhausted)
             seg.lyrics_response = lyr_resp
             seg.lyrics_exhausted = False
-            seg.lyrics_total_attempts += 1
             try:
                 self._save_checkpoint(TaskType.LYRICS, seg)
             except Exception:
-                seg.lyrics_response, seg.lyrics_exhausted, seg.lyrics_total_attempts = prev_lyr
+                seg.lyrics_response, seg.lyrics_exhausted = prev_lyr
                 raise
 
     def complete_job(self, job: BaseJob, result_data: Any) -> None:
@@ -1412,7 +1409,6 @@ class Pipeline(BaseModel):
             assert seg is not None
             if seg.lyrics_response is not None or seg.lyrics_exhausted:
                 return FailureOutcome(action="ignored")
-            seg.lyrics_total_attempts += 1
             seg.lyrics_tier_attempts += 1
             target_fps = _float_fps(seg.target_fps)
             if seg.lyrics_tier_attempts >= max_runs:
@@ -1439,7 +1435,6 @@ class Pipeline(BaseModel):
         if task_type == TaskType.SUMMARY:
             if self.summary.response is not None or self.summary.exhausted:
                 return FailureOutcome(action="ignored")
-            self.summary.total_attempts += 1
             self.summary.tier_attempts += 1
             tier_attempts = self.summary.tier_attempts
             media_state: MediaStageState = self.summary
@@ -1447,7 +1442,6 @@ class Pipeline(BaseModel):
             assert seg is not None
             if seg.subtitles_response is not None or seg.subtitles_exhausted:
                 return FailureOutcome(action="ignored")
-            seg.subtitles_total_attempts += 1
             seg.subtitles_tier_attempts += 1
             tier_attempts = seg.subtitles_tier_attempts
             media_state = seg

@@ -187,18 +187,19 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
         if user_context:
             logfire.info(f"Loaded user context ({len(user_context)} characters).")
 
+        use_summary = settings.concurrency.summary > 0
+        use_lyrics = settings.concurrency.lyrics > 0
+
+        sum_reencode = settings.reencode.summary
+        seg_reencode = settings.reencode.segment
         reencode_possible = bool(
-            settings.reencode.summary.threshold > 0
-            or settings.reencode.segment.threshold > 0
-            or settings.reencode.summary.fallback.attempts > 0
-            or settings.reencode.segment.fallback.attempts > 0
+            (use_summary and (sum_reencode.threshold > 0 or sum_reencode.fallback.attempts > 0))
+            or seg_reencode.threshold > 0
+            or seg_reencode.fallback.attempts > 0
         )
         if reencode_possible:
             _, _, encoder = await init_ffmpeg_engine(settings.reencode.encoder)
             settings.reencode.encoder = encoder
-
-        use_summary = settings.concurrency.summary > 0
-        use_lyrics = settings.concurrency.lyrics > 0
 
         pipeline = await Pipeline.create(
             raw_video_path=input_video_path,
