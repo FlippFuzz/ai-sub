@@ -19,6 +19,7 @@ from ai_sub.config import (
     SearchTool,
     StringList,
     YamlFileSettings,
+    merge_section_defaults,
 )
 
 
@@ -59,15 +60,7 @@ class WorkerAiSettings(AiSettings):
         Returns:
             Any: Input dictionary with worker default search tools merged.
         """
-        if not isinstance(val, dict) or "search" not in val:
-            return val
-        updated = dict(val)
-        raw_search = updated["search"]
-        if raw_search is None:
-            updated.pop("search")
-        elif isinstance(raw_search, dict):
-            updated["search"] = {"tools": _default_worker_search_tools(), **raw_search}
-        return updated
+        return merge_section_defaults(val, {"search": {"tools": _default_worker_search_tools()}})
 
 
 class WorkerSettings(YamlFileSettings):

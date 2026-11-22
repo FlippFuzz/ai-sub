@@ -192,6 +192,8 @@ def validate_duration_bound(
 def _clean_context_item(data: Any) -> Any:
     """Recursively converts Pydantic models, lists, and dicts into JSON-serializable primitives.
 
+    Excludes internal reasoning traces (`thoughts`), duplicate `user_context`, and `None` fields.
+
     Args:
         data: Input object to clean.
 
@@ -215,37 +217,6 @@ def _clean_context_item(data: Any) -> Any:
     if isinstance(data, (list, tuple)):
         return [_clean_context_item(item) for item in data if item is not None]
     return data
-
-
-def serialize_prompt_context(data: Any) -> str:
-    """Serializes models, lists of models, or dictionaries into clean, compact JSON for prompt injection.
-
-    Systematically excludes:
-    - `thoughts`: Raw internal model reasoning traces.
-    - `user_context`: Prevents duplicate context injection across stages.
-    - `None` values: Compacts prompt size and conserves tokens.
-
-    Args:
-        data: A Pydantic model instance, list of models, dictionary, or primitive to serialize.
-
-    Returns:
-        str: Clean JSON string ready for prompt template encapsulation.
-    """
-    cleaned = _clean_context_item(data)
-    return json.dumps(cleaned, ensure_ascii=False)
-
-
-def append_xml_section(parts: list[str], tag: str, *lines: str) -> None:
-    """Appends an XML-tagged section with 2-space indented lines to prompt parts.
-
-    Args:
-        parts: Accumulator list of prompt lines.
-        tag: XML tag name wrapping the content.
-        *lines: Content lines to include inside the tag.
-    """
-    parts.append(f"<{tag}>")
-    parts.extend(f"  {line}" for line in lines)
-    parts.append(f"</{tag}>")
 
 
 def build_user_prompt(
@@ -273,7 +244,13 @@ def build_user_prompt(
         str: Formatted user prompt string.
     """
     parts: list[str] = []
-    append_xml_section(parts, "task", *task_lines)
+
+    def _append(tag: str, *lines: str) -> None:
+        parts.append(f"<{tag}>")
+        parts.extend(f"  {line}" for line in lines)
+        parts.append(f"</{tag}>")
+
+    _append("task", *task_lines)
 
     if segment_duration_ms > 0:
         start_tc = format_ms_timestamp(segment_offset_ms, include_hours=True)
@@ -287,22 +264,20 @@ def build_user_prompt(
                     "starting at 00:00.000. Never use full-video absolute timestamps in your output.",
                 ]
             )
-        append_xml_section(parts, "segment_time_window", *window_lines)
+        _append("segment_time_window", *window_lines)
 
-    if user_context and user_context.strip():
-        append_xml_section(parts, "user_provided_context", user_context.strip())
-
-    if global_summary:
-        append_xml_section(parts, "global_video_summary", serialize_prompt_context(global_summary))
-
-    for tag, content in extra_sections:
+    for tag, content in (
+        ("user_provided_context", user_context),
+        ("global_video_summary", global_summary),
+        *extra_sections,
+    ):
         if content is None:
             continue
         if isinstance(content, str):
             if text := content.strip():
-                append_xml_section(parts, tag, text)
+                _append(tag, text)
         elif content:
-            append_xml_section(parts, tag, serialize_prompt_context(content))
+            _append(tag, json.dumps(_clean_context_item(content), ensure_ascii=False))
 
     return "\n".join(parts)
 
@@ -466,17 +441,13 @@ class AiJob(BaseJob):
 
         raw_duration = data.get("video_duration_ms")
         context_duration: int | None = None
-        if isinstance(raw_duration, int) and not isinstance(raw_duration, bool) and raw_duration > 0:
-            context_duration = raw_duration
-        elif isinstance(raw_duration, str):
-            stripped = raw_duration.strip()
-            if stripped:
-                try:
-                    parsed = int(stripped)
-                    if parsed > 0:
-                        context_duration = parsed
-                except ValueError:
-                    pass
+        if isinstance(raw_duration, (int, str)) and not isinstance(raw_duration, bool):
+            try:
+                parsed = int(raw_duration)
+                if parsed > 0:
+                    context_duration = parsed
+            except ValueError:
+                pass
 
         try:
             return cls.model_validate(

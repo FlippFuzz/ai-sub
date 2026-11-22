@@ -36,6 +36,27 @@ R = TypeVar("R")
 # Matches managed segment chunks, re-encoded outputs, and summary proxies
 MANAGED_PATTERN = re.compile(r"^(?:reencoded_)?(?:part_\d{3,}|summary)_[A-Za-z0-9_-]+\.[^./]+$")
 
+_RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+
+# Transient/server Interactions API error codes (plus standard gRPC aliases); all other codes are non-retryable
+_RETRYABLE_INTERACTION_CODES = frozenset(
+    {
+        "api_error",
+        "internal",
+        "internal_server_error",
+        "service_unavailable",
+        "unavailable",
+        "deadline_exceeded",
+        "gateway_timeout",
+        "request_timeout",
+        "bad_gateway",
+        "rate_limit_exceeded",
+        "too_many_requests",
+        "resource_exhausted",
+        "aborted",
+    }
+)
+
 
 class QuotaExceededError(Exception):
     """Raised when an AI model provider's daily quota limit is exhausted."""
@@ -43,6 +64,18 @@ class QuotaExceededError(Exception):
 
 class InteractionFailedError(Exception):
     """Raised when a Gemini interaction terminates in a failed or cancelled state."""
+
+    retryable: bool
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        """Initializes the interaction failure exception.
+
+        Args:
+            message: Diagnostic failure description.
+            retryable: Whether the failure is transient/server-side and eligible for retries.
+        """
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def _extract_status_code(e: Exception) -> int | None:
@@ -54,13 +87,15 @@ def _extract_status_code(e: Exception) -> int | None:
     Returns:
         int | None: HTTP status code integer or None.
     """
-    status_code = (
-        getattr(e, "code", None)
-        or getattr(e, "status_code", None)
-        or getattr(getattr(e, "response", None), "status_code", None)
-    )
-    if isinstance(status_code, int):
-        return status_code
+    for candidate in (
+        getattr(e, "status_code", None),
+        getattr(e, "code", None),
+        getattr(getattr(e, "response", None), "status_code", None),
+        getattr(getattr(e, "raw_response", None), "status_code", None),
+        getattr(getattr(e, "http_res", None), "status_code", None),
+    ):
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            return candidate
     if not isinstance(e, (ValidationError, ValueError, TypeError, KeyError, InteractionFailedError)):
         if match := re.search(r"\b(408|429|500|502|503|504)\b", str(e)):
             return int(match.group(1))
@@ -105,29 +140,22 @@ def is_retryable_error(e: Exception) -> bool:
     if _is_daily_quota_exceeded(e):
         return False
 
-    if isinstance(
-        e,
-        (
-            InteractionFailedError,
-            TransportError,
-            TimeoutException,
-            ConnectionError,
-            asyncio.TimeoutError,
-            TimeoutError,
-        ),
-    ):
+    if isinstance(e, InteractionFailedError):
+        return e.retryable
+
+    if isinstance(e, (TransportError, TimeoutException, ConnectionError, asyncio.TimeoutError, TimeoutError)):
         return True
 
     status_code = _extract_status_code(e)
     if status_code is not None:
-        return status_code in (408, 429, 500, 502, 503, 504)
+        return status_code in _RETRYABLE_STATUS_CODES
 
     err_str = str(e).lower()
     return any(term in err_str for term in ("connection", "timeout", "temporarily unavailable"))
 
 
 def _get_unique_display_name(file_path: Path) -> str:
-    """Constructs a unique display name using workspace folder and filename.
+    """Constructs a unique display name using workspace folder and filename without dereferencing symlinks.
 
     Args:
         file_path: Path to the local file.
@@ -135,9 +163,10 @@ def _get_unique_display_name(file_path: Path) -> str:
     Returns:
         str: Display name formatted as 'workspace/filename.ext'.
     """
-    resolved = file_path.resolve()
-    safe_name = urllib.parse.quote(resolved.name, safe=".-_")
-    safe_parent = urllib.parse.quote(resolved.parent.name, safe=".-_")
+    # Use abspath instead of resolve() so symlinked summary_<tag> proxies retain their managed name.
+    abs_path = Path(os.path.abspath(file_path))
+    safe_name = urllib.parse.quote(abs_path.name, safe=".-_")
+    safe_parent = urllib.parse.quote(abs_path.parent.name, safe=".-_")
     return f"{safe_parent}/{safe_name}"
 
 
@@ -229,29 +258,48 @@ def _extract_thought_text(step: Any) -> str | None:
     return None
 
 
-def _format_interaction_errors(interaction: Any) -> str:
-    """Formats error details attached to a failed or cancelled interaction.
+def _inspect_interaction_failure(interaction: Any, status: str | None) -> tuple[str, bool]:
+    """Extracts error descriptions and retryability from a failed or cancelled interaction.
 
     Args:
         interaction: Interaction response object.
+        status: Terminal interaction status string (e.g. 'failed' or 'cancelled').
 
     Returns:
-        str: Combined error description string.
+        tuple[str, bool]: (formatted_error_details, is_retryable).
     """
     errors = getattr(interaction, "errors", None) or getattr(interaction, "error", None)
     if not errors:
-        return "No error details provided."
+        return "No error details provided.", status != "cancelled"
+
     items = errors if isinstance(errors, list) else [errors]
     parts: list[str] = []
+    saw_code = False
+    all_codes_retryable = True
+
     for item in items:
         if isinstance(item, dict):
             code, msg = item.get("code"), item.get("message")
         else:
             code, msg = getattr(item, "code", None), getattr(item, "message", None)
+
+        if isinstance(code, int) and not isinstance(code, bool):
+            saw_code = True
+            if code not in _RETRYABLE_STATUS_CODES:
+                all_codes_retryable = False
+        elif code is not None:
+            saw_code = True
+            norm_code = str(code).strip().rsplit("/", 1)[-1].lower().replace("-", "_")
+            if norm_code not in _RETRYABLE_INTERACTION_CODES:
+                all_codes_retryable = False
+
         text = f"{code}: {msg}" if code and msg else (msg or code or str(item))
         if text:
             parts.append(str(text))
-    return "; ".join(parts) or str(errors)
+
+    details = "; ".join(parts) or str(errors)
+    retryable = all_codes_retryable if saw_code else (status != "cancelled")
+    return details, retryable
 
 
 def calculate_sha256_hex(file_path: Path) -> str:
@@ -712,8 +760,10 @@ class GeminiExecutor:
                 interaction = await self._client.aio.interactions.create(**kwargs)
                 status = getattr(interaction, "status", None)
                 if status in ("failed", "cancelled"):
+                    details, retryable = _inspect_interaction_failure(interaction, status)
                     raise InteractionFailedError(
-                        f"Interaction {status} on {model_id}: {_format_interaction_errors(interaction)}"
+                        f"Interaction {status} on {model_id}: {details}",
+                        retryable=retryable,
                     )
                 api_span.set_attribute("outcome", "success")
                 api_span.set_attribute("status_code", 200)

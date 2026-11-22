@@ -37,7 +37,7 @@ from ai_sub.pipeline import Pipeline
 from ai_sub.search import BaseSearchProvider, create_search_providers, order_lyrics_providers
 from ai_sub.standalone_config import StandaloneSettings
 from ai_sub.telemetry import setup_logging
-from ai_sub.video import compute_file_id_hash, init_ffmpeg_engine, sanitize_filename
+from ai_sub.video import init_ffmpeg_engine
 
 
 class AiSubResult(IntEnum):
@@ -213,8 +213,6 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
             search_settings=settings.ai.search,
             split_settings=settings.split,
             retry_settings=settings.retry,
-            media_tag=compute_file_id_hash(input_video_path.name),
-            output_stem=sanitize_filename(input_video_path.stem),
             user_context=user_context,
             validation_buffer_ms=int(settings.ai.buffer.total_seconds() * 1000),
             summary_enabled=use_summary,
@@ -238,9 +236,9 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
             stack.push_async_callback(executor.aclose)
 
             reencode_sem = asyncio.Semaphore(settings.concurrency.reencode)
-            summary_sem = asyncio.Semaphore(settings.concurrency.summary if settings.concurrency.summary > 0 else 1)
+            summary_sem = asyncio.Semaphore(max(1, settings.concurrency.summary))
             subtitles_sem = asyncio.Semaphore(settings.concurrency.subtitles)
-            lyrics_sem = asyncio.Semaphore(settings.concurrency.lyrics if settings.concurrency.lyrics > 0 else 1)
+            lyrics_sem = asyncio.Semaphore(max(1, settings.concurrency.lyrics))
 
             progress = Progress(
                 SpinnerColumn(),
@@ -405,12 +403,9 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
             return AiSubResult.IN_PROGRESS
 
         # Finalize and stitch synchronized subtitle tracks
-        out_srt = out_dir / f"{input_video_path.stem}.{pipeline.full_shortcode}.srt"
-        raw_out_srt = out_dir / f"{input_video_path.stem}.raw-{pipeline.full_shortcode}.srt"
-
         generated = pipeline.finalize(
-            output_primary_path=out_srt,
-            output_raw_path=raw_out_srt if use_lyrics else None,
+            output_dir=out_dir,
+            filename_stem=input_video_path.stem,
             allow_partial=True,
         )
         for g in generated:

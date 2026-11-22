@@ -193,8 +193,8 @@ class LyricsAiResponse(BaseSubtitleAiResponse):
 
     Note: Preserving draft timestamps and block count parity is intentionally guided via
     the system prompt rather than enforced in Pydantic validators; validation ensures non-empty
-    subtitles when draft subtitles exist, and Pipeline.finalize falls back to draft subtitles
-    if retries are exhausted.
+    subtitles when draft subtitles exist, and Pipeline.finalize emits an error placeholder in
+    the refined SRT while preserving draft subtitles in the raw SRT track if retries are exhausted.
     """
 
     subtitles: list[Subtitles] = Field(

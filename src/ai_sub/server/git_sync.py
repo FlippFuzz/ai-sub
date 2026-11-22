@@ -27,6 +27,7 @@ from ai_sub.shortcode import parse_subtitle_track, subtitle_track_sort_key
 os.environ["GIT_TERMINAL_PROMPT"] = "0"
 JST = timezone(timedelta(hours=9))
 _MAX_REBASE_STEPS = 50
+_URL_CREDS_RE = re.compile(r"(https?://)[^/@\s]+@")
 
 _T = TypeVar("_T")
 _CompletedCache = dict[tuple[str, str], dict[str, bool]]
@@ -45,7 +46,7 @@ def redact_url_credentials(url: str) -> str:
     try:
         parsed = urllib.parse.urlsplit(url)
     except ValueError:
-        return re.sub(r"(https?://)[^/@\s]+@", r"\1***:***@", url)
+        return _URL_CREDS_RE.sub(r"\1***:***@", url)
     if parsed.username is not None or parsed.password is not None:
         host = parsed.hostname or ""
         if parsed.port is not None:
@@ -68,6 +69,19 @@ def _decode_git_stream(stream: Any) -> str:
     if isinstance(stream, bytes):
         return stream.decode("utf-8", errors="replace").strip()
     return str(stream).strip()
+
+
+def _is_rebasing(repo: Repo) -> bool:
+    """Checks whether a Git repository currently has an active rebase in progress.
+
+    Args:
+        repo: Active GitPython Repo instance.
+
+    Returns:
+        bool: True if rebase-merge or rebase-apply state exists, False otherwise.
+    """
+    git_dir = Path(repo.git_dir)
+    return (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists()
 
 
 class GitSyncManager:
@@ -119,7 +133,7 @@ class GitSyncManager:
             pat = self.config.get_pat_value().strip()
             if pat:
                 text = text.replace(pat, "***")
-        return re.sub(r"(https?://)[^/@\s]+@", r"\1***:***@", text)
+        return _URL_CREDS_RE.sub(r"\1***:***@", text)
 
     def _sanitize_error(self, err: Exception) -> str:
         """Formats an exception including sanitized Git command stdout/stderr details.
@@ -266,8 +280,7 @@ class GitSyncManager:
             repo: Active GitPython Repo instance.
             warning_message: Diagnostic warning logged when dirty state is found.
         """
-        git_dir = Path(repo.git_dir)
-        if (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists():
+        if _is_rebasing(repo):
             logfire.warning(warning_message)
             try:
                 repo.git.rebase("--abort")
@@ -314,11 +327,10 @@ class GitSyncManager:
             RuntimeError: If rebase fails to advance, exceeds max steps, or hits a non-README conflict.
         """
         editor_cmd = f'"{sys.executable}" -c "import sys; sys.exit(0)"'
-        rebase_merge_dir = Path(repo.git_dir) / "rebase-merge"
-        rebase_apply_dir = Path(repo.git_dir) / "rebase-apply"
+        git_dir = Path(repo.git_dir)
 
         def _rebase_marker() -> str | None:
-            for marker_file in (rebase_merge_dir / "msgnum", rebase_apply_dir / "next"):
+            for marker_file in (git_dir / "rebase-merge" / "msgnum", git_dir / "rebase-apply" / "next"):
                 if marker_file.is_file():
                     try:
                         return f"{marker_file.parent.name}:{marker_file.read_text(encoding='utf-8').strip()}"
@@ -330,14 +342,13 @@ class GitSyncManager:
             repo.git.pull("origin", branch, "--rebase")
             return True
         except GitCommandError as pull_err:
-            rebase_in_progress = rebase_merge_dir.exists() or rebase_apply_dir.exists()
-            if not rebase_in_progress:
+            if not _is_rebasing(repo):
                 logfire.warning(f"Git pull --rebase failed without active rebase: {self._sanitize_error(pull_err)}")
                 raise
 
             try:
                 steps = 0
-                while rebase_merge_dir.exists() or rebase_apply_dir.exists():
+                while _is_rebasing(repo):
                     steps += 1
                     if steps > _MAX_REBASE_STEPS:
                         repo.git.rebase("--abort")
@@ -363,7 +374,7 @@ class GitSyncManager:
                             repo.git.rebase("--continue", env={**os.environ, "GIT_EDITOR": editor_cmd})
                             logfire.info(f"Continued rebase after resolving {conflicted_readme} conflict.")
                         except GitCommandError as cont_err:
-                            if rebase_merge_dir.exists() or rebase_apply_dir.exists():
+                            if _is_rebasing(repo):
                                 new_marker = _rebase_marker()
                                 if new_marker is not None and new_marker != prev_marker:
                                     continue
@@ -382,7 +393,7 @@ class GitSyncManager:
                 logfire.info("Resolved all channel README conflicts and completed rebase.")
                 return True
             except Exception as rebase_err:
-                if rebase_merge_dir.exists() or rebase_apply_dir.exists():
+                if _is_rebasing(repo):
                     try:
                         repo.git.rebase("--abort")
                     except Exception:
@@ -926,8 +937,11 @@ class GitSyncManager:
         is_yt = clean_meta.get("source_type") == "youtube"
         single_entry: _CacheUpdate = (video_id, full_shortcode, uploader, is_yt)
 
-        if not git_enabled or repo is None or self.config is None:
+        def _cache_result() -> _CacheUpdate:
             return self._scan_completed_cache_sync() if self._pending_cache_rescan else single_entry
+
+        if not git_enabled or repo is None or self.config is None:
+            return _cache_result()
 
         branch = self.config.branch
         try:
@@ -950,7 +964,7 @@ class GitSyncManager:
                     logfire.warning(
                         f"No Git changes detected after staging for {video_id}.{full_shortcode}; skipping push."
                     )
-                    return self._scan_completed_cache_sync() if self._pending_cache_rescan else single_entry
+                    return _cache_result()
         except Exception as e:
             sanitized = self._sanitize_error(e)
             logfire.error(f"Git staging/commit failed for {video_id}.{full_shortcode}: {sanitized}")
@@ -960,7 +974,7 @@ class GitSyncManager:
             try:
                 repo.git.push("-u", "origin", branch)
                 logfire.info(f"Git push succeeded to origin/{branch}.")
-                return self._scan_completed_cache_sync() if self._pending_cache_rescan else single_entry
+                return _cache_result()
             except GitCommandError as e:
                 sanitized = self._sanitize_error(e)
                 if attempt >= 4:

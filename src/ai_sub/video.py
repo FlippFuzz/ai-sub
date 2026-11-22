@@ -152,9 +152,8 @@ def _probe_binary_info(binary_path: str) -> tuple[str, str]:
         config_line = "unknown"
         for line in proc.stdout.splitlines():
             stripped = line.strip()
-            if not version_line or version_line == "unknown":
-                if stripped.startswith(("ffmpeg version", "ffprobe version")):
-                    version_line = stripped
+            if version_line == "unknown" and stripped.startswith(("ffmpeg version", "ffprobe version")):
+                version_line = stripped
             if stripped.startswith("configuration:"):
                 config_line = stripped
                 break
@@ -346,12 +345,12 @@ async def _run_ffprobe_video_entry(video_path: Path, entry: str, *extra_args: st
     return next((line.strip() for line in stdout.splitlines() if line.strip()), "")
 
 
-async def _probe_stream_fps(video_path: Path, entry: str) -> float:
-    """Probes a framerate stream entry (e.g., 'r_frame_rate' or 'avg_frame_rate') using ffprobe.
+async def get_video_fps(video_path: Path, entry: str = "avg_frame_rate") -> float:
+    """Probes a framerate stream entry (e.g., 'avg_frame_rate' or 'r_frame_rate') using ffprobe.
 
     Args:
         video_path: Path to the target media file.
-        entry: FFprobe stream entry name to inspect.
+        entry: FFprobe stream entry name to inspect. Defaults to 'avg_frame_rate'.
 
     Returns:
         float: Probed framerate in frames per second.
@@ -366,18 +365,6 @@ async def _probe_stream_fps(video_path: Path, entry: str) -> float:
     except (subprocess.CalledProcessError, ValueError, ZeroDivisionError) as e:
         logfire.exception(f"Could not determine {entry} for {video_path.name}")
         raise RuntimeError(f"Could not determine {entry} for video file: {video_path.name}") from e
-
-
-async def get_video_fps(video_path: Path) -> float:
-    """Calculates the average framerate (FPS) of a video file.
-
-    Args:
-        video_path: Path to the target media file.
-
-    Returns:
-        float: Frames per second.
-    """
-    return await _probe_stream_fps(video_path, "avg_frame_rate")
 
 
 async def get_keyframe_fps(video_path: Path) -> float:
@@ -509,7 +496,7 @@ async def is_valid_reencoded_file(
             input_duration, output_duration, avg_fps = await asyncio.gather(
                 get_video_duration_ms(input_path),
                 get_video_duration_ms(output_path),
-                _probe_stream_fps(output_path, "avg_frame_rate"),
+                get_video_fps(output_path),
             )
             return avg_fps > 0 and _check_reencoded_duration(
                 input_duration,
@@ -521,8 +508,8 @@ async def is_valid_reencoded_file(
         input_duration, output_duration, r_fps, avg_fps = await asyncio.gather(
             get_video_duration_ms(input_path),
             get_video_duration_ms(output_path),
-            _probe_stream_fps(output_path, "r_frame_rate"),
-            _probe_stream_fps(output_path, "avg_frame_rate"),
+            get_video_fps(output_path, "r_frame_rate"),
+            get_video_fps(output_path),
         )
         if not _check_reencoded_duration(input_duration, output_duration, fps, duration_tolerance_ms):
             return False
@@ -624,7 +611,7 @@ async def split_video(
     """Splits an input video into uniform segments using FFmpeg stream copying.
 
     Skips splitting if valid segments matching 'part_%03d_<media_tag>', split duration, and total
-    duration already exist.
+    duration already exist, and drops any zero-duration trailing stub segments emitted at EOF.
 
     Args:
         input_video: Path to the input video.
@@ -650,8 +637,10 @@ async def split_video(
             total_segment_duration = sum(durations)
             threshold = duration_tolerance_ms * len(existing_segments)
 
-            if abs(input_duration - total_segment_duration) <= threshold and _segments_match_split_duration(
-                durations, split_duration_s, duration_tolerance_ms, split_meta_path
+            if (
+                all(d > 0 for d in durations)
+                and abs(input_duration - total_segment_duration) <= threshold
+                and _segments_match_split_duration(durations, split_duration_s, duration_tolerance_ms, split_meta_path)
             ):
                 logfire.info(f"Reusing {len(existing_segments)} existing valid segments for {input_video.name}.")
                 return existing_segments
@@ -704,6 +693,18 @@ async def split_video(
         raise
 
     segments = _find_split_segments(output_dir, ext, media_tag)
+    while segments:
+        tail = segments[-1]
+        try:
+            tail_ms = 0 if tail.stat().st_size == 0 else await get_video_duration_ms(tail)
+        except (OSError, RuntimeError):
+            tail_ms = 0
+        if tail_ms > 0:
+            break
+        logfire.warning(f"Dropping empty/zero-duration trailing segment: {tail.name}")
+        tail.unlink(missing_ok=True)
+        segments.pop()
+
     if segments:
         atomic_write_text(split_meta_path, json.dumps({"split_duration_s": split_duration_s}))
     return segments

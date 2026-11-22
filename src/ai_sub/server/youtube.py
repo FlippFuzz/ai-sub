@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field, RootModel
 from yt_dlp import YoutubeDL
 
 from ai_sub.config import atomic_write_text
+from ai_sub.server.git_sync import redact_url_credentials
 from ai_sub.server.server_config import YoutubeSourceConfig
 from ai_sub.video import ensure_ffmpeg, sanitize_uploader
 
@@ -89,7 +90,6 @@ class ChannelInfo(BaseModel):
     """Metadata for a mapped YouTube channel."""
 
     uploader_id: str
-    channel_name: str | None = None
     timestamp: int
 
 
@@ -395,10 +395,7 @@ class YouTubeClient:
         cookie_p = self.config.cookiefile
         cookie_resolved = cookie_p.resolve() if cookie_p else None
         cookie_exists = bool(cookie_resolved and cookie_resolved.is_file())
-
-        proxy_str = str(self.config.proxy) if self.config.proxy else "None"
-        # Mask all userinfo variants (user:pass, user, user:) from telemetry logs
-        masked_proxy = re.sub(r"://[^@]+@", "://***:***@", proxy_str)
+        masked_proxy = redact_url_credentials(str(self.config.proxy)) if self.config.proxy else "None"
 
         try:
             pot_plugin_ver = importlib.metadata.version("bgutil-ytdlp-pot-provider")
@@ -451,7 +448,6 @@ class YouTubeClient:
         self,
         channel_id: str | None,
         uploader_id: str | None,
-        channel_name: str | None,
         timestamp: int = 0,
     ) -> None:
         """Records a new or updated channel mapping and saves to disk under lock if dirty or changed.
@@ -459,7 +455,6 @@ class YouTubeClient:
         Args:
             channel_id: Unique YouTube channel ID (e.g. 'UC...').
             uploader_id: Channel handle or user ID.
-            channel_name: Human-readable channel display name.
             timestamp: Latest video timestamp in seconds.
         """
         if not channel_id or not uploader_id or str(uploader_id).lower() == "youtube":
@@ -477,7 +472,6 @@ class YouTubeClient:
             if changed:
                 self._channel_map.root[c_str] = ChannelInfo(
                     uploader_id=u_str,
-                    channel_name=str(channel_name) if channel_name else (existing.channel_name if existing else None),
                     timestamp=effective_ts,
                 )
                 self._channel_map_dirty = True
@@ -508,14 +502,12 @@ class YouTubeClient:
                     if not info:
                         return None
                     handle = _extract_handle(info)
-                    name = info.get("channel") or info.get("uploader")
                     c_id = info.get("channel_id") or channel_id
                     if handle and str(handle).lower() != "youtube":
                         clean_handle = sanitize_uploader(str(handle), fallback="youtube")
                         self._record_channel_mapping(
                             channel_id=str(c_id) if c_id else None,
                             uploader_id=clean_handle,
-                            channel_name=str(name) if name else None,
                             timestamp=_parse_entry_timestamp(info),
                         )
                         return clean_handle
@@ -547,7 +539,6 @@ class YouTubeClient:
         """
         uploader_id = _extract_handle(entry)
         channel_id = entry.get("channel_id")
-        channel_name = entry.get("channel") or entry.get("uploader")
         ts_int = _parse_entry_timestamp(entry)
 
         # 1. Direct explicit handle on entry
@@ -557,7 +548,6 @@ class YouTubeClient:
                 self._record_channel_mapping(
                     channel_id=str(channel_id),
                     uploader_id=clean_handle,
-                    channel_name=str(channel_name) if channel_name else None,
                     timestamp=ts_int,
                 )
             return clean_handle
@@ -576,7 +566,6 @@ class YouTubeClient:
                 self._record_channel_mapping(
                     channel_id=c_str,
                     uploader_id=clean_handle,
-                    channel_name=str(channel_name) if channel_name else None,
                     timestamp=ts_int,
                 )
                 return clean_handle

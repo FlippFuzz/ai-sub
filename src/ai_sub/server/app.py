@@ -186,7 +186,13 @@ def create_app(settings: ServerSettings) -> FastAPI:
             filename=media_path.name,
         )
 
-    @app.post("/api/v1/tasks/{task_id}/complete")
+    @app.post(
+        "/api/v1/tasks/{task_id}/complete",
+        responses={
+            409: {"description": "Task was not assigned to this worker or has already completed"},
+            422: {"description": "Submitted task result failed server-side schema validation"},
+        },
+    )
     async def complete_task(task_id: str, req: TaskCompleteRequest) -> dict[str, str]:
         """Submits completed and validated structured AI results for a task.
 
@@ -198,16 +204,22 @@ def create_app(settings: ServerSettings) -> FastAPI:
             dict[str, str]: Operation status confirmation dictionary.
 
         Raises:
-            HTTPException: If the task was not claimed by this worker or has already completed.
+            HTTPException: If server validation rejects the payload (422) or the lease is invalid (409).
         """
-        success = await coordinator.complete_task(
+        accepted, validation_error = await coordinator.complete_task(
             task_id,
             req.worker_id,
             req.result,
         )
         coordinator.schedule_finalize_check()
 
-        if not success:
+        if validation_error is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Result validation failed: {validation_error}",
+            )
+
+        if not accepted:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Task was not assigned to this worker or has already completed.",

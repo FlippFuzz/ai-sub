@@ -156,6 +156,34 @@ class WorkerRunner:
             return False
         return (monotonic() - self._last_busy_timestamp) >= self.settings.idletimeout.total_seconds()
 
+    def _notify_model_state_change(self) -> None:
+        """Triggers worker shutdown if all models are finished and wakes waiting slots (caller holds _cond)."""
+        if self._all_models_finished():
+            logfire.info("All configured models have exhausted quotas or reached task limits. Shutting down worker.")
+            self._shutdown = True
+        self._cond.notify_all()
+
+    async def _shutdown_from_poll(
+        self,
+        model: str,
+        *,
+        version_mismatch: bool = False,
+        fatal_error: bool = False,
+    ) -> None:
+        """Releases the slot's poll reservation and signals global worker shutdown.
+
+        Args:
+            model: Model identifier bound to this slot.
+            version_mismatch: Whether shutdown was triggered by an ai-sub version mismatch. Defaults to False.
+            fatal_error: Whether shutdown was triggered by a permanent server/auth error. Defaults to False.
+        """
+        async with self._cond:
+            self._claim_polls_per_model[model] = max(0, self._claim_polls_per_model[model] - 1)
+            self._version_mismatch = self._version_mismatch or version_mismatch
+            self._fatal_error = self._fatal_error or fatal_error
+            self._shutdown = True
+            self._cond.notify_all()
+
     async def _heartbeat_loop(
         self,
         task_id: str,
@@ -228,11 +256,12 @@ class WorkerRunner:
             raw_name = f"{raw_name}.mp4"
         safe_name = sanitize_filename(raw_name)
 
+        # Keep video_id as the immediate parent directory so Gemini Files API display_name matches across slots
         chunk_dir = (
             self.settings.workdir
+            / f"{sanitize_filename(task.model)}_{slot_id}"
             / sanitize_filename(task.pipeline_name)
             / sanitize_filename(task.video_id)
-            / f"slot_{slot_id}"
         )
         chunk_path = chunk_dir / safe_name
 
@@ -375,13 +404,7 @@ class WorkerRunner:
                                 f"[{slot_label}] Reached max tasks limit ({self.settings.maxtasks}) "
                                 f"for model '{model}'. Stopping new task claims for this model."
                             )
-                        if self._all_models_finished():
-                            logfire.info(
-                                "All configured models have reached their task limits or exhausted quotas. "
-                                "Shutting down worker."
-                            )
-                            self._shutdown = True
-                        self._cond.notify_all()
+                        self._notify_model_state_change()
                     logfire.info(f"[{slot_label}] Task '{claim.task_id}' processed and accepted by server.")
                 else:
                     logfire.warning(f"[{slot_label}] Task '{claim.task_id}' completion was not accepted by server.")
@@ -413,12 +436,7 @@ class WorkerRunner:
                 # cannot race to re-claim another task for the exhausted model.
                 async with self._cond:
                     self._exhausted_models.add(model)
-                    if self._all_models_finished():
-                        logfire.info(
-                            "All configured models have exhausted quotas or reached task limits. Shutting down worker."
-                        )
-                        self._shutdown = True
-                    self._cond.notify_all()
+                    self._notify_model_state_change()
                 err_msg = str(e).strip() or "Daily quota limit reached"
                 await self.client.fail_task(
                     task_id=claim.task_id,
@@ -568,7 +586,7 @@ class WorkerRunner:
                 if self._should_stop(model):
                     if model in self._exhausted_models:
                         logfire.info(f"[{slot_label}] Model quota exhausted. Exiting slot.")
-                    elif 0 < self.settings.maxtasks <= self._tasks_completed_per_model.get(model, 0):
+                    elif self._is_model_done(model):
                         logfire.info(
                             f"[{slot_label}] Reached max tasks limit ({self.settings.maxtasks}) "
                             f"for model '{model}'. Exiting slot."
@@ -590,11 +608,7 @@ class WorkerRunner:
                     f"[{slot_label}] ai-sub package version mismatch: {e}. "
                     "Shutting down worker so worker.sh can update to latest version."
                 )
-                async with self._cond:
-                    self._claim_polls_per_model[model] = max(0, self._claim_polls_per_model[model] - 1)
-                    self._version_mismatch = True
-                    self._shutdown = True
-                    self._cond.notify_all()
+                await self._shutdown_from_poll(model, version_mismatch=True)
                 break
             except HTTPStatusError as e:
                 if e.response.status_code in (401, 403, 404):
@@ -602,11 +616,7 @@ class WorkerRunner:
                         f"[{slot_label}] Server rejected task claim with HTTP {e.response.status_code}: {e}. "
                         "Check serverurl and serverauth. Shutting down worker."
                     )
-                    async with self._cond:
-                        self._claim_polls_per_model[model] = max(0, self._claim_polls_per_model[model] - 1)
-                        self._fatal_error = True
-                        self._shutdown = True
-                        self._cond.notify_all()
+                    await self._shutdown_from_poll(model, fatal_error=True)
                     break
                 claim_failed = True
                 logfire.warning(f"[{slot_label}] Failed to claim task from server: {e}. Retrying in 5s...")

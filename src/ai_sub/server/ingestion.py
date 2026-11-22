@@ -54,18 +54,13 @@ def _cleanup_failed_job_dir(job_dir: Path) -> None:
     """
     if not job_dir.is_dir():
         return
-    yaml_files = list(job_dir.glob("*.yaml"))
-    if yaml_files:
-        for part_file in job_dir.glob("*.part"):
-            try:
-                part_file.unlink()
-            except OSError:
-                pass
-        for ytdl_file in job_dir.glob("*.ytdl"):
-            try:
-                ytdl_file.unlink()
-            except OSError:
-                pass
+    if list(job_dir.glob("*.yaml")):
+        for pattern in ("*.part", "*.ytdl"):
+            for tmp_file in job_dir.glob(pattern):
+                try:
+                    tmp_file.unlink()
+                except OSError:
+                    pass
     else:
         shutil.rmtree(job_dir, ignore_errors=True)
 
@@ -80,9 +75,8 @@ class IngestionManager:
     youtube_client: YouTubeClient
     local_videos: dict[str, QueuedVideo]
     youtube_videos: dict[str, QueuedVideo]
-    _scan_members_only_ids: set[str]
     _download_members_only_ids: set[str]
-    _aborted_videos: dict[tuple[str, str], str]
+    _aborted_videos: dict[tuple[str, Literal["local", "youtube"], str], str]
     _youtube_cooldown_until: float
     _youtube_cooldown_reason: str | None
     _last_idle_summary: dict[str, str]
@@ -120,7 +114,6 @@ class IngestionManager:
         self.youtube_client = YouTubeClient(config.youtube, base_work_dir)
         self.local_videos = {}
         self.youtube_videos = {}
-        self._scan_members_only_ids = set()
         self._download_members_only_ids = set()
         self._aborted_videos = {}
         self._youtube_cooldown_until = 0.0
@@ -135,15 +128,31 @@ class IngestionManager:
         self._started = False
         self._stopped = False
 
-    def mark_video_aborted(self, runner_name: str, video_id: str, reason: str) -> None:
+    def mark_video_aborted(
+        self,
+        runner_name: str,
+        source_type: Literal["local", "youtube"],
+        video_id: str,
+        reason: str,
+    ) -> None:
         """Records an aborted video for a specific runner so it is held out from automatic retry.
 
         Args:
             runner_name: Target combination runner name.
+            source_type: Ingestion source type ('local' or 'youtube').
             video_id: Video identifier that aborted.
             reason: Human-readable abort reason displayed on the dashboard.
         """
-        self._aborted_videos[(runner_name, video_id)] = reason
+        self._aborted_videos[(runner_name, source_type, video_id)] = reason
+
+    def _clear_local_aborts(self, video_id: str) -> None:
+        """Clears aborted-video markers for a local video across all runners.
+
+        Args:
+            video_id: Local video identifier.
+        """
+        for key in [k for k in self._aborted_videos if k[1] == "local" and k[2] == video_id]:
+            self._aborted_videos.pop(key, None)
 
     def _is_youtube_in_cooldown(self) -> bool:
         """Checks if YouTube operations are temporarily suspended due to bot detection or failure limit.
@@ -283,8 +292,7 @@ class IngestionManager:
                 else:
                     existing = self.local_videos[vid]
                     if existing.timestamp != item.timestamp or existing.local_path != item.local_path:
-                        for key in [k for k in self._aborted_videos if k[1] == vid]:
-                            self._aborted_videos.pop(key, None)
+                        self._clear_local_aborts(vid)
                         existing.status = "ready"
                         existing.error_reason = None
                         existing.retry_after = None
@@ -296,9 +304,7 @@ class IngestionManager:
 
             for vid in set(self.local_videos.keys()) - set(discovered.keys()):
                 self.local_videos.pop(vid, None)
-                if vid not in self.youtube_videos:
-                    for key in [k for k in self._aborted_videos if k[1] == vid]:
-                        self._aborted_videos.pop(key, None)
+                self._clear_local_aborts(vid)
 
             if self.local_videos:
                 logfire.debug(f"Watch folders scan complete: {len(self.local_videos)} local file(s) tracked.")
@@ -333,16 +339,16 @@ class IngestionManager:
                 logfire.warning(f"Unexpected error during YouTube source scan: {e}")
                 return list(self.youtube_videos.values())
 
-            if scan_result.members_only_ids:
-                self._scan_members_only_ids.update(scan_result.members_only_ids)
-                for ignored_vid in scan_result.members_only_ids:
-                    self.youtube_videos.pop(ignored_vid, None)
+            for ignored_vid in scan_result.members_only_ids:
+                self.youtube_videos.pop(ignored_vid, None)
 
             discovered_new = 0
             for item in scan_result.videos:
                 if item.video_id in scan_result.members_only_ids:
                     continue
-                self._scan_members_only_ids.discard(item.video_id)
+                # Guard against concurrent download marking this video members-only while scan was running.
+                if item.video_id in self._download_members_only_ids and item.video_id not in ignored_snapshot:
+                    continue
                 self._download_members_only_ids.discard(item.video_id)
 
                 if item.video_id not in self.youtube_videos:
@@ -446,7 +452,7 @@ class IngestionManager:
                 continue
 
             if not self._is_completed_for_runner(v, runner.full_shortcode):
-                abort_reason = self._aborted_videos.get((runner.config.name, v.video_id))
+                abort_reason = self._aborted_videos.get((runner.config.name, v.source_type, v.video_id))
                 if abort_reason is not None:
                     status_val = "failed"
                     error_reason = abort_reason
@@ -500,7 +506,7 @@ class IngestionManager:
         """
         if not is_valid_video_id(video.video_id):
             logfire.warning(f"Skipping queued video with invalid video ID {video.video_id!r}.")
-            self._aborted_videos[(runner.config.name, video.video_id)] = "Invalid video ID"
+            self._aborted_videos[(runner.config.name, video.source_type, video.video_id)] = "Invalid video ID"
             return False, False, False
 
         if video.source_type == "local" and (not video.local_path or not video.local_path.is_file()):
@@ -614,7 +620,7 @@ class IngestionManager:
                 for v in candidates:
                     if self._is_completed_for_runner(v, runner.full_shortcode):
                         completed_in_git += 1
-                    elif (runner.config.name, v.video_id) in self._aborted_videos:
+                    elif (runner.config.name, v.source_type, v.video_id) in self._aborted_videos:
                         aborted_count += 1
                     elif v.retry_after is not None and now < v.retry_after:
                         in_cooldown += 1
@@ -656,24 +662,16 @@ class IngestionManager:
                 max_failures = self.config.youtube.maxfailures
 
                 for video in eligible:
-                    if self._stopped:
-                        return
-                    if not runner.is_idle():
+                    if self._stopped or not runner.is_idle():
                         break
 
                     if video.source_type == "youtube":
-                        if self._is_youtube_in_cooldown():
-                            continue
-                        if self.youtube_videos.get(video.video_id) is not video:
+                        if self._is_youtube_in_cooldown() or self.youtube_videos.get(video.video_id) is not video:
                             continue
                     elif self.local_videos.get(video.video_id) is not video:
                         continue
 
-                    if (runner.config.name, video.video_id) in self._aborted_videos:
-                        continue
                     if self._is_completed_for_runner(video, runner.full_shortcode):
-                        continue
-                    if video.retry_after is not None and monotonic() < video.retry_after:
                         continue
 
                     fed, stop_runner, is_dl_failure = await self._try_feed_runner(runner, video)
@@ -686,6 +684,8 @@ class IngestionManager:
                             break
                     if fed or stop_runner:
                         break
+                if self._stopped:
+                    return
 
     async def start(self) -> None:
         """Starts the ingestion manager with an initial scan, followed by periodic delta intake loops."""

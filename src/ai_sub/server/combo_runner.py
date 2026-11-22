@@ -268,7 +268,6 @@ class ComboRunner:
         task_type: TaskType,
         video_id: str,
         media_path: Path,
-        status: TaskStatus = TaskStatus.PENDING,
         segment_index: int | None = None,
     ) -> None:
         """Creates or updates a pending ServerTask entry in self.tasks.
@@ -278,7 +277,6 @@ class ComboRunner:
             task_type: Type of AI task.
             video_id: Owning video identifier.
             media_path: Path to the segment or summary media file.
-            status: Task status. Defaults to TaskStatus.PENDING.
             segment_index: Zero-based segment index, if applicable. Defaults to None.
         """
         if task_id in self.tasks:
@@ -295,7 +293,7 @@ class ComboRunner:
             segment_index=segment_index,
             model=self._stage_config(task_type).model,
             media_path=media_path,
-            status=status,
+            status=TaskStatus.PENDING,
         )
 
     async def _create_pipeline(
@@ -658,6 +656,14 @@ class ComboRunner:
         Returns:
             bool: True if an active video was successfully restored, False otherwise.
         """
+
+        async def _purge_dir(target: Path, message: str, info: bool = False) -> None:
+            if info:
+                logfire.info(message)
+            else:
+                logfire.warning(message)
+            await asyncio.to_thread(shutil.rmtree, target, ignore_errors=True)
+
         with logfire.span("Disk Resume Check: {combo}", combo=self.config.name) as resume_span:
             job_dirs: list[tuple[Literal["local", "youtube"], Path]] = []
             for stype in ("local", "youtube"):
@@ -686,44 +692,43 @@ class ComboRunner:
             for folder_source_type, d in job_dirs:
                 meta_file = d / "video_meta.json"
                 if not meta_file.is_file():
-                    logfire.info(
-                        f"Purging stale folder without metadata: {folder_source_type}/{d.name} in {self.config.name}"
+                    await _purge_dir(
+                        d,
+                        f"Purging stale folder without metadata: {folder_source_type}/{d.name} in {self.config.name}",
+                        info=True,
                     )
-                    await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
                     continue
 
                 try:
                     with open(meta_file, "r", encoding="utf-8") as f:
                         meta = json.load(f)
                     if not isinstance(meta, dict):
-                        logfire.warning(f"Purging job folder with invalid metadata: {folder_source_type}/{d.name}")
-                        await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
+                        await _purge_dir(d, f"Purging job folder with invalid metadata: {folder_source_type}/{d.name}")
                         continue
 
                     raw_path_str = str(meta.get("raw_path") or "")
                     raw_path = Path(raw_path_str) if raw_path_str else None
                     if not raw_path or not raw_path.is_file():
-                        logfire.warning(
+                        await _purge_dir(
+                            d,
                             f"Purging job folder with missing raw video: {folder_source_type}/{d.name} "
-                            f"in {self.config.name}"
+                            f"in {self.config.name}",
                         )
-                        await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
                         continue
 
                     raw_ts = meta.get("timestamp", 0)
                     if isinstance(raw_ts, bool):
-                        logfire.warning(f"Purging job folder with invalid timestamp: {folder_source_type}/{d.name}")
-                        await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
+                        await _purge_dir(d, f"Purging job folder with invalid timestamp: {folder_source_type}/{d.name}")
                         continue
                     timestamp = int(raw_ts)
 
                     source_type = meta.get("source_type", folder_source_type)
                     if source_type not in ("local", "youtube"):
-                        logfire.warning(
+                        await _purge_dir(
+                            d,
                             f"Purging job folder with invalid source_type {source_type!r}: "
-                            f"{folder_source_type}/{d.name}"
+                            f"{folder_source_type}/{d.name}",
                         )
-                        await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
                         continue
 
                     channel_raw = meta.get("channel_name")
@@ -737,8 +742,10 @@ class ComboRunner:
                     }
                     valid_candidates.append((d, parsed_meta, raw_path))
                 except Exception as e:
-                    logfire.warning(f"Purging job folder with corrupt metadata: {folder_source_type}/{d.name} ({e})")
-                    await asyncio.to_thread(shutil.rmtree, d, ignore_errors=True)
+                    await _purge_dir(
+                        d,
+                        f"Purging job folder with corrupt metadata: {folder_source_type}/{d.name} ({e})",
+                    )
 
             valid_candidates.sort(key=lambda item: _get_mtime(item[0]), reverse=True)
 
@@ -783,10 +790,11 @@ class ComboRunner:
             pipeline, job_dir = resumed
             for cand_dir, _, _ in valid_candidates:
                 if cand_dir != job_dir and cand_dir not in failed_resume_dirs:
-                    logfire.info(
-                        f"Purging older job folder: {cand_dir.parent.name}/{cand_dir.name} in {self.config.name}"
+                    await _purge_dir(
+                        cand_dir,
+                        f"Purging older job folder: {cand_dir.parent.name}/{cand_dir.name} in {self.config.name}",
+                        info=True,
                     )
-                    await asyncio.to_thread(shutil.rmtree, cand_dir, ignore_errors=True)
 
             self.pipeline = pipeline
             self.tasks.clear()
@@ -835,22 +843,3 @@ class ComboRunner:
         self.active_reencode_segments.clear()
         self._reencode_wake_event.clear()
         return purge_dir
-
-    async def clear_active_video(self, purge_disk: bool = True) -> None:
-        """Clears the active video state for this runner, optionally purging working directory files.
-
-        Args:
-            purge_disk: Whether to remove the active video's working directory on disk. Defaults to True.
-        """
-        with logfire.span("Clear Active Video: {combo}", combo=self.config.name) as clear_span:
-            await self.stop_background_tasks()
-            purge_dir = self.detach_active_state(purge_disk=purge_disk)
-            purged_path = str(purge_dir) if purge_dir is not None and purge_dir.exists() else None
-            if purge_dir is not None and purge_dir.exists():
-                try:
-                    await asyncio.to_thread(shutil.rmtree, purge_dir)
-                except OSError as e:
-                    logfire.warning(f"Could not purge job directory {purge_dir.name}: {e}")
-
-            clear_span.set_attribute("purged_directory", purged_path or "none")
-            self.status = RunnerStatus.IDLE

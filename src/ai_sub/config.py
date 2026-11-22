@@ -121,7 +121,7 @@ SearchToolList = Annotated[list[SearchTool], NoDecode, BeforeValidator(lambda va
 PathList = Annotated[list[Path], NoDecode, BeforeValidator(lambda val: _parse_list_items(val, Path))]
 
 
-def _merge_section_defaults(val: Any, section_defaults: dict[str, dict[str, Any]]) -> Any:
+def merge_section_defaults(val: Any, section_defaults: dict[str, dict[str, Any]]) -> Any:
     """Strips None section entries and merges partial dicts with section-specific defaults.
 
     Args:
@@ -467,7 +467,7 @@ class SearchSettings(BaseConfigModel):
         Returns:
             Any: Input dictionary with search backoff defaults merged.
         """
-        return _merge_section_defaults(
+        return merge_section_defaults(
             val,
             {
                 "backoff": {
@@ -598,7 +598,7 @@ class ReencodeSettings(BaseConfigModel):
         Returns:
             Any: Input dictionary with stage-specific re-encode defaults merged.
         """
-        return _merge_section_defaults(
+        return merge_section_defaults(
             val,
             {
                 "summary": {"threshold": ByteSize(300_000_000), "fps": "keyframes"},
@@ -665,18 +665,14 @@ class StageModelsMixin(BaseConfigModel):
         Returns:
             Any: Normalized dictionary with null stages stripped and stage-appropriate agentic defaults.
         """
-        if not isinstance(val, dict):
-            return val
-        updated = dict(val)
-        for stage in ("summary", "subtitles", "lyrics"):
-            if stage not in updated:
-                continue
-            stage_val = updated[stage]
-            if stage_val is None:
-                updated.pop(stage)
-            elif stage in ("summary", "lyrics") and isinstance(stage_val, dict) and "agentic" not in stage_val:
-                updated[stage] = {**stage_val, "agentic": True}
-        return updated
+        return merge_section_defaults(
+            val,
+            {
+                "summary": {"agentic": True},
+                "subtitles": {},
+                "lyrics": {"agentic": True},
+            },
+        )
 
 
 class AiSettings(BaseConfigModel):

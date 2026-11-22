@@ -15,7 +15,7 @@ from typing import Any, Literal
 import logfire
 from pydantic import ValidationError
 
-from ai_sub.pipeline import Pipeline, SegmentState, probe_keyframe_base_fps
+from ai_sub.pipeline import MediaStageState, Pipeline, SegmentState, probe_keyframe_base_fps
 from ai_sub.protocol import (
     TaskClaimResponse,
     TaskType,
@@ -95,7 +95,7 @@ def is_valid_video_id(video_id: str) -> bool:
     Returns:
         bool: True if safe for directory path construction, False otherwise.
     """
-    return video_id not in (".", "..") and bool(video_id.strip()) and "/" not in video_id and "\\" not in video_id
+    return video_id.strip() not in ("", ".", "..") and "/" not in video_id and "\\" not in video_id
 
 
 def _release_task_lease(task: ServerTask) -> None:
@@ -109,20 +109,20 @@ def _release_task_lease(task: ServerTask) -> None:
     task.last_heartbeat = None
 
 
-def _get_stage_tier(pipeline: Pipeline, task: ServerTask) -> int | None:
-    """Returns the current fallback FPS tier for the unit associated with a server task.
+def _get_stage_media_state(pipeline: Pipeline, task: ServerTask) -> MediaStageState | None:
+    """Returns the SummaryState or SegmentState associated with a server task.
 
     Args:
         pipeline: Active Pipeline instance.
         task: Server task belonging to the pipeline.
 
     Returns:
-        int | None: Active fallback_tier, or None if unavailable.
+        MediaStageState | None: Active stage media state, or None if unavailable.
     """
     if task.task_type == TaskType.SUMMARY:
-        return pipeline.summary.fallback_tier
+        return pipeline.summary
     if task.segment_index is not None and 0 <= task.segment_index < len(pipeline.segments):
-        return pipeline.segments[task.segment_index].fallback_tier
+        return pipeline.segments[task.segment_index]
     return None
 
 
@@ -452,7 +452,7 @@ class ComboRunnersCoordinator:
     _background_tasks: set[asyncio.Task[Any]]
     _stopping: bool
     on_runners_finalized: Callable[[], Any] | None
-    on_video_aborted: Callable[[str, str, str], None] | None
+    on_video_aborted: Callable[[str, Literal["local", "youtube"], str, str], None] | None
 
     def __init__(self, settings: ServerSettings, git_sync: GitSyncManager) -> None:
         """Initializes the central combination runners coordinator.
@@ -672,7 +672,7 @@ class ComboRunnersCoordinator:
                     logfire.exception(f"Error resuming runner '{name}' from disk: {e}")
                     try:
                         # Preserve on-disk checkpoints when startup recovery raises unexpectedly
-                        await runner.clear_active_video(purge_disk=False)
+                        await self._clear_runner_after_finalize(runner, purge_disk=False)
                     except Exception as clear_err:
                         logfire.warning(f"Error resetting in-memory state for failed runner '{name}': {clear_err}")
 
@@ -886,31 +886,63 @@ class ComboRunnersCoordinator:
         Returns:
             bool: True indicating the task failure was processed.
         """
-        if error_message and error_message not in reason:
-            detail = f"[{reason}] {error_message}"
-        else:
-            detail = reason or error_message or "Unknown failure"
+        with logfire.span(
+            "Process Task Failure: {task_id}",
+            task_id=task.task_id,
+            worker_id=worker_id,
+            reason=reason,
+        ) as fail_span:
+            if error_message and error_message not in reason:
+                detail = f"[{reason}] {error_message}"
+            else:
+                detail = reason or error_message or "Unknown failure"
 
-        duration_s = (time() - task.claimed_at) if task.claimed_at else None
-        _release_task_lease(task)
+            duration_s = (time() - task.claimed_at) if task.claimed_at else None
+            _release_task_lease(task)
 
-        if is_retryable:
-            task.status = TaskStatus.PENDING
-            self._log_activity(
-                event_type="retry",
-                task=task,
-                worker_id=worker_id,
-                duration_s=duration_s,
-                detail=detail,
-            )
-            logfire.warning(
-                f"Task '{task.task_id}' failed by worker '{worker_id}' (retryable: {reason}). Reset to PENDING."
-            )
-            return True
+            if is_retryable:
+                task.status = TaskStatus.PENDING
+                self._log_activity(
+                    event_type="retry",
+                    task=task,
+                    worker_id=worker_id,
+                    duration_s=duration_s,
+                    detail=detail,
+                )
+                logfire.warning(
+                    f"Task '{task.task_id}' failed by worker '{worker_id}' (retryable: {reason}). Reset to PENDING."
+                )
+                fail_span.set_attribute("result", task.status.value)
+                return True
 
-        runner = self.runners.get(task.pipeline_name)
-        if not runner:
-            task.status = TaskStatus.FAILED
+            runner = self.runners.get(task.pipeline_name)
+            if not runner:
+                task.status = TaskStatus.FAILED
+                self._log_activity(
+                    event_type="fail",
+                    task=task,
+                    worker_id=worker_id,
+                    duration_s=duration_s,
+                    detail=detail,
+                )
+                fail_span.set_attribute("result", task.status.value)
+                return True
+
+            outcome = await runner.on_task_failed(task.task_id, fallback_base_fps=fallback_base_fps)
+            max_runs = self.settings.retry.maxruns
+
+            if outcome.action == "fallback_reencode":
+                fps_str = f"{outcome.target_fps:.4g}" if outcome.target_fps is not None else "unknown"
+                detail = f"{detail}\n-> Falling back to {fps_str} fps (tier {outcome.fallback_tier})"
+            elif outcome.action == "exhausted":
+                detail = f"{detail}\n-> Exhausted all {max_runs} run(s) and fallback FPS tiers."
+                logfire.error(f"Task '{task.task_id}' marked FAILED after exhausting retries and fallback tiers.")
+            elif outcome.action == "retry":
+                logfire.warning(
+                    f"Task '{task.task_id}' failed by worker '{worker_id}' "
+                    f"(attempt {outcome.tier_attempts}/{max_runs}). Reset to PENDING."
+                )
+
             self._log_activity(
                 event_type="fail",
                 task=task,
@@ -918,70 +950,8 @@ class ComboRunnersCoordinator:
                 duration_s=duration_s,
                 detail=detail,
             )
-            return True
-
-        outcome = await runner.on_task_failed(task.task_id, fallback_base_fps=fallback_base_fps)
-        max_runs = self.settings.retry.maxruns
-
-        if outcome.action == "fallback_reencode":
-            fps_str = f"{outcome.target_fps:.4g}" if outcome.target_fps is not None else "unknown"
-            detail = f"{detail}\n-> Falling back to {fps_str} fps (tier {outcome.fallback_tier})"
-        elif outcome.action == "exhausted":
-            detail = f"{detail}\n-> Exhausted all {max_runs} run(s) and fallback FPS tiers."
-            logfire.error(f"Task '{task.task_id}' marked FAILED after exhausting retries and fallback tiers.")
-        elif outcome.action == "retry":
-            logfire.warning(
-                f"Task '{task.task_id}' failed by worker '{worker_id}' "
-                f"(attempt {outcome.tier_attempts}/{max_runs}). Reset to PENDING."
-            )
-
-        self._log_activity(
-            event_type="fail",
-            task=task,
-            worker_id=worker_id,
-            duration_s=duration_s,
-            detail=detail,
-        )
-        return True
-
-    async def _record_fail_with_span(
-        self,
-        task: ServerTask,
-        worker_id: str,
-        reason: str,
-        error_message: str | None,
-        is_retryable: bool,
-        fallback_base_fps: float | None,
-    ) -> bool:
-        """Wraps _fail_task_locked with a Logfire telemetry span while lock is held.
-
-        Args:
-            task: Affected server task.
-            worker_id: Worker reporting the failure.
-            reason: Error code or exception description.
-            error_message: Optional error details.
-            is_retryable: Whether failure is retryable.
-            fallback_base_fps: Optional pre-probed base FPS for tier-0 keyframes fallback.
-
-        Returns:
-            bool: True if failure was processed.
-        """
-        with logfire.span(
-            "Process Task Failure: {task_id}",
-            task_id=task.task_id,
-            worker_id=worker_id,
-            reason=reason,
-        ) as fail_span:
-            success = await self._fail_task_locked(
-                task=task,
-                worker_id=worker_id,
-                reason=reason,
-                error_message=error_message,
-                is_retryable=is_retryable,
-                fallback_base_fps=fallback_base_fps,
-            )
             fail_span.set_attribute("result", task.status.value)
-            return success
+            return True
 
     @staticmethod
     def _prepare_probe_context(
@@ -1003,10 +973,46 @@ class ComboRunnersCoordinator:
         probe_paths = runner.pipeline.get_fallback_probe_paths(task.task_type, task.segment_index)
         if probe_paths is None:
             return None
-        expected_tier = _get_stage_tier(runner.pipeline, task)
+        stage_state = _get_stage_media_state(runner.pipeline, task)
+        expected_tier = stage_state.fallback_tier if stage_state is not None else None
         # Refresh heartbeat so the lease sweeper does not reclaim the task while probing off-lock
         task.last_heartbeat = time()
         return probe_paths, task.claim_generation, expected_tier
+
+    async def _fail_or_prepare_probe_locked(
+        self,
+        runner: ComboRunner,
+        task: ServerTask,
+        worker_id: str,
+        reason: str,
+        error_message: str | None,
+        is_retryable: bool,
+    ) -> tuple[bool, tuple[tuple[Path, Path | None], int, int | None] | None]:
+        """Records failure immediately under lock, or prepares off-lock probe context for tier-0 keyframes.
+
+        Args:
+            runner: Owning ComboRunner instance.
+            task: Affected server task.
+            worker_id: Worker reporting the failure.
+            reason: Error code or exception description.
+            error_message: Optional error details.
+            is_retryable: Whether failure is retryable and exempt from attempt counting.
+
+        Returns:
+            tuple[bool, tuple[tuple[Path, Path | None], int, int | None] | None]:
+                (recorded, None) when handled immediately, or (False, probe_ctx) when off-lock probing is needed.
+        """
+        probe_ctx = self._prepare_probe_context(runner, task) if not is_retryable else None
+        if probe_ctx is not None:
+            return False, probe_ctx
+        recorded = await self._fail_task_locked(
+            task=task,
+            worker_id=worker_id,
+            reason=reason,
+            error_message=error_message,
+            is_retryable=is_retryable,
+        )
+        return recorded, None
 
     async def _fail_task_with_probe(
         self,
@@ -1017,7 +1023,6 @@ class ComboRunnersCoordinator:
         error_message: str | None,
         is_retryable: bool,
         probe_ctx: tuple[tuple[Path, Path | None], int, int | None],
-        with_span: bool,
     ) -> bool:
         """Probes keyframe FPS off-lock, re-verifies lease ownership, and records task failure.
 
@@ -1029,7 +1034,6 @@ class ComboRunnersCoordinator:
             error_message: Optional error details.
             is_retryable: Whether failure is retryable.
             probe_ctx: Tuple of (probe_paths, expected_generation, expected_tier).
-            with_span: Whether to wrap failure recording in a Logfire span.
 
         Returns:
             bool: True if failure was recorded, False if the lease or tier became stale while probing.
@@ -1048,19 +1052,11 @@ class ComboRunnersCoordinator:
                 return False
 
             runner, task = claimed
-            if runner.pipeline is None or _get_stage_tier(runner.pipeline, task) != expected_tier:
+            stage_state = _get_stage_media_state(runner.pipeline, task) if runner.pipeline is not None else None
+            if stage_state is None or stage_state.fallback_tier != expected_tier:
                 logfire.warning(f"Discarding stale {action.lower()} probe for '{task_id}': stage tier changed.")
                 return False
 
-            if with_span:
-                return await self._record_fail_with_span(
-                    task=task,
-                    worker_id=worker_id,
-                    reason=reason,
-                    error_message=error_message,
-                    is_retryable=is_retryable,
-                    fallback_base_fps=fallback_base_fps,
-                )
             return await self._fail_task_locked(
                 task=task,
                 worker_id=worker_id,
@@ -1075,7 +1071,7 @@ class ComboRunnersCoordinator:
         task_id: str,
         worker_id: str,
         result: dict[str, Any],
-    ) -> bool:
+    ) -> tuple[bool, str | None]:
         """Records task completion and persists the result to disk.
 
         Checkpoint persistence errors (OSError) propagate without failing or revoking the lease so
@@ -1088,18 +1084,20 @@ class ComboRunnersCoordinator:
             result: Validated AI result dictionary.
 
         Returns:
-            bool: True if completion was accepted, False otherwise.
+            tuple[bool, str | None]: (accepted, validation_error_message). Returns (True, None) on
+            acceptance, (False, None) when the lease is invalid/stale, or (False, error_detail) when
+            server-side validation rejects the payload.
 
         Raises:
             OSError: If saving the durable YAML checkpoint fails on disk.
         """
         probe_ctx: tuple[tuple[Path, Path | None], int, int | None] | None = None
-        val_error_msg: str | None = None
+        val_error_detail: str | None = None
 
         async with self._lock:
             claimed = self._get_claimed_task(task_id, worker_id, action="Completion")
             if not claimed:
-                return False
+                return False, None
 
             runner, task = claimed
             with logfire.span("Process Complete Task: {task_id}", task_id=task_id, worker_id=worker_id) as comp_span:
@@ -1116,17 +1114,17 @@ class ComboRunnersCoordinator:
                     logfire.warning(f"Task '{task_id}' validation failed: {val_err}. Routing to fail.")
                     comp_span.set_attribute("result", "validation_failed")
                     comp_span.set_attribute("error", str(val_err))
-                    val_error_msg = f"Server validation error: {val_err}"
-                    probe_ctx = self._prepare_probe_context(runner, task)
+                    val_error_detail = str(val_err)
+                    _, probe_ctx = await self._fail_or_prepare_probe_locked(
+                        runner,
+                        task,
+                        worker_id,
+                        reason="EXECUTION_ERROR",
+                        error_message=f"Server validation error: {val_error_detail}",
+                        is_retryable=False,
+                    )
                     if probe_ctx is None:
-                        await self._fail_task_locked(
-                            task=task,
-                            worker_id=worker_id,
-                            reason="EXECUTION_ERROR",
-                            error_message=val_error_msg,
-                            is_retryable=False,
-                        )
-                        return False
+                        return False, val_error_detail
                 else:
                     self._log_activity(
                         event_type="complete",
@@ -1138,20 +1136,19 @@ class ComboRunnersCoordinator:
                     comp_span.set_attribute("result", "accepted")
                     comp_span.set_attribute("duration_s", round(duration, 1))
                     logfire.info(f"Task '{task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
-                    return True
+                    return True, None
 
-        assert probe_ctx is not None and val_error_msg is not None
-        await self._fail_task_with_probe(
+        assert probe_ctx is not None and val_error_detail is not None
+        recorded = await self._fail_task_with_probe(
             task_id=task_id,
             worker_id=worker_id,
             action="Validation failure",
             reason="EXECUTION_ERROR",
-            error_message=val_error_msg,
+            error_message=f"Server validation error: {val_error_detail}",
             is_retryable=False,
             probe_ctx=probe_ctx,
-            with_span=False,
         )
-        return False
+        return False, (val_error_detail if recorded else None)
 
     async def fail_task(
         self,
@@ -1182,16 +1179,16 @@ class ComboRunnersCoordinator:
                 return False
 
             runner, task = claimed
-            probe_ctx = self._prepare_probe_context(runner, task) if not is_retryable else None
+            recorded, probe_ctx = await self._fail_or_prepare_probe_locked(
+                runner,
+                task,
+                worker_id,
+                reason=reason,
+                error_message=error_message,
+                is_retryable=is_retryable,
+            )
             if probe_ctx is None:
-                return await self._record_fail_with_span(
-                    task=task,
-                    worker_id=worker_id,
-                    reason=reason,
-                    error_message=error_message,
-                    is_retryable=is_retryable,
-                    fallback_base_fps=None,
-                )
+                return recorded
 
         return await self._fail_task_with_probe(
             task_id=task_id,
@@ -1201,7 +1198,6 @@ class ComboRunnersCoordinator:
             error_message=error_message,
             is_retryable=is_retryable,
             probe_ctx=probe_ctx,
-            with_span=True,
         )
 
     def get_task_media_path(self, task_id: str) -> Path | None:
@@ -1218,16 +1214,17 @@ class ComboRunnersCoordinator:
             return found[1].media_path
         return None
 
-    async def _clear_runner_after_finalize(self, runner: ComboRunner) -> None:
-        """Stops runner tasks, detaches state under lock, deletes job_dir off-lock, and sets IDLE.
+    async def _clear_runner_after_finalize(self, runner: ComboRunner, purge_disk: bool = True) -> None:
+        """Stops runner tasks, detaches state under lock, deletes job_dir off-lock if requested, and sets IDLE.
 
         Args:
             runner: Combination runner to clear and reset.
+            purge_disk: Whether to delete the active job directory on disk. Defaults to True.
         """
         await runner.stop_background_tasks()
         async with self._lock:
             self._push_retry_after.pop(runner.config.name, None)
-            purge_dir = runner.detach_active_state(purge_disk=True)
+            purge_dir = runner.detach_active_state(purge_disk=purge_disk)
 
         try:
             if purge_dir is not None and purge_dir.exists():
@@ -1278,7 +1275,7 @@ class ComboRunnersCoordinator:
                 )
                 if self.on_video_aborted is not None:
                     try:
-                        self.on_video_aborted(runner.config.name, pipe.video_id, "Summary failed")
+                        self.on_video_aborted(runner.config.name, pipe.source_type, pipe.video_id, "Summary failed")
                     except Exception as cb_err:
                         logfire.warning(f"Error invoking on_video_aborted callback: {cb_err}")
 
@@ -1418,25 +1415,15 @@ class ComboRunnersCoordinator:
             for t in runner.tasks.values():
                 if t.status != TaskStatus.CLAIMED:
                     continue
-                task_fallback_tier = 0
-                task_target_fps: float | str | None = None
-                if pipe is not None:
-                    if t.task_type == TaskType.SUMMARY:
-                        task_fallback_tier = pipe.summary.fallback_tier
-                        task_target_fps = pipe.summary.target_fps
-                    elif t.segment_index is not None and 0 <= t.segment_index < len(pipe.segments):
-                        seg = pipe.segments[t.segment_index]
-                        task_fallback_tier = seg.fallback_tier
-                        task_target_fps = seg.target_fps
-
+                stage_state = _get_stage_media_state(pipe, t) if pipe is not None else None
                 tasks_list.append(
                     {
                         "task_id": t.task_id,
                         "type": t.task_type.value,
                         "worker_id": t.worker_id,
                         "elapsed_s": int(now - t.claimed_at) if t.claimed_at else None,
-                        "fallback_tier": task_fallback_tier,
-                        "target_fps": task_target_fps,
+                        "fallback_tier": stage_state.fallback_tier if stage_state is not None else 0,
+                        "target_fps": stage_state.target_fps if stage_state is not None else None,
                         "logfire_query": _format_logfire_query(t),
                     }
                 )

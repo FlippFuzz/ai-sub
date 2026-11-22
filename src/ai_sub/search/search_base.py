@@ -22,6 +22,7 @@ from pyrate_limiter import Duration, Limiter, limiter_factory
 from ai_sub.config import SearchSettings
 
 T = TypeVar("T")
+_PUNCT_TRANSLATOR = str.maketrans("", "", string.punctuation)
 
 
 class _BoundedCache(OrderedDict[str, Any]):
@@ -69,7 +70,9 @@ class WebQueryResult(BaseModel):
 
 
 def normalize_query(query: str) -> str:
-    """Strips punctuation and normalizes query case for deduplicated caching.
+    """Strips punctuation, collapses whitespace, and casefolds a query for deduplicated caching.
+
+    Falls back to whitespace-collapsed casefolded input when punctuation removal leaves an empty string.
 
     Args:
         query: Raw search query string.
@@ -77,8 +80,8 @@ def normalize_query(query: str) -> str:
     Returns:
         str: Normalized query key.
     """
-    translator = str.maketrans("", "", string.punctuation)
-    return query.translate(translator).casefold()
+    cleaned = " ".join(query.translate(_PUNCT_TRANSLATOR).split()).casefold()
+    return cleaned or " ".join(query.split()).casefold()
 
 
 def parse_retry_after(header_value: str | None) -> float | None:
@@ -344,7 +347,7 @@ class BaseSearchProvider(ABC):
             q = raw_q.strip() if raw_q else ""
             if not q:
                 continue
-            dedup_key = normalize_query(q) or q.casefold()
+            dedup_key = normalize_query(q)
             if dedup_key in seen_keys:
                 continue
             seen_keys.add(dedup_key)
@@ -400,20 +403,6 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
         """
         return self.settings.get_key_for_provider(self.provider_name)
 
-    def _bearer_headers(self) -> dict[str, str]:
-        """Builds a standard Bearer Authorization header using this provider's API key.
-
-        Returns:
-            dict[str, str]: Authorization header mapping.
-
-        Raises:
-            ValueError: If the required API key is not configured.
-        """
-        key = self._get_api_key()
-        if key is None:
-            raise ValueError(f"{self.provider_name.capitalize()} API key is required but not configured.")
-        return {"Authorization": f"Bearer {key.get_secret_value()}"}
-
     def _get_headers(self) -> dict[str, str]:
         """Constructs provider-specific HTTP headers including authorization.
 
@@ -421,8 +410,16 @@ class BaseHttpSearchProvider(BaseSearchProvider, ABC):
 
         Returns:
             dict[str, str]: Header key-value mapping.
+
+        Raises:
+            ValueError: If the required API key is not configured.
         """
-        return self._bearer_headers() if self.requires_api_key else {}
+        if not self.requires_api_key:
+            return {}
+        key = self._get_api_key()
+        if key is None:
+            raise ValueError(f"{self.provider_name.capitalize()} API key is required but not configured.")
+        return {"Authorization": f"Bearer {key.get_secret_value()}"}
 
     async def __aenter__(self) -> Self:
         """Initializes the authenticated HTTP client session.
