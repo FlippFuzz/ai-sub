@@ -14,6 +14,7 @@ coordinator:
   heartbeattimeout: 300        # Lease expiration timeout in seconds
   validationbuffer: 2          # Allowed subtitle end timestamp buffer in seconds
   activitymaxlen: 50           # Maximum worker activity events preserved per pipeline
+  nfo: false                   # Generate Jellyfin .nfo metadata (in .int/<shortcode>/) from summary
 
 # Task Execution and Distributed Retry Controls
 retry:

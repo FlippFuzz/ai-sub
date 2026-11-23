@@ -138,8 +138,8 @@ class WorkerClient:
             if resp.status_code == 200:
                 data = TaskHeartbeatResponse.model_validate(resp.json())
                 return data.acknowledged
-            if resp.status_code >= 500:
-                logfire.warning(f"Heartbeat received server error {resp.status_code} for task '{task_id}'")
+            if resp.status_code in (408, 429) or resp.status_code >= 500:
+                logfire.warning(f"Heartbeat received transient HTTP {resp.status_code} for task '{task_id}'")
                 return None
             logfire.warning(f"Heartbeat returned unexpected status {resp.status_code} for task '{task_id}'")
             return False

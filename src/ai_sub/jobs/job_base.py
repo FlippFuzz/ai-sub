@@ -192,7 +192,7 @@ def validate_duration_bound(
 def _clean_context_item(data: Any) -> Any:
     """Recursively converts Pydantic models, lists, and dicts into JSON-serializable primitives.
 
-    Excludes internal reasoning traces (`thoughts`), duplicate `user_context`, and `None` fields.
+    Excludes internal reasoning traces (`thoughts`) and `None` fields.
 
     Args:
         data: Input object to clean.
@@ -203,17 +203,13 @@ def _clean_context_item(data: Any) -> Any:
     if hasattr(data, "model_dump"):
         dumped = data.model_dump(
             mode="json",
-            exclude={"thoughts": True, "user_context": True},
+            exclude={"thoughts": True},
             exclude_none=True,
             by_alias=True,
         )
         return _clean_context_item(dumped)
     if isinstance(data, dict):
-        return {
-            k: _clean_context_item(v)
-            for k, v in data.items()
-            if k not in ("thoughts", "user_context") and v is not None
-        }
+        return {k: _clean_context_item(v) for k, v in data.items() if k != "thoughts" and v is not None}
     if isinstance(data, (list, tuple)):
         return [_clean_context_item(item) for item in data if item is not None]
     return data

@@ -366,9 +366,6 @@ class ComboRunner:
             if task_id and task_id in self.tasks:
                 self.tasks[task_id].status = TaskStatus.FAILED
 
-            if pipeline.is_done():
-                self._reencode_wake_event.set()
-
         self.sync_tasks_from_pipeline()
 
     async def _run_single_reencode(self, job: ReencodeJob, pipeline: Pipeline) -> None:

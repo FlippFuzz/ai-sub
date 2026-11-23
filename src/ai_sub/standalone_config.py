@@ -124,6 +124,10 @@ class StandaloneSettings(BaseSettings):
         default=None,
         description="Path to a text file containing user background context.",
     )
+    nfo: bool = Field(
+        default=False,
+        description="Whether to generate a Jellyfin-compatible .nfo file from the global summary.",
+    )
     video: CliPositionalArg[FilePath] = Field(
         description="Path to the video file to transcribe and subtitle.",
     )

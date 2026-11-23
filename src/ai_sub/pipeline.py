@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import shutil
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,7 +27,7 @@ from ai_sub.config import (
     atomic_write_text,
 )
 from ai_sub.gemini_executor import calculate_sha256_hex
-from ai_sub.jobs.job_base import AiJob, BaseJob, TaskType
+from ai_sub.jobs.job_base import AiJob, BaseJob, TaskType, parse_timestamp_string_ms
 from ai_sub.jobs.lyrics import LYRICS_PROMPT_VERSION, LyricsAiResponse, LyricsJob
 from ai_sub.jobs.reencode import ReencodeJob
 from ai_sub.jobs.subtitles import SUBTITLES_PROMPT_VERSION, SubtitlesAiResponse, SubtitlesJob
@@ -169,6 +171,56 @@ def _append_segment_events(
                 text=error_text,
             )
         )
+
+
+def _build_nfo_xml(summary: SummaryAiResponse, title: str | None = None) -> str:
+    """Builds a Jellyfin-compatible Movie NFO XML string from a global summary response.
+
+    Args:
+        summary: Phase 1 global video summary containing plot and chapter timeline.
+        title: Optional video title to expose in `<title>`. Omitted when None.
+
+    Returns:
+        str: Formatted UTF-8 XML document string.
+    """
+    root = ET.Element("movie")
+
+    if title and (clean_title := title.strip()):
+        title_el = ET.SubElement(root, "title")
+        title_el.text = clean_title
+
+    if plot_text := summary.overall_summary.strip():
+        plot_el = ET.SubElement(root, "plot")
+        plot_el.text = plot_text
+
+    chapter_entries: list[tuple[str, int]] = []
+    prev_start_s: int | None = None
+    for ch in summary.chapters:
+        ch_title = ch.title.strip()
+        if not ch_title:
+            continue
+        try:
+            start_ms = parse_timestamp_string_ms(ch.start)
+        except ValueError:
+            continue
+
+        raw_s = start_ms // 1000
+        if prev_start_s is not None and raw_s <= prev_start_s:
+            start_s = max(prev_start_s + 1, math.ceil(start_ms / 1000))
+        else:
+            start_s = raw_s
+
+        prev_start_s = start_s
+        chapter_entries.append((ch_title, start_s))
+
+    if chapter_entries:
+        chapters_el = ET.SubElement(root, "chapters")
+        for ch_title, start_s in chapter_entries:
+            ET.SubElement(chapters_el, "chapter", name=ch_title, start=str(start_s))
+
+    ET.indent(root, space="  ")
+    body = ET.tostring(root, encoding="unicode", short_empty_elements=False)
+    return f'<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n{body}\n'
 
 
 def _resolve_target_fps(
@@ -799,60 +851,46 @@ class Pipeline(BaseModel):
 
         return proxy_path
 
-    async def _validate_encoded_media(
-        self,
-        source_path: Path,
-        encoded_path: Path,
-        fps: float | Literal["keyframes"],
-        duration_tolerance_ms: int,
-    ) -> tuple[Path | None, bool]:
-        """Validates an existing compressed file on disk against expected duration and FPS.
-
-        Args:
-            source_path: Uncompressed source file path.
-            encoded_path: Candidate re-encoded file path.
-            fps: Expected target framerate or 'keyframes'.
-            duration_tolerance_ms: Allowed duration tolerance in milliseconds.
-
-        Returns:
-            tuple[Path | None, bool]: (encoded_path, True) if valid, else (None, False).
-        """
-        if await is_valid_reencoded_file(
-            input_path=source_path,
-            output_path=encoded_path,
-            fps=fps,
-            duration_tolerance_ms=duration_tolerance_ms,
-        ):
-            return encoded_path, True
-        return None, False
-
     async def _prepare_media_states(self) -> None:
         """Evaluates media compression needs and validates existing encoded files against target FPS."""
+
+        async def _check_stage_media(
+            state: MediaStageState,
+            cfg: StageReencodeSettings,
+            source_path: Path,
+            encoded_path: Path,
+            is_summary: bool = False,
+        ) -> None:
+            desired_fps = _resolve_target_fps(state.target_fps, state.fallback_tier, cfg, source_path)
+            state.target_fps = desired_fps
+            if desired_fps is None:
+                state.media_path = await self._link_raw_summary_proxy() if is_summary else source_path
+                state.media_ready = True
+            elif await is_valid_reencoded_file(
+                input_path=source_path,
+                output_path=encoded_path,
+                fps=desired_fps,
+                duration_tolerance_ms=int(cfg.tolerance.total_seconds() * 1000),
+            ):
+                state.media_path = encoded_path
+                state.media_ready = True
+            else:
+                state.media_path = None
+                state.media_ready = False
+
         if self.summary_enabled:
             if self.summary.response is not None or self.summary.exhausted:
                 self.summary.media_ready = True
             else:
-                sum_cfg = self.reencode_settings.summary
-                desired_sum_fps = _resolve_target_fps(
-                    self.summary.target_fps,
-                    self.summary.fallback_tier,
-                    sum_cfg,
+                await _check_stage_media(
+                    self.summary,
+                    self.reencode_settings.summary,
                     self.raw_video_path,
+                    self.job_dir / f"reencoded_summary_{self.media_tag}.mp4",
+                    is_summary=True,
                 )
-                self.summary.target_fps = desired_sum_fps
-                if desired_sum_fps is None:
-                    self.summary.media_path = await self._link_raw_summary_proxy()
-                    self.summary.media_ready = True
-                else:
-                    self.summary.media_path, self.summary.media_ready = await self._validate_encoded_media(
-                        self.raw_video_path,
-                        self.job_dir / f"reencoded_summary_{self.media_tag}.mp4",
-                        desired_sum_fps,
-                        int(sum_cfg.tolerance.total_seconds() * 1000),
-                    )
 
         seg_cfg = self.reencode_settings.segment
-        seg_tolerance_ms = int(seg_cfg.tolerance.total_seconds() * 1000)
         probe_sem = asyncio.Semaphore(8)
 
         async def _check_segment(seg: SegmentState) -> None:
@@ -862,24 +900,7 @@ class Pipeline(BaseModel):
                     seg.media_path = out_p if out_p.is_file() else seg.raw_path
                     seg.media_ready = True
                     return
-
-                desired_fps = _resolve_target_fps(
-                    seg.target_fps,
-                    seg.fallback_tier,
-                    seg_cfg,
-                    seg.raw_path,
-                )
-                seg.target_fps = desired_fps
-                if desired_fps is None:
-                    seg.media_path = seg.raw_path
-                    seg.media_ready = True
-                else:
-                    seg.media_path, seg.media_ready = await self._validate_encoded_media(
-                        seg.raw_path,
-                        out_p,
-                        desired_fps,
-                        seg_tolerance_ms,
-                    )
+                await _check_stage_media(seg, seg_cfg, seg.raw_path, out_p)
 
         await asyncio.gather(*(_check_segment(seg) for seg in self.segments))
 
@@ -1528,6 +1549,35 @@ class Pipeline(BaseModel):
             "retry": self.retry_settings.model_dump(mode="json"),
             "context": self.user_context,
         }
+
+    def write_nfo(
+        self,
+        output_dir: Path | None = None,
+        filename_stem: str | None = None,
+    ) -> Path | None:
+        """Writes a Jellyfin-compatible .nfo metadata file from the Phase 1 global summary.
+
+        Args:
+            output_dir: Destination directory for the .nfo file. Defaults to job_dir.
+            filename_stem: Base filename stem for the .nfo output. Defaults to self.filename_stem.
+
+        Returns:
+            Path | None: Path to the written .nfo file, or None if summary data is unavailable.
+        """
+        if self.summary.response is None:
+            logfire.warning(f"Skipping .nfo generation for '{self.video_id}': global summary is unavailable.")
+            return None
+
+        target_dir = output_dir if output_dir is not None else self.job_dir
+        stem = filename_stem if filename_stem is not None else self.filename_stem
+        nfo_path = target_dir / f"{stem}.nfo"
+
+        xml_content = _build_nfo_xml(
+            summary=self.summary.response,
+            title=self.title if self.source_type == "youtube" else None,
+        )
+        atomic_write_text(nfo_path, xml_content)
+        return nfo_path
 
     def finalize(
         self,

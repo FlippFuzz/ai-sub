@@ -14,12 +14,13 @@ All standalone settings can be configured via command-line arguments (e.g., `--a
 
 ---
 
-## User Context Options
+## Context & Output Options
 
-| Argument               | Environment Variable | Description                                                                                            | Default |
-| :--------------------- | :------------------- | :----------------------------------------------------------------------------------------------------- | :------ |
-| `--context <text>`     | `AISUB_CONTEXT`      | Inline text providing background context, speaker names, or translation preferences (`None` disables). | _None_  |
-| `--contextfile <path>` | `AISUB_CONTEXTFILE`  | Path to a text file containing user background context (`None` disables).                              | _None_  |
+| Argument               | Environment Variable | Description                                                                                                                  | Default |
+| :--------------------- | :------------------- | :--------------------------------------------------------------------------------------------------------------------------- | :------ |
+| `--context <text>`     | `AISUB_CONTEXT`      | Inline text providing background context, speaker names, or translation preferences (`None` disables).                       | _None_  |
+| `--contextfile <path>` | `AISUB_CONTEXTFILE`  | Path to a text file containing user background context (`None` disables).                                                    | _None_  |
+| `--nfo <bool>`         | `AISUB_NFO`          | Generate `<input_filename_stem>.nfo` (Jellyfin plot & chapters; requires `concurrency.summary > 0` and NFO Chapters plugin). | `False` |
 
 ---
 

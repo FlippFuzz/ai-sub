@@ -67,6 +67,10 @@ class CoordinatorConfig(BaseConfigModel):
         default=50,
         description="Maximum number of recent worker activity events preserved per combination pipeline.",
     )
+    nfo: bool = Field(
+        default=False,
+        description="Whether to generate a Jellyfin-compatible .nfo file from the global summary.",
+    )
 
 
 class ServerReencodeSettings(ReencodeSettings):

@@ -190,6 +190,11 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
         use_summary = settings.concurrency.summary > 0
         use_lyrics = settings.concurrency.lyrics > 0
 
+        if settings.nfo and not use_summary:
+            logfire.warning(
+                "NFO generation requires summary to be enabled (concurrency.summary > 0); skipping .nfo output."
+            )
+
         sum_reencode = settings.reencode.summary
         seg_reencode = settings.reencode.segment
         reencode_possible = bool(
@@ -410,6 +415,10 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
         )
         for g in generated:
             logfire.info(f"Subtitles written to {g.name}")
+
+        if settings.nfo and use_summary:
+            if nfo_path := pipeline.write_nfo(output_dir=out_dir, filename_stem=input_video_path.stem):
+                logfire.info(f"NFO written to {nfo_path.name}")
 
         if not pipeline.is_done():
             return AiSubResult.IN_PROGRESS

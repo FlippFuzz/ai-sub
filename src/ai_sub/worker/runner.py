@@ -146,15 +146,21 @@ class WorkerRunner:
             or (self._deadline is not None and monotonic() >= self._deadline)
         )
 
-    def _is_idle_timed_out(self) -> bool:
-        """Checks whether all slots are idle with no in-flight polls and idletimeout has elapsed (caller holds _cond).
+    def _is_idle_timed_out(self, timeout_s: float, ignore_polls: bool = False) -> bool:
+        """Checks whether all slots are idle and the idle or error timeout has elapsed (caller holds _cond).
+
+        Args:
+            timeout_s: Timeout duration in seconds.
+            ignore_polls: Whether to ignore in-flight claim polls (used for error timeouts). Defaults to False.
 
         Returns:
-            bool: True if no active tasks or claim polls remain and idle duration reached idletimeout.
+            bool: True if no blocking work remains and elapsed idle time reached timeout_s.
         """
-        if sum(self._active_tasks_per_model.values()) > 0 or sum(self._claim_polls_per_model.values()) > 0:
+        if sum(self._active_tasks_per_model.values()) > 0:
             return False
-        return (monotonic() - self._last_busy_timestamp) >= self.settings.idletimeout.total_seconds()
+        if not ignore_polls and sum(self._claim_polls_per_model.values()) > 0:
+            return False
+        return (monotonic() - self._last_busy_timestamp) >= timeout_s
 
     def _notify_model_state_change(self) -> None:
         """Triggers worker shutdown if all models are finished and wakes waiting slots (caller holds _cond)."""
@@ -416,19 +422,16 @@ class WorkerRunner:
                 current = asyncio.current_task()
                 if current is not None and current.cancelling():
                     raise
-                if lease_revoked.is_set():
-                    logfire.warning(f"[{slot_label}] Task '{claim.task_id}' lease was revoked by server.")
-                else:
-                    logfire.warning(
-                        f"[{slot_label}] Task '{claim.task_id}' cancelled unexpectedly; reporting retryable failure."
-                    )
-                    await self.client.fail_task(
-                        task_id=claim.task_id,
-                        worker_id=self.settings.id,
-                        reason="[RETRYABLE_ERROR] Unexpected internal task cancellation",
-                        error_message="Unexpected internal task cancellation",
-                        is_retryable=True,
-                    )
+                logfire.warning(
+                    f"[{slot_label}] Task '{claim.task_id}' cancelled unexpectedly; reporting retryable failure."
+                )
+                await self.client.fail_task(
+                    task_id=claim.task_id,
+                    worker_id=self.settings.id,
+                    reason="[RETRYABLE_ERROR] Unexpected internal task cancellation",
+                    error_message="Unexpected internal task cancellation",
+                    is_retryable=True,
+                )
 
             except QuotaExceededError as e:
                 logfire.warning(f"[{slot_label}] Daily quota reached for model '{claim.model}': {e}")
@@ -460,28 +463,6 @@ class WorkerRunner:
                     is_retryable=is_retryable,
                 )
 
-    async def _wait_for_condition(self, timeout_s: float, model: str, check_idle: bool = True) -> None:
-        """Sleeps while holding _cond until timeout expires, slot should stop, or idle timeout is reached.
-
-        Args:
-            timeout_s: Maximum duration to wait in seconds.
-            model: Model identifier bound to this slot.
-            check_idle: Whether to exit early when idle timeout has elapsed. Defaults to True.
-        """
-        deadline = monotonic() + max(0.0, timeout_s)
-        if self._deadline is not None:
-            deadline = min(deadline, self._deadline)
-
-        while not self._should_stop(model) and not (check_idle and self._is_idle_timed_out()):
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                break
-            try:
-                async with asyncio.timeout(remaining):
-                    await self._cond.wait()
-            except TimeoutError:
-                break
-
     async def _wait_after_poll(
         self,
         model: str,
@@ -504,13 +485,9 @@ class WorkerRunner:
         """
 
         def _shutdown_if_timed_out() -> bool:
-            if sum(self._active_tasks_per_model.values()) > 0:
-                return False
-            if not is_error and sum(self._claim_polls_per_model.values()) > 0:
+            if not self._is_idle_timed_out(timeout_s, ignore_polls=is_error):
                 return False
             elapsed = monotonic() - self._last_busy_timestamp
-            if elapsed < timeout_s:
-                return False
             if is_error:
                 logfire.error(
                     f"[{slot_label}] Server unreachable or failing claims for {elapsed:.1f}s. Shutting down worker."
@@ -531,15 +508,27 @@ class WorkerRunner:
         if _shutdown_if_timed_out():
             return True
 
+        wait_s = poll_interval_s
         if sum(self._active_tasks_per_model.values()) == 0 and (
             is_error or sum(self._claim_polls_per_model.values()) == 0
         ):
             wait_s = min(poll_interval_s, max(0.0, timeout_s - (monotonic() - self._last_busy_timestamp)))
-        else:
-            wait_s = poll_interval_s
 
         self._cond.notify_all()
-        await self._wait_for_condition(wait_s, model, check_idle=not is_error)
+        deadline = monotonic() + max(0.0, wait_s)
+        if self._deadline is not None:
+            deadline = min(deadline, self._deadline)
+
+        while not self._should_stop(model) and (is_error or not self._is_idle_timed_out(timeout_s)):
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                break
+            try:
+                async with asyncio.timeout(remaining):
+                    await self._cond.wait()
+            except TimeoutError:
+                break
+
         return self._should_stop(model) or _shutdown_if_timed_out()
 
     async def _model_slot_loop(

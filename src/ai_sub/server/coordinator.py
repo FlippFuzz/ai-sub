@@ -799,9 +799,8 @@ class ComboRunnersCoordinator:
                             continue
 
                         required_tools = runner.search_tools_for_task(task.task_type)
-                        if task.task_type in (TaskType.SUMMARY, TaskType.LYRICS):
-                            if required_tools and not all(t.lower() in worker_tools for t in required_tools):
-                                continue
+                        if required_tools and not all(t.lower() in worker_tools for t in required_tools):
+                            continue
 
                         now = time()
                         task.status = TaskStatus.CLAIMED
@@ -1093,6 +1092,7 @@ class ComboRunnersCoordinator:
         """
         probe_ctx: tuple[tuple[Path, Path | None], int, int | None] | None = None
         val_error_detail: str | None = None
+        val_error_msg = ""
 
         async with self._lock:
             claimed = self._get_claimed_task(task_id, worker_id, action="Completion")
@@ -1115,12 +1115,13 @@ class ComboRunnersCoordinator:
                     comp_span.set_attribute("result", "validation_failed")
                     comp_span.set_attribute("error", str(val_err))
                     val_error_detail = str(val_err)
+                    val_error_msg = f"Server validation error: {val_error_detail}"
                     _, probe_ctx = await self._fail_or_prepare_probe_locked(
                         runner,
                         task,
                         worker_id,
                         reason="EXECUTION_ERROR",
-                        error_message=f"Server validation error: {val_error_detail}",
+                        error_message=val_error_msg,
                         is_retryable=False,
                     )
                     if probe_ctx is None:
@@ -1144,7 +1145,7 @@ class ComboRunnersCoordinator:
             worker_id=worker_id,
             action="Validation failure",
             reason="EXECUTION_ERROR",
-            error_message=f"Server validation error: {val_error_detail}",
+            error_message=val_error_msg,
             is_retryable=False,
             probe_ctx=probe_ctx,
         )
@@ -1291,8 +1292,9 @@ class ComboRunnersCoordinator:
                     video_id=pipe.video_id,
                 ):
                     generated_srts = await asyncio.to_thread(pipe.finalize, allow_partial=True)
+                    nfo_file = await asyncio.to_thread(pipe.write_nfo) if self.settings.coordinator.nfo else None
             except Exception as e:
-                logfire.error(f"Subtitle stitching failed for '{runner.config.name}': {e}")
+                logfire.error(f"Output finalization failed for '{runner.config.name}': {e}")
                 async with self._lock:
                     runner.status = RunnerStatus.PUSH_FAILED
                     self._push_retry_after[runner.config.name] = monotonic() + _PUSH_RETRY_COOLDOWN_S
@@ -1308,6 +1310,7 @@ class ComboRunnersCoordinator:
                     srt_files=generated_srts,
                     yaml_files=yaml_files,
                     meta_file=meta_file if meta_file.is_file() else None,
+                    nfo_file=nfo_file,
                 )
             except Exception as e:
                 logfire.error(f"Git push failed for '{runner.config.name}': {e}. Setting PUSH_FAILED.")

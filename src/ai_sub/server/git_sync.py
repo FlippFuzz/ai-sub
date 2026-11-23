@@ -312,15 +312,12 @@ class GitSyncManager:
         count = int(count_str) if count_str else 0
         return count > 0, count
 
-    def _pull_rebase_with_readme_resolution(self, repo: Repo, branch: str) -> bool:
+    def _pull_rebase_with_readme_resolution(self, repo: Repo, branch: str) -> None:
         """Pulls and rebases onto origin/<branch>, auto-resolving channel README.md conflicts.
 
         Args:
             repo: Active GitPython Repo instance.
             branch: Target remote branch name.
-
-        Returns:
-            bool: True if pull/rebase completed cleanly.
 
         Raises:
             GitCommandError: If pulling fails without starting a rebase.
@@ -340,7 +337,7 @@ class GitSyncManager:
 
         try:
             repo.git.pull("origin", branch, "--rebase")
-            return True
+            return
         except GitCommandError as pull_err:
             if not _is_rebasing(repo):
                 logfire.warning(f"Git pull --rebase failed without active rebase: {self._sanitize_error(pull_err)}")
@@ -391,7 +388,6 @@ class GitSyncManager:
                         ) from pull_err
 
                 logfire.info("Resolved all channel README conflicts and completed rebase.")
-                return True
             except Exception as rebase_err:
                 if _is_rebasing(repo):
                     try:
@@ -856,8 +852,9 @@ class GitSyncManager:
         srt_files: list[Path],
         yaml_files: list[Path],
         meta_file: Path | None = None,
+        nfo_file: Path | None = None,
     ) -> _CacheUpdate:
-        """Synchronous implementation of committing and pushing finalized subtitles.
+        """Synchronous implementation of committing and pushing finalized subtitles and artifacts.
 
         Args:
             uploader: Channel or uploader identifier.
@@ -866,6 +863,7 @@ class GitSyncManager:
             srt_files: List of generated subtitle files to commit.
             yaml_files: List of intermediate YAML state files.
             meta_file: Optional video metadata JSON file. Defaults to None.
+            nfo_file: Optional Jellyfin NFO metadata file. Defaults to None.
 
         Returns:
             _CacheUpdate: Completed cache delta, full scan dictionary, or None if rescan failed.
@@ -903,6 +901,11 @@ class GitSyncManager:
 
         for yf in yaml_files:
             shutil.copy2(yf, int_dir / yf.name)
+
+        if nfo_file and nfo_file.is_file():
+            target_nfo = int_dir / nfo_file.name
+            shutil.copy2(nfo_file, target_nfo)
+            logfire.info(f"Copied NFO metadata to {target_nfo}")
 
         clean_meta: dict[str, Any] = {
             "video_id": video_id,
@@ -1008,8 +1011,9 @@ class GitSyncManager:
         srt_files: list[Path],
         yaml_files: list[Path],
         meta_file: Path | None = None,
+        nfo_file: Path | None = None,
     ) -> None:
-        """Moves subtitle files and YAML traces into the repository, then commits and pushes under lock.
+        """Moves subtitle files, YAML traces, and optional NFO into the repository, then commits and pushes.
 
         Args:
             uploader: Channel or uploader identifier.
@@ -1018,6 +1022,7 @@ class GitSyncManager:
             srt_files: List of generated subtitle files to commit.
             yaml_files: List of intermediate YAML state files.
             meta_file: Optional video metadata JSON file. Defaults to None.
+            nfo_file: Optional Jellyfin NFO metadata file. Defaults to None.
         """
         await self._run_locked_thread(
             self._finalize_and_push_sync,
@@ -1027,5 +1032,6 @@ class GitSyncManager:
             srt_files,
             yaml_files,
             meta_file,
+            nfo_file,
             on_result=self._apply_cache_update,
         )

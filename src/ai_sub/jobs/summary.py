@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 from textwrap import dedent
-from typing import ClassVar
+from typing import ClassVar, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationInfo, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
-from ai_sub.jobs.job_base import AiJob, CleanTimestamp, Prompt, TaskType, WorkerContext, build_user_prompt
+from ai_sub.jobs.job_base import (
+    AiJob,
+    CleanTimestamp,
+    Prompt,
+    TaskType,
+    WorkerContext,
+    build_user_prompt,
+    format_ms_timestamp,
+    parse_timestamp_string_ms,
+    validate_duration_bound,
+)
 
 SUMMARY_PROMPT_VERSION = 1
 
@@ -105,6 +115,30 @@ class ChapterItem(BaseModel):
         description="Original artist, group, or composer in native script if known; otherwise null. Independent of song_title.",  # noqa: E501
     )
 
+    @model_validator(mode="after")
+    def validate_chapter(self) -> Self:
+        """Validates that the chapter has a non-empty title and start precedes end.
+
+        Returns:
+            Self: Validated chapter item.
+
+        Raises:
+            ValueError: If title is blank or timestamps are invalid or non-increasing.
+        """
+        if not self.title.strip():
+            raise ValueError("Chapter title must not be empty.")
+        try:
+            start_ms = parse_timestamp_string_ms(self.start)
+            end_ms = parse_timestamp_string_ms(self.end)
+        except ValueError as e:
+            raise ValueError(f"Invalid timestamp in chapter '{self.title}': {e}") from e
+        if start_ms >= end_ms:
+            raise ValueError(
+                f"Invalid timestamp in chapter '{self.title}': "
+                f"start time ({self.start}) must precede end time ({self.end})."
+            )
+        return self
+
 
 class EntityItem(BaseModel):
     """Represents an identified person, character, host, or participant in the video."""
@@ -161,6 +195,53 @@ class SummaryAiResponse(BaseModel):
         default_factory=list,
         description="Model reasoning traces per turn, preserved on disk but omitted from LLM output schemas.",
     )
+
+    @model_validator(mode="after")
+    def validate_chapters(self, info: ValidationInfo) -> Self:
+        """Validates that chapters are chronological, non-overlapping, and within video duration bounds.
+
+        Args:
+            info: Pydantic validation context.
+
+        Returns:
+            Self: Validated summary response instance.
+
+        Raises:
+            ValueError: If chapters overlap, are out of order, or exceed video duration bounds.
+        """
+        if not self.chapters:
+            return self
+
+        prev_end_ms: int | None = None
+        for i, chapter in enumerate(self.chapters):
+            start_ms = parse_timestamp_string_ms(chapter.start)
+            end_ms = parse_timestamp_string_ms(chapter.end)
+            if prev_end_ms is not None and start_ms < prev_end_ms:
+                prev = self.chapters[i - 1]
+                raise ValueError(
+                    f"Chapter {i} ('{chapter.title}' starting at {chapter.start}) overlaps or precedes "
+                    f"chapter {i - 1} ('{prev.title}' ending at {prev.end})."
+                )
+            prev_end_ms = end_ms
+
+        context = info.context or {}
+        duration_ms = context.get("video_duration_ms")
+        buffer_ms = context.get("validation_buffer_ms")
+        if duration_ms is not None and buffer_ms is not None:
+            for i, chapter in enumerate(self.chapters):
+                if parse_timestamp_string_ms(chapter.start) >= duration_ms:
+                    raise ValueError(
+                        f"Chapter {i} start time ({chapter.start}) must precede duration "
+                        f"({format_ms_timestamp(duration_ms)})."
+                    )
+            validate_duration_bound(
+                self.chapters,
+                duration_ms,
+                buffer_ms,
+                item_label="Chapter",
+            )
+
+        return self
 
 
 class SummaryJob(AiJob):

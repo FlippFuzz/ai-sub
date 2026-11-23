@@ -22,6 +22,7 @@ Showcase of sample subtitled YouTube videos can be found at [ai-sub-showcase](ht
   - [Option 1: Recommended Setup (Gemini + Tinyfish)](#option-1-recommended-setup-gemini--tinyfish)
   - [Option 2: Free Search Setup (DuckDuckGo)](#option-2-free-search-setup-duckduckgo)
   - [Option 3: Providing Custom Notes & Lore](#option-3-providing-custom-notes--lore)
+  - [Option 4: Generating Jellyfin NFO Files (Plot & Chapters)](#option-4-generating-jellyfin-nfo-files-plot--chapters)
 - [Intermediate Files & Forcing Regeneration](#intermediate-files--forcing-regeneration)
 - [Distributed Server & Worker Deployment](#distributed-server--worker-deployment)
 - [Configuration](#configuration)
@@ -164,6 +165,19 @@ ai-sub --context "The streamers are Fuwawa and Mococo. Keep 'Bau bau' untranslat
 # Notes from a text file
 ai-sub --contextfile "notes.txt" "video.mp4"
 ```
+
+---
+
+### Option 4: Generating Jellyfin NFO Files (Plot & Chapters)
+
+Pass `--nfo true` (or set `coordinator.nfo: true` in `server.yaml`) to generate a Jellyfin-compatible `.nfo` file containing `<plot>` and `<chapters>` from the Phase 1 global summary (requires `concurrency.summary > 0` in standalone mode and [jellyfin-plugin-nfo-chapters](https://github.com/Viperinius/jellyfin-plugin-nfo-chapters) for chapter import):
+
+```bash
+ai-sub --nfo true "video.mp4"
+```
+
+- **Standalone & local files:** Outputs `<video_stem>.nfo` without a `<title>` tag.
+- **Server YouTube videos:** Outputs `<uploader>/v/<video_id>/.int/<full_shortcode>/<video_id>.nfo` with `<title>` populated from the original YouTube video title.
 
 ---
 

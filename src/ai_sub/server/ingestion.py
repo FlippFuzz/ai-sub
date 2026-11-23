@@ -20,7 +20,6 @@ from ai_sub.server.youtube import (
     VALID_VIDEO_EXTENSIONS,
     DiscoveredVideo,
     DownloadedVideo,
-    ScanResult,
     YouTubeBotDetectionError,
     YouTubeClient,
     YouTubeVideoUnavailableError,
@@ -263,20 +262,6 @@ class IngestionManager:
 
         return discovered
 
-    def _scan_youtube_sources(self, deep_scan: bool, ignored_ids: frozenset[str]) -> ScanResult:
-        """Fetches metadata for YouTube sources off-thread without mutating shared state.
-
-        Args:
-            deep_scan: If True, crawls full channel history; if False, uses per-URL deep-scan state.
-            ignored_ids: Snapshot of download-confirmed members-only video IDs to skip.
-
-        Returns:
-            ScanResult: Discovered YouTube videos, members-only IDs, and completed URL timestamps.
-        """
-        if not self.config.youtube.urls or self._is_youtube_in_cooldown():
-            return ScanResult()
-        return self.youtube_client.scan_sources(deep_scan=deep_scan, ignored_ids=ignored_ids)
-
     async def _scan_watch_folders_async(self) -> list[QueuedVideo]:
         """Scans local watch directories off-thread and updates in-memory cache safely on the event loop.
 
@@ -331,7 +316,11 @@ class IngestionManager:
         async with self._scan_lock:
             ignored_snapshot = frozenset(self._download_members_only_ids)
             try:
-                scan_result = await asyncio.to_thread(self._scan_youtube_sources, deep_scan, ignored_snapshot)
+                scan_result = await asyncio.to_thread(
+                    self.youtube_client.scan_sources,
+                    deep_scan=deep_scan,
+                    ignored_ids=ignored_snapshot,
+                )
             except YouTubeBotDetectionError as e:
                 self._trigger_youtube_cooldown(reason=str(e))
                 return list(self.youtube_videos.values())
@@ -606,6 +595,8 @@ class IngestionManager:
                 return
 
             now = monotonic()
+            consecutive_download_failures = 0
+            max_failures = self.config.youtube.maxfailures
 
             for runner in idle_runners:
                 candidates: list[QueuedVideo] = list(self.local_videos.values())
@@ -658,9 +649,6 @@ class IngestionManager:
 
                 self._last_idle_summary.pop(runner.config.name, None)
 
-                consecutive_download_failures = 0
-                max_failures = self.config.youtube.maxfailures
-
                 for video in eligible:
                     if self._stopped or not runner.is_idle():
                         break
@@ -682,6 +670,8 @@ class IngestionManager:
                                 reason=f"{consecutive_download_failures} consecutive download failures"
                             )
                             break
+                    elif fed and video.source_type == "youtube":
+                        consecutive_download_failures = 0
                     if fed or stop_runner:
                         break
                 if self._stopped:
