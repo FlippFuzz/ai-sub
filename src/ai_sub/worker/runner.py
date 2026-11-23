@@ -75,6 +75,7 @@ class WorkerRunner:
     client: WorkerClient
     _cond: asyncio.Condition
     _shutdown: bool
+    _idle_draining: bool
     _exhausted_models: set[str]
     _tasks_completed_per_model: dict[str, int]
     _active_tasks_per_model: dict[str, int]
@@ -98,6 +99,7 @@ class WorkerRunner:
         unique_models = list(dict.fromkeys(settings.models))
         self._cond = asyncio.Condition()
         self._shutdown = False
+        self._idle_draining = False
         self._exhausted_models = set()
         self._tasks_completed_per_model = {model: 0 for model in unique_models}
         self._active_tasks_per_model = {model: 0 for model in unique_models}
@@ -121,6 +123,24 @@ class WorkerRunner:
         if 0 < self.settings.maxtasks <= self._tasks_completed_per_model.get(model, 0):
             return True
         return False
+
+    def _is_model_poll_capped(self, model: str) -> bool:
+        """Checks whether completed, active, and polling tasks for a model already reach maxtasks.
+
+        Args:
+            model: Model identifier.
+
+        Returns:
+            bool: True if no additional claim poll should be started for this model.
+        """
+        if self.settings.maxtasks <= 0:
+            return False
+        total = (
+            self._tasks_completed_per_model.get(model, 0)
+            + self._active_tasks_per_model.get(model, 0)
+            + self._claim_polls_per_model.get(model, 0)
+        )
+        return total >= self.settings.maxtasks
 
     def _all_models_finished(self) -> bool:
         """Checks whether all configured models have finished execution.
@@ -473,6 +493,9 @@ class WorkerRunner:
     ) -> bool:
         """Handles idle/error timeout checks and backoff waiting after an empty or failed poll (caller holds _cond).
 
+        Stops issuing new polls once the idle deadline has expired with no active tasks,
+        draining any outstanding claim polls before shutting down.
+
         Args:
             model: Model identifier bound to this slot.
             slot_label: Display label for logs.
@@ -483,8 +506,18 @@ class WorkerRunner:
         Returns:
             bool: True if the slot should stop polling and exit; False to retry polling.
         """
+        idle_timeout_s = self.settings.idletimeout.total_seconds()
 
         def _shutdown_if_timed_out() -> bool:
+            if self._idle_draining and self._is_idle_timed_out(idle_timeout_s):
+                elapsed = monotonic() - self._last_busy_timestamp
+                logfire.info(
+                    f"[{slot_label}] All slots have been idle for {elapsed / 60:.1f}m "
+                    f"(timeout: {idle_timeout_s / 60:.1f}m). Shutting down worker."
+                )
+                self._shutdown = True
+                self._cond.notify_all()
+                return True
             if not self._is_idle_timed_out(timeout_s, ignore_polls=is_error):
                 return False
             elapsed = monotonic() - self._last_busy_timestamp
@@ -502,34 +535,62 @@ class WorkerRunner:
             self._cond.notify_all()
             return True
 
+        def _update_idle_draining() -> bool:
+            if (
+                not is_error
+                and sum(self._active_tasks_per_model.values()) == 0
+                and sum(self._claim_polls_per_model.values()) > 0
+                and (monotonic() - self._last_busy_timestamp) >= timeout_s
+            ):
+                self._idle_draining = True
+            return self._idle_draining
+
         if self._should_stop(model):
             self._cond.notify_all()
             return True
         if _shutdown_if_timed_out():
             return True
 
-        wait_s = poll_interval_s
-        if sum(self._active_tasks_per_model.values()) == 0 and (
-            is_error or sum(self._claim_polls_per_model.values()) == 0
-        ):
-            wait_s = min(poll_interval_s, max(0.0, timeout_s - (monotonic() - self._last_busy_timestamp)))
+        if not _update_idle_draining():
+            wait_s = poll_interval_s
+            if sum(self._active_tasks_per_model.values()) == 0:
+                wait_s = min(poll_interval_s, max(0.0, timeout_s - (monotonic() - self._last_busy_timestamp)))
 
-        self._cond.notify_all()
-        deadline = monotonic() + max(0.0, wait_s)
-        if self._deadline is not None:
-            deadline = min(deadline, self._deadline)
+            self._cond.notify_all()
+            deadline = monotonic() + max(0.0, wait_s)
+            if self._deadline is not None:
+                deadline = min(deadline, self._deadline)
 
-        while not self._should_stop(model) and (is_error or not self._is_idle_timed_out(timeout_s)):
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                break
-            try:
-                async with asyncio.timeout(remaining):
-                    await self._cond.wait()
-            except TimeoutError:
-                break
+            while (
+                not self._should_stop(model)
+                and not self._idle_draining
+                and (is_error or not self._is_idle_timed_out(timeout_s))
+            ):
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    async with asyncio.timeout(remaining):
+                        await self._cond.wait()
+                except TimeoutError:
+                    break
 
-        return self._should_stop(model) or _shutdown_if_timed_out()
+        if self._should_stop(model):
+            self._cond.notify_all()
+            return True
+        if _shutdown_if_timed_out():
+            return True
+
+        if _update_idle_draining():
+            self._cond.notify_all()
+            while not self._should_stop(model) and self._idle_draining:
+                if _shutdown_if_timed_out():
+                    return True
+                await self._cond.wait()
+            if self._should_stop(model) or _shutdown_if_timed_out():
+                return True
+
+        return False
 
     async def _model_slot_loop(
         self,
@@ -557,11 +618,7 @@ class WorkerRunner:
 
         while True:
             async with self._cond:
-                while not self._should_stop(model) and 0 < self.settings.maxtasks <= (
-                    self._tasks_completed_per_model.get(model, 0)
-                    + self._active_tasks_per_model.get(model, 0)
-                    + self._claim_polls_per_model.get(model, 0)
-                ):
+                while not self._should_stop(model) and (self._idle_draining or self._is_model_poll_capped(model)):
                     await self._cond.wait()
 
                 if self._deadline is not None and monotonic() >= self._deadline and not self._shutdown:
@@ -625,6 +682,7 @@ class WorkerRunner:
                     self._claim_polls_per_model[model] = max(0, self._claim_polls_per_model[model] - 1)
                     self._active_tasks_per_model[model] = self._active_tasks_per_model.get(model, 0) + 1
                     self._fatal_error = False
+                    self._idle_draining = False
                     self._last_busy_timestamp = monotonic()
                     self._cond.notify_all()
                 try:
@@ -632,6 +690,7 @@ class WorkerRunner:
                 finally:
                     async with self._cond:
                         self._active_tasks_per_model[model] = max(0, self._active_tasks_per_model[model] - 1)
+                        self._idle_draining = False
                         self._last_busy_timestamp = monotonic()
                         self._cond.notify_all()
                 continue

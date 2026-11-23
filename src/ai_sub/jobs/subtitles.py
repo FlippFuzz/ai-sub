@@ -12,6 +12,8 @@ from pydantic import (
     Field,
     NonNegativeInt,
     ValidationInfo,
+    ValidatorFunctionWrapHandler,
+    field_validator,
     model_validator,
 )
 from pydantic.json_schema import SkipJsonSchema
@@ -298,6 +300,33 @@ class BaseSubtitleJob(AiJob):
         default=None,
         description="Optional global summary context from phase 1.",
     )
+
+    @field_validator("global_summary", mode="wrap")
+    @classmethod
+    def _validate_global_summary(
+        cls,
+        value: Any,
+        handler: ValidatorFunctionWrapHandler,
+        info: ValidationInfo,
+    ) -> SummaryAiResponse | None:
+        """Validates global_summary without applying segment-level video_duration_ms bounds.
+
+        Args:
+            value: Raw global_summary input value.
+            handler: Default Pydantic field validator handler.
+            info: Outer Pydantic validation context.
+
+        Returns:
+            SummaryAiResponse | None: Validated global summary or None.
+        """
+        if value is None:
+            return None
+        context = info.context
+        if isinstance(context, dict) and "video_duration_ms" in context:
+            # Strip the segment's video_duration_ms so full-video chapters survive segment checkpoint loads.
+            summary_context = {k: v for k, v in context.items() if k != "video_duration_ms"} or None
+            return SummaryAiResponse.model_validate(value, context=summary_context)
+        return handler(value)
 
 
 class SubtitlesJob(BaseSubtitleJob):

@@ -611,7 +611,8 @@ async def split_video(
     """Splits an input video into uniform segments using FFmpeg stream copying.
 
     Skips splitting if valid segments matching 'part_%03d_<media_tag>', split duration, and total
-    duration already exist, and drops any zero-duration trailing stub segments emitted at EOF.
+    duration already exist, and drops any confirmed empty or zero-duration trailing stub segments
+    emitted at EOF after verifying remaining timeline coverage.
 
     Args:
         input_video: Path to the input video.
@@ -624,11 +625,13 @@ async def split_video(
         list[Path]: Numerically sorted list of generated segment paths.
 
     Raises:
+        RuntimeError: If dropped trailing segments leave incomplete timeline coverage or a segment probe fails.
         subprocess.CalledProcessError: If FFmpeg segmentation fails.
     """
     ext = input_video.suffix
     existing_segments = _find_split_segments(output_dir, ext, media_tag)
     split_meta_path = output_dir / f".split_{media_tag}.json"
+    input_duration: int | None = None
 
     if existing_segments:
         try:
@@ -693,17 +696,28 @@ async def split_video(
         raise
 
     segments = _find_split_segments(output_dir, ext, media_tag)
+    dropped_trailing = False
     while segments:
         tail = segments[-1]
-        try:
-            tail_ms = 0 if tail.stat().st_size == 0 else await get_video_duration_ms(tail)
-        except (OSError, RuntimeError):
-            tail_ms = 0
+        tail_ms = 0 if tail.stat().st_size == 0 else await get_video_duration_ms(tail)
         if tail_ms > 0:
             break
         logfire.warning(f"Dropping empty/zero-duration trailing segment: {tail.name}")
         tail.unlink(missing_ok=True)
         segments.pop()
+        dropped_trailing = True
+
+    if dropped_trailing:
+        if input_duration is None:
+            input_duration = await get_video_duration_ms(input_video)
+        durations = await asyncio.gather(*(get_video_duration_ms(s) for s in segments))
+        total_segment_duration = sum(durations)
+        threshold = duration_tolerance_ms * max(1, len(segments))
+        if not all(d > 0 for d in durations) or abs(input_duration - total_segment_duration) > threshold:
+            raise RuntimeError(
+                f"Dropped trailing segment(s) for {input_video.name} left incomplete timeline coverage "
+                f"({total_segment_duration}ms vs {input_duration}ms)."
+            )
 
     if segments:
         atomic_write_text(split_meta_path, json.dumps({"split_duration_s": split_duration_s}))

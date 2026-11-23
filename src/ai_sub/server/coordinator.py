@@ -27,6 +27,7 @@ from ai_sub.server.server_config import ServerSettings
 from ai_sub.telemetry import get_app_version
 
 _PUSH_RETRY_COOLDOWN_S = 60.0
+_ProbeContext = tuple[tuple[Path, Path | None], ServerTask, int, int | None]
 
 
 def _escape_sql_literal(value: str) -> str:
@@ -515,6 +516,7 @@ class ComboRunnersCoordinator:
         worker_id: str,
         action: str,
         expected_generation: int | None = None,
+        expected_task: ServerTask | None = None,
     ) -> tuple[ComboRunner, ServerTask] | None:
         """Locates a task and verifies that it is actively claimed by the specified worker.
 
@@ -523,6 +525,7 @@ class ComboRunnersCoordinator:
             worker_id: Worker identifier asserting lease ownership.
             action: Operation label used in rejection warning logs.
             expected_generation: Optional lease generation that must still match. Defaults to None.
+            expected_task: Optional ServerTask instance that must still match by identity. Defaults to None.
 
         Returns:
             tuple[ComboRunner, ServerTask] | None: (runner, task) if validly claimed, else None.
@@ -533,6 +536,10 @@ class ComboRunnersCoordinator:
             return None
 
         runner, task = found
+        if expected_task is not None and task is not expected_task:
+            logfire.warning(f"{action} rejected for task '{task_id}': task instance was replaced.")
+            return None
+
         if task.status != TaskStatus.CLAIMED or task.worker_id != worker_id:
             logfire.warning(
                 f"{action} rejected for task '{task_id}': status={task.status.value}, "
@@ -956,16 +963,15 @@ class ComboRunnersCoordinator:
     def _prepare_probe_context(
         runner: ComboRunner,
         task: ServerTask,
-    ) -> tuple[tuple[Path, Path | None], int, int | None] | None:
-        """Captures off-lock probe paths, claim generation, and stage tier while refreshing heartbeat.
+    ) -> _ProbeContext | None:
+        """Captures off-lock probe paths, task instance, claim generation, and stage tier while refreshing heartbeat.
 
         Args:
             runner: Owning ComboRunner instance.
             task: Claimed ServerTask instance.
 
         Returns:
-            tuple[tuple[Path, Path | None], int, int | None] | None:
-                (probe_paths, claim_generation, current_tier) if probing is needed, else None.
+            _ProbeContext | None: (probe_paths, task, claim_generation, current_tier) if probing is needed, else None.
         """
         if runner.pipeline is None:
             return None
@@ -976,7 +982,7 @@ class ComboRunnersCoordinator:
         expected_tier = stage_state.fallback_tier if stage_state is not None else None
         # Refresh heartbeat so the lease sweeper does not reclaim the task while probing off-lock
         task.last_heartbeat = time()
-        return probe_paths, task.claim_generation, expected_tier
+        return probe_paths, task, task.claim_generation, expected_tier
 
     async def _fail_or_prepare_probe_locked(
         self,
@@ -986,7 +992,7 @@ class ComboRunnersCoordinator:
         reason: str,
         error_message: str | None,
         is_retryable: bool,
-    ) -> tuple[bool, tuple[tuple[Path, Path | None], int, int | None] | None]:
+    ) -> tuple[bool, _ProbeContext | None]:
         """Records failure immediately under lock, or prepares off-lock probe context for tier-0 keyframes.
 
         Args:
@@ -998,7 +1004,7 @@ class ComboRunnersCoordinator:
             is_retryable: Whether failure is retryable and exempt from attempt counting.
 
         Returns:
-            tuple[bool, tuple[tuple[Path, Path | None], int, int | None] | None]:
+            tuple[bool, _ProbeContext | None]:
                 (recorded, None) when handled immediately, or (False, probe_ctx) when off-lock probing is needed.
         """
         probe_ctx = self._prepare_probe_context(runner, task) if not is_retryable else None
@@ -1021,7 +1027,7 @@ class ComboRunnersCoordinator:
         reason: str,
         error_message: str | None,
         is_retryable: bool,
-        probe_ctx: tuple[tuple[Path, Path | None], int, int | None],
+        probe_ctx: _ProbeContext,
     ) -> bool:
         """Probes keyframe FPS off-lock, re-verifies lease ownership, and records task failure.
 
@@ -1032,12 +1038,12 @@ class ComboRunnersCoordinator:
             reason: Error code or exception description.
             error_message: Optional error details.
             is_retryable: Whether failure is retryable.
-            probe_ctx: Tuple of (probe_paths, expected_generation, expected_tier).
+            probe_ctx: Tuple of (probe_paths, expected_task, expected_generation, expected_tier).
 
         Returns:
             bool: True if failure was recorded, False if the lease or tier became stale while probing.
         """
-        probe_paths, expected_generation, expected_tier = probe_ctx
+        probe_paths, expected_task, expected_generation, expected_tier = probe_ctx
         fallback_base_fps = await probe_keyframe_base_fps(*probe_paths)
 
         async with self._lock:
@@ -1046,6 +1052,7 @@ class ComboRunnersCoordinator:
                 worker_id,
                 action=action,
                 expected_generation=expected_generation,
+                expected_task=expected_task,
             )
             if not claimed:
                 return False
@@ -1090,7 +1097,7 @@ class ComboRunnersCoordinator:
         Raises:
             OSError: If saving the durable YAML checkpoint fails on disk.
         """
-        probe_ctx: tuple[tuple[Path, Path | None], int, int | None] | None = None
+        probe_ctx: _ProbeContext | None = None
         val_error_detail: str | None = None
         val_error_msg = ""
 

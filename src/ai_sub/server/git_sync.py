@@ -27,7 +27,7 @@ from ai_sub.shortcode import parse_subtitle_track, subtitle_track_sort_key
 os.environ["GIT_TERMINAL_PROMPT"] = "0"
 JST = timezone(timedelta(hours=9))
 _MAX_REBASE_STEPS = 50
-_URL_CREDS_RE = re.compile(r"(https?://)[^/@\s]+@")
+_URL_CREDS_RE = re.compile(r"(https?://)[^/?#\s]+@", re.IGNORECASE)
 
 _T = TypeVar("_T")
 _CompletedCache = dict[tuple[str, str], dict[str, bool]]
@@ -866,7 +866,7 @@ class GitSyncManager:
             nfo_file: Optional Jellyfin NFO metadata file. Defaults to None.
 
         Returns:
-            _CacheUpdate: Completed cache delta, full scan dictionary, or None if rescan failed.
+            _CacheUpdate: Full scan dictionary when a pending rescan succeeds, or single completed entry delta.
 
         Raises:
             RuntimeError: If git staging, commit, rebase, or push fails after exhausting retries.
@@ -941,7 +941,11 @@ class GitSyncManager:
         single_entry: _CacheUpdate = (video_id, full_shortcode, uploader, is_yt)
 
         def _cache_result() -> _CacheUpdate:
-            return self._scan_completed_cache_sync() if self._pending_cache_rescan else single_entry
+            if self._pending_cache_rescan:
+                scanned = self._scan_completed_cache_sync()
+                if scanned is not None:
+                    return scanned
+            return single_entry
 
         if not git_enabled or repo is None or self.config is None:
             return _cache_result()
