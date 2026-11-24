@@ -16,12 +16,13 @@ dependencies = [
     "static-ffmpeg",
     "pydantic",
     "pydantic-settings",
-    "google-genai >= 2.3.0",
-    "logfire[google-genai, httpx]",
+    "google-genai >= 3.0.0",
+    "logfire[google-genai, httpx] >= 4.39.0",
+    "opentelemetry-instrumentation-httpx >= 0.65b0",
     "ddgs",
-    "httpx",
+    "httpx2",
     "json_repair",
-    "pyrate-limiter",
+    "pyrate-limiter >= 4.0.0",
     "rich",
     "pyyaml",
 ]
@@ -67,3 +68,8 @@ fixable = ["ALL"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+ignore = ["work/"]

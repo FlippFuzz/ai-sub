@@ -4,35 +4,44 @@ from __future__ import annotations
 
 import asyncio
 import math
-import random
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
-import logfire
 from ddgs import DDGS
-from pyrate_limiter import Duration, Limiter, limiter_factory
+from ddgs.exceptions import DDGSException, RatelimitException, TimeoutException
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import BaseSearchProvider, WebSearchResult
+from ai_sub.search.search_base import BaseSearchProvider, WebSearchResult
 
 
-def _fetch_ddgs(query: str, max_results: int = 10) -> list[dict[str, Any]]:
+def _fetch_ddgs(query: str, max_results: int = 10, timeout: int = 5) -> list[dict[str, Any]]:
     """Executes a synchronous DuckDuckGo search query.
+
+    Treats normal empty-result errors from ddgs as an empty list to match HTTP search providers,
+    while propagating rate-limit, timeout, and unexpected backend errors for retry handling.
 
     Args:
         query: Search query string.
         max_results: Maximum results to retrieve. Defaults to 10.
+        timeout: HTTP request timeout in seconds. Defaults to 5.
 
     Returns:
-        list[dict[str, Any]]: Raw response dictionaries.
+        list[dict[str, Any]]: Raw response dictionaries, or an empty list if no results are found.
+
+    Raises:
+        DDGSException: If DuckDuckGo encounters rate-limiting, a timeout, or a backend error.
     """
-    with DDGS() as ddgs:
-        return list(ddgs.text(query, max_results=max_results))
+    with DDGS(timeout=timeout) as ddgs:
+        try:
+            return list(ddgs.text(query, max_results=max_results))
+        except DDGSException as e:
+            if not isinstance(e, (RatelimitException, TimeoutException)) and "no results found" in str(e).lower():
+                return []
+            raise
 
 
 class DuckDuckGoSearchProvider(BaseSearchProvider):
     """Encapsulates DuckDuckGo search operations with caching and rate limiting."""
-
-    _limiter: Limiter
 
     def __init__(self, settings: SearchSettings) -> None:
         """Initializes the DuckDuckGo provider.
@@ -41,9 +50,6 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
             settings: Search configuration settings.
         """
         super().__init__(settings, provider_name="duckduckgo")
-        rate = 1 if self.settings.qps < 1 else int(self.settings.qps)
-        duration = int(math.ceil(1 / self.settings.qps)) * Duration.SECOND if self.settings.qps < 1 else Duration.SECOND
-        self._limiter = limiter_factory.create_inmemory_limiter(rate_per_duration=rate, duration=duration)
 
     async def _do_search(self, query: str) -> list[WebSearchResult]:
         """Performs a DuckDuckGo search query.
@@ -54,40 +60,17 @@ class DuckDuckGoSearchProvider(BaseSearchProvider):
         Returns:
             list[WebSearchResult]: Formatted search result items.
         """
-        max_attempts = self.settings.retries + 1
-        raw_results: list[dict[str, Any]] = []
 
-        for attempt in range(max_attempts):
-            await self._limiter.try_acquire_async("duckduckgo", blocking=True)
-            try:
-                raw_results = await asyncio.to_thread(_fetch_ddgs, query, 10)
-                break
-            except Exception as e:
-                if attempt < self.settings.retries:
-                    backoff = min(
-                        self.settings.max_wait_seconds,
-                        (self.settings.min_wait_seconds * (self.settings.multiplier**attempt)) + random.uniform(0, 1),
-                    )
-                    logfire.warning(
-                        f"DuckDuckGo search for '{query}' failed with {e} (attempt {attempt + 1}/{max_attempts}). "
-                        f"Retrying in {backoff:.2f}s..."
-                    )
-                    await asyncio.sleep(backoff)
-                    continue
-                logfire.error(f"DuckDuckGo search for '{query}' exhausted all {max_attempts} attempts: {e}")
-                return []
+        def _is_retryable(e: Exception) -> bool:
+            return isinstance(e, (DDGSException, ConnectionError, asyncio.TimeoutError, OSError))
 
-        results: list[WebSearchResult] = []
-        for item in raw_results:
-            title = item.get("title")
-            url = item.get("href")
-            body = item.get("body")
-            if title and url and body:
-                try:
-                    results.append(WebSearchResult(title=title, url=url, content=str(body)[: self.settings.max_length]))
-                except Exception:
-                    continue
-        return results
+        timeout_s = max(1, math.ceil(self.settings.timeout.total_seconds()))
+        raw_results = await self._execute_with_retry(
+            action_desc=f"DuckDuckGo search for '{query}'",
+            operation=lambda: asyncio.to_thread(_fetch_ddgs, query, 10, timeout_s),
+            is_retryable=_is_retryable,
+        )
+        return self._to_web_results((item.get("title"), item.get("href"), item.get("body")) for item in raw_results)
 
     async def web_search_duckduckgo_multi(self, queries: list[str]) -> list[dict[str, Any]]:
         """Perform multiple web search queries in parallel using DuckDuckGo.

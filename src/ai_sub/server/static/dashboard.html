@@ -2,7 +2,8 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>AI Sub Coordinator</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Sub</title>
     <style>
       :root {
         --bg: #0f172a;
@@ -14,10 +15,11 @@
         --accent: #38bdf8;
         --green: #22c55e;
         --yellow: #eab308;
+        --amber: #f59e0b;
         --red: #ef4444;
-        --blue: #38bdf8;
-        --purple: #a855f7;
-        --pink: #ec4899;
+      }
+      * {
+        box-sizing: border-box;
       }
       body {
         font-family:
@@ -28,25 +30,44 @@
         padding: 24px;
       }
       h1,
-      h2,
-      h3,
-      h4 {
+      h3 {
         margin-top: 0;
         font-weight: 600;
       }
+      .muted {
+        color: var(--muted);
+      }
+      .mono {
+        font-family:
+          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 12px;
+      }
       .header {
         display: flex;
+        flex-wrap: wrap;
         justify-content: space-between;
         align-items: center;
+        gap: 12px;
         border-bottom: 1px solid var(--border);
         padding-bottom: 16px;
-        margin-bottom: 24px;
-      }
-      .grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-        gap: 16px;
         margin-bottom: 20px;
+      }
+      .title-wrap {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .version-tag {
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--muted);
+      }
+      .header-controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
       }
       .card {
         background: var(--panel);
@@ -55,106 +76,96 @@
         padding: 20px;
         box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
       }
-      .stage-card {
+      .box-inner {
         background: var(--card-inner);
         border: 1px solid var(--border);
         border-radius: 6px;
-        padding: 16px;
-        display: flex;
-        flex-direction: column;
-        justify-content: space-between;
-        min-height: 110px;
-      }
-      .progress-bar {
-        background: #1e293b;
-        border-radius: 9999px;
-        height: 8px;
-        overflow: hidden;
-        margin: 8px 0;
-        border: 1px solid var(--border);
-        display: flex;
-      }
-      .progress-fill-done {
-        background: var(--green);
-        height: 100%;
-        transition: width 0.3s;
-      }
-      .progress-fill-prog {
-        background: var(--blue);
-        height: 100%;
-        transition: width 0.3s;
+        padding: 12px 14px;
+        margin-bottom: 14px;
       }
       .badge {
-        display: inline-block;
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
         padding: 3px 8px;
         border-radius: 4px;
         font-size: 11px;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.025em;
+        white-space: nowrap;
       }
       .badge-claim,
       .badge-claimed,
       .badge-processing,
-      .badge-in_progress {
-        background: rgba(56, 189, 248, 0.2);
+      .badge-subtitles_running {
+        background: rgba(56, 189, 248, 0.25);
         color: #7dd3fc;
-        border: 1px solid rgba(56, 189, 248, 0.4);
+        border: 1px solid rgba(56, 189, 248, 0.55);
       }
       .badge-complete,
       .badge-completed,
-      .badge-ready {
-        background: rgba(34, 197, 94, 0.2);
+      .badge-ready,
+      .badge-done {
+        background: rgba(34, 197, 94, 0.25);
         color: #86efac;
-        border: 1px solid rgba(34, 197, 94, 0.4);
+        border: 1px solid rgba(34, 197, 94, 0.55);
       }
       .badge-fail,
       .badge-failed,
       .badge-push_failed {
-        background: rgba(239, 68, 68, 0.2);
+        background: rgba(239, 68, 68, 0.25);
         color: #fca5a5;
-        border: 1px solid rgba(239, 68, 68, 0.4);
+        border: 1px solid rgba(239, 68, 68, 0.55);
+      }
+      .badge-retry,
+      .badge-draft_fallback {
+        background: rgba(245, 158, 11, 0.25);
+        color: #fcd34d;
+        border: 1px solid rgba(245, 158, 11, 0.55);
       }
       .badge-timeout,
-      .badge-preparing,
-      .badge-unplayable {
-        background: rgba(234, 179, 8, 0.2);
+      .badge-preparing {
+        background: rgba(234, 179, 8, 0.25);
         color: #fde047;
-        border: 1px solid rgba(234, 179, 8, 0.4);
+        border: 1px solid rgba(234, 179, 8, 0.55);
+      }
+      .badge-encoding {
+        background: rgba(99, 102, 241, 0.25);
+        color: #a5b4fc;
+        border: 1px solid rgba(99, 102, 241, 0.55);
       }
       .badge-pending,
       .badge-idle,
-      .badge-skipped {
-        background: rgba(148, 163, 184, 0.15);
+      .badge-disabled {
+        background: rgba(148, 163, 184, 0.16);
         color: #cbd5e1;
         border: 1px solid var(--border);
       }
-      .badge-finalizing {
-        background: rgba(168, 85, 247, 0.2);
+      .badge-finalizing,
+      .badge-lyrics_running,
+      .badge-lyrics_pending {
+        background: rgba(168, 85, 247, 0.25);
         color: #d8b4fe;
-        border: 1px solid rgba(168, 85, 247, 0.4);
+        border: 1px solid rgba(168, 85, 247, 0.55);
       }
       .badge-youtube {
-        background: rgba(239, 68, 68, 0.15);
+        background: rgba(239, 68, 68, 0.16);
         color: #fca5a5;
-        border: 1px solid rgba(239, 68, 68, 0.3);
+        border: 1px solid rgba(239, 68, 68, 0.35);
       }
       .badge-local {
-        background: rgba(56, 189, 248, 0.15);
+        background: rgba(56, 189, 248, 0.16);
         color: #7dd3fc;
-        border: 1px solid rgba(56, 189, 248, 0.3);
+        border: 1px solid rgba(56, 189, 248, 0.35);
       }
       .badge-clickable {
         cursor: pointer;
-        transition:
-          background 0.15s,
-          border-color 0.15s;
         user-select: none;
+        transition: filter 0.15s;
       }
       .badge-clickable:hover {
-        background: rgba(56, 189, 248, 0.35);
-        border-color: #38bdf8;
-        color: #fff;
+        filter: brightness(1.2);
       }
       .banner-cooldown {
         background: rgba(234, 179, 8, 0.12);
@@ -172,24 +183,29 @@
         background: #334155;
         color: var(--text);
         border: 1px solid var(--border);
-        padding: 6px 14px;
+        padding: 6px 12px;
         border-radius: 6px;
         cursor: pointer;
         font-size: 12px;
         font-weight: 500;
-        transition:
-          background 0.15s,
-          border-color 0.15s;
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
       }
       .btn:hover {
         background: #475569;
       }
+      .btn-sm {
+        padding: 3px 9px;
+        font-size: 11px;
+      }
       .table-container {
         max-height: 380px;
-        overflow-y: auto;
-        position: relative;
+        overflow: auto;
         border: 1px solid var(--border);
         border-radius: 6px;
+        -webkit-overflow-scrolling: touch;
       }
       table {
         width: 100%;
@@ -205,21 +221,16 @@
       th {
         color: var(--muted);
         font-weight: 500;
-      }
-      .table-container th {
+        white-space: nowrap;
         position: sticky;
         top: 0;
         background: var(--panel);
         z-index: 2;
       }
-      .mono {
-        font-family:
-          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 12px;
-      }
       .tabs {
         display: flex;
-        gap: 8px;
+        flex-wrap: wrap;
+        gap: 6px;
         border-bottom: 1px solid var(--border);
         margin-bottom: 20px;
       }
@@ -227,43 +238,25 @@
         background: transparent;
         border: none;
         color: var(--muted);
-        padding: 10px 18px;
+        padding: 10px 16px;
         font-size: 14px;
         font-weight: 600;
         cursor: pointer;
         border-bottom: 2px solid transparent;
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
       }
       .tab-btn.active {
         color: var(--accent);
         border-bottom-color: var(--accent);
       }
-      .expand-btn {
-        background: transparent;
-        border: 1px solid var(--border);
-        color: var(--muted);
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-size: 11px;
-        cursor: pointer;
-      }
-      .expand-btn:hover {
-        color: var(--text);
-        border-color: var(--muted);
-      }
       .detail-row {
         background: var(--card-inner);
         font-size: 12px;
         color: #cbd5e1;
-        display: none;
       }
       .detail-box {
         padding: 12px 16px;
         white-space: pre-wrap;
-        word-break: break-all;
-        margin: 0;
+        word-break: break-word;
         line-height: 1.5;
       }
       .detail-box-fail {
@@ -271,26 +264,10 @@
         border-left: 3px solid var(--red);
         color: #fca5a5;
       }
-      .detail-query-bar {
-        margin-top: 10px;
-        padding-top: 10px;
-        border-top: 1px solid rgba(255, 255, 255, 0.08);
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        font-family:
-          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-        font-size: 11px;
-        color: var(--muted);
-      }
-      .detail-query-code {
-        color: #7dd3fc;
-        background: #0b1120;
-        padding: 4px 8px;
-        border-radius: 4px;
-        border: 1px solid var(--border);
-        word-break: break-all;
+      .detail-box-warn {
+        background: rgba(245, 158, 11, 0.08);
+        border-left: 3px solid var(--amber);
+        color: #fcd34d;
       }
       .video-title-link {
         color: inherit;
@@ -300,51 +277,209 @@
         text-decoration: underline;
         color: var(--accent);
       }
-      .video-thumb {
-        width: 140px;
+      .active-header {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 14px;
+        margin-bottom: 16px;
+      }
+      .active-identity {
+        display: flex;
+        gap: 14px;
+        align-items: flex-start;
+        flex: 1 1 340px;
+        min-width: 0;
+      }
+      .active-models {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        text-align: right;
+      }
+      .thumb {
         aspect-ratio: 16 / 9;
         object-fit: cover;
-        border-radius: 6px;
+        border-radius: 5px;
         border: 1px solid var(--border);
         flex-shrink: 0;
         background: #0b1120;
-      }
-      .queue-thumb {
-        width: 64px;
-        aspect-ratio: 16 / 9;
-        object-fit: cover;
-        border-radius: 4px;
-        border: 1px solid var(--border);
         display: block;
-        background: #0b1120;
       }
-      .thumb-prep {
+      .thumb-lg {
+        width: 140px;
+      }
+      .thumb-md {
         width: 80px;
-        aspect-ratio: 16 / 9;
-        object-fit: cover;
-        border-radius: 4px;
-        border: 1px solid rgba(234, 179, 8, 0.3);
-        flex-shrink: 0;
+      }
+      .thumb-sm {
+        width: 64px;
+      }
+      .stage-line {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px 10px;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      .stage-label {
+        font-weight: 600;
+        min-width: 96px;
+      }
+      .summary-drawer {
         background: #0b1120;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 14px;
+        margin-bottom: 14px;
+        font-size: 13px;
+        line-height: 1.5;
+      }
+      .section-kicker {
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        margin: 10px 0 4px;
+      }
+      .section-kicker:first-child {
+        margin-top: 0;
+      }
+      .summary-list {
+        margin: 0;
+        padding-left: 18px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .chunk-matrix {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 8px;
+      }
+      .chunk-tile {
+        position: relative;
+        min-width: 42px;
+        height: 34px;
+        padding: 0 6px;
+        border-radius: 5px;
+        font-family:
+          ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        user-select: none;
+      }
+      .chunk-tile.selected {
+        outline: 2px solid #f8fafc;
+        outline-offset: 1px;
+      }
+      .chunk-pending {
+        background: #0f172a;
+        color: #64748b;
+        border: 1px solid #334155;
+      }
+      .chunk-ready {
+        background: rgba(148, 163, 184, 0.22);
+        color: #e2e8f0;
+        border: 1px solid #64748b;
+      }
+      .chunk-lyrics_pending {
+        background: rgba(236, 72, 153, 0.18);
+        color: #f9a8d4;
+        border: 1px dashed rgba(236, 72, 153, 0.65);
+      }
+      .fallback-dot {
+        position: absolute;
+        top: 2px;
+        right: 2px;
+        width: 6px;
+        height: 6px;
+        border-radius: 9999px;
+        background: var(--amber);
+      }
+      .matrix-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 14px;
+        margin-top: 10px;
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+      }
+      .legend-swatch {
+        width: 11px;
+        height: 11px;
+        border-radius: 3px;
+        display: inline-block;
+      }
+      .inspector-head {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+        padding-bottom: 10px;
+        margin-bottom: 10px;
+        border-bottom: 1px solid var(--border);
+      }
+      .inspector-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+        gap: 10px 16px;
+        font-size: 13px;
+      }
+      .leases-bar {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+      }
+      @media (max-width: 640px) {
+        body {
+          padding: 12px;
+        }
+        .card {
+          padding: 14px;
+        }
+        .thumb-lg {
+          width: 104px;
+        }
+        .active-models {
+          text-align: left;
+        }
+        th,
+        td {
+          padding: 8px 9px;
+          font-size: 12px;
+        }
       }
     </style>
   </head>
   <body>
     <div class="header">
-      <div>
-        <h1 style="margin: 0">AI Sub Coordinator</h1>
+      <div class="title-wrap">
+        <h1 style="margin: 0">AI Sub</h1>
+        <span class="version-tag" id="server-version-tag"></span>
       </div>
-      <div style="display: flex; gap: 12px; align-items: center">
-        <span
-          class="mono"
-          style="color: var(--muted); font-size: 12px"
-          id="last-updated-text"
-          >Updated just now</span
-        >
-        <button class="btn" onclick="updateDashboard()">Refresh UI</button>
-        <span class="badge badge-complete" id="connection-status"
-          >Live (auto-refresh 60s)</span
-        >
+      <div class="header-controls">
+        <span id="github-link-container"></span>
+        <span class="mono muted" id="last-updated-text">Updated just now</span>
+        <button type="button" class="btn" onclick="updateDashboard()">
+          Refresh UI
+        </button>
       </div>
     </div>
 
@@ -353,10 +488,44 @@
     <div id="tab-content"></div>
 
     <script>
-      let lastSuccessTime = Date.now()
+      const FETCH_TIMEOUT_MS = 15000
+      const MATRIX_LEGEND = [
+        ["chunk-pending", "Pending"],
+        ["badge-encoding", "Encoding"],
+        ["chunk-ready", "Ready"],
+        ["badge-subtitles_running", "Subtitles"],
+        ["chunk-lyrics_pending", "Lyrics Queued"],
+        ["badge-lyrics_running", "Lyrics"],
+        ["badge-done", "Done"],
+        ["badge-draft_fallback", "Lyrics Failed"],
+        ["badge-failed", "Failed"],
+      ]
+      const CHUNK_CLASSES = {
+        pending: "chunk-pending",
+        ready: "chunk-ready",
+        lyrics_pending: "chunk-lyrics_pending",
+        encoding: "badge-encoding",
+        subtitles_running: "badge-subtitles_running",
+        lyrics_running: "badge-lyrics_running",
+        done: "badge-done",
+        draft_fallback: "badge-draft_fallback",
+        failed: "badge-failed",
+      }
 
-      function esc(s) {
-        return String(s ?? "").replace(
+      let currentData = null
+      let lastSuccessTime = Date.now()
+      let lastFetchAttempt = 0
+      let isFetching = false
+      let refreshTimer = null
+      let selectedPipelineName = null
+      const manualChunkByPipeline = {}
+      const closedInspectorByPipeline = {}
+      const lastVideoByPipeline = {}
+      const summaryDrawerOpen = {}
+      const expandedActivityIds = new Set()
+
+      const esc = (s) =>
+        String(s ?? "").replace(
           /[&<>"']/g,
           (c) =>
             ({
@@ -367,411 +536,673 @@
               "'": "&#39;",
             })[c],
         )
-      }
 
-      function formatLocalTime(epochSec) {
-        if (!epochSec) return "-"
-        return new Date(epochSec * 1000).toLocaleTimeString([], {
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-        })
-      }
+      const titleCase = (s) =>
+        String(s ?? "")
+          .replaceAll("_", " ")
+          .replace(/\b\w/g, (c) => c.toUpperCase())
 
-      function formatLocalDate(epochSec) {
-        if (!epochSec) return "-"
-        return new Date(epochSec * 1000).toLocaleDateString([], {
-          year: "numeric",
-          month: "short",
-          day: "numeric",
-        })
-      }
+      const badge = (cls, text) =>
+        `<span class="badge badge-${esc(cls)}">${esc(text)}</span>`
+
+      const isSafeHttpUrl = (url) =>
+        typeof url === "string" && /^https?:\/\//i.test(url.trim())
+
+      const resolveAttempt = (isActiveOrDone, tierAttempts, maxRuns) =>
+        Math.min(
+          maxRuns,
+          Math.max(0, isActiveOrDone ? tierAttempts + 1 : tierAttempts),
+        )
 
       function formatDuration(sec) {
         if (sec == null || sec <= 0) return "0s"
-        const sNum = Number(sec)
-        const hours = Math.floor(sNum / 3600)
-        const mins = Math.floor((sNum % 3600) / 60)
-        const s = Math.floor(sNum % 60)
-        if (hours > 0) return `${hours}h ${mins}m`
-        if (mins > 0) return `${mins}m ${s}s`
+        const sNum = Math.floor(Number(sec))
+        const h = Math.floor(sNum / 3600)
+        const m = Math.floor((sNum % 3600) / 60)
+        const s = sNum % 60
+        if (h > 0) return `${h}h ${m}m ${s}s`
+        if (m > 0) return `${m}m ${s}s`
         return `${s}s`
       }
+
+      function formatTimestamp(sec, includeHours = false) {
+        const total = Math.max(0, Math.floor(Number(sec) || 0))
+        const h = Math.floor(total / 3600)
+        const m = Math.floor((total % 3600) / 60)
+        const s = total % 60
+        const pad = (n) => String(n).padStart(2, "0")
+        if (includeHours || h > 0) return `${pad(h)}:${pad(m)}:${pad(s)}`
+        return `${pad(m)}:${pad(s)}`
+      }
+
+      function formatActivityDuration(sec) {
+        if (sec == null || sec <= 0) return ""
+        const num = Number(sec)
+        return num < 1 ? ` ${num.toFixed(1)}s` : ` ${formatDuration(num)}`
+      }
+
+      function formatLocalDateTime(epochSec) {
+        if (!epochSec) return "-"
+        const d = new Date(epochSec * 1000)
+        return `${d.toLocaleDateString("en-US", { month: "short", day: "numeric" })}, ${d.toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })}`
+      }
+
+      const formatLocalDate = (epochSec) =>
+        epochSec
+          ? new Date(epochSec * 1000).toLocaleDateString("en-US", {
+              year: "numeric",
+              month: "short",
+              day: "numeric",
+            })
+          : "-"
+
+      function formatFps(fps) {
+        if (fps == null) return "Raw (no reencode)"
+        if (fps === "keyframes") return "Keyframes"
+        const num = Number(fps)
+        return Number.isFinite(num)
+          ? `${Number(num.toFixed(4))} fps`
+          : String(fps)
+      }
+
+      const pct = (done, total, unit) =>
+        `${done}/${total} ${unit} (${total > 0 ? Math.round((done / total) * 100) : 0}%)`
+
+      const ytThumb = (v, sizeCls, alt = "") =>
+        v.source_type === "youtube" && v.video_id
+          ? `<img class="thumb ${sizeCls}" src="https://i.ytimg.com/vi/${encodeURIComponent(v.video_id)}/mqdefault.jpg" alt="${esc(alt)}" onerror="this.style.display='none'">`
+          : ""
+
+      const videoTitle = (v, bold = false) => {
+        const inner = bold ? `<b>${esc(v.title)}</b>` : esc(v.title)
+        return v.source_type === "youtube" && v.video_id
+          ? `<a href="https://youtu.be/${encodeURIComponent(v.video_id)}" target="_blank" rel="noopener noreferrer" class="video-title-link">${inner}</a>`
+          : inner
+      }
+
+      const queryButton = (
+        query,
+        label = "Copy Query 📋",
+        title = "Click to copy Logfire query",
+      ) =>
+        query
+          ? `<button type="button" class="btn btn-sm mono" data-query="${esc(query)}" onclick="copyQueryFromData(this)" title="${esc(title)}">${esc(label)}</button>`
+          : ""
+
+      function syncUrlState() {
+        if (!selectedPipelineName) return
+        const url = new URL(window.location.href)
+        url.searchParams.set("tab", selectedPipelineName)
+        const manualChunk = manualChunkByPipeline[selectedPipelineName]
+        if (manualChunk != null)
+          url.searchParams.set("chunk", String(manualChunk))
+        else url.searchParams.delete("chunk")
+        window.history.replaceState(null, "", url.toString())
+      }
+
+      ;(function initUrlState() {
+        const params = new URLSearchParams(window.location.search)
+        const tab = params.get("tab")
+        const chunkStr = params.get("chunk")
+        if (tab) {
+          selectedPipelineName = tab
+          if (chunkStr !== null && /^\d+$/.test(chunkStr)) {
+            manualChunkByPipeline[tab] = Number(chunkStr)
+          }
+        }
+      })()
 
       function updateRelativeTime() {
         const el = document.getElementById("last-updated-text")
         if (!el) return
         const sec = Math.floor((Date.now() - lastSuccessTime) / 1000)
-        if (sec < 3) {
-          el.innerText = "Updated just now"
-        } else if (sec < 60) {
-          el.innerText = `Updated ${sec}s ago`
-        } else {
-          const mins = Math.floor(sec / 60)
-          const remSec = sec % 60
-          el.innerText = `Updated ${mins}m ${remSec}s ago`
-        }
+        el.innerText =
+          sec < 3 ? "Updated just now" : `Updated ${formatDuration(sec)} ago`
       }
-
       setInterval(updateRelativeTime, 1000)
-
-      function copyTextFallback(text) {
-        const prev = document.activeElement
-        const ta = document.createElement("textarea")
-        ta.value = text
-        ta.style.position = "fixed"
-        ta.style.opacity = "0"
-        document.body.appendChild(ta)
-        ta.focus()
-        ta.select()
-        let success = false
-        try {
-          success = document.execCommand("copy")
-        } catch (e) {
-          console.error("Fallback clipboard copy failed:", e)
-        } finally {
-          document.body.removeChild(ta)
-          if (prev && typeof prev.focus === "function") {
-            prev.focus()
-          }
-        }
-        return success
-      }
 
       function copyQueryFromData(el) {
         const query = el.getAttribute("data-query")
-        if (!query) return
+        if (!query || el.dataset.copying === "1") return
 
-        const setStatus = (msg, colorVar) => {
-          const original = el.innerText
+        const original = el.innerText
+        el.dataset.copying = "1"
+        const showStatus = (msg, color) => {
           el.innerText = msg
-          el.style.borderColor = colorVar
-          el.style.color = colorVar
+          el.style.borderColor = color
+          el.style.color = color
           setTimeout(() => {
             el.innerText = original
             el.style.borderColor = ""
             el.style.color = ""
+            delete el.dataset.copying
           }, 1500)
         }
-
-        const onSuccess = () => setStatus("Copied Query!", "var(--green)")
-        const onFail = () => setStatus("Copy Failed", "var(--red)")
+        const fallback = () => {
+          const prev = document.activeElement
+          const ta = document.createElement("textarea")
+          ta.value = query
+          ta.style.cssText = "position:fixed;opacity:0"
+          document.body.appendChild(ta)
+          ta.focus()
+          ta.select()
+          let ok = false
+          try {
+            ok = document.execCommand("copy")
+          } finally {
+            document.body.removeChild(ta)
+            if (prev?.focus) prev.focus()
+          }
+          showStatus(
+            ok ? "Copied Query!" : "Copy Failed",
+            ok ? "var(--green)" : "var(--red)",
+          )
+        }
 
         if (navigator.clipboard && window.isSecureContext) {
           navigator.clipboard
             .writeText(query)
-            .then(onSuccess)
-            .catch(() => {
-              if (copyTextFallback(query)) {
-                onSuccess()
-              } else {
-                onFail()
-              }
-            })
+            .then(() => showStatus("Copied Query!", "var(--green)"))
+            .catch(fallback)
         } else {
-          if (copyTextFallback(query)) {
-            onSuccess()
-          } else {
-            onFail()
-          }
+          fallback()
         }
       }
 
-      function renderStageCard({
-        stepNumber,
-        title,
-        done,
-        inProgress,
-        total,
-        infoText,
-      }) {
-        const donePct = total > 0 ? Math.round((done / total) * 100) : 0
-        const progPct = total > 0 ? Math.round((inProgress / total) * 100) : 0
+      function selectTabByBtn(btn) {
+        selectedPipelineName = btn.getAttribute("data-pipeline")
+        syncUrlState()
+        renderPipelineView()
+      }
+
+      function toggleSummaryDrawer(btn) {
+        const name = btn.getAttribute("data-pipeline")
+        summaryDrawerOpen[name] = !summaryDrawerOpen[name]
+        renderPipelineView()
+      }
+
+      function resolveSelectedChunkIndex(pipeName, segments) {
+        if (!segments?.length || closedInspectorByPipeline[pipeName])
+          return null
+        const manual = manualChunkByPipeline[pipeName]
+        if (manual != null && segments.some((s) => s.index === manual))
+          return manual
+        const active = segments.find((s) =>
+          ["subtitles_running", "lyrics_running", "encoding"].includes(
+            s.matrix_status,
+          ),
+        )
+        if (active) return active.index
+        const issue = segments.find(
+          (s) =>
+            ["failed", "draft_fallback"].includes(s.matrix_status) ||
+            s.fallback_tier > 0,
+        )
+        return (issue || segments[0]).index
+      }
+
+      function selectChunkTile(btn) {
+        const pipeName = btn.getAttribute("data-pipeline")
+        const idx = Number(btn.getAttribute("data-chunk"))
+        const pipe = currentData?.pipelines?.find((p) => p.name === pipeName)
+        const activeIdx = resolveSelectedChunkIndex(
+          pipeName,
+          pipe?.stages?.segments,
+        )
+        if (activeIdx === idx && manualChunkByPipeline[pipeName] === idx) {
+          delete manualChunkByPipeline[pipeName]
+          closedInspectorByPipeline[pipeName] = true
+        } else {
+          manualChunkByPipeline[pipeName] = idx
+          delete closedInspectorByPipeline[pipeName]
+        }
+        syncUrlState()
+        renderPipelineView()
+      }
+
+      function closeInspector(btn) {
+        const pipeName = btn.getAttribute("data-pipeline")
+        delete manualChunkByPipeline[pipeName]
+        closedInspectorByPipeline[pipeName] = true
+        syncUrlState()
+        renderPipelineView()
+      }
+
+      function toggleActivityDetail(btn) {
+        const eid = btn.getAttribute("data-event-id")
+        if (expandedActivityIds.has(eid)) expandedActivityIds.delete(eid)
+        else expandedActivityIds.add(eid)
+        const row = document.getElementById("detail-" + eid)
+        if (row)
+          row.style.display = expandedActivityIds.has(eid)
+            ? "table-row"
+            : "none"
+      }
+
+      function renderSummaryDrawer(preview) {
+        const chapters =
+          (preview.chapters || [])
+            .map((ch) => {
+              const song = ch.song_title
+                ? ` <span style="color:#d8b4fe;">[🎵 ${esc(ch.song_title)}${ch.song_artist ? ` — ${esc(ch.song_artist)}` : ""}]</span>`
+                : ""
+              return `<li><span class="mono" style="color:var(--accent);">${esc(ch.start)}–${esc(ch.end)}</span> <b>${esc(ch.title)}</b>${song}: <span style="color:#cbd5e1;">${esc(ch.description)}</span></li>`
+            })
+            .join("") || '<li class="muted">None recorded.</li>'
+
+        const entities =
+          (preview.entities || [])
+            .map((e) => {
+              const orig = e.original_name ? ` (${esc(e.original_name)})` : ""
+              const role = e.role_or_affiliation
+                ? ` — ${esc(e.role_or_affiliation)}`
+                : ""
+              const ticks = e.speech_patterns_or_ticks
+                ? ` · <i>${esc(e.speech_patterns_or_ticks)}</i>`
+                : ""
+              return `<li><b>${esc(e.name)}</b>${orig}<span class="muted">${role}${ticks}</span></li>`
+            })
+            .join("") || '<li class="muted">None recorded.</li>'
+
+        const glossary = (preview.domain_glossary || [])
+          .map(
+            (g) =>
+              `<li><b>${esc(g.term)}</b>: <span style="color:#cbd5e1;">${esc(g.meaning)}</span></li>`,
+          )
+          .join("")
 
         return `
-          <div class="stage-card">
-            <div>
-              <b style="font-size: 13px;">${stepNumber}. ${esc(title)}</b>
-              <div style="display:flex; justify-content:space-between; font-size: 11px; margin-top: 6px;">
-                <span>
-                  ${inProgress > 0 ? `<span style="color:var(--blue); font-weight:600;">${inProgress} In Progress</span> · ` : ""}
-                  <b style="color:var(--green);">${done} Done</b>
-                </span>
-                <span style="color:var(--muted);">Total: ${total} (${donePct}%)</span>
+          <div class="summary-drawer">
+            <div class="section-kicker">Overall Summary</div>
+            <div style="color:#e2e8f0;">${esc(preview.overall_summary)}</div>
+            <div class="section-kicker">Chapters (${(preview.chapters || []).length})</div>
+            <ul class="summary-list">${chapters}</ul>
+            <div class="section-kicker">Entities (${(preview.entities || []).length})</div>
+            <ul class="summary-list">${entities}</ul>
+            ${glossary ? `<div class="section-kicker">Domain Glossary (${preview.domain_glossary.length})</div><ul class="summary-list">${glossary}</ul>` : ""}
+          </div>
+        `
+      }
+
+      function renderChunkInspector(pipeName, seg) {
+        const startS = Math.floor((seg.offset_ms || 0) / 1000)
+        const endS = startS + Math.floor((seg.duration_ms || 0) / 1000)
+        const useHours = endS >= 3600
+        const windowText = `${formatTimestamp(startS, useHours)} – ${formatTimestamp(endS, useHours)}`
+
+        const fpsText = formatFps(seg.target_fps)
+        const mediaState = seg.is_encoding
+          ? "Compressing locally"
+          : seg.media_ready
+            ? "Ready"
+            : "Pending compression"
+
+        const subDetail =
+          seg.active_task_type === "subtitles" && seg.active_worker_id
+            ? `Running on ${seg.active_worker_id} (${formatDuration(seg.active_elapsed_s)})`
+            : seg.subtitles_line_count != null
+              ? `Completed (${seg.subtitles_line_count} line${seg.subtitles_line_count === 1 ? "" : "s"})`
+              : titleCase(seg.subtitles_status)
+
+        const subAttempt = resolveAttempt(
+          ["completed", "in_progress"].includes(seg.subtitles_status),
+          seg.subtitles_tier_attempts,
+          seg.max_runs,
+        )
+
+        const lyrDetail =
+          seg.active_task_type === "lyrics" && seg.active_worker_id
+            ? `Running on ${seg.active_worker_id} (${formatDuration(seg.active_elapsed_s)})`
+            : seg.lyrics_line_count != null
+              ? `Completed (${seg.lyrics_line_count} line${seg.lyrics_line_count === 1 ? "" : "s"})`
+              : seg.lyrics_status === "draft_fallback"
+                ? "Exhausted (error in refined SRT, raw SRT available)"
+                : titleCase(seg.lyrics_status)
+
+        const matrixStatusLabel =
+          seg.matrix_status === "draft_fallback"
+            ? "Lyrics Failed"
+            : titleCase(seg.matrix_status)
+
+        const showLyrAttempts =
+          !["waiting", "skipped", "disabled"].includes(seg.lyrics_status) ||
+          seg.lyrics_tier_attempts > 0
+        const lyrAttempt = resolveAttempt(
+          ["completed", "in_progress"].includes(seg.lyrics_status),
+          seg.lyrics_tier_attempts,
+          seg.max_runs,
+        )
+
+        const songsHtml =
+          seg.subtitles_line_count == null
+            ? '<span class="muted">Pending transcription</span>'
+            : seg.detected_songs?.length > 0
+              ? seg.detected_songs
+                  .map((s) =>
+                    badge(
+                      "finalizing",
+                      `🎵 ${s.title || "Unknown Title"}${s.artist ? ` — ${s.artist}` : ""} (${s.start}–${s.end})`,
+                    ),
+                  )
+                  .join(" ")
+              : '<span class="muted">None detected</span>'
+
+        const label = String(seg.index).padStart(3, "0")
+        return `
+          <div class="box-inner">
+            <div class="inspector-head">
+              <div style="display:flex; flex-wrap:wrap; align-items:center; gap:8px;">
+                <b class="mono" style="font-size:13px;">Chunk #${label}</b>
+                ${badge(seg.matrix_status, matrixStatusLabel)}
+                <span class="mono muted">${esc(windowText)}</span>
               </div>
-              <div class="progress-bar">
-                <div class="progress-fill-done" style="width: ${donePct}%;"></div>
-                <div class="progress-fill-prog" style="width: ${progPct}%;"></div>
+              <div style="display:flex; align-items:center; gap:6px;">
+                ${queryButton(seg.logfire_query, "Copy Chunk Query 📋", "Click to copy Logfire query for this chunk")}
+                <button type="button" class="btn btn-sm" data-pipeline="${esc(pipeName)}" onclick="closeInspector(this)" title="Close chunk details">✕</button>
               </div>
             </div>
-            <div style="font-size: 11px; color: var(--muted); margin-top: 4px;">
-              ${infoText}
+            <div class="inspector-grid">
+              <div>
+                <div class="section-kicker">Encoding &amp; Media</div>
+                <div>${esc(fpsText)}</div>
+                <div class="muted" style="font-size:12px;">Media: ${esc(mediaState)}</div>
+              </div>
+              <div>
+                <div class="section-kicker">Subtitles Stage</div>
+                <div>${esc(subDetail)}</div>
+                <div class="muted" style="font-size:12px;">Fallback: Tier ${seg.fallback_tier}/${seg.max_fallback_tiers} · Attempt ${subAttempt}/${seg.max_runs}</div>
+              </div>
+              <div>
+                <div class="section-kicker">Lyrics Stage</div>
+                <div>${esc(lyrDetail)}</div>
+                ${showLyrAttempts ? `<div class="muted" style="font-size:12px;">Attempt ${lyrAttempt}/${seg.max_runs}</div>` : ""}
+              </div>
+              <div>
+                <div class="section-kicker">Detected Singing</div>
+                <div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:2px;">${songsHtml}</div>
+              </div>
             </div>
           </div>
         `
       }
 
-      let currentData = null
-      let selectedPipelineIndex = 0
+      function renderActiveVideoCard(pipe) {
+        const v = pipe.active_video
+        const {
+          summary: sum,
+          reencoding: reenc,
+          subtitles: sub,
+          lyrics: lyr,
+          segments = [],
+        } = pipe.stages
 
-      function selectTab(index) {
-        selectedPipelineIndex = index
-        renderPipelineView()
-      }
-
-      function toggleDetail(idx) {
-        const el = document.getElementById("detail-" + idx)
-        if (el) {
-          el.style.display =
-            el.style.display === "table-row" ? "none" : "table-row"
-        }
-      }
-
-      function renderPipelineView() {
-        if (!currentData || !currentData.pipelines) return
-
-        // Render global YouTube Cooldown banner if active
-        const cd = currentData.youtube_cooldown
-        const bannerContainer = document.getElementById(
-          "cooldown-banner-container",
+        const sumFps = formatFps(sum.target_fps)
+        const sumAttempt = resolveAttempt(
+          sum.done > 0 || sum.in_progress > 0,
+          sum.tier_attempts,
+          sum.max_runs,
         )
-        if (cd && cd.in_cooldown) {
-          bannerContainer.innerHTML = `
-            <div class="banner-cooldown">
-              <span>⚠️</span>
-              <div>
-                <b>YouTube Intake Paused:</b> ${esc(cd.reason || "Download failure threshold reached")}.
-                Resuming in <b>${formatDuration(cd.remaining_seconds)}</b>. Local intake files continue to process unhindered.
-              </div>
-            </div>
-          `
-        } else {
-          bannerContainer.innerHTML = ""
+        const sumFallbackMeta = `Fallback: Tier ${sum.fallback_tier}/${sum.max_fallback_tiers} · Attempt ${sumAttempt}/${sum.max_runs}`
+
+        let sumText = `Waiting for worker · ${sumFps} · ${sumFallbackMeta}`
+        if (!sum.enabled) sumText = "Disabled"
+        else if (sum.done > 0 && sum.preview)
+          sumText = `${sumFps} · ${sumFallbackMeta} · ${sum.preview.chapters.length} chapters · ${sum.preview.entities.length} entities · ${sum.preview.domain_glossary.length} glossary`
+        else if (sum.done > 0) sumText = `${sumFps} · ${sumFallbackMeta}`
+        else if (sum.exhausted)
+          sumText = `Failed across all tiers · ${sumFps} · ${sumFallbackMeta}`
+        else if (sum.in_progress > 0)
+          sumText = `Worker ${sum.worker_id} (${formatDuration(sum.elapsed_s)}) · ${sumFps} · ${sumFallbackMeta}`
+        else if (sum.is_encoding)
+          sumText = `Compressing proxy · ${sumFps} · ${sumFallbackMeta}`
+
+        const encParts = [pct(reenc.done, reenc.total, "ready")]
+        if (reenc.in_progress > 0)
+          encParts.push(
+            `<span style="color:#a5b4fc;">${reenc.in_progress} encoding</span>`,
+          )
+        if (reenc.fallback_count > 0)
+          encParts.push(
+            `<span style="color:#fcd34d;">${reenc.fallback_count} in fallback</span>`,
+          )
+
+        const subParts = [pct(sub.done, sub.total, "done")]
+        if (sub.in_progress > 0)
+          subParts.push(
+            `<span style="color:#7dd3fc;">${sub.in_progress} running</span>`,
+          )
+        if ((sub.failed || 0) > 0)
+          subParts.push(
+            `<span style="color:#fca5a5;">${sub.failed} failed</span>`,
+          )
+
+        let lyrHtml = `<span class="muted">Waiting for transcription to detect singing</span>`
+        if (!lyr.enabled) lyrHtml = `<span class="muted">Disabled</span>`
+        else if (lyr.skipped)
+          lyrHtml = `<span class="muted">Skipped (no singing detected)</span>`
+        else if (lyr.total > 0) {
+          const lyrParts = [pct(lyr.done, lyr.total, "done")]
+          if (lyr.in_progress > 0)
+            lyrParts.push(
+              `<span style="color:#d8b4fe;">${lyr.in_progress} running</span>`,
+            )
+          if (lyr.failed > 0)
+            lyrParts.push(
+              `<span style="color:#fcd34d;">${lyr.failed} failed (raw available)</span>`,
+            )
+          lyrHtml = lyrParts.join(" · ")
         }
 
-        const pipe =
-          currentData.pipelines[selectedPipelineIndex] ||
-          currentData.pipelines[0]
-        if (!pipe) return
+        const selectedIdx = resolveSelectedChunkIndex(pipe.name, segments)
+        const selectedSeg =
+          selectedIdx != null
+            ? segments.find((s) => s.index === selectedIdx)
+            : null
 
-        const tabs = document.getElementById("pipeline-tabs")
-        tabs.innerHTML = currentData.pipelines
-          .map((p, idx) => {
-            const pStatus = p.status || (p.idle ? "idle" : "processing")
-            return `
-              <button class="tab-btn ${idx === selectedPipelineIndex ? "active" : ""}" onclick="selectTab(${idx})">
-                ${esc(p.name)}
-                <span class="badge badge-${esc(pStatus)}">${esc(pStatus)}</span>
-              </button>
-            `
+        const tilesHtml = segments
+          .map((seg) => {
+            const label = String(seg.index).padStart(3, "0")
+            const cls = CHUNK_CLASSES[seg.matrix_status] || "chunk-pending"
+            const selCls = seg.index === selectedIdx ? "selected" : ""
+            const dot =
+              seg.fallback_tier > 0 ? '<span class="fallback-dot"></span>' : ""
+            return `<button type="button" class="chunk-tile ${cls} ${selCls}" data-pipeline="${esc(pipe.name)}" data-chunk="${seg.index}" onclick="selectChunkTile(this)" title="Chunk #${label} · ${formatFps(seg.target_fps)}">${label}${dot}</button>`
           })
           .join("")
 
-        const v = pipe.active_video
-        const st = pipe.stages
+        const legendHtml =
+          MATRIX_LEGEND.map(
+            ([cls, label]) =>
+              `<span class="legend-item"><span class="legend-swatch ${cls}"></span>${label}</span>`,
+          ).join("") +
+          '<span class="legend-item"><span style="width:7px;height:7px;border-radius:9999px;background:var(--amber);display:inline-block;"></span>Fallback FPS</span>'
 
-        let activeSection = ""
-        if (v && st) {
-          const sum = st.summary
-          const reenc = st.reencoding
-          const sub = st.subtitles
-          const lyr = st.lyrics
-
-          const durMin = Math.floor(v.duration_ms / 60000)
-          const durSec = Math.floor((v.duration_ms % 60000) / 1000)
-          const durationFormatted =
-            durMin > 0 ? `${durMin}m ${durSec}s` : `${durSec}s`
-
-          const sumInfo =
-            sum.done > 0
-              ? "Macro knowledge index & chapters ready."
-              : sum.in_progress > 0
-                ? `Running by worker <b>${esc(sum.worker_id)}</b> (${formatDuration(sum.elapsed_s)})`
-                : "Waiting for worker pickup."
-
-          const reencInfo =
-            reenc.total === 0
-              ? "Waiting for video segmentation..."
-              : reenc.pending > 0
-                ? `${reenc.pending} chunk(s) pending compression`
-                : "All chunks compressed and ready."
-
-          const subInfo =
-            sub.in_progress > 0
-              ? `${sub.in_progress} chunk(s) actively running on workers`
-              : sub.done === sub.total && sub.total > 0
-                ? "All subtitle chunks transcribed."
-                : sum.done === 0
-                  ? "Waiting for whole-video summary to complete."
-                  : "Waiting for worker pickup."
-
-          const lyrInfo =
-            lyr.status === "pending"
-              ? "Vocal performances will be detected during transcription."
-              : lyr.status === "skipped"
-                ? "No vocal singing detected across all chunks."
-                : lyr.in_progress > 0
-                  ? lyr.active_leases
-                      .map(
-                        (l) =>
-                          `Refining with <b>${esc(l.worker_id)}</b> (${formatDuration(l.elapsed_s)})`,
-                      )
-                      .join(", ")
-                  : lyr.done === lyr.total
-                    ? "All singing chunks refined."
-                    : "Waiting for worker pickup."
-
-          const isYt = v.source_type === "youtube"
-          const thumbHtml =
-            isYt && v.video_id
-              ? `<img class="video-thumb" src="https://i.ytimg.com/vi/${esc(v.video_id)}/mqdefault.jpg" alt="${esc(v.title)}" onerror="this.style.display='none'">`
-              : ""
-          const titleHtml =
-            isYt && v.video_id
-              ? `<a href="https://youtu.be/${esc(v.video_id)}" target="_blank" rel="noopener noreferrer" class="video-title-link">${esc(v.title)}</a>`
-              : esc(v.title)
-
-          activeSection = `
-            <div class="card" style="margin-bottom: 20px;">
-              <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom: 16px; gap: 16px;">
-                <div style="display:flex; gap: 16px; align-items:flex-start;">
-                  ${thumbHtml}
-                  <div>
-                    <div style="display:flex; gap: 8px; align-items:center; margin-bottom: 6px;">
-                      <span class="badge badge-complete">Active Video</span>
-                      <span class="badge badge-${esc(v.source_type)}">${esc(v.source_type)}</span>
-                      <span class="badge badge-${esc(pipe.status || "processing")}">${esc(pipe.status || "processing")}</span>
-                    </div>
-                    <h3 style="margin-bottom: 4px;">${titleHtml}</h3>
-                    <div style="color: var(--muted); font-size: 13px;">
-                      Channel: <b>${esc(v.channel_name || v.uploader)}</b> (@${esc(v.uploader)}) | Duration: ${durationFormatted}
-                    </div>
-                  </div>
-                </div>
-                <div style="text-align: right; display: flex; flex-direction: column; gap: 4px; flex-shrink: 0;">
-                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Summary:</span> ${esc(pipe.models.summary.split(":").pop())}</div>
-                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Subtitles:</span> ${esc(pipe.models.subtitles.split(":").pop())}</div>
-                  <div class="mono" style="font-size:11px; color:var(--muted);"><span style="color:#64748b;">Lyrics:</span> ${esc(pipe.models.lyrics.split(":").pop())}</div>
-                </div>
-              </div>
-
-              <div class="grid">
-                ${renderStageCard({ stepNumber: 1, title: "Whole-Video Summary", done: sum.done, inProgress: sum.in_progress, total: sum.total, infoText: sumInfo })}
-                ${renderStageCard({ stepNumber: 2, title: "Chunk Compression", done: reenc.done, inProgress: reenc.in_progress, total: reenc.total, infoText: reencInfo })}
-                ${renderStageCard({ stepNumber: 3, title: "Subtitles Transcription", done: sub.done, inProgress: sub.in_progress, total: sub.total, infoText: subInfo })}
-                ${renderStageCard({ stepNumber: 4, title: "Lyrics Refinement", done: lyr.done, inProgress: lyr.in_progress, total: lyr.total, infoText: lyrInfo })}
-              </div>
-
-              <div style="font-size: 12px; margin-top: 8px;">
-                <b>Active Leases:</b>
-                ${
-                  pipe.tasks
-                    .filter((t) => t.status === "claimed")
-                    .map((t) => {
-                      const parts = t.task_id.split("::")
-                      const lastPart = parts.pop()
-                      const taskLabel =
-                        lastPart === t.type ? t.type : `${t.type} ${lastPart}`
-                      const dur = formatDuration(t.elapsed_s)
-                      const query = t.logfire_query || ""
-                      return `
-                        <span class="badge badge-claim mono badge-clickable"
-                              data-query="${esc(query)}"
-                              onclick="copyQueryFromData(this)"
-                              title="Click to copy Logfire query: ${esc(query)}">
-                          ${esc(taskLabel)} (${esc(t.worker_id)}) [${dur}] 📋
-                        </span>
-                      `
-                    })
-                    .join(" ") ||
-                  '<span style="color:var(--muted);">No active worker leases at this moment</span>'
-                }
-              </div>
-            </div>
-          `
-        } else {
-          const totalTracked = currentData.total_tracked_videos || 0
-          const qTotal = pipe.queue_total ?? (pipe.next_in_queue || []).length
-
-          let statusTitle = `${pipe.name} is currently idle`
-          let statusDesc = "Waiting for next video from intake sources..."
-          let prepDetail = ""
-
-          if (cd && cd.in_cooldown) {
-            statusDesc = `Waiting for next video (YouTube intake is paused on cooldown for another ${formatDuration(cd.remaining_seconds)}, local files still process).`
-          } else if (totalTracked > 0 && qTotal === 0) {
-            statusTitle = `${pipe.name} is idle — all videos complete for this pipeline`
-            statusDesc = `All ${totalTracked} tracked video(s) have finished processing for ${pipe.name}. Waiting for new uploads or files...`
-          }
-
-          if (pipe.status === "preparing") {
-            const prep = pipe.preparing_video
-            if (prep && prep.title) {
-              statusTitle = `${pipe.name} is preparing media`
-              statusDesc =
-                "Downloading video stream or generating segment chunks..."
-              const channelDisplay = prep.channel_name || prep.uploader
-              const isPrepYt = (prep.source_type || "youtube") === "youtube"
-              const prepThumb =
-                isPrepYt && prep.video_id
-                  ? `<img class="thumb-prep" src="https://i.ytimg.com/vi/${esc(prep.video_id)}/mqdefault.jpg" alt="${esc(prep.title)}" onerror="this.style.display='none'">`
+        const leasesHtml =
+          (pipe.tasks || [])
+            .map((t) => {
+              const parts = t.task_id.split("::")
+              const last = parts.pop()
+              const taskLabel = last === t.type ? t.type : `${t.type} ${last}`
+              const tierTag =
+                t.fallback_tier > 0
+                  ? ` [T${t.fallback_tier}: ${formatFps(t.target_fps)}]`
                   : ""
-              const prepTitle =
-                isPrepYt && prep.video_id
-                  ? `<a href="https://youtu.be/${esc(prep.video_id)}" target="_blank" rel="noopener noreferrer" class="video-title-link"><b>${esc(prep.title)}</b></a>`
-                  : `<b>${esc(prep.title)}</b>`
+              return `<span class="badge badge-claim mono badge-clickable" data-query="${esc(t.logfire_query || "")}" onclick="copyQueryFromData(this)" title="Click to copy Logfire query">${esc(taskLabel)}${esc(tierTag)} (${esc(t.worker_id)}) [${esc(formatDuration(t.elapsed_s))}] 📋</span>`
+            })
+            .join("") ||
+          '<span class="muted">No active worker leases at this moment</span>'
 
-              prepDetail = `
-                <div style="margin-top: 14px; display: inline-flex; align-items: center; gap: 12px; background: rgba(234, 179, 8, 0.1); border: 1px solid rgba(234, 179, 8, 0.3); border-radius: 6px; padding: 8px 14px; font-size: 13px;">
-                  ${prepThumb}
-                  <div style="display:flex; flex-direction:column; align-items:flex-start; gap: 4px;">
-                    <div style="display:flex; align-items:center; gap: 8px;">
-                      <span class="badge badge-${esc(prep.source_type || "youtube")}">${esc(prep.source_type || "youtube")}</span>
-                      ${prepTitle}
-                    </div>
-                    <span style="color: var(--muted); font-size: 12px;">(${esc(channelDisplay)} @${esc(prep.uploader)})</span>
+        const isDrawerOpen = Boolean(summaryDrawerOpen[pipe.name])
+        return `
+          <div class="card" style="margin-bottom: 20px;">
+            <div class="active-header">
+              <div class="active-identity">
+                ${ytThumb(v, "thumb-lg", v.title)}
+                <div style="min-width:0;">
+                  <div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:6px;">
+                    ${badge(v.source_type, v.source_type)}
+                    ${badge(pipe.status || "processing", pipe.status || "processing")}
+                  </div>
+                  <h3 style="margin-bottom:4px; word-break:break-word;">${videoTitle(v)}</h3>
+                  <div class="muted" style="font-size:13px;">
+                    Channel: <b style="color:var(--text);">${esc(v.channel_name || v.uploader)}</b> (@${esc(v.uploader)}) · Duration: <b style="color:var(--text);">${esc(formatDuration(Math.floor((v.duration_ms || 0) / 1000)))}</b>
                   </div>
                 </div>
-              `
-            } else {
-              statusTitle = `${pipe.name} is preparing media`
-              statusDesc =
-                "Downloading video stream or generating segment chunks..."
-            }
-          } else if (pipe.status === "finalizing") {
-            statusTitle = `${pipe.name} is finalizing subtitles`
-            statusDesc =
-              "Stitching completed subtitle segments and committing to Git..."
-          } else if (pipe.status === "push_failed") {
-            statusTitle = `${pipe.name} encountered a Git push failure`
-            statusDesc =
-              "Subtitles completed on disk. Retrying Git synchronization automatically on next cycle..."
-          }
-
-          activeSection = `
-            <div class="card" style="margin-bottom: 20px; padding: 36px; text-align: center;">
-              <div style="margin-bottom: 10px;">
-                <span class="badge badge-${esc(pipe.status || "idle")}">${esc(pipe.status || "idle")}</span>
               </div>
-              <h3 style="margin-bottom: 6px;">${esc(statusTitle)}</h3>
-              <p style="color: var(--muted); margin: 0;">${esc(statusDesc)}</p>
-              ${prepDetail}
-              <div class="mono" style="font-size: 12px; margin-top: 14px; color: var(--muted);">
-                Models: ${esc(pipe.models.summary.split(":").pop())} / ${esc(pipe.models.subtitles.split(":").pop())} / ${esc(pipe.models.lyrics.split(":").pop())}
+              <div class="active-models mono" style="font-size:11px; color:var(--muted);">
+                <div><span style="color:#64748b;">Summary:</span> ${esc(pipe.models.summary)}</div>
+                <div><span style="color:#64748b;">Subtitles:</span> ${esc(pipe.models.subtitles)}</div>
+                <div><span style="color:#64748b;">Lyrics:</span> ${esc(pipe.models.lyrics)}</div>
               </div>
             </div>
-          `
+
+            <div class="box-inner" style="display:flex; flex-direction:column; gap:6px;">
+              <div class="stage-line">
+                <span class="stage-label">1. Summary</span>
+                ${badge(sum.status, titleCase(sum.status))}
+                <span class="muted" style="font-size:12px;">${esc(sumText)}</span>
+                ${sum.done > 0 && sum.preview ? `<button type="button" class="btn btn-sm" data-pipeline="${esc(pipe.name)}" onclick="toggleSummaryDrawer(this)">${isDrawerOpen ? "Hide Summary" : "View Summary"}</button>` : ""}
+                ${sum.in_progress > 0 ? queryButton(sum.logfire_query, "Query 📋", "Click to copy Logfire query for summary") : ""}
+              </div>
+              <div class="stage-line"><span class="stage-label">2. Encoding</span><span style="font-size:12px;">${encParts.join(" · ")}</span></div>
+              <div class="stage-line"><span class="stage-label">3. Subtitles</span><span style="font-size:12px;">${subParts.join(" · ")}</span></div>
+              <div class="stage-line"><span class="stage-label">4. Lyrics</span><span style="font-size:12px;">${lyrHtml}</span></div>
+            </div>
+
+            ${isDrawerOpen && sum.preview ? renderSummaryDrawer(sum.preview) : ""}
+
+            <div style="margin-bottom: 14px;">
+              <div style="display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px; font-size:12px; color:var(--muted);">
+                <b style="color:var(--text);">Chunk Matrix (${segments.length})</b>
+                <span>Tap chunk to inspect details</span>
+              </div>
+              <div class="chunk-matrix">${tilesHtml}</div>
+              <div class="matrix-legend">${legendHtml}</div>
+            </div>
+
+            ${selectedSeg ? renderChunkInspector(pipe.name, selectedSeg) : ""}
+
+            <div class="leases-bar"><b>Active Leases:</b> ${leasesHtml}</div>
+          </div>
+        `
+      }
+
+      function renderIdleCard(pipe, cd, totalTracked) {
+        const qTotal = pipe.queue_total ?? (pipe.next_in_queue || []).length
+        let title = `${pipe.name} is currently idle`
+        let desc = "Waiting for next video from intake sources..."
+        let prepHtml = ""
+
+        if (cd?.in_cooldown) {
+          desc = `Waiting for next video (YouTube intake paused on cooldown for ${formatDuration(cd.remaining_seconds)}, local files still process).`
+        } else if (totalTracked > 0 && qTotal === 0) {
+          title = `${pipe.name} is idle — all videos complete for this pipeline`
+          desc = `All ${totalTracked} tracked video(s) have finished processing for ${pipe.name}. Waiting for new uploads or files...`
         }
+
+        if (pipe.status === "preparing") {
+          title = `${pipe.name} is preparing media`
+          desc = "Downloading video stream or generating segment chunks..."
+          const prep = pipe.preparing_video
+          if (prep?.title) {
+            const pObj = { source_type: prep.source_type || "youtube", ...prep }
+            prepHtml = `
+              <div style="margin-top:14px; display:inline-flex; flex-wrap:wrap; align-items:center; gap:12px; background:rgba(234,179,8,0.1); border:1px solid rgba(234,179,8,0.3); border-radius:6px; padding:8px 14px; font-size:13px; text-align:left;">
+                ${ytThumb(pObj, "thumb-md", prep.title)}
+                <div style="display:flex; flex-direction:column; gap:4px;">
+                  <div style="display:flex; flex-wrap:wrap; align-items:center; gap:8px;">
+                    ${badge(pObj.source_type, pObj.source_type)}
+                    ${videoTitle(pObj, true)}
+                  </div>
+                  <span class="muted" style="font-size:12px;">(${esc(prep.channel_name || prep.uploader)} @${esc(prep.uploader)})</span>
+                </div>
+              </div>
+            `
+          }
+        }
+
+        return `
+          <div class="card" style="margin-bottom: 20px; padding: 32px 20px; text-align: center;">
+            <div style="margin-bottom: 10px;">${badge(pipe.status || "idle", pipe.status || "idle")}</div>
+            <h3 style="margin-bottom: 6px;">${esc(title)}</h3>
+            <p class="muted" style="margin: 0;">${esc(desc)}</p>
+            ${prepHtml}
+            <div class="mono muted" style="margin-top: 14px;">
+              Models: ${esc(pipe.models.summary)} / ${esc(pipe.models.subtitles)} / ${esc(pipe.models.lyrics)}
+            </div>
+          </div>
+        `
+      }
+
+      function renderPipelineView() {
+        if (!currentData?.pipelines?.length) return
+
+        const ver = currentData.server_version
+        document.getElementById("server-version-tag").innerText = ver
+          ? `v${ver}`
+          : ""
+        document.title = ver ? `AI Sub v${ver}` : "AI Sub"
+        document.getElementById("github-link-container").innerHTML =
+          isSafeHttpUrl(currentData.git_repo_url)
+            ? `<a href="${esc(currentData.git_repo_url)}" target="_blank" rel="noopener noreferrer" class="btn">GitHub ↗</a>`
+            : ""
+
+        const cd = currentData.youtube_cooldown
+        document.getElementById("cooldown-banner-container").innerHTML =
+          cd?.in_cooldown
+            ? `<div class="banner-cooldown"><span>⚠️</span><div><b>YouTube Intake Paused:</b> ${esc(cd.reason || "Download failure threshold reached")}. Resuming in <b>${esc(formatDuration(cd.remaining_seconds))}</b>. Local intake files continue to process unhindered.</div></div>`
+            : ""
+
+        const pipelines = currentData.pipelines
+        const validEventIds = new Set()
+        for (const p of pipelines) {
+          ;(p.recent_activity || []).forEach((a) => {
+            validEventIds.add(a.event_id)
+          })
+        }
+        for (const eid of expandedActivityIds) {
+          if (!validEventIds.has(eid)) expandedActivityIds.delete(eid)
+        }
+
+        let pipe = pipelines.find((p) => p.name === selectedPipelineName)
+        if (!pipe) {
+          pipe = pipelines[0]
+          selectedPipelineName = pipe.name
+          syncUrlState()
+        }
+
+        for (const p of pipelines) {
+          const curVid = p.active_video ? p.active_video.video_id : null
+          const hasPrevious = Object.hasOwn(lastVideoByPipeline, p.name)
+          if (hasPrevious && lastVideoByPipeline[p.name] !== curVid) {
+            delete manualChunkByPipeline[p.name]
+            delete closedInspectorByPipeline[p.name]
+            delete summaryDrawerOpen[p.name]
+            if (p.name === selectedPipelineName) syncUrlState()
+          }
+          lastVideoByPipeline[p.name] = curVid
+        }
+
+        document.getElementById("pipeline-tabs").innerHTML = pipelines
+          .map(
+            (p) =>
+              `<button type="button" class="tab-btn ${p.name === pipe.name ? "active" : ""}" data-pipeline="${esc(p.name)}" onclick="selectTabByBtn(this)">${esc(p.name)}</button>`,
+          )
+          .join("")
+
+        const totalTracked = currentData.total_tracked_videos || 0
+        const activeSection =
+          pipe.active_video && pipe.stages
+            ? renderActiveVideoCard(pipe)
+            : renderIdleCard(pipe, cd, totalTracked)
 
         const qItems = pipe.next_in_queue || []
         const qTotal = pipe.queue_total ?? qItems.length
-        const totalTrackedAll = currentData.total_tracked_videos || 0
         const emptyQueueMsg =
-          totalTrackedAll > 0 && qTotal === 0
-            ? `All ${totalTrackedAll} tracked video(s) have finished processing for ${pipe.name}.`
+          totalTracked > 0 && qTotal === 0
+            ? `All ${totalTracked} tracked video(s) have finished processing for ${pipe.name}.`
             : "No pending videos in queue for this pipeline."
-
-        const queueTitleSuffix =
+        const queueSuffix =
           qTotal > qItems.length
             ? `(Showing ${qItems.length} of ${qTotal})`
             : `(${qTotal})`
@@ -779,106 +1210,97 @@
         const queueTable =
           qItems
             .map((q) => {
-              let statusCell = `<span class="badge badge-complete">Ready</span>`
-              if (q.status === "unplayable") {
-                statusCell = `<span class="badge badge-timeout">Unplayable</span> <span style="font-size:11px; color:var(--muted);">${esc(q.error_reason || "Ineligible")} · Retry in ${formatDuration(q.retry_in_s)}</span>`
-              } else if (q.status === "failed") {
-                statusCell = `<span class="badge badge-fail">Failed</span> <span style="font-size:11px; color:var(--muted);">${esc(q.error_reason || "Error")} · Retry in ${formatDuration(q.retry_in_s)}</span>`
-              }
-
-              const dateDisplay =
-                q.timestamp > 0 ? formatLocalDate(q.timestamp) : "-"
-              const isQYt = q.source_type === "youtube"
-              const qTitleHtml =
-                isQYt && q.video_id
-                  ? `<a href="https://youtu.be/${esc(q.video_id)}" target="_blank" rel="noopener noreferrer" class="video-title-link">${esc(q.title)}</a>`
-                  : esc(q.title)
-
-              const qThumbHtml =
-                isQYt && q.video_id
-                  ? `<img class="queue-thumb" src="https://i.ytimg.com/vi/${esc(q.video_id)}/default.jpg" alt="" onerror="this.style.display='none'">`
-                  : `<span style="color:var(--muted);">-</span>`
+              const retryNote =
+                q.retry_in_s != null
+                  ? ` · Retry in ${formatDuration(q.retry_in_s)}`
+                  : ""
+              let statusCell = badge("complete", "Ready")
+              if (q.status === "unplayable")
+                statusCell = `${badge("timeout", "Unplayable")} <span class="muted" style="font-size:11px;">${esc(q.error_reason || "Ineligible")}${esc(retryNote)}</span>`
+              else if (q.status === "failed")
+                statusCell = `${badge("fail", "Failed")} <span class="muted" style="font-size:11px;">${esc(q.error_reason || "Error")}${esc(retryNote)}</span>`
 
               return `
                 <tr>
-                  <td>${qThumbHtml}</td>
-                  <td>${qTitleHtml}</td>
-                  <td><b>${esc(q.channel_name || q.uploader)}</b> <span class="mono" style="color:var(--muted);">(@${esc(q.uploader)})</span></td>
-                  <td class="mono" style="font-size:12px;">${esc(dateDisplay)}</td>
-                  <td><span class="badge badge-${esc(q.source_type)}">${esc(q.source_type)}</span></td>
+                  <td>${ytThumb(q, "thumb-sm") || '<span class="muted">-</span>'}</td>
+                  <td>${videoTitle(q)}</td>
+                  <td><b>${esc(q.channel_name || q.uploader)}</b> <span class="mono muted">(@${esc(q.uploader)})</span></td>
+                  <td class="mono" style="white-space:nowrap;">${esc(q.timestamp > 0 ? formatLocalDate(q.timestamp) : "-")}</td>
+                  <td>${badge(q.source_type, q.source_type)}</td>
                   <td>${statusCell}</td>
                 </tr>
               `
             })
             .join("") ||
-          `<tr><td colspan="6" style="color: var(--muted);">${esc(emptyQueueMsg)}</td></tr>`
+          `<tr><td colspan="6" class="muted">${esc(emptyQueueMsg)}</td></tr>`
+
+        const videoMetaById = {}
+        for (const item of [
+          pipe.active_video,
+          pipe.preparing_video,
+          ...qItems,
+        ]) {
+          if (item?.video_id) videoMetaById[item.video_id] = item
+        }
 
         const activityTable =
           (pipe.recent_activity || [])
-            .map((a, idx) => {
+            .map((a) => {
+              const eid = a.event_id
               const parts = a.task_id.split("::")
-              const cleanTaskId =
+              const cleanTask =
                 parts.length > 2
                   ? parts.slice(2).join(" ")
                   : parts[1] || a.task_id
-              const activityTime = formatLocalTime(a.timestamp)
-              const durText = a.duration_s ? formatDuration(a.duration_s) : ""
-              const hasDetail = Boolean(a.detail || a.logfire_query)
-              const videoIdDisplay = a.video_id || parts[1] || "-"
-
-              const queryHtml = a.logfire_query
-                ? `
-                <div class="detail-query-bar">
-                  <div>Logfire Query: <code class="detail-query-code">${esc(a.logfire_query)}</code></div>
-                  <button class="btn" data-query="${esc(a.logfire_query)}" onclick="copyQueryFromData(this)">Copy Query</button>
-                </div>
-              `
+              const vid = a.video_id || parts[1] || ""
+              const vidMeta = vid ? videoMetaById[vid] : null
+              const vidTitleAttr = vidMeta?.title
+                ? ` title="${esc(vidMeta.title)}"`
                 : ""
+              const vidHtml = !vid
+                ? "-"
+                : vidMeta?.source_type === "youtube"
+                  ? `<a href="https://youtu.be/${encodeURIComponent(vid)}" target="_blank" rel="noopener noreferrer" class="video-title-link"${vidTitleAttr}>${esc(vid)}</a>`
+                  : `<span${vidTitleAttr}>${esc(vid)}</span>`
+
+              const durText = formatActivityDuration(a.duration_s)
+              const hasDetail = Boolean(a.detail)
+              const evBadge = a.logfire_query
+                ? `<span class="badge badge-${esc(a.event_type)} badge-clickable" data-query="${esc(a.logfire_query)}" onclick="copyQueryFromData(this)" title="Click to copy Logfire query">${esc(a.event_type + durText)} 📋</span>`
+                : badge(a.event_type, a.event_type + durText)
+              const boxCls =
+                a.event_type === "fail"
+                  ? "detail-box-fail"
+                  : a.event_type === "retry" || a.event_type === "timeout"
+                    ? "detail-box-warn"
+                    : ""
 
               return `
                 <tr>
-                  <td class="mono">${esc(activityTime)}</td>
+                  <td class="mono" style="white-space:nowrap;">${esc(formatLocalDateTime(a.timestamp))}</td>
                   <td class="mono"><b>${esc(a.worker_id)}</b></td>
-                  <td class="mono">${esc(videoIdDisplay)}</td>
-                  <td class="mono">${esc(cleanTaskId)}</td>
-                  <td><span class="badge badge-${esc(a.event_type)}">${esc(a.event_type)} ${durText}</span></td>
-                  <td>${hasDetail ? `<button class="expand-btn" onclick="toggleDetail(${idx})">Details</button>` : "-"}</td>
+                  <td class="mono">${vidHtml}</td>
+                  <td class="mono">${esc(cleanTask)}</td>
+                  <td>${evBadge}</td>
+                  <td>${hasDetail ? `<button type="button" class="btn btn-sm" data-event-id="${esc(eid)}" onclick="toggleActivityDetail(this)">Details</button>` : "-"}</td>
                 </tr>
                 ${
                   hasDetail
-                    ? `
-                  <tr class="detail-row" id="detail-${idx}">
-                    <td colspan="6">
-                      <div class="detail-box ${a.event_type === "fail" ? "detail-box-fail" : ""}">
-                        <div>${esc(a.detail || "No error details recorded.")}</div>
-                        ${queryHtml}
-                      </div>
-                    </td>
-                  </tr>
-                `
+                    ? `<tr class="detail-row" id="detail-${esc(eid)}" style="display:${expandedActivityIds.has(eid) ? "table-row" : "none"};"><td colspan="6"><div class="detail-box ${boxCls}"><div>${esc(a.detail)}</div></div></td></tr>`
                     : ""
                 }
               `
             })
             .join("") ||
-          `<tr><td colspan="6" style="color: var(--muted);">No worker activity recorded yet for ${esc(pipe.name)}.</td></tr>`
+          `<tr><td colspan="6" class="muted">No worker activity recorded yet for ${esc(pipe.name)}.</td></tr>`
 
         document.getElementById("tab-content").innerHTML = `
           ${activeSection}
           <div class="card">
-            <h3>Next In Queue for ${esc(pipe.name)} ${esc(queueTitleSuffix)}</h3>
+            <h3>Next In Queue for ${esc(pipe.name)} ${esc(queueSuffix)}</h3>
             <div class="table-container">
               <table>
-                <thead>
-                  <tr>
-                    <th style="width: 70px;">Thumbnail</th>
-                    <th>Video Title</th>
-                    <th>Channel / Uploader</th>
-                    <th>Published</th>
-                    <th>Source</th>
-                    <th>Status</th>
-                  </tr>
-                </thead>
+                <thead><tr><th style="width:70px;">Thumbnail</th><th>Video Title</th><th>Channel / Uploader</th><th>Published</th><th>Source</th><th>Status</th></tr></thead>
                 <tbody>${queueTable}</tbody>
               </table>
             </div>
@@ -887,16 +1309,7 @@
             <h3>Recent Worker Activity for ${esc(pipe.name)}</h3>
             <div class="table-container">
               <table>
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Worker</th>
-                    <th>Video ID</th>
-                    <th>Task</th>
-                    <th>Event</th>
-                    <th>Action</th>
-                  </tr>
-                </thead>
+                <thead><tr><th>Time</th><th>Worker</th><th>Video ID</th><th>Task</th><th>Event</th><th>Action</th></tr></thead>
                 <tbody>${activityTable}</tbody>
               </table>
             </div>
@@ -904,37 +1317,51 @@
         `
       }
 
+      function scheduleRefresh() {
+        clearTimeout(refreshTimer)
+        refreshTimer = setTimeout(() => {
+          if (document.visibilityState === "visible") updateDashboard()
+          else scheduleRefresh()
+        }, 60000)
+      }
+
       async function updateDashboard() {
-        const statusBadge = document.getElementById("connection-status")
+        if (isFetching) return
+        isFetching = true
+        lastFetchAttempt = Date.now()
+        const controller = new AbortController()
+        const abortTimer = setTimeout(
+          () => controller.abort(),
+          FETCH_TIMEOUT_MS,
+        )
         try {
-          const res = await fetch("/api/v1/dashboard/data")
-          if (!res.ok) {
-            if (statusBadge) {
-              statusBadge.className = "badge badge-fail"
-              statusBadge.innerText = "Server Error (" + res.status + ")"
-            }
-            return
-          }
+          const res = await fetch("/api/v1/dashboard/data", {
+            signal: controller.signal,
+          })
+          if (!res.ok) return
           currentData = await res.json()
           lastSuccessTime = Date.now()
           updateRelativeTime()
-
-          if (statusBadge) {
-            statusBadge.className = "badge badge-complete"
-            statusBadge.innerText = "Live (auto-refresh 60s)"
-          }
-
           renderPipelineView()
         } catch (err) {
           console.error(err)
-          if (statusBadge) {
-            statusBadge.className = "badge badge-fail"
-            statusBadge.innerText = "Disconnected"
-          }
+        } finally {
+          clearTimeout(abortTimer)
+          isFetching = false
+          scheduleRefresh()
         }
       }
 
-      setInterval(updateDashboard, 60000)
+      const refreshOnReturn = () => {
+        if (
+          document.visibilityState === "visible" &&
+          Date.now() - lastFetchAttempt >= 5000
+        ) {
+          updateDashboard()
+        }
+      }
+      document.addEventListener("visibilitychange", refreshOnReturn)
+      window.addEventListener("focus", refreshOnReturn)
       updateDashboard()
     </script>
   </body>

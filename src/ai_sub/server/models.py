@@ -1,7 +1,9 @@
-"""Internal data models for server tasks, active videos, worker leases, and activity events."""
+"""Internal data models for server task leases and worker activity telemetry."""
 
 from __future__ import annotations
 
+import uuid
+from datetime import timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
@@ -9,7 +11,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_sub.config import RetrySettings
-from ai_sub.jobs.base import Prompt
+from ai_sub.pipeline import Pipeline
 from ai_sub.protocol import TaskClaimResponse, TaskType
 
 
@@ -23,7 +25,7 @@ class TaskStatus(str, Enum):
 
 
 class ServerTask(BaseModel):
-    """Represents an atomic unit of AI generation work managed in server memory."""
+    """Tracks worker lease state and routing metadata for an active pipeline task."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -31,97 +33,96 @@ class ServerTask(BaseModel):
     task_type: TaskType = Field(description="Type of task (summary, subtitles, or lyrics).")
     pipeline_name: str = Field(description="Identifier of the owning pipeline.")
     video_id: str = Field(description="Video identifier.")
-    segment_index: int | None = Field(default=None, description="Index of the 5-minute video segment, if applicable.")
+    segment_index: int | None = Field(default=None, description="Index of the video segment, if applicable.")
     model: str = Field(description="Target Gemini model identifier.")
     media_path: Path = Field(description="Local filesystem path to the compressed media file.")
-    video_duration_ms: int = Field(description="Duration of the segment in milliseconds.")
-    prompt: Prompt = Field(description="System and user prompt pair.")
-    response_schema_name: str = Field(description="Expected response schema class name.")
 
     status: TaskStatus = Field(default=TaskStatus.PENDING, description="Current task state.")
     worker_id: str | None = Field(default=None, description="Identifier of the worker holding the lease.")
     claimed_at: float | None = Field(default=None, description="Timestamp when task was claimed.")
     last_heartbeat: float | None = Field(default=None, description="Timestamp of the most recent worker heartbeat.")
-    attempts: int = Field(default=0, description="Total attempts recorded for this task.")
-
-    search_tools: list[str] = Field(default_factory=list, description="Permitted search tool names.")
-    agentic_video: bool = Field(default=False, description="Whether agentic video inspection is enabled.")
-    service_tier: str | None = Field(default=None, description="Optional Google Gemini service tier.")
-
-    detected_performances: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description="Detected singing performances passed to lyrics refinement.",
+    claim_generation: int = Field(
+        default=0,
+        description="Monotonic claim generation counter incremented each time this task is leased.",
     )
-    draft_subtitles: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description="Draft subtitles passed to lyrics refinement.",
-    )
-    result: dict[str, Any] | None = Field(default=None, description="Validated output received from worker.")
 
-    def to_claim_response(self, media_url: str, retry: RetrySettings) -> TaskClaimResponse:
-        """Serializes this task into the wire claim response sent to workers.
+    def to_claim_response(
+        self,
+        pipeline: Pipeline,
+        search_tools: list[str],
+        media_url: str,
+        retry: RetrySettings,
+        validation_buffer: timedelta,
+    ) -> TaskClaimResponse:
+        """Serializes this task and its authoritative pipeline context into a claim response.
 
         Args:
+            pipeline: Active Pipeline owning this task.
+            search_tools: Search tools permitted for this task type.
             media_url: Relative URL endpoint where the worker downloads media.
             retry: Server retry policy.
+            validation_buffer: Subtitle timestamp overflow tolerance buffer.
 
         Returns:
             TaskClaimResponse: Formatted response model.
         """
+        common: dict[str, Any] = {
+            "task_id": self.task_id,
+            "task_type": self.task_type,
+            "pipeline_name": self.pipeline_name,
+            "video_id": self.video_id,
+            "model": self.model,
+            "media_url": media_url,
+            "user_context": pipeline.user_context,
+            "search_tools": search_tools,
+            "validation_buffer": validation_buffer,
+            "retry": retry,
+        }
+
+        if self.task_type == TaskType.SUMMARY:
+            return TaskClaimResponse(
+                video_duration_ms=pipeline.duration_ms,
+                agentic_video=pipeline.summary_config.agentic,
+                service_tier=pipeline.summary_config.tier,
+                **common,
+            )
+
+        assert self.segment_index is not None
+        seg = pipeline.segments[self.segment_index]
+        common["video_duration_ms"] = seg.duration_ms
+        common["segment_offset_ms"] = seg.offset_ms
+        common["global_summary"] = pipeline.summary.response
+
+        if self.task_type == TaskType.SUBTITLES:
+            return TaskClaimResponse(
+                agentic_video=pipeline.subtitles_config.agentic,
+                service_tier=pipeline.subtitles_config.tier,
+                **common,
+            )
+
+        sub_resp = seg.subtitles_response
         return TaskClaimResponse(
-            task_id=self.task_id,
-            task_type=self.task_type,
-            pipeline_name=self.pipeline_name,
-            video_id=self.video_id,
-            model=self.model,
-            media_url=media_url,
-            video_duration_ms=self.video_duration_ms,
-            prompt_system=self.prompt.system,
-            prompt_user=self.prompt.user,
-            response_schema_name=self.response_schema_name,
-            search_tools=self.search_tools,
-            agentic_video=self.agentic_video,
-            service_tier=self.service_tier,
-            detected_performances=self.detected_performances,
-            retry=retry,
+            draft_subtitles=sub_resp.subtitles if sub_resp else [],
+            detected_performances=sub_resp.detected_musical_performances if sub_resp else [],
+            agentic_video=pipeline.lyrics_config.agentic,
+            service_tier=pipeline.lyrics_config.tier,
+            **common,
         )
-
-
-class ActiveVideo(BaseModel):
-    """Metadata and filesystem paths for the video currently active in a pipeline."""
-
-    video_id: str = Field(description="Video identifier.")
-    uploader: str = Field(description="Channel or uploader handle/identifier.")
-    channel_name: str | None = Field(default=None, description="Display name of the channel.")
-    title: str = Field(description="Display title of the video.")
-    filename_stem: str = Field(description="Filesystem-safe base name for output files.")
-    source_type: Literal["local", "youtube"] = Field(default="local", description="Ingestion source type.")
-    timestamp: int = Field(default=0, description="Upload or file modification Unix timestamp.")
-    user_context: str | None = Field(default=None, description="Generated context string passed to LLM prompts.")
-    job_dir: Path = Field(description="Subdirectory containing all files for this video job.")
-    raw_path: Path = Field(description="Filesystem path to the original raw video.")
-    duration_ms: int = Field(description="Total video duration in milliseconds.")
-    summary_proxy_path: Path | None = Field(default=None, description="Path to the whole-video summary proxy.")
-    segment_paths: list[Path] = Field(default_factory=list, description="Ordered paths to 5-minute chunk files.")
-    reencoded_segment_paths: dict[int, Path] = Field(
-        default_factory=dict,
-        description="Mapping of segment indices to their compressed low-bitrate media files.",
-    )
-    segment_durations_ms: list[int] = Field(default_factory=list, description="Durations for each 5-minute chunk.")
 
 
 class ActivityEvent(BaseModel):
     """Log record of worker task events for dashboard observability."""
 
+    event_id: str = Field(
+        default_factory=lambda: uuid.uuid4().hex[:12],
+        description="Unique identifier for this activity event.",
+    )
     timestamp: float = Field(description="Unix timestamp of the event.")
-    time_str: str = Field(description="Human-readable event time string (HH:MM:SS).")
-    event_type: Literal["claim", "complete", "fail", "timeout"] = Field(description="Event classification.")
+    event_type: Literal["complete", "retry", "fail", "timeout"] = Field(description="Event classification.")
     task_id: str = Field(description="Task identifier.")
-    pipeline: str = Field(description="Pipeline name.")
     worker_id: str = Field(description="Worker identifier.")
-    model: str = Field(description="Target model.")
     video_id: str | None = Field(default=None, description="Video identifier associated with this task.")
-    duration_s: float | None = Field(default=None, description="Execution duration in seconds if complete.")
+    duration_s: float | None = Field(default=None, description="Execution duration in seconds if available.")
     detail: str | None = Field(default=None, description="Optional extra detail or error string.")
     logfire_query: str | None = Field(
         default=None,

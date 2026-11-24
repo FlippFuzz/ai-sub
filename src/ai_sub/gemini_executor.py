@@ -9,40 +9,123 @@ import inspect
 import json
 import mimetypes
 import os
-import random
 import re
 import urllib.parse
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 from time import time
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 import json_repair
 import logfire
 from google import genai
 from google.genai import types
-from httpx import TimeoutException, TransportError
+from httpx2 import TimeoutException, TransportError
 from pydantic import BaseModel, ValidationError
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
-from ai_sub.config import AiSettings, RetrySettings, ServiceTier, Settings
-from ai_sub.jobs.base import Prompt
-from ai_sub.search.base import BaseSearchProvider
+from ai_sub.config import AiSettings, RetrySettings, ServiceTier
+from ai_sub.jobs.job_base import Prompt
+from ai_sub.search.search_base import BaseSearchProvider
 
 T = TypeVar("T", bound=BaseModel)
+R = TypeVar("R")
 
-# Matches segment chunks (local or worker-prefixed) and global summary proxies
-MANAGED_PATTERN = re.compile(r"^(?:.*_)?(part_\d{3}|summary_proxy)\.[^./]+$")
+# Matches managed segment chunks, re-encoded outputs, and summary proxies
+MANAGED_PATTERN = re.compile(r"^(?:reencoded_)?(?:part_\d{3,}|summary)_[A-Za-z0-9_-]+\.[^./]+$")
+
+_RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+
+# Transient/server Interactions API error codes (plus standard gRPC aliases); all other codes are non-retryable
+_RETRYABLE_INTERACTION_CODES = frozenset(
+    {
+        "api_error",
+        "internal",
+        "internal_server_error",
+        "service_unavailable",
+        "unavailable",
+        "deadline_exceeded",
+        "gateway_timeout",
+        "request_timeout",
+        "bad_gateway",
+        "rate_limit_exceeded",
+        "too_many_requests",
+        "resource_exhausted",
+        "aborted",
+    }
+)
 
 
 class QuotaExceededError(Exception):
     """Raised when an AI model provider's daily quota limit is exhausted."""
 
 
+class InteractionFailedError(Exception):
+    """Raised when a Gemini interaction terminates in a failed or cancelled state."""
+
+    retryable: bool
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        """Initializes the interaction failure exception.
+
+        Args:
+            message: Diagnostic failure description.
+            retryable: Whether the failure is transient/server-side and eligible for retries.
+        """
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _extract_status_code(e: Exception) -> int | None:
+    """Extracts an HTTP status code from an exception if available.
+
+    Args:
+        e: Caught exception.
+
+    Returns:
+        int | None: HTTP status code integer or None.
+    """
+    for candidate in (
+        getattr(e, "status_code", None),
+        getattr(e, "code", None),
+        getattr(getattr(e, "response", None), "status_code", None),
+        getattr(getattr(e, "raw_response", None), "status_code", None),
+        getattr(getattr(e, "http_res", None), "status_code", None),
+    ):
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            return candidate
+    if not isinstance(e, (ValidationError, ValueError, TypeError, KeyError, InteractionFailedError)):
+        if match := re.search(r"\b(408|429|500|502|503|504)\b", str(e)):
+            return int(match.group(1))
+    return None
+
+
+def _classify_api_outcome(err: Exception, quota_err: bool, status_code: int | None) -> str:
+    """Classifies a failed Gemini API attempt into a canonical outcome tag.
+
+    Args:
+        err: Raised exception.
+        quota_err: Whether daily project quota was exhausted.
+        status_code: Extracted HTTP status code if available.
+
+    Returns:
+        str: Canonical outcome string for telemetry grouping.
+    """
+    if quota_err:
+        return "quota_exceeded"
+    if isinstance(err, InteractionFailedError):
+        return "interaction_failed"
+    if isinstance(err, (TimeoutException, asyncio.TimeoutError, TimeoutError)) or status_code == 408:
+        return "timeout"
+    if status_code is not None:
+        return "http_error"
+    return "error"
+
+
 def is_retryable_error(e: Exception) -> bool:
-    """Determines if an error is a transient network or server error eligible for retry.
+    """Determines if an error is a retryable network, server, or interaction failure.
 
     Args:
         e: Caught exception.
@@ -50,41 +133,40 @@ def is_retryable_error(e: Exception) -> bool:
     Returns:
         bool: True if error can be retried, False otherwise.
     """
-    # Deterministic validation or client programming errors are never transient
+    # Deterministic validation or client programming errors are never retryable
     if isinstance(e, (ValidationError, ValueError, TypeError, KeyError)):
         return False
 
     if _is_daily_quota_exceeded(e):
         return False
 
+    if isinstance(e, InteractionFailedError):
+        return e.retryable
+
     if isinstance(e, (TransportError, TimeoutException, ConnectionError, asyncio.TimeoutError, TimeoutError)):
         return True
 
-    status_code = getattr(e, "code", None) or getattr(e, "status_code", None)
-    if isinstance(status_code, int):
-        return status_code in (408, 429, 500, 502, 503, 504)
+    status_code = _extract_status_code(e)
+    if status_code is not None:
+        return status_code in _RETRYABLE_STATUS_CODES
 
     err_str = str(e).lower()
-    if re.search(r"\b(408|500|502|503|504)\b", err_str):
-        return True
     return any(term in err_str for term in ("connection", "timeout", "temporarily unavailable"))
 
 
 def _get_unique_display_name(file_path: Path) -> str:
-    """Constructs a unique display name using workspace folder and filename.
+    """Constructs a unique display name using workspace folder and filename without dereferencing symlinks.
 
     Args:
         file_path: Path to the local file.
 
     Returns:
-        str: Display name formatted as 'workspace/filename.ext' or 'workspace/reencoded/filename.ext'.
+        str: Display name formatted as 'workspace/filename.ext'.
     """
-    resolved = file_path.resolve()
-    safe_name = urllib.parse.quote(resolved.name, safe=".-_")
-    safe_parent = urllib.parse.quote(resolved.parent.name, safe=".-_")
-    if resolved.parent.name == "reencoded":
-        safe_grandparent = urllib.parse.quote(resolved.parent.parent.name, safe=".-_")
-        return f"{safe_grandparent}/reencoded/{safe_name}"
+    # Use abspath instead of resolve() so symlinked summary_<tag> proxies retain their managed name.
+    abs_path = Path(os.path.abspath(file_path))
+    safe_name = urllib.parse.quote(abs_path.name, safe=".-_")
+    safe_parent = urllib.parse.quote(abs_path.parent.name, safe=".-_")
     return f"{safe_parent}/{safe_name}"
 
 
@@ -176,6 +258,50 @@ def _extract_thought_text(step: Any) -> str | None:
     return None
 
 
+def _inspect_interaction_failure(interaction: Any, status: str | None) -> tuple[str, bool]:
+    """Extracts error descriptions and retryability from a failed or cancelled interaction.
+
+    Args:
+        interaction: Interaction response object.
+        status: Terminal interaction status string (e.g. 'failed' or 'cancelled').
+
+    Returns:
+        tuple[str, bool]: (formatted_error_details, is_retryable).
+    """
+    errors = getattr(interaction, "errors", None) or getattr(interaction, "error", None)
+    if not errors:
+        return "No error details provided.", status != "cancelled"
+
+    items = errors if isinstance(errors, list) else [errors]
+    parts: list[str] = []
+    saw_code = False
+    all_codes_retryable = True
+
+    for item in items:
+        if isinstance(item, dict):
+            code, msg = item.get("code"), item.get("message")
+        else:
+            code, msg = getattr(item, "code", None), getattr(item, "message", None)
+
+        if isinstance(code, int) and not isinstance(code, bool):
+            saw_code = True
+            if code not in _RETRYABLE_STATUS_CODES:
+                all_codes_retryable = False
+        elif code is not None:
+            saw_code = True
+            norm_code = str(code).strip().rsplit("/", 1)[-1].lower().replace("-", "_")
+            if norm_code not in _RETRYABLE_INTERACTION_CODES:
+                all_codes_retryable = False
+
+        text = f"{code}: {msg}" if code and msg else (msg or code or str(item))
+        if text:
+            parts.append(str(text))
+
+    details = "; ".join(parts) or str(errors)
+    retryable = all_codes_retryable if saw_code else (status != "cancelled")
+    return details, retryable
+
+
 def calculate_sha256_hex(file_path: Path) -> str:
     """Calculates the SHA256 hex digest of a file using Python 3.11+ C file_digest.
 
@@ -223,21 +349,18 @@ class GeminiExecutor:
     _last_cleanup_time: float
     _cleanup_lock: asyncio.Lock
 
-    def __init__(self, settings: Settings | AiSettings) -> None:
+    def __init__(self, ai_settings: AiSettings, retry_settings: RetrySettings | None = None) -> None:
         """Initializes the Gemini executor with disabled SDK retries for custom orchestration.
 
         Args:
-            settings: Root application configuration or dedicated AiSettings.
+            ai_settings: AI engine configuration settings.
+            retry_settings: Optional default retry policy. Defaults to RetrySettings().
 
         Raises:
             ValueError: If the Google Gemini API key is missing.
         """
-        if isinstance(settings, Settings):
-            self.ai_settings = settings.ai
-            self.default_retry_settings = settings.retry
-        else:
-            self.ai_settings = settings
-            self.default_retry_settings = RetrySettings()
+        self.ai_settings = ai_settings
+        self.default_retry_settings = retry_settings or RetrySettings()
 
         if self.ai_settings.key is None:
             raise ValueError("Google Gemini API key is missing.")
@@ -248,13 +371,24 @@ class GeminiExecutor:
         self._last_cleanup_time = 0.0
         self._cleanup_lock = asyncio.Lock()
 
-        api_key = self.ai_settings.key.get_secret_value() if self.ai_settings.key else ""
+        api_key = self.ai_settings.key.get_secret_value()
         retry_options = types.HttpRetryOptions(attempts=1)
         http_kwargs: dict[str, Any] = {"retry_options": retry_options}
-        if self.ai_settings.base_url:
-            http_kwargs["base_url"] = str(self.ai_settings.base_url)
+        if self.ai_settings.baseurl:
+            http_kwargs["base_url"] = str(self.ai_settings.baseurl)
 
         self._client = genai.Client(api_key=api_key, http_options=types.HttpOptions(**http_kwargs))
+
+    async def aclose(self) -> None:
+        """Closes underlying Gemini API HTTP transports and rate limiters."""
+        for limiter in (*self._request_limiters.values(), *self._token_limiters.values()):
+            limiter.close()
+        self._request_limiters.clear()
+        self._token_limiters.clear()
+        try:
+            await self._client.aio.aclose()
+        finally:
+            self._client.close()
 
     def _get_limiters(self, model_id: str) -> tuple[Limiter, Limiter]:
         """Retrieves or creates rate limiters for a specific model ID.
@@ -274,10 +408,59 @@ class GeminiExecutor:
             )
         return self._request_limiters[model_id], self._token_limiters[model_id]
 
+    async def _retry_operation(
+        self,
+        operation: Callable[[int, int], Awaitable[R]],
+        retry: RetrySettings,
+        op_label: str,
+        model_id: str | None = None,
+    ) -> R:
+        """Executes an API operation with exponential backoff retries on retryable errors.
+
+        Args:
+            operation: Async callable receiving (attempt_number, max_attempts) and executing the request.
+            retry: Effective retry policy.
+            op_label: Descriptive operation label for log messages.
+            model_id: Optional model ID to mark quota-exhausted on daily quota errors. Defaults to None.
+
+        Returns:
+            R: Operation return value.
+
+        Raises:
+            QuotaExceededError: If daily project quota is exhausted.
+            RuntimeError: If retries are unexpectedly exhausted without returning or raising.
+        """
+        max_attempts = retry.perturn + 1
+        for attempt in range(max_attempts):
+            try:
+                return await operation(attempt + 1, max_attempts)
+            except QuotaExceededError:
+                raise
+            except Exception as err:
+                if _is_daily_quota_exceeded(err):
+                    if model_id:
+                        self._quota_exhausted[model_id] = True
+                        logfire.warning(f"Daily quota exhausted for {model_id}: {err}")
+                    raise QuotaExceededError(str(err)) from err
+
+                if is_retryable_error(err) and attempt < retry.perturn:
+                    backoff = retry.backoff.compute_delay(attempt)
+                    logfire.warning(
+                        f"Retryable error during {op_label} "
+                        f"(attempt {attempt + 1}/{max_attempts}): {err}. Retrying in {backoff:.2f}s..."
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+
+                logfire.error(f"{op_label} failed permanently: {err}")
+                raise
+
+        raise RuntimeError(f"{op_label} failed after {max_attempts} attempts.")
+
     async def _cleanup_storage_if_needed(self) -> None:
         """Deletes oldest managed segment files if total storage exceeds high-water mark."""
         now = time()
-        cooldown_seconds = self.ai_settings.storage.cleanup_interval_minutes * 60
+        cooldown_seconds = self.ai_settings.storage.cleanupinterval.total_seconds()
         if (now - self._last_cleanup_time) < cooldown_seconds:
             return
 
@@ -286,8 +469,8 @@ class GeminiExecutor:
                 return
 
             with logfire.span("Storage cleanup check", _level="debug"):
-                max_bytes = int(self.ai_settings.storage.max_gb * 1024 * 1024 * 1024)
-                target_bytes = int(self.ai_settings.storage.target_gb * 1024 * 1024 * 1024)
+                max_bytes = int(self.ai_settings.storage.max)
+                target_bytes = int(self.ai_settings.storage.target)
 
                 try:
                     files = [
@@ -298,8 +481,8 @@ class GeminiExecutor:
                     total_bytes = sum(f.size_bytes or 0 for f in files)
                     if total_bytes >= max_bytes:
                         logfire.info(
-                            f"Files API storage threshold reached ({total_bytes / (1024**3):.2f} GB used). "
-                            f"Cleaning down to {self.ai_settings.storage.target_gb} GB..."
+                            f"Files API storage threshold reached ({total_bytes / 1_000_000_000:.2f} GB used). "
+                            f"Cleaning down to {target_bytes / 1_000_000_000:.2f} GB..."
                         )
                         managed = sorted(
                             [f for f in files if f.display_name and MANAGED_PATTERN.match(Path(f.display_name).name)],
@@ -321,11 +504,16 @@ class GeminiExecutor:
                 finally:
                     self._last_cleanup_time = time()
 
-    async def ensure_file_uploaded(self, file_path: Path) -> types.File:
+    async def ensure_file_uploaded(
+        self,
+        file_path: Path,
+        retry_settings: RetrySettings | None = None,
+    ) -> types.File:
         """Verifies remote file presence, performing upload and status polling as needed.
 
         Args:
             file_path: Local path to the segment file.
+            retry_settings: Optional retry policy for retryable Files API errors. Defaults to None.
 
         Returns:
             types.File: Active remote file handle from the Gemini Files API.
@@ -333,6 +521,8 @@ class GeminiExecutor:
         Raises:
             RuntimeError: If file processing fails on the server or status cannot be retrieved.
         """
+        retry = retry_settings or self.default_retry_settings
+
         with logfire.span("Gemini Files API: {filename}", filename=file_path.name, _level="debug"):
             await self._cleanup_storage_if_needed()
 
@@ -354,20 +544,25 @@ class GeminiExecutor:
                     async for remote_file in await self._client.aio.files.list(
                         config=types.ListFilesConfig(page_size=100)
                     ):
-                        if remote_file.display_name == display_name:
-                            if remote_file.state == types.FileState.ACTIVE:
-                                if remote_file.size_bytes == local_size and _hashes_match(
-                                    remote_file.sha256_hash, await _get_local_hex()
-                                ):
+                        if remote_file.display_name != display_name:
+                            continue
+
+                        if remote_file.state == types.FileState.FAILED and remote_file.name:
+                            try:
+                                await self._client.aio.files.delete(name=remote_file.name)
+                            except Exception:
+                                pass
+                            continue
+
+                        if remote_file.state in (types.FileState.ACTIVE, types.FileState.PROCESSING):
+                            if remote_file.size_bytes == local_size and _hashes_match(
+                                remote_file.sha256_hash, await _get_local_hex()
+                            ):
+                                if remote_file.state == types.FileState.ACTIVE:
                                     existing_active = remote_file
                                     break
-                            elif remote_file.state == types.FileState.PROCESSING and existing_processing is None:
-                                existing_processing = remote_file
-                            elif remote_file.state == types.FileState.FAILED and remote_file.name:
-                                try:
-                                    await self._client.aio.files.delete(name=remote_file.name)
-                                except Exception:
-                                    pass
+                                if existing_processing is None:
+                                    existing_processing = remote_file
             except Exception as e:
                 logfire.debug(f"Remote file search error for {file_path.name}: {e}")
 
@@ -375,7 +570,7 @@ class GeminiExecutor:
                 logfire.info(f"Reusing existing remote file: {file_path.name} ({existing_active.name})")
                 return existing_active
 
-            poll_interval = self.ai_settings.storage.polling_interval_seconds
+            poll_interval = self.ai_settings.storage.pollinterval.total_seconds()
             if existing_processing:
                 uploaded = existing_processing
             else:
@@ -399,9 +594,13 @@ class GeminiExecutor:
 
                 try:
                     with logfire.span("Uploading {filename} to Gemini Files API", filename=file_path.name):
-                        uploaded = await self._client.aio.files.upload(
-                            file=upload_path,
-                            config=types.UploadFileConfig(display_name=display_name, mime_type=resolved_mime),
+                        uploaded = await self._retry_operation(
+                            operation=lambda _a, _m: self._client.aio.files.upload(
+                                file=upload_path,
+                                config=types.UploadFileConfig(display_name=display_name, mime_type=resolved_mime),
+                            ),
+                            retry=retry,
+                            op_label=f"upload '{file_path.name}'",
                         )
                 finally:
                     if temp_link and temp_link.exists():
@@ -410,18 +609,22 @@ class GeminiExecutor:
                         except OSError:
                             pass
 
-                await asyncio.sleep(poll_interval)
-
             if uploaded.state != types.FileState.ACTIVE:
+                if uploaded.state == types.FileState.FAILED:
+                    raise RuntimeError(f"File {file_path.name} failed to process on Gemini server.")
                 with logfire.span("Waiting for Gemini to process {filename}", filename=file_path.name):
                     while uploaded.state != types.FileState.ACTIVE:
                         if uploaded.state == types.FileState.FAILED:
                             raise RuntimeError(f"File {file_path.name} failed to process on Gemini server.")
-                        await asyncio.sleep(poll_interval)
-                        if uploaded.name:
-                            uploaded = await self._client.aio.files.get(name=uploaded.name)
-                        else:
+                        remote_name = uploaded.name
+                        if not remote_name:
                             raise RuntimeError(f"Could not retrieve file '{file_path.name}' status.")
+                        await asyncio.sleep(poll_interval)
+                        uploaded = await self._retry_operation(
+                            operation=lambda _a, _m, name=remote_name: self._client.aio.files.get(name=name),
+                            retry=retry,
+                            op_label=f"poll file '{file_path.name}'",
+                        )
 
             return uploaded
 
@@ -443,6 +646,7 @@ class GeminiExecutor:
 
         dispatch_map: dict[str, Callable[..., Any]] = {}
         interaction_tools: list[dict[str, Any]] = []
+        # FunctionDeclaration.from_callable is typed against BaseApiClient and is needed for use_json_schema=True.
         api_client = self._client._api_client
 
         items: list[Callable[..., Any] | dict[str, Any]] = []
@@ -485,6 +689,9 @@ class GeminiExecutor:
         generation_config: dict[str, Any],
         service_tier: ServiceTier | None,
         token_weight: int,
+        task_label: str = "Generation",
+        attempt: int = 1,
+        max_attempts: int = 1,
     ) -> Any:
         """Executes a single search turn call to Gemini Interactions API with rate limiter acquisition.
 
@@ -498,12 +705,16 @@ class GeminiExecutor:
             generation_config: Generation configuration settings.
             service_tier: Optional Gemini service tier.
             token_weight: Token weight for rate limiter acquisition.
+            task_label: Task category label for telemetry attribution. Defaults to 'Generation'.
+            attempt: 1-based retry attempt index. Defaults to 1.
+            max_attempts: Maximum attempts configured for this turn. Defaults to 1.
 
         Returns:
             Any: Interaction response object returned by the Gemini API.
 
         Raises:
             QuotaExceededError: If daily project quota is exhausted.
+            InteractionFailedError: If the interaction status is 'failed' or 'cancelled'.
         """
         if self._quota_exhausted.get(model_id, False):
             raise QuotaExceededError(f"Daily quota previously exhausted for model '{model_id}'.")
@@ -529,94 +740,50 @@ class GeminiExecutor:
         if service_tier is not None:
             kwargs["service_tier"] = service_tier
 
-        await req_limiter.try_acquire_async("rpm")
+        # Acquire token budget before request slot so a long TPM wait does not hold and expire an RPM slot
+        # early before the HTTP request actually fires. Full video tokens are conservatively charged on
+        # every API turn (including continuations and retries) to protect daily free-tier request quotas.
         await tok_limiter.try_acquire_async("tpm", weight=token_weight)
+        await req_limiter.try_acquire_async("rpm")
 
-        try:
-            return await self._client.aio.interactions.create(**kwargs)
-        except Exception as e:
-            if _is_daily_quota_exceeded(e):
-                self._quota_exhausted[model_id] = True
-                logfire.warning(f"Daily quota exhausted for {model_id}: {e}")
-                raise QuotaExceededError(str(e)) from e
-            raise
-
-    async def _execute_turn_with_retry(
-        self,
-        model_id: str,
-        input_payload: Any,
-        previous_interaction_id: str | None,
-        system_instruction: str,
-        tools: list[dict[str, Any]] | None,
-        response_format: dict[str, Any] | None,
-        generation_config: dict[str, Any],
-        service_tier: ServiceTier | None,
-        token_weight: int,
-        search_turns: int,
-        retry: RetrySettings,
-    ) -> Any:
-        """Executes a single search turn with exponential backoff on transient network or 5xx errors.
-
-        Args:
-            model_id: Target Gemini model identifier.
-            input_payload: Search turn input payload.
-            previous_interaction_id: Previous interaction ID for stateful turns.
-            system_instruction: System instruction prompt.
-            tools: Registered Interactions API tools for this turn.
-            response_format: Target response format schema.
-            generation_config: Thinking and temperature generation configuration.
-            service_tier: Optional Gemini service tier.
-            token_weight: Token weight for rate limiter acquisition.
-            search_turns: Current search turn index.
-            retry: Effective retry settings for backoff intervals.
-
-        Returns:
-            Any: Successful interaction response object.
-
-        Raises:
-            QuotaExceededError: If daily project quota is reached.
-            RuntimeError: If turn retries are exhausted.
-        """
-        turn_max_attempts = retry.per_run + 1
-
-        for search_turn_attempt in range(turn_max_attempts):
+        raised_err: Exception | None = None
+        with logfire.span(
+            "Gemini API: {model_id} ({attempt}/{max_attempts})",
+            model_id=model_id,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            task=task_label,
+            service_tier=service_tier or "default",
+            _level="debug",
+        ) as api_span:
             try:
-                return await self._create_interaction(
-                    model_id=model_id,
-                    input_payload=input_payload,
-                    previous_interaction_id=previous_interaction_id,
-                    system_instruction=system_instruction,
-                    tools=tools,
-                    response_format=response_format,
-                    generation_config=generation_config,
-                    service_tier=service_tier,
-                    token_weight=token_weight,
-                )
-            except QuotaExceededError:
-                raise
-            except Exception as err:
-                if _is_daily_quota_exceeded(err):
-                    self._quota_exhausted[model_id] = True
-                    logfire.warning(f"Daily quota exhausted for {model_id}: {err}")
-                    raise QuotaExceededError(str(err)) from err
-
-                if is_retryable_error(err) and search_turn_attempt < retry.per_run:
-                    backoff = min(
-                        float(retry.max_wait_seconds),
-                        float(retry.min_wait_seconds) * (float(retry.multiplier) ** search_turn_attempt),
-                    ) + random.uniform(0, 1)
-
-                    logfire.warning(
-                        f"Transient error on {model_id} search turn {search_turns} "
-                        f"(attempt {search_turn_attempt + 1}/{turn_max_attempts}): {err}. Retrying in {backoff:.2f}s..."
+                interaction = await self._client.aio.interactions.create(**kwargs)
+                status = getattr(interaction, "status", None)
+                if status in ("failed", "cancelled"):
+                    details, retryable = _inspect_interaction_failure(interaction, status)
+                    raise InteractionFailedError(
+                        f"Interaction {status} on {model_id}: {details}",
+                        retryable=retryable,
                     )
-                    await asyncio.sleep(backoff)
-                    continue
+                api_span.set_attribute("outcome", "success")
+                api_span.set_attribute("status_code", 200)
+                api_span.set_attribute("is_retryable", False)
+                return interaction
+            except Exception as err:
+                status_code = _extract_status_code(err)
+                quota_err = _is_daily_quota_exceeded(err)
+                retryable = False if quota_err else is_retryable_error(err)
+                api_span.set_attribute("outcome", _classify_api_outcome(err, quota_err, status_code))
+                if status_code is not None:
+                    api_span.set_attribute("status_code", status_code)
+                api_span.set_attribute("error_type", type(err).__name__)
+                api_span.set_attribute("is_retryable", retryable)
+                api_span.set_level("warning" if (retryable or quota_err) else "error")
+                api_span.record_exception(err)
+                raised_err = err
 
-                logfire.error(f"Search turn {search_turns} failed permanently on {model_id}: {err}")
-                raise
-
-        raise RuntimeError(f"Turn execution failed on {model_id} after {turn_max_attempts} attempts.")
+        assert raised_err is not None
+        raise raised_err
 
     async def _execute_function_calls(
         self,
@@ -685,29 +852,35 @@ class GeminiExecutor:
         text_content: str,
         response_type: type[T],
         video_duration_ms: int,
+        validation_buffer_ms: int,
         accumulated_thoughts: list[str],
+        validation_context: dict[str, Any] | None = None,
     ) -> T:
-        """Parses output text into the target Pydantic schema, applying json_repair fallback if needed.
+        """Parses output text into the target Pydantic schema, applying json_repair only on JSON decode errors.
 
         Args:
             text_content: Raw text returned by the model.
             response_type: Target Pydantic model class.
             video_duration_ms: Duration in milliseconds for timestamp context validation.
+            validation_buffer_ms: Allowed subtitle end timestamp overflow buffer in milliseconds.
             accumulated_thoughts: Collected reasoning traces to attach to the output.
+            validation_context: Optional extra context merged into Pydantic validation. Defaults to None.
 
         Returns:
             T: Validated Pydantic model instance.
         """
-        validation_context = {
+        merged_context: dict[str, Any] = {
+            **(validation_context or {}),
             "video_duration_ms": video_duration_ms,
-            "validation_buffer_ms": self.ai_settings.validation_buffer_ms,
+            "validation_buffer_ms": validation_buffer_ms,
         }
 
         try:
-            output = response_type.model_validate_json(text_content, context=validation_context)
-        except Exception:
-            repaired = json_repair.loads(text_content)
-            output = response_type.model_validate(repaired, context=validation_context)
+            parsed = json.loads(text_content)
+        except json.JSONDecodeError:
+            parsed = json_repair.loads(text_content)
+
+        output = response_type.model_validate(parsed, context=merged_context)
 
         if hasattr(output, "thoughts") and accumulated_thoughts:
             setattr(output, "thoughts", accumulated_thoughts)
@@ -729,7 +902,9 @@ class GeminiExecutor:
         label: str,
         media_name: str,
         video_duration_ms: int,
+        validation_buffer_ms: int,
         retry: RetrySettings,
+        validation_context: dict[str, Any] | None = None,
     ) -> T:
         """Executes a single end-to-end multi-turn interaction session until final model output is validated.
 
@@ -747,19 +922,22 @@ class GeminiExecutor:
             label: Task category label for telemetry spans.
             media_name: Filename of the media chunk.
             video_duration_ms: Segment duration in milliseconds.
+            validation_buffer_ms: Allowed subtitle end timestamp overflow buffer in milliseconds.
             retry: Effective retry settings for turn execution.
+            validation_context: Optional extra context passed to Pydantic validation. Defaults to None.
 
         Returns:
             T: Parsed and validated Pydantic model instance.
 
         Raises:
-            ValueError: If the model returns empty text content on the final search turn.
+            ValueError: If the interaction is incomplete, emits unknown/disallowed tool calls,
+                or produces empty text output.
         """
         interaction_input: Any = initial_input
         previous_interaction_id: str | None = None
         accumulated_thoughts: list[str] = []
         search_turns = 0
-        max_search_turns = self.ai_settings.search.max_turns
+        max_search_turns = self.ai_settings.search.maxturns
 
         while True:
             span_desc = (
@@ -779,47 +957,73 @@ class GeminiExecutor:
             ):
                 current_tools = None if search_turns >= max_search_turns else gemini_tools
 
-                interaction = await self._execute_turn_with_retry(
-                    model_id=model_id,
-                    input_payload=interaction_input,
-                    previous_interaction_id=previous_interaction_id,
-                    system_instruction=prompt.system,
-                    tools=current_tools,
-                    response_format=response_format,
-                    generation_config=generation_config,
-                    service_tier=service_tier,
-                    token_weight=token_weight,
-                    search_turns=search_turns,
+                interaction = await self._retry_operation(
+                    operation=lambda attempt_num, max_attempts: self._create_interaction(
+                        model_id=model_id,
+                        input_payload=interaction_input,
+                        previous_interaction_id=previous_interaction_id,
+                        system_instruction=prompt.system,
+                        tools=current_tools,
+                        response_format=response_format,
+                        generation_config=generation_config,
+                        service_tier=service_tier,
+                        token_weight=token_weight,
+                        task_label=label,
+                        attempt=attempt_num,
+                        max_attempts=max_attempts,
+                    ),
                     retry=retry,
+                    op_label=f"{model_id} search turn {search_turns}",
+                    model_id=model_id,
                 )
 
-                for step in getattr(interaction, "steps", []) or []:
+                if getattr(interaction, "status", None) == "incomplete":
+                    raise ValueError(
+                        f"Model '{model_id}' returned incomplete interaction on search turn {search_turns}."
+                    )
+
+                steps = getattr(interaction, "steps", []) or []
+                for step in steps:
                     if getattr(step, "type", None) == "thought":
                         if thought_text := _extract_thought_text(step):
                             accumulated_thoughts.append(thought_text)
 
-                function_call_steps = [
-                    s
-                    for s in getattr(interaction, "steps", []) or []
-                    if getattr(s, "type", None) == "function_call" and getattr(s, "name", None) in dispatch_map
+                all_function_calls = [s for s in steps if getattr(s, "type", None) == "function_call"]
+                unknown_tools = [
+                    str(getattr(s, "name", None) or "<unnamed>")
+                    for s in all_function_calls
+                    if getattr(s, "name", None) not in dispatch_map
                 ]
+                if unknown_tools:
+                    raise ValueError(
+                        f"Model '{model_id}' called unknown or disallowed tool(s) "
+                        f"{unknown_tools} on search turn {search_turns}."
+                    )
 
-                if function_call_steps and search_turns < max_search_turns and dispatch_map:
+                if all_function_calls and search_turns < max_search_turns and dispatch_map:
                     search_turns += 1
-                    interaction_input = await self._execute_function_calls(function_call_steps, dispatch_map)
+                    interaction_input = await self._execute_function_calls(all_function_calls, dispatch_map)
                     raw_id = getattr(interaction, "id", None)
                     previous_interaction_id = raw_id if isinstance(raw_id, str) else None
                     continue
 
                 text_content = self._extract_interaction_text(interaction)
                 if not text_content:
+                    if all_function_calls:
+                        called = [str(getattr(s, "name", None) or "<unnamed>") for s in all_function_calls]
+                        raise ValueError(
+                            f"Model '{model_id}' attempted tool call(s) {called} after reaching "
+                            f"max search turns ({max_search_turns})."
+                        )
                     raise ValueError(f"Model '{model_id}' returned empty output on search turn {search_turns}.")
 
                 return self._parse_and_validate_structured_output(
                     text_content=text_content,
                     response_type=response_type,
                     video_duration_ms=video_duration_ms,
+                    validation_buffer_ms=validation_buffer_ms,
                     accumulated_thoughts=accumulated_thoughts,
+                    validation_context=validation_context,
                 )
 
     async def run_structured(
@@ -834,6 +1038,8 @@ class GeminiExecutor:
         agentic_video: bool = False,
         task_label: str | None = None,
         retry_settings: RetrySettings | None = None,
+        validation_buffer_ms: int = 2000,
+        validation_context: dict[str, Any] | None = None,
     ) -> T:
         """Uploads media and generates validated structured outputs using the Gemini Interactions API.
 
@@ -842,12 +1048,14 @@ class GeminiExecutor:
             media_path: Path to the local video segment.
             video_duration_ms: Duration in milliseconds for token rate calculations.
             response_type: Expected Pydantic model response schema.
-            model_name: Full model identifier (must begin with 'google-gla:').
+            model_name: Gemini model identifier (e.g., 'gemini-3.8-flash').
             service_tier: Optional Gemini service tier.
             tools: Sequence of callable tools, tool dicts, or BaseSearchProvider instances.
             agentic_video: Whether to enable Agentic Video Understanding.
             task_label: Optional label for display in turn spans.
             retry_settings: Optional task-specific retry policy overriding default settings.
+            validation_buffer_ms: Allowed subtitle timestamp overflow tolerance in milliseconds. Defaults to 2000.
+            validation_context: Optional extra context passed to Pydantic validation. Defaults to None.
 
         Returns:
             T: Parsed and validated Pydantic model instance.
@@ -855,21 +1063,20 @@ class GeminiExecutor:
         Raises:
             QuotaExceededError: If daily quota is exhausted for the model.
             RuntimeError: If media fails to process or retries are exhausted.
-            ValidationError: If model output validation fails and outer retries are exhausted.
+            ValidationError: If model output validation fails and validation retries are exhausted.
             ValueError: If input arguments or model identifiers are invalid.
         """
-        if not model_name.lower().startswith("google-gla:"):
-            raise ValueError(f"Model identifier '{model_name}' must start with 'google-gla:'.")
-
-        model_id = model_name.split(":", 1)[-1]
+        model_id = model_name.strip()
+        if not model_id:
+            raise ValueError("Model identifier must not be empty.")
         if self._quota_exhausted.get(model_id, False):
             raise QuotaExceededError(f"Daily quota previously exhausted for model '{model_id}'.")
 
-        effective_retry = retry_settings or getattr(self, "default_retry_settings", None) or RetrySettings()
-        remote_file = await self.ensure_file_uploaded(media_path)
+        effective_retry = retry_settings or self.default_retry_settings
+        remote_file = await self.ensure_file_uploaded(media_path, retry_settings=effective_retry)
 
         tokens = _calculate_tokens(prompt, video_duration_ms)
-        token_weight = min(tokens, self.ai_settings.tpm)
+        token_weight = max(1, min(tokens, self.ai_settings.tpm))
 
         media_input: dict[str, Any] = {"type": "video", "uri": remote_file.uri, "mime_type": remote_file.mime_type}
         if agentic_video:
@@ -884,7 +1091,7 @@ class GeminiExecutor:
         }
         generation_config = {"thinking_level": "high", "thinking_summaries": "auto"}
         label = task_label.capitalize() if task_label else "Generation"
-        max_outer_attempts = effective_retry.per_run + 1
+        max_outer_attempts = effective_retry.validation + 1
 
         for outer_attempt in range(max_outer_attempts):
             try:
@@ -902,25 +1109,22 @@ class GeminiExecutor:
                     label=label,
                     media_name=media_path.name,
                     video_duration_ms=video_duration_ms,
+                    validation_buffer_ms=validation_buffer_ms,
                     retry=effective_retry,
+                    validation_context=validation_context,
                 )
             except QuotaExceededError:
                 raise
             except (ValidationError, ValueError) as val_err:
-                if outer_attempt < effective_retry.per_run:
-                    backoff = min(
-                        float(effective_retry.max_wait_seconds),
-                        float(effective_retry.min_wait_seconds) * (float(effective_retry.multiplier) ** outer_attempt),
-                    ) + random.uniform(0, 1)
+                if outer_attempt < effective_retry.validation:
+                    backoff = effective_retry.backoff.compute_delay(outer_attempt)
                     logfire.warning(
-                        f"Schema validation failure on {model_id} (outer attempt {outer_attempt + 1}/"
+                        f"Schema validation failure on {model_id} (attempt {outer_attempt + 1}/"
                         f"{max_outer_attempts}): {val_err}. Restarting in {backoff:.2f}s..."
                     )
                     await asyncio.sleep(backoff)
                     continue
-                logfire.error(
-                    f"Schema validation exhausted all {max_outer_attempts} outer attempts on {model_id}: {val_err}"
-                )
+                logfire.error(f"Schema validation exhausted all {max_outer_attempts} attempts on {model_id}: {val_err}")
                 raise
 
-        raise RuntimeError(f"Agent execution failed after {effective_retry.per_run} retries.")
+        raise RuntimeError(f"Agent execution failed after {effective_retry.validation} validation retries.")

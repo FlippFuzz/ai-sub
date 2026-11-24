@@ -1,42 +1,107 @@
-"""FFmpeg-based video manipulation utilities for segmentation and compression."""
+"""FFmpeg-based video manipulation utilities for segmentation, probing, and compression."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import math
 import os
+import re
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
+from typing import Literal
 
 import logfire
 import static_ffmpeg
 
+from ai_sub.config import atomic_write_text
+
 _FFMPEG_INITIALIZED: bool = False
 _FFMPEG_PATH: str = "ffmpeg"
 _FFPROBE_PATH: str = "ffprobe"
-_FFMPEG_SEMAPHORE: asyncio.Semaphore | None = None
+_VFR_FLAG: str | None = None
 
 
-def set_ffmpeg_concurrency(max_concurrent: int) -> None:
-    """Sets the maximum number of concurrent FFmpeg operations.
+def sanitize_filename(name: str) -> str:
+    """Sanitizes a string to produce a safe filesystem filename stem.
+
+    Replaces reserved characters, control characters, and normalizes spacing.
 
     Args:
-        max_concurrent: Maximum concurrent FFmpeg subprocesses allowed.
-    """
-    global _FFMPEG_SEMAPHORE
-    _FFMPEG_SEMAPHORE = asyncio.Semaphore(max(1, max_concurrent))
-
-
-def _get_ffmpeg_semaphore() -> asyncio.Semaphore:
-    """Retrieves or initializes the global FFmpeg concurrency semaphore.
+        name: Raw filename or stem string.
 
     Returns:
-        asyncio.Semaphore: Global semaphore instance.
+        str: Filesystem-safe sanitized filename string.
     """
-    global _FFMPEG_SEMAPHORE
-    if _FFMPEG_SEMAPHORE is None:
-        _FFMPEG_SEMAPHORE = asyncio.Semaphore(1)
-    return _FFMPEG_SEMAPHORE
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    cleaned = cleaned.strip(" .")
+    return cleaned or "video"
+
+
+def truncate_utf8_bytes(text: str, max_bytes: int, fallback: str = "video") -> str:
+    """Truncates a string cleanly on a UTF-8 character boundary to fit within max_bytes.
+
+    Args:
+        text: Input string to truncate.
+        max_bytes: Maximum allowed UTF-8 byte length.
+        fallback: Value returned if truncation yields an empty string. Defaults to 'video'.
+
+    Returns:
+        str: UTF-8 byte-bounded string with trailing spaces/dots stripped.
+
+    Raises:
+        ValueError: If max_bytes is not positive.
+    """
+    if max_bytes <= 0:
+        raise ValueError(f"max_bytes must be positive, got {max_bytes}.")
+    encoded = text.encode("utf-8")
+    if len(encoded) > max_bytes:
+        text = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    cleaned = text.strip(" .")
+    return cleaned or fallback
+
+
+def compute_file_id_hash(filename: str, length: int = 11) -> str:
+    """Computes a compact deterministic lowercase hex digest of a filename.
+
+    Matches the 11-character length of YouTube video IDs by default while remaining
+    case-insensitive and free of delimiter characters across operating systems.
+
+    Args:
+        filename: File name (including extension) to hash.
+        length: Number of hex characters to return (1-64). Defaults to 11.
+
+    Returns:
+        str: Lowercase SHA-256 hex prefix string.
+
+    Raises:
+        ValueError: If length is outside [1, 64].
+    """
+    if not (1 <= length <= 64):
+        raise ValueError(f"Hash length must be between 1 and 64, got {length}.")
+    return hashlib.sha256(filename.encode("utf-8")).hexdigest()[:length]
+
+
+def sanitize_uploader(raw_uploader: str, fallback: str = "unknown") -> str:
+    """Normalizes an uploader handle or folder name into a safe single directory component.
+
+    Args:
+        raw_uploader: Raw handle, folder name, or uploader identifier.
+        fallback: Value returned if the sanitized result is empty or unsafe. Defaults to 'unknown'.
+
+    Returns:
+        str: Safe single-component uploader identifier (max 50 characters).
+    """
+    stripped = str(raw_uploader).strip().strip("@")
+    if not stripped:
+        return fallback
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stripped)[:50].strip(" .")
+    if not cleaned or cleaned in (".", ".."):
+        return fallback
+    return cleaned
 
 
 def _find_system_binary(binary_name: str) -> str | None:
@@ -87,9 +152,8 @@ def _probe_binary_info(binary_path: str) -> tuple[str, str]:
         config_line = "unknown"
         for line in proc.stdout.splitlines():
             stripped = line.strip()
-            if not version_line or version_line == "unknown":
-                if stripped.startswith(("ffmpeg version", "ffprobe version")):
-                    version_line = stripped
+            if version_line == "unknown" and stripped.startswith(("ffmpeg version", "ffprobe version")):
+                version_line = stripped
             if stripped.startswith("configuration:"):
                 config_line = stripped
                 break
@@ -165,7 +229,7 @@ async def init_ffmpeg_engine(requested_encoder: str | None = None) -> tuple[str,
 
 
 async def _run_ffmpeg(cmd: list[str]) -> str:
-    """Executes an FFmpeg command asynchronously with cancellation handling.
+    """Executes an FFmpeg or FFprobe command asynchronously with cancellation handling.
 
     Args:
         cmd: Command arguments as a list of strings.
@@ -200,6 +264,27 @@ async def _run_ffmpeg(cmd: list[str]) -> str:
     return stdout_str
 
 
+async def _get_vfr_flag() -> str:
+    """Detects whether the installed FFmpeg binary supports '-fps_mode' (5.1+) or legacy '-vsync'.
+
+    Uses '-h full' because '-fps_mode' is an advanced option omitted from basic '-h' output.
+
+    Returns:
+        str: Supported FFmpeg flag ('-fps_mode' or '-vsync').
+    """
+    global _VFR_FLAG
+    if _VFR_FLAG is not None:
+        return _VFR_FLAG
+
+    ffmpeg_bin, _ = ensure_ffmpeg()
+    try:
+        help_out = await _run_ffmpeg([ffmpeg_bin, "-h", "full"])
+        _VFR_FLAG = "-fps_mode" if re.search(r"(?:^|\s)-fps_mode\b", help_out) else "-vsync"
+    except Exception:
+        _VFR_FLAG = "-fps_mode"
+    return _VFR_FLAG
+
+
 async def get_video_duration_ms(video_path: Path) -> int:
     """Calculates the duration of a video file in milliseconds.
 
@@ -231,38 +316,89 @@ async def get_video_duration_ms(video_path: Path) -> int:
         raise RuntimeError(f"Could not determine duration for video file: {video_path.name}") from e
 
 
-async def get_video_fps(video_path: Path) -> float:
-    """Calculates the average framerate (FPS) of a video file.
+async def _run_ffprobe_video_entry(video_path: Path, entry: str, *extra_args: str) -> str:
+    """Queries a single video stream field via ffprobe and returns its first non-empty line.
 
     Args:
         video_path: Path to the target media file.
+        entry: FFprobe stream entry name (e.g. 'avg_frame_rate', 'nb_read_frames').
+        *extra_args: Optional additional ffprobe flags placed before '-select_streams'.
 
     Returns:
-        float: Frames per second.
+        str: First non-empty trimmed output line from ffprobe.
+    """
+    _, ffprobe_bin = ensure_ffmpeg()
+    cmd = [
+        ffprobe_bin,
+        "-v",
+        "error",
+        *extra_args,
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        f"stream={entry}",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video_path),
+    ]
+    stdout = await _run_ffmpeg(cmd)
+    return next((line.strip() for line in stdout.splitlines() if line.strip()), "")
+
+
+async def get_video_fps(video_path: Path, entry: str = "avg_frame_rate") -> float:
+    """Probes a framerate stream entry (e.g., 'avg_frame_rate' or 'r_frame_rate') using ffprobe.
+
+    Args:
+        video_path: Path to the target media file.
+        entry: FFprobe stream entry name to inspect. Defaults to 'avg_frame_rate'.
+
+    Returns:
+        float: Probed framerate in frames per second.
 
     Raises:
         RuntimeError: If the framerate cannot be determined.
     """
-    _, ffprobe_bin = ensure_ffmpeg()
     try:
-        cmd = [
-            ffprobe_bin,
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=avg_frame_rate",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(video_path),
-        ]
-        stdout = await _run_ffmpeg(cmd)
-        num, den = map(int, stdout.strip().split("/"))
+        first_line = await _run_ffprobe_video_entry(video_path, entry)
+        num, den = map(int, first_line.split("/"))
         return num / den
     except (subprocess.CalledProcessError, ValueError, ZeroDivisionError) as e:
-        logfire.exception(f"Could not determine FPS for {video_path.name}")
-        raise RuntimeError(f"Could not determine FPS for video file: {video_path.name}") from e
+        logfire.exception(f"Could not determine {entry} for {video_path.name}")
+        raise RuntimeError(f"Could not determine {entry} for video file: {video_path.name}") from e
+
+
+async def get_keyframe_fps(video_path: Path) -> float:
+    """Probes the effective keyframe rate (keyframes per second) of a video file.
+
+    Args:
+        video_path: Path to the target video file.
+
+    Returns:
+        float: Average keyframe rate in frames per second.
+
+    Raises:
+        RuntimeError: If keyframe count or duration cannot be probed.
+    """
+    duration_ms = await get_video_duration_ms(video_path)
+    if duration_ms <= 0:
+        raise RuntimeError(f"Invalid video duration ({duration_ms}ms) for {video_path.name}")
+
+    try:
+        first_line = await _run_ffprobe_video_entry(
+            video_path,
+            "nb_read_frames",
+            "-skip_frame",
+            "nokey",
+            "-count_frames",
+        )
+        keyframe_count = int(first_line)
+    except (subprocess.CalledProcessError, ValueError) as e:
+        logfire.exception(f"Could not determine keyframe rate for {video_path.name}")
+        raise RuntimeError(f"Could not determine keyframe rate for video file: {video_path.name}") from e
+
+    if keyframe_count <= 0:
+        raise RuntimeError(f"Keyframe count must be positive for video file: {video_path.name}")
+    return keyframe_count / (duration_ms / 1000.0)
 
 
 async def get_working_encoder() -> str:
@@ -276,6 +412,7 @@ async def get_working_encoder() -> str:
 
     for encoder in candidates:
         try:
+            # Minimum dimensions >= 145x145 are required by NVENC and QSV encoders
             await _run_ffmpeg(
                 cmd=[
                     ffmpeg_bin,
@@ -286,7 +423,7 @@ async def get_working_encoder() -> str:
                     "-f",
                     "lavfi",
                     "-i",
-                    "color=c=black:s=64x64:d=0.01",
+                    "color=c=black:s=256x256:d=0.01",
                     "-c:v",
                     encoder,
                     "-b:v",
@@ -303,34 +440,198 @@ async def get_working_encoder() -> str:
     return "libx264"
 
 
+def _check_reencoded_duration(
+    input_duration_ms: int,
+    output_duration_ms: int,
+    fps: float,
+    duration_tolerance_ms: int,
+) -> bool:
+    """Checks whether re-encoded output duration falls within FPS-adjusted tolerance bounds.
+
+    Args:
+        input_duration_ms: Source video duration in milliseconds.
+        output_duration_ms: Candidate re-encoded video duration in milliseconds.
+        fps: Effective framerate in frames per second.
+        duration_tolerance_ms: Base allowed duration variance in milliseconds.
+
+    Returns:
+        bool: True if output duration is within allowed overshoot and undershoot bounds.
+    """
+    frame_slack = int(1000 / fps) if fps < 1.0 else 0
+    max_overshoot = duration_tolerance_ms + frame_slack
+    max_undershoot = duration_tolerance_ms + min(frame_slack, input_duration_ms // 2)
+    diff = output_duration_ms - input_duration_ms
+    return -max_undershoot <= diff <= max_overshoot
+
+
+async def is_valid_reencoded_file(
+    input_path: Path,
+    output_path: Path,
+    fps: float | Literal["keyframes"],
+    duration_tolerance_ms: int = 100,
+) -> bool:
+    """Verifies whether an existing re-encoded file matches input duration and expected framerate.
+
+    Args:
+        input_path: Source input media file path.
+        output_path: Candidate re-encoded media file path.
+        fps: Target framerate in FPS or 'keyframes' for native VFR keyframes.
+        duration_tolerance_ms: Allowed duration variance in milliseconds. Defaults to 100.
+
+    Returns:
+        bool: True if output file exists, is non-empty, and matches duration and FPS criteria; False otherwise.
+    """
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        return False
+    try:
+        if os.path.samefile(input_path, output_path):
+            return False
+    except OSError:
+        pass
+
+    try:
+        if fps == "keyframes":
+            if input_path.is_file() and output_path.stat().st_size == input_path.stat().st_size:
+                return False
+            input_duration, output_duration, avg_fps = await asyncio.gather(
+                get_video_duration_ms(input_path),
+                get_video_duration_ms(output_path),
+                get_video_fps(output_path),
+            )
+            return avg_fps > 0 and _check_reencoded_duration(
+                input_duration,
+                output_duration,
+                avg_fps,
+                duration_tolerance_ms,
+            )
+
+        input_duration, output_duration, r_fps, avg_fps = await asyncio.gather(
+            get_video_duration_ms(input_path),
+            get_video_duration_ms(output_path),
+            get_video_fps(output_path, "r_frame_rate"),
+            get_video_fps(output_path),
+        )
+        if not _check_reencoded_duration(input_duration, output_duration, fps, duration_tolerance_ms):
+            return False
+
+        # Validate target FPS against r_frame_rate (constant stream rate) and avg_frame_rate
+        # using a tight relative tolerance so closely spaced fallback FPS tiers remain distinct.
+        fps_tol = max(1e-9, fps * 0.02)
+        if abs(fps - r_fps) < fps_tol or abs(fps - avg_fps) < fps_tol:
+            return True
+
+        # Short tail clips emit few frames (including 1 frame when expected < 0.45);
+        # match FFmpeg vf_fps round-to-nearest bounds without accepting higher-FPS tier files.
+        duration_s = output_duration / 1000.0
+        if duration_s > 0 and avg_fps > 0 and 0 < (fps * duration_s) < 5.0:
+            if r_fps <= fps + fps_tol or abs(r_fps - avg_fps) < max(1e-6, avg_fps * 1e-3):
+                expected = fps * duration_s
+                actual_frames = round(avg_fps * duration_s)
+                lo = max(1, math.floor(expected + 0.45))
+                hi = max(1, math.floor(expected + 0.55))
+                return lo <= actual_frames <= hi
+
+        return False
+    except Exception:
+        return False
+
+
+def _find_split_segments(output_dir: Path, ext: str, media_tag: str) -> list[Path]:
+    """Finds and numerically sorts generated split segments matching 'part_%03d_<media_tag>'.
+
+    Args:
+        output_dir: Directory containing segment files.
+        ext: File extension including leading dot.
+        media_tag: Video ID or filename hash appended to each segment filename.
+
+    Returns:
+        list[Path]: Segments sorted by ascending numeric chunk index.
+    """
+    if not output_dir.is_dir():
+        return []
+    segment_re = re.compile(rf"^part_(\d{{3,}})_{re.escape(media_tag)}{re.escape(ext)}$")
+    matched: list[tuple[int, Path]] = []
+    for entry in output_dir.iterdir():
+        if entry.is_file() and (m := segment_re.match(entry.name)):
+            matched.append((int(m.group(1)), entry))
+    matched.sort(key=lambda item: item[0])
+    return [path for _, path in matched]
+
+
+def _segments_match_split_duration(
+    durations_ms: list[int],
+    split_duration_s: int,
+    duration_tolerance_ms: int,
+    split_meta_path: Path,
+) -> bool:
+    """Verifies that cached segments align with the requested split_duration_s.
+
+    Prefers the recorded split metadata sidecar when present; otherwise checks non-final segment
+    durations to reject segments generated under a markedly different split duration.
+
+    Args:
+        durations_ms: Probed segment durations in milliseconds.
+        split_duration_s: Requested target segment duration in seconds.
+        duration_tolerance_ms: Allowed per-segment duration tolerance in milliseconds.
+        split_meta_path: Path to the split configuration sidecar file.
+
+    Returns:
+        bool: True if existing segments match the split configuration.
+    """
+    if split_meta_path.is_file():
+        try:
+            meta = json.loads(split_meta_path.read_text(encoding="utf-8"))
+            if isinstance(meta, dict) and meta.get("split_duration_s") == split_duration_s:
+                return True
+            return False
+        except Exception:
+            return False
+
+    split_ms = split_duration_s * 1000
+    if len(durations_ms) > 1:
+        non_final = durations_ms[:-1]
+        if max(non_final) > max(split_ms * 1.5, split_ms + duration_tolerance_ms):
+            return False
+        if (sum(non_final) / len(non_final)) < split_ms * 0.5:
+            return False
+    elif durations_ms and durations_ms[0] > max(split_ms * 1.5, split_ms + duration_tolerance_ms):
+        return False
+
+    return True
+
+
 @logfire.instrument("Splitting video into segments")
 async def split_video(
     input_video: Path,
     output_dir: Path,
     split_duration_s: int,
-    output_pattern: str = "part_%03d",
+    media_tag: str,
     duration_tolerance_ms: int = 100,
 ) -> list[Path]:
     """Splits an input video into uniform segments using FFmpeg stream copying.
 
-    Skips splitting if valid segments matching the pattern and duration already exist.
+    Skips splitting if valid segments matching 'part_%03d_<media_tag>', split duration, and total
+    duration already exist, and drops any confirmed empty or zero-duration trailing stub segments
+    emitted at EOF after verifying remaining timeline coverage.
 
     Args:
         input_video: Path to the input video.
         output_dir: Directory where segments will be saved.
         split_duration_s: Target segment length in seconds.
-        output_pattern: Pattern formatting segment filenames. Defaults to 'part_%03d'.
+        media_tag: Video ID or filename hash appended to each segment filename.
         duration_tolerance_ms: Allowed total duration variance in milliseconds.
 
     Returns:
-        list[Path]: Sorted list of generated segment paths.
+        list[Path]: Numerically sorted list of generated segment paths.
 
     Raises:
+        RuntimeError: If dropped trailing segments leave incomplete timeline coverage or a segment probe fails.
         subprocess.CalledProcessError: If FFmpeg segmentation fails.
     """
     ext = input_video.suffix
-    glob_pattern = output_pattern.replace("%03d", "*") + ext
-    existing_segments = sorted(output_dir.glob(glob_pattern))
+    existing_segments = _find_split_segments(output_dir, ext, media_tag)
+    split_meta_path = output_dir / f".split_{media_tag}.json"
+    input_duration: int | None = None
 
     if existing_segments:
         try:
@@ -339,25 +640,31 @@ async def split_video(
             total_segment_duration = sum(durations)
             threshold = duration_tolerance_ms * len(existing_segments)
 
-            if abs(input_duration - total_segment_duration) < threshold:
+            if (
+                all(d > 0 for d in durations)
+                and abs(input_duration - total_segment_duration) <= threshold
+                and _segments_match_split_duration(durations, split_duration_s, duration_tolerance_ms, split_meta_path)
+            ):
                 logfire.info(f"Reusing {len(existing_segments)} existing valid segments for {input_video.name}.")
                 return existing_segments
 
             logfire.warning(
-                f"Re-splitting {input_video.name}: existing duration ({total_segment_duration}ms) "
-                f"mismatches input ({input_duration}ms)."
+                f"Re-splitting {input_video.name}: existing segments do not match current duration or split config."
             )
-            for segment in existing_segments:
-                try:
-                    segment.unlink()
-                except OSError:
-                    pass
         except Exception:
             logfire.warning(f"Re-splitting {input_video.name}: existing segments verification failed.")
 
+        for segment in existing_segments:
+            try:
+                segment.unlink()
+            except OSError:
+                pass
+        split_meta_path.unlink(missing_ok=True)
+
     ffmpeg_bin, _ = ensure_ffmpeg()
     escaped_dir = str(output_dir).replace("%", "%%")
-    full_output_pattern = str(Path(escaped_dir) / f"{output_pattern}{ext}")
+    safe_tag = media_tag.replace("%", "%%")
+    full_output_pattern = str(Path(escaped_dir) / f"part_%03d_{safe_tag}{ext}")
 
     cmd = [
         ffmpeg_bin,
@@ -370,7 +677,9 @@ async def split_video(
         "-c",
         "copy",
         "-map",
-        "0",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
         "-f",
         "segment",
         "-segment_time",
@@ -380,67 +689,94 @@ async def split_video(
         full_output_pattern,
     ]
 
-    sem = _get_ffmpeg_semaphore()
-    async with sem:
-        try:
-            await _run_ffmpeg(cmd)
-        except subprocess.CalledProcessError as e:
-            logfire.exception(f"FFmpeg split failed. Stdout: {e.stdout}, Stderr: {e.stderr}")
-            raise
+    try:
+        await _run_ffmpeg(cmd)
+    except subprocess.CalledProcessError as e:
+        logfire.exception(f"FFmpeg split failed. Stdout: {e.stdout}, Stderr: {e.stderr}")
+        raise
 
-    return sorted(output_dir.glob(glob_pattern))
+    segments = _find_split_segments(output_dir, ext, media_tag)
+    dropped_trailing = False
+    while segments:
+        tail = segments[-1]
+        tail_ms = 0 if tail.stat().st_size == 0 else await get_video_duration_ms(tail)
+        if tail_ms > 0:
+            break
+        logfire.warning(f"Dropping empty/zero-duration trailing segment: {tail.name}")
+        tail.unlink(missing_ok=True)
+        segments.pop()
+        dropped_trailing = True
+
+    if dropped_trailing:
+        if input_duration is None:
+            input_duration = await get_video_duration_ms(input_video)
+        durations = await asyncio.gather(*(get_video_duration_ms(s) for s in segments))
+        total_segment_duration = sum(durations)
+        threshold = duration_tolerance_ms * max(1, len(segments))
+        if not all(d > 0 for d in durations) or abs(input_duration - total_segment_duration) > threshold:
+            raise RuntimeError(
+                f"Dropped trailing segment(s) for {input_video.name} left incomplete timeline coverage "
+                f"({total_segment_duration}ms vs {input_duration}ms)."
+            )
+
+    if segments:
+        atomic_write_text(split_meta_path, json.dumps({"split_duration_s": split_duration_s}))
+    return segments
 
 
 async def reencode_video(
     input_path: Path,
     output_path: Path,
-    fps: float,
+    fps: float | Literal["keyframes"],
     height: int,
-    bitrate_kb: int,
+    bitrate: int,
     encoder: str,
     duration_tolerance_ms: int = 100,
     keyframe_only: bool = False,
 ) -> None:
-    """Compresses a video segment or full video using low framerates and downscaled resolution.
+    """Compresses a video segment or full video using low framerates or keyframes and downscaled resolution.
+
+    Encodes atomically via a temporary file and validates output before replacing output_path.
 
     Args:
         input_path: Source video media path.
         output_path: Destination path for compressed output.
-        fps: Target framerate.
+        fps: Target framerate in FPS, or 'keyframes' to keep native keyframes without frame duplication.
         height: Target height resolution.
-        bitrate_kb: Target bitrate in Kilobytes per second.
+        bitrate: Target video bitrate in bytes per second.
         encoder: Encoder codec to employ.
         duration_tolerance_ms: Allowed duration variance in milliseconds.
         keyframe_only: Whether to decode only keyframes from the input video.
 
     Raises:
+        RuntimeError: If the re-encoded output fails duration or framerate validation.
         subprocess.CalledProcessError: If FFmpeg re-encoding fails.
     """
-    if output_path.exists():
-        try:
-            input_duration, output_duration, output_fps = await asyncio.gather(
-                get_video_duration_ms(input_path),
-                get_video_duration_ms(output_path),
-                get_video_fps(output_path),
-            )
-            effective_tolerance = duration_tolerance_ms + (int(1000 / fps) if fps < 1.0 else 0)
-            if abs(input_duration - output_duration) < effective_tolerance and abs(fps - output_fps) < 0.01:
-                logfire.info(f"Reusing existing valid compressed media: {output_path.name}")
-                return
-        except Exception:
-            pass
+    if await is_valid_reencoded_file(
+        input_path=input_path,
+        output_path=output_path,
+        fps=fps,
+        duration_tolerance_ms=duration_tolerance_ms,
+    ):
+        logfire.info(f"Reusing existing valid compressed media: {output_path.name}")
+        return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_output = output_path.with_name(f".{output_path.stem}.{uuid.uuid4().hex[:8]}.tmp{output_path.suffix}")
 
     ffmpeg_bin, _ = ensure_ffmpeg()
-    video_bytes_per_sec = bitrate_kb * 1024
+    video_bits_per_sec = bitrate * 8
+    audio_args = ["-c:a", "aac", "-b:a", "64k", "-ac", "1", "-ar", "16000"]
 
-    # Container-aware audio encoding: .mov supports pcm_u8; .mp4 requires aac
-    if output_path.suffix.lower() == ".mp4":
-        audio_args = ["-c:a", "aac", "-b:a", "64k", "-ac", "1", "-ar", "16000"]
+    decode_keyframes = keyframe_only or fps == "keyframes"
+    input_args = ["-skip_frame", "nokey"] if decode_keyframes else []
+
+    if fps == "keyframes":
+        vf_filter = f"scale=-2:{height}"
+        video_rate_args = [await _get_vfr_flag(), "vfr"]
     else:
-        audio_args = ["-c:a", "pcm_u8", "-ac", "1", "-ar", "16000"]
-
-    input_args = ["-skip_frame", "nokey"] if keyframe_only else []
-    vf_filter = f"scale=-2:{height},fps={fps}" if keyframe_only else f"fps={fps},scale=-2:{height}"
+        vf_filter = f"scale=-2:{height},fps={fps}" if decode_keyframes else f"fps={fps},scale=-2:{height}"
+        video_rate_args = ["-g", str(max(1, int(fps * 10)))]
 
     cmd = [
         ffmpeg_bin,
@@ -452,26 +788,43 @@ async def reencode_video(
         *input_args,
         "-i",
         str(input_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
         "-vf",
         vf_filter,
         "-c:v",
         encoder,
-        "-g",
-        str(int(fps * 10)),
+        "-pix_fmt",
+        "yuv420p",
+        *video_rate_args,
         "-b:v",
-        str(video_bytes_per_sec * 8),
+        str(video_bits_per_sec),
         "-maxrate",
-        str(video_bytes_per_sec * 8),
+        str(video_bits_per_sec),
         "-bufsize",
-        str(video_bytes_per_sec * 8 * 2),
+        str(video_bits_per_sec * 2),
         *audio_args,
-        str(output_path),
+        str(temp_output),
     ]
 
-    sem = _get_ffmpeg_semaphore()
-    async with sem:
-        try:
-            await _run_ffmpeg(cmd)
-        except subprocess.CalledProcessError as e:
-            logfire.exception(f"FFmpeg re-encoding failed for {input_path.name}. Stderr: {e.stderr}")
-            raise
+    try:
+        await _run_ffmpeg(cmd)
+        if not await is_valid_reencoded_file(
+            input_path=input_path,
+            output_path=temp_output,
+            fps=fps,
+            duration_tolerance_ms=duration_tolerance_ms,
+        ):
+            raise RuntimeError(f"Re-encoded output failed validation for {input_path.name} at {fps} fps.")
+        os.replace(temp_output, output_path)
+    except subprocess.CalledProcessError as e:
+        logfire.exception(f"FFmpeg re-encoding failed for {input_path.name}. Stderr: {e.stderr}")
+        raise
+    finally:
+        if temp_output.exists():
+            try:
+                temp_output.unlink()
+            except OSError:
+                pass

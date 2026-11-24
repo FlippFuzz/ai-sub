@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
-import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -21,10 +20,10 @@ from ai_sub.protocol import (
     TaskHeartbeatRequest,
     TaskHeartbeatResponse,
 )
-from ai_sub.server.config import ServerSettings
-from ai_sub.server.coordinator import PipelineCoordinator
+from ai_sub.server.coordinator import ComboRunnersCoordinator
 from ai_sub.server.git_sync import GitSyncManager
 from ai_sub.server.ingestion import IngestionManager
+from ai_sub.server.server_config import ServerSettings
 from ai_sub.telemetry import get_app_version
 
 DASHBOARD_HTML_PATH = Path(__file__).parent / "static" / "dashboard.html"
@@ -39,10 +38,9 @@ def create_app(settings: ServerSettings) -> FastAPI:
     Returns:
         FastAPI: Configured FastAPI application instance.
     """
-    git_sync = GitSyncManager(settings.git, settings.server.work_dir)
-    coordinator = PipelineCoordinator(settings, git_sync=git_sync)
-    ingestion = IngestionManager(settings.sources, coordinator, git_sync, settings.server.work_dir)
-    background_tasks: set[asyncio.Task[Any]] = set()
+    git_sync = GitSyncManager(settings.git, settings.coordinator.workdir)
+    coordinator = ComboRunnersCoordinator(settings, git_sync=git_sync)
+    ingestion = IngestionManager(settings.sources, coordinator, git_sync, settings.coordinator.workdir)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -57,7 +55,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
         await git_sync.ensure_repo()
         await coordinator.start()
         ingestion_task = asyncio.create_task(ingestion.start())
-        logfire.info(f"ai-sub-server started on {settings.server.host}:{settings.server.port}")
+        logfire.info(f"ai-sub-server started on {settings.http.host}:{settings.http.port}")
         yield
         if not ingestion_task.done():
             ingestion_task.cancel()
@@ -88,16 +86,16 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
     @app.get("/api/v1/dashboard/data")
     async def get_dashboard_data() -> dict[str, Any]:
-        """Returns live dashboard telemetry, active pipelines, queue, and recent event logs.
+        """Returns live dashboard telemetry, active runners, queue, and recent event logs.
 
         Returns:
             dict[str, Any]: Complete dashboard state dictionary.
         """
-        pipeline_queues = ingestion.get_all_pipeline_queues()
+        runner_queues = ingestion.get_all_runner_queues()
         cooldown_info = ingestion.get_youtube_cooldown_info()
         total_tracked = len(ingestion.local_videos) + len(ingestion.youtube_videos)
         return coordinator.get_dashboard_data(
-            pipeline_queues=pipeline_queues,
+            pipeline_queues=runner_queues,
             youtube_cooldown=cooldown_info,
             total_tracked_videos=total_tracked,
         )
@@ -105,17 +103,36 @@ def create_app(settings: ServerSettings) -> FastAPI:
     @app.post(
         "/api/v1/tasks/claim",
         response_model=TaskClaimResponse | None,
-        responses={204: {"description": "No pending tasks available matching worker capabilities"}},
+        responses={
+            204: {"description": "No pending tasks available matching worker capabilities"},
+            409: {"description": "Worker client package version does not match server version"},
+        },
     )
     async def claim_task(req: TaskClaimRequest) -> TaskClaimResponse | Response:
         """Claims an available pending task matching the worker's models and search capabilities.
 
+        Validates strict package version parity before assigning work.
+
         Args:
-            req: Worker task claim request containing worker ID, supported models, and search tools.
+            req: Worker task claim request containing worker ID, client version, models, and search tools.
 
         Returns:
             TaskClaimResponse | Response: Assigned task details or 204 No Content response if none available.
+
+        Raises:
+            HTTPException: If the worker's ai-sub version does not match the server's version.
         """
+        server_version = get_app_version()
+        if req.client_version != server_version:
+            logfire.warning(
+                f"Worker '{req.worker_id}' rejected: version mismatch "
+                f"(server={server_version}, client={req.client_version})"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"VERSION_MISMATCH: server={server_version}, client={req.client_version}",
+            )
+
         task = await coordinator.claim_task(
             worker_id=req.worker_id,
             models=req.models,
@@ -130,15 +147,14 @@ def create_app(settings: ServerSettings) -> FastAPI:
         """Renews an active task lease timestamp.
 
         Args:
-            task_id: Unique task identifier.
+            task_id: Unique task identifier (already unquoted by FastAPI).
             req: Heartbeat request containing worker ID.
 
         Returns:
             TaskHeartbeatResponse: Acknowledgment status confirming whether lease was renewed.
         """
-        clean_task_id = urllib.parse.unquote(task_id)
         acknowledged = await coordinator.record_heartbeat(
-            clean_task_id,
+            task_id,
             req.worker_id,
         )
         return TaskHeartbeatResponse(acknowledged=acknowledged)
@@ -149,7 +165,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
         """Streams the video media chunk associated with an active task.
 
         Args:
-            task_id: Unique task identifier.
+            task_id: Unique task identifier (already unquoted by FastAPI).
             filename: Optional filename in URL path for client-side extension preservation. Defaults to None.
 
         Returns:
@@ -158,8 +174,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
         Raises:
             HTTPException: If the media chunk file is not found on disk.
         """
-        clean_task_id = urllib.parse.unquote(task_id)
-        media_path = coordinator.get_task_media_path(clean_task_id)
+        media_path = coordinator.get_task_media_path(task_id)
         if not media_path or not media_path.is_file():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media chunk file not found.")
 
@@ -171,43 +186,44 @@ def create_app(settings: ServerSettings) -> FastAPI:
             filename=media_path.name,
         )
 
-    @app.post("/api/v1/tasks/{task_id}/complete")
+    @app.post(
+        "/api/v1/tasks/{task_id}/complete",
+        responses={
+            409: {"description": "Task was not assigned to this worker or has already completed"},
+            422: {"description": "Submitted task result failed server-side schema validation"},
+        },
+    )
     async def complete_task(task_id: str, req: TaskCompleteRequest) -> dict[str, str]:
         """Submits completed and validated structured AI results for a task.
 
         Args:
-            task_id: Unique task identifier.
+            task_id: Unique task identifier (already unquoted by FastAPI).
             req: Completion request containing task result data.
 
         Returns:
             dict[str, str]: Operation status confirmation dictionary.
 
         Raises:
-            HTTPException: If the task was not claimed by this worker or has already completed.
+            HTTPException: If server validation rejects the payload (422) or the lease is invalid (409).
         """
-        clean_task_id = urllib.parse.unquote(task_id)
-        success = await coordinator.complete_task(
-            clean_task_id,
+        accepted, validation_error = await coordinator.complete_task(
+            task_id,
             req.worker_id,
             req.result,
         )
-        if not success:
+        coordinator.schedule_finalize_check()
+
+        if validation_error is not None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Result validation failed: {validation_error}",
+            )
+
+        if not accepted:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Task was not assigned to this worker or has already completed.",
             )
-
-        async def _finalize_and_feed() -> None:
-            try:
-                finalized = await coordinator.check_and_finalize_completed_pipelines()
-                if finalized:
-                    await ingestion.feed_idle_pipelines()
-            except Exception as e:
-                logfire.exception(f"Background finalization and pipeline feed error: {e}")
-
-        bg_task = asyncio.create_task(_finalize_and_feed())
-        background_tasks.add(bg_task)
-        bg_task.add_done_callback(background_tasks.discard)
 
         return {"status": "ok"}
 
@@ -216,8 +232,8 @@ def create_app(settings: ServerSettings) -> FastAPI:
         """Reports a task execution failure or quota exhaustion to release the lease.
 
         Args:
-            task_id: Unique task identifier.
-            req: Failure report request containing reason, optional error details, and transient flag.
+            task_id: Unique task identifier (already unquoted by FastAPI).
+            req: Failure report request containing reason, optional error details, and retryable flag.
 
         Returns:
             dict[str, str]: Operation status confirmation dictionary.
@@ -225,43 +241,20 @@ def create_app(settings: ServerSettings) -> FastAPI:
         Raises:
             HTTPException: If the task could not be found or was not held by this worker.
         """
-        clean_task_id = urllib.parse.unquote(task_id)
         success = await coordinator.fail_task(
-            task_id=clean_task_id,
+            task_id=task_id,
             worker_id=req.worker_id,
             reason=req.reason,
             error_message=req.error_message,
-            is_transient=req.is_transient,
+            is_retryable=req.is_retryable,
         )
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Task could not be found or was not held by this worker.",
             )
+
+        coordinator.schedule_finalize_check()
         return {"status": "ok"}
-
-    @app.get("/api/v1/status")
-    async def get_server_status() -> dict[str, Any]:
-        """Returns macroscopic pipeline and in-memory queue status.
-
-        Returns:
-            dict[str, Any]: Mapping of server status and pipeline queue metrics.
-        """
-        pipeline_status = {}
-        for name, pipe in coordinator.pipelines.items():
-            pipeline_status[name] = {
-                "status": pipe.status.value,
-                "idle": pipe.is_idle(),
-                "active_video": pipe.active_video.video_id if pipe.active_video else None,
-                "total_tasks": len(pipe.tasks),
-                "pending_tasks": sum(1 for t in pipe.tasks.values() if t.status.value == "pending"),
-                "claimed_tasks": sum(1 for t in pipe.tasks.values() if t.status.value == "claimed"),
-                "completed_tasks": sum(1 for t in pipe.tasks.values() if t.status.value == "completed"),
-            }
-
-        return {
-            "status": "online",
-            "pipelines": pipeline_status,
-        }
 
     return app

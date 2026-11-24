@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import BaseHttpSearchProvider, WebSearchResult
+from ai_sub.search.search_base import BaseHttpSearchProvider, WebSearchResult
 
 
 class OllamaSearchProvider(BaseHttpSearchProvider):
@@ -18,16 +19,6 @@ class OllamaSearchProvider(BaseHttpSearchProvider):
             settings: Search configuration settings.
         """
         super().__init__(settings, provider_name="ollama")
-
-    def _get_headers(self) -> dict[str, str]:
-        """Constructs authorization headers for Ollama API requests.
-
-        Returns:
-            dict[str, str]: HTTP request headers.
-        """
-        key = self._get_api_key()
-        assert key is not None
-        return {"Authorization": f"Bearer {key.get_secret_value()}"}
 
     def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
         """Returns tool callables for Gemini model registration.
@@ -47,19 +38,8 @@ class OllamaSearchProvider(BaseHttpSearchProvider):
             list[WebSearchResult]: Formatted search results.
         """
         response = await self._request("POST", "https://ollama.com/api/web_search", json={"query": query})
-        data = response.json()
-
-        results: list[WebSearchResult] = []
-        for item in data.get("results") or []:
-            title = item.get("title")
-            url = item.get("url")
-            content = item.get("content")
-            if title and url and content:
-                try:
-                    results.append(WebSearchResult(title=title, url=url, content=content[: self.settings.max_length]))
-                except Exception:
-                    continue
-        return results
+        raw_results = response.json().get("results") or []
+        return self._to_web_results((item.get("title"), item.get("url"), item.get("content")) for item in raw_results)
 
     async def web_search_ollama_multi(self, queries: list[str]) -> list[dict[str, Any]]:
         """Perform multiple web search queries in parallel using Ollama.

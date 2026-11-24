@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable
-
-import logfire
+from collections.abc import Callable
+from typing import Any
 
 from ai_sub.config import SearchSettings
-from ai_sub.search.base import BaseHttpSearchProvider, WebSearchResult, normalize_query
+from ai_sub.search.search_base import BaseHttpSearchProvider, WebSearchResult, normalize_query
 
 
 class TinyfishSearchProvider(BaseHttpSearchProvider):
@@ -26,9 +25,13 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
 
         Returns:
             dict[str, str]: HTTP request headers.
+
+        Raises:
+            ValueError: If the Tinyfish API key is not configured.
         """
         key = self._get_api_key()
-        assert key is not None
+        if key is None:
+            raise ValueError("Tinyfish API key is required but not configured.")
         return {"X-API-Key": key.get_secret_value(), "Content-Type": "application/json"}
 
     def get_tools(self) -> list[Callable[..., Any] | dict[str, Any]]:
@@ -55,31 +58,26 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
         Returns:
             list[WebSearchResult]: Formatted search result items containing title, url, and content.
         """
-        cache_key = f"search:{normalize_query(query)}:{purpose}:{language}"
-        if cache_key in self._cache:
-            logfire.debug("Using cached Tinyfish search result for {query=}", query=query)
-            return self._cache[cache_key]
-
         params: dict[str, str] = {"query": query, "purpose": purpose}
         if language:
             params["language"] = language
 
-        with logfire.span("tinyfish_search: {query=}", query=query, purpose=purpose, language=language or "auto"):
+        async def _fetch() -> list[WebSearchResult]:
             response = await self._request("GET", "https://api.search.tinyfish.ai", params=params)
-            raw_results = response.json().get("results", [])
+            payload = response.json() or {}
+            raw_results = payload.get("results") or []
+            return self._to_web_results(
+                (item.get("title"), item.get("url"), item.get("snippet")) for item in raw_results
+            )
 
-            results: list[WebSearchResult] = []
-            max_len = self.settings.max_length
-            for item in raw_results:
-                title, url, snippet = item.get("title"), item.get("url"), item.get("snippet")
-                if title and url and snippet:
-                    try:
-                        results.append(WebSearchResult(title=title, url=url, content=str(snippet)[:max_len]))
-                    except Exception:
-                        continue
-
-            self._cache[cache_key] = results
-            return results
+        return await self._cached_search(
+            cache_key=f"search:{normalize_query(query)}:{purpose}:{language}",
+            span_template="tinyfish_search: {query=}",
+            fetcher=_fetch,
+            query=query,
+            purpose=purpose,
+            language=language or "auto",
+        )
 
     async def tinyfish_search_multi(
         self,
@@ -123,31 +121,43 @@ class TinyfishSearchProvider(BaseHttpSearchProvider):
         Returns:
             list[dict[str, Any]]: List of extracted web pages containing markdown text, title, url, and language.
         """
-        valid_urls = [u for u in urls if u and u.startswith(("http://", "https://"))][:10]
+        valid_urls: list[str] = []
+        seen_urls: set[str] = set()
+        for raw_url in urls:
+            if not raw_url:
+                continue
+            cleaned = raw_url.strip()
+            if cleaned.lower().startswith(("http://", "https://")) and cleaned not in seen_urls:
+                seen_urls.add(cleaned)
+                valid_urls.append(cleaned)
+                if len(valid_urls) >= 10:
+                    break
+
         if not valid_urls:
             return []
 
-        cache_key = f"fetch:{','.join(sorted(valid_urls))}:{purpose}"
-        if cache_key in self._cache:
-            logfire.debug("Using cached Tinyfish fetch results for {urls=}", urls=valid_urls)
-            return self._cache[cache_key]
-
         payload = {"urls": valid_urls, "purpose": purpose, "format": "markdown"}
-        with logfire.span("tinyfish_fetch: {urls=}", urls=valid_urls, purpose=purpose):
+
+        async def _fetch() -> list[dict[str, Any]]:
             response = await self._request("POST", "https://api.fetch.tinyfish.ai", json=payload)
-            raw_results = response.json().get("results", [])
+            data = response.json() or {}
+            raw_results = data.get("results") or []
 
-            results: list[dict[str, Any]] = []
-            max_len = self.settings.max_length * 2
-            for page in raw_results:
-                results.append(
-                    {
-                        "url": page.get("url"),
-                        "title": page.get("title"),
-                        "language": page.get("language"),
-                        "text": str(page.get("text") or "")[:max_len],
-                    }
-                )
+            max_len = self.settings.maxlength * 2
+            return [
+                {
+                    "url": page.get("url"),
+                    "title": page.get("title"),
+                    "language": page.get("language"),
+                    "text": str(page.get("text") or "")[:max_len],
+                }
+                for page in raw_results
+            ]
 
-            self._cache[cache_key] = results
-            return results
+        return await self._cached_search(
+            cache_key=f"fetch:{','.join(sorted(valid_urls))}:{purpose}",
+            span_template="tinyfish_fetch: {urls=}",
+            fetcher=_fetch,
+            urls=valid_urls,
+            purpose=purpose,
+        )

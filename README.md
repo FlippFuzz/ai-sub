@@ -22,6 +22,7 @@ Showcase of sample subtitled YouTube videos can be found at [ai-sub-showcase](ht
   - [Option 1: Recommended Setup (Gemini + Tinyfish)](#option-1-recommended-setup-gemini--tinyfish)
   - [Option 2: Free Search Setup (DuckDuckGo)](#option-2-free-search-setup-duckduckgo)
   - [Option 3: Providing Custom Notes & Lore](#option-3-providing-custom-notes--lore)
+  - [Option 4: Generating Jellyfin NFO Files (Plot & Chapters)](#option-4-generating-jellyfin-nfo-files-plot--chapters)
 - [Intermediate Files & Forcing Regeneration](#intermediate-files--forcing-regeneration)
 - [Distributed Server & Worker Deployment](#distributed-server--worker-deployment)
 - [Configuration](#configuration)
@@ -155,27 +156,40 @@ ai-sub --ai.search.tools=duckduckgo,lrclib "path\to\video.mp4"
 
 ### Option 3: Providing Custom Notes & Lore
 
-You can feed custom notes to the AI (such as character names, spelling preferences, or specific terms) using `--context` or a text file:
+You can feed custom notes to the AI (such as character names, spelling preferences, or specific terms) using `--context` or `--contextfile`:
 
 ```bash
 # Inline notes
 ai-sub --context "The streamers are Fuwawa and Mococo. Keep 'Bau bau' untranslated." "video.mp4"
 
 # Notes from a text file
-ai-sub --context-file "notes.txt" "video.mp4"
+ai-sub --contextfile "notes.txt" "video.mp4"
 ```
+
+---
+
+### Option 4: Generating Jellyfin NFO Files (Plot & Chapters)
+
+Pass `--nfo true` (or set `coordinator.nfo: true` in `server.yaml`) to generate a Jellyfin-compatible `.nfo` file containing `<plot>` and `<chapters>` from the Phase 1 global summary (requires `concurrency.summary > 0` in standalone mode and [jellyfin-plugin-nfo-chapters](https://github.com/Viperinius/jellyfin-plugin-nfo-chapters) for chapter import):
+
+```bash
+ai-sub --nfo true "video.mp4"
+```
+
+- **Standalone & local files:** Outputs `<video_stem>.nfo` without a `<title>` tag.
+- **Server YouTube videos:** Outputs `<uploader>/v/<video_id>/.int/<full_shortcode>/<video_id>.nfo` with `<title>` populated from the original YouTube video title.
 
 ---
 
 ## Intermediate Files & Forcing Regeneration
 
-Inside the temporary directory (`tmp_<video_name>`), AI Sub generates standalone state files (`.yaml`) and intermediate subtitles (`.srt`) tracking the progress of each video chunk and global summary:
+Inside the temporary directory (`tmp_<video_name>`), AI Sub generates standalone state files (`.yaml`) and intermediate media chunks (`part_000_<hash>.mp4`, `summary_<hash>.mp4`) tracking the progress of each video chunk and global summary:
 
-- `summary.<summary_shortcode>.yaml`: Caches the global video summary and metadata (where `<summary_shortcode>` combines the summary model shortcode and prompt version, e.g., `g35l-01`).
-- `<part_name>.subtitles.<subtitles_shortcode>.yaml` & `.srt`: Caches raw segment dialogue transcription and timing (where `<subtitles_shortcode>` incorporates summary lineage and subtitle model shortcode/version, e.g., `g35l-01_g38f-19`).
-- `<part_name>.lyrics.<lyrics_shortcode>.yaml` & `.srt`: Caches refined song lyrics and translations when musical performances are detected (where `<lyrics_shortcode>` incorporates subtitle lineage and lyrics model shortcode/version, e.g., `g35l-01_g38f-19_g35l-10`).
+- `summary.<summary_code>.yaml`: Caches the global video summary and metadata (e.g., `summary.g35l.yaml`).
+- `part_<index>.subtitles.<subtitles_lineage>.yaml`: Caches raw segment dialogue transcription, timing, and active fallback FPS tier (e.g., `part_000.subtitles.g35l-g4h.yaml`, or `part_000.subtitles.g4h.yaml` when summary is disabled).
+- `part_<index>.lyrics.<lyrics_lineage>.yaml`: Caches refined song lyrics and translations when musical performances are detected (e.g., `part_000.lyrics.g35l-g4h-g35l.yaml`).
 
-Delete the corresponding `.yaml` state files in the temporary directory to force a regeneration of a specific summary, chunk transcription, or lyrics pass.
+You can re-run `ai-sub` as many times as needed—completed units are skipped automatically while incomplete units are retried. State files from mismatched prompt versions (or stale upstream outputs) are automatically rejected and overwritten. After `retry.maxruns` (default `3`) non-retryable failures at a tier, the unit automatically steps down to a lower FPS fallback tier on the next run before stopping. Summary and segment fallback settings are controlled separately: `reencode.summary.fallback.attempts` and `reencode.summary.fallback.multiplier` govern the whole-video summary proxy, while `reencode.segment.fallback.attempts` and `reencode.segment.fallback.multiplier` govern individual video chunks (each tier divides FPS by the stage's `multiplier`, up to `attempts` tiers). Delete a specific `.yaml` state file to force regeneration of that unit.
 
 ---
 
@@ -192,4 +206,4 @@ For complete setup instructions (systemd services, Nginx reverse proxy, Basic Au
 
 ## Configuration
 
-For advanced settings (such as custom frame rates, custom models, rate limits, per-stage agentic video toggles, and storage cleanup rules), refer to [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md:1).
+For advanced settings (such as custom frame rates, fallback FPS multipliers, custom models, rate limits, per-stage agentic video toggles, and storage cleanup rules), refer to [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md:1).

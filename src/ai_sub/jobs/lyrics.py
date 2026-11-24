@@ -3,25 +3,21 @@
 from __future__ import annotations
 
 from textwrap import dedent
-from typing import Any, ClassVar
+from typing import ClassVar, Self
 
 import logfire
-from pydantic import Field
+from pydantic import Field, ValidationInfo, model_validator
 
-from ai_sub.jobs.base import (
-    Prompt,
-    WorkerContext,
-    format_ms_timestamp,
-    serialize_prompt_context,
-)
+from ai_sub.jobs.job_base import Prompt, TaskType, WorkerContext, build_user_prompt
 from ai_sub.jobs.subtitles import (
     BaseSubtitleAiResponse,
     BaseSubtitleJob,
     DetectedMusicalPerformance,
     Subtitles,
 )
-from ai_sub.search.base import BaseSearchProvider
+from ai_sub.jobs.summary import SummaryAiResponse
 from ai_sub.search.lrclib import LrclibSearchProvider
+from ai_sub.search.search_base import BaseSearchProvider
 
 LYRICS_PROMPT_VERSION = 10
 
@@ -82,7 +78,7 @@ async def prefetch_lyrics(
     """Pre-fetches lyrics from LRCLIB and web search providers before the first LLM turn.
 
     Args:
-        performances: List of detected musical performances.
+        performances: List of detected musical performance models.
         search_providers: Available search providers on the worker.
 
     Returns:
@@ -99,147 +95,146 @@ async def prefetch_lyrics(
         elif p.provider_name not in ("builtin", "lrclib") and web_provider is None:
             web_provider = p
 
+    seen_tracks: set[tuple[str, str]] = set()
     for perf in performances:
         if not perf.title or not perf.title.strip():
             continue
 
         clean_title = perf.title.strip()
         clean_artist = perf.artist.strip() if perf.artist else None
-        logfire.info(f"Pre-fetching lyrics for: '{clean_title}' by '{clean_artist or 'Unknown'}'")
+        track_key = (clean_title.casefold(), (clean_artist or "").casefold())
+        if track_key in seen_tracks:
+            continue
+        seen_tracks.add(track_key)
 
-        perf_found = False
-        if lrclib_provider is not None:
-            try:
-                lrclib_results = await lrclib_provider.search_lrclib_lyrics_database(
-                    track_title=clean_title,
-                    artist_name=clean_artist,
-                )
-                if lrclib_results:
-                    best = lrclib_results[0]
-                    results_parts.append(
-                        f"Official Lyrics for '{best.get('track_name')}' by {best.get('artist_name')}:\n"
-                        f"{best.get('plain_lyrics')}"
+        artist_label = clean_artist or "Unknown"
+
+        with logfire.span(
+            "Pre-fetching lyrics for: '{title}' by '{artist}'",
+            title=clean_title,
+            artist=artist_label,
+        ):
+            perf_found = False
+            if lrclib_provider is not None:
+                try:
+                    lrclib_results = await lrclib_provider.search_lrclib_lyrics_database(
+                        track_title=clean_title,
+                        artist_name=clean_artist,
                     )
-                    perf_found = True
-            except Exception as e:
-                logfire.warning(f"LRCLIB pre-fetch error for '{clean_title}': {e}")
+                    if lrclib_results:
+                        entries = [
+                            f"Official Lyrics for '{item.get('track_name')}' by {item.get('artist_name')}:\n"
+                            f"{item.get('plain_lyrics')}"
+                            for item in lrclib_results
+                        ]
+                        results_parts.append("\n---\n".join(entries))
+                        perf_found = True
+                except Exception as e:
+                    logfire.warning(f"LRCLIB pre-fetch error for '{clean_title}': {e}")
 
-        if not perf_found and web_provider is not None:
-            try:
-                query = f"{clean_title} {clean_artist or ''} lyrics 歌詞"
-                search_res = await web_provider.search_single(query.strip())
-                if search_res:
-                    snippets = "\n---\n".join(f"[{r.title}]: {r.content}" for r in search_res[:2])
-                    results_parts.append(f"Web Search Results for '{clean_title}':\n{snippets}")
-            except Exception as e:
-                logfire.debug(f"Web search pre-fetch error for '{clean_title}': {e}")
+            if not perf_found and web_provider is not None:
+                try:
+                    query_parts = [clean_title]
+                    if clean_artist:
+                        query_parts.append(clean_artist)
+                    query_parts.append("lyrics")
+                    search_res = await web_provider.search_single(" ".join(query_parts))
+                    if search_res:
+                        snippets = "\n---\n".join(f"[{r.title}]: {r.content}" for r in search_res[:2])
+                        results_parts.append(f"Web Search Results for '{clean_title}':\n{snippets}")
+                except Exception as e:
+                    logfire.debug(f"Web search pre-fetch error for '{clean_title}': {e}")
 
     return "\n\n".join(results_parts)
 
 
 def get_lyrics_prompt(
     draft_subtitles: list[Subtitles],
-    detected_performances: list[Any],
+    detected_performances: list[DetectedMusicalPerformance],
     initial_search_results: str | None = None,
     user_context: str | None = None,
-    global_summary: Any | None = None,
+    global_summary: SummaryAiResponse | None = None,
     segment_offset_ms: int = 0,
     segment_duration_ms: int = 0,
 ) -> Prompt:
     """Generates the prompt for musical subtitle refinement.
 
     Args:
-        draft_subtitles: List of initial subtitles.
-        detected_performances: List of detected musical performances.
-        initial_search_results: Optional pre-fetched lyrics and search text from Python.
-        user_context: Optional background text or directives supplied by the user.
-        global_summary: Optional global summary schema or dictionary.
-        segment_offset_ms: Absolute start time offset of this segment in milliseconds.
-        segment_duration_ms: Duration of this segment in milliseconds.
+        draft_subtitles: List of initial subtitle models.
+        detected_performances: List of detected musical performance models.
+        initial_search_results: Optional pre-fetched lyrics and search text. Defaults to None.
+        user_context: Optional background text or directives supplied by the user. Defaults to None.
+        global_summary: Optional global summary model. Defaults to None.
+        segment_offset_ms: Absolute start time offset in milliseconds. Defaults to 0.
+        segment_duration_ms: Duration of this segment in milliseconds. Defaults to 0.
 
     Returns:
         Prompt: Configured system and user prompt pair.
     """
-    parts = [
-        "<task>",
-        "  Refine the provided draft subtitles for the musical performance. Correct Japanese lyrics and polish English translations while keeping all timestamps strictly frozen.",  # noqa: E501
-        "</task>",
-    ]
-    if segment_duration_ms > 0:
-        start_tc = format_ms_timestamp(segment_offset_ms)
-        end_tc = format_ms_timestamp(segment_offset_ms + segment_duration_ms)
-        parts.extend(
-            [
-                "<segment_time_window>",
-                f"  This video segment covers {start_tc} to {end_tc} of the full video.",
-                "</segment_time_window>",
-            ]
-        )
-    if user_context and user_context.strip():
-        parts.extend(
-            [
-                "<user_provided_context>",
-                f"  {user_context.strip()}",
-                "</user_provided_context>",
-            ]
-        )
-    if global_summary:
-        summary_json = serialize_prompt_context(global_summary)
-        parts.extend(
-            [
-                "<global_video_summary>",
-                f"  {summary_json}",
-                "</global_video_summary>",
-            ]
-        )
-    if detected_performances:
-        perf_json = serialize_prompt_context(detected_performances)
-        parts.extend(
-            [
-                "<detected_musical_performances>",
-                f"  {perf_json}",
-                "</detected_musical_performances>",
-            ]
-        )
-    if initial_search_results and initial_search_results.strip():
-        parts.extend(
-            [
-                "<initial_search_results>",
-                f"  {initial_search_results.strip()}",
-                "</initial_search_results>",
-            ]
-        )
-
-    draft_json = serialize_prompt_context(draft_subtitles)
-    parts.extend(
-        [
-            "<draft_subtitles_to_refine>",
-            f"  {draft_json}",
-            "</draft_subtitles_to_refine>",
-        ]
+    user_prompt = build_user_prompt(
+        task_lines=[
+            "Refine the provided draft subtitles for the musical performance. Correct Japanese lyrics and polish English translations while keeping all timestamps strictly frozen.",  # noqa: E501
+        ],
+        user_context=user_context,
+        global_summary=global_summary,
+        segment_offset_ms=segment_offset_ms,
+        segment_duration_ms=segment_duration_ms,
+        extra_sections=[
+            ("detected_musical_performances", detected_performances),
+            ("initial_search_results", initial_search_results),
+            ("draft_subtitles_to_refine", draft_subtitles),
+        ],
     )
-
-    return Prompt(system=_LYRICS_SYSTEM_TEMPLATE, user="\n".join(parts))
+    return Prompt(system=_LYRICS_SYSTEM_TEMPLATE, user=user_prompt)
 
 
 class LyricsAiResponse(BaseSubtitleAiResponse):
-    """Structured response schema returned by the model for musical subtitle refinement."""
+    """Structured response schema returned by the model for musical subtitle refinement.
+
+    Note: Preserving draft timestamps and block count parity is intentionally guided via
+    the system prompt rather than enforced in Pydantic validators; validation ensures non-empty
+    subtitles when draft subtitles exist, and Pipeline.finalize emits an error placeholder in
+    the refined SRT while preserving draft subtitles in the raw SRT track if retries are exhausted.
+    """
 
     subtitles: list[Subtitles] = Field(
         alias="subs",
         description="Refined chronological synchronized subtitle events with frozen timestamps.",
     )
 
+    @model_validator(mode="after")
+    def validate_non_empty_subtitles(self, info: ValidationInfo) -> Self:
+        """Ensures refined lyrics are non-empty when draft subtitles were supplied.
+
+        Args:
+            info: Pydantic validation context.
+
+        Returns:
+            Self: Validated instance.
+
+        Raises:
+            ValueError: If refined subtitles are empty while draft subtitles exist.
+        """
+        context = info.context or {}
+        if context.get("require_subtitles") and not self.subtitles:
+            raise ValueError("Refined lyrics output cannot be empty when draft subtitles exist.")
+        return self
+
 
 class LyricsJob(BaseSubtitleJob):
     """Job container holding refined subtitles for a segment with musical performance."""
 
+    task_type: ClassVar[TaskType] = TaskType.LYRICS
     prompt_version_field: ClassVar[str] = "lyrics_prompt_version"
     prompt_version: ClassVar[int] = LYRICS_PROMPT_VERSION
 
     lyrics_prompt_version: int = Field(
         default=LYRICS_PROMPT_VERSION,
         description="Prompt version employed for this refinement response.",
+    )
+    model_name: str = Field(
+        default="gemini-3.5-flash-lite",
+        description="Gemini model identifier.",
     )
     draft_subtitles: list[Subtitles] = Field(
         default_factory=list,
@@ -249,10 +244,28 @@ class LyricsJob(BaseSubtitleJob):
         default_factory=list,
         description="Detected singing performances in this segment.",
     )
+    agentic_video: bool = Field(
+        default=True,
+        description="Whether to enable agentic video exploration.",
+    )
     response: LyricsAiResponse | None = Field(
         default=None,
         description="Structured AI output once refined.",
     )
+
+    @model_validator(mode="after")
+    def validate_response_non_empty(self) -> Self:
+        """Rejects saved checkpoints whose refined response is empty when draft subtitles exist.
+
+        Returns:
+            Self: Validated instance.
+
+        Raises:
+            ValueError: If saved response subtitles are empty while draft subtitles exist.
+        """
+        if self.draft_subtitles and self.response is not None and not self.response.subtitles:
+            raise ValueError("Saved lyrics response cannot be empty when draft subtitles exist.")
+        return self
 
     async def execute(self, ctx: WorkerContext) -> LyricsAiResponse:
         """Refines draft subtitles for detected singing performances using lyrics search.
@@ -267,7 +280,6 @@ class LyricsJob(BaseSubtitleJob):
             performances=self.detected_performances,
             search_providers=ctx.search_providers,
         )
-
         prompt = get_lyrics_prompt(
             draft_subtitles=self.draft_subtitles,
             detected_performances=self.detected_performances,
@@ -277,18 +289,10 @@ class LyricsJob(BaseSubtitleJob):
             segment_offset_ms=self.segment_offset_ms,
             segment_duration_ms=self.video_duration_ms,
         )
-
-        res = await ctx.executor.run_structured(
+        return await self._run_structured(
+            ctx=ctx,
             prompt=prompt,
-            media_path=ctx.media_path,
-            video_duration_ms=self.video_duration_ms,
             response_type=LyricsAiResponse,
-            model_name=ctx.executor.ai_settings.model_lyrics,
-            service_tier=ctx.executor.ai_settings.service_tier_lyrics,
             tools=ctx.search_providers,
-            agentic_video=ctx.executor.ai_settings.agentic_video_lyrics,
-            task_label="lyrics",
+            validation_context={"require_subtitles": bool(self.draft_subtitles)},
         )
-        self.response = res
-        self.total_attempts += 1
-        return res

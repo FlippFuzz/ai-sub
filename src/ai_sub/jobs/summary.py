@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 from textwrap import dedent
-from typing import ClassVar
+from typing import ClassVar, Self
 
-from pydantic import (
-    BaseModel,
-    Field,
-    PositiveInt,
-)
+from pydantic import BaseModel, Field, ValidationInfo, model_validator
 from pydantic.json_schema import SkipJsonSchema
 
-from ai_sub.jobs.base import AiJob, CleanTimestamp, Prompt, WorkerContext
+from ai_sub.jobs.job_base import (
+    AiJob,
+    CleanTimestamp,
+    Prompt,
+    TaskType,
+    WorkerContext,
+    build_user_prompt,
+    format_ms_timestamp,
+    parse_timestamp_string_ms,
+    validate_duration_bound,
+)
 
 SUMMARY_PROMPT_VERSION = 1
 
@@ -81,23 +87,16 @@ def get_summary_prompt(user_context: str | None = None) -> Prompt:
     Returns:
         Prompt: Configured system and user prompt pair.
     """
-    parts = [
-        "<task>",
-        "  Analyze the provided video using your agentic video exploration capabilities.",
-        "  Build the global summary, divide the video into natural chapters, identify participants and domain terms,",
-        "  research participant lore, species/roles, and verbal ticks using web search in parallel batches,",
-        "  and compile game mechanics and glossary terminology for accurate downstream subtitle translation.",
-        "</task>",
-    ]
-    if user_context and user_context.strip():
-        parts.extend(
-            [
-                "<user_provided_context>",
-                f"  {user_context.strip()}",
-                "</user_provided_context>",
-            ]
-        )
-    return Prompt(system=_SUMMARY_SYSTEM_TEMPLATE, user="\n".join(parts))
+    user_prompt = build_user_prompt(
+        task_lines=[
+            "Analyze the provided video using your agentic video exploration capabilities.",
+            "Build the global summary, divide the video into natural chapters, identify participants and domain terms,",
+            "research participant lore, species/roles, and verbal ticks using web search in parallel batches,",
+            "and compile game mechanics and glossary terminology for accurate downstream subtitle translation.",
+        ],
+        user_context=user_context,
+    )
+    return Prompt(system=_SUMMARY_SYSTEM_TEMPLATE, user=user_prompt)
 
 
 class ChapterItem(BaseModel):
@@ -115,6 +114,30 @@ class ChapterItem(BaseModel):
         default=None,
         description="Original artist, group, or composer in native script if known; otherwise null. Independent of song_title.",  # noqa: E501
     )
+
+    @model_validator(mode="after")
+    def validate_chapter(self) -> Self:
+        """Validates that the chapter has a non-empty title and start precedes end.
+
+        Returns:
+            Self: Validated chapter item.
+
+        Raises:
+            ValueError: If title is blank or timestamps are invalid or non-increasing.
+        """
+        if not self.title.strip():
+            raise ValueError("Chapter title must not be empty.")
+        try:
+            start_ms = parse_timestamp_string_ms(self.start)
+            end_ms = parse_timestamp_string_ms(self.end)
+        except ValueError as e:
+            raise ValueError(f"Invalid timestamp in chapter '{self.title}': {e}") from e
+        if start_ms >= end_ms:
+            raise ValueError(
+                f"Invalid timestamp in chapter '{self.title}': "
+                f"start time ({self.start}) must precede end time ({self.end})."
+            )
+        return self
 
 
 class EntityItem(BaseModel):
@@ -173,26 +196,72 @@ class SummaryAiResponse(BaseModel):
         description="Model reasoning traces per turn, preserved on disk but omitted from LLM output schemas.",
     )
 
-    @property
-    def glossary_dict(self) -> dict[str, str]:
-        """The glossary is returned as a key-value dictionary mapping term to meaning.
+    @model_validator(mode="after")
+    def validate_chapters(self, info: ValidationInfo) -> Self:
+        """Validates that chapters are chronological, non-overlapping, and within video duration bounds.
+
+        Args:
+            info: Pydantic validation context.
 
         Returns:
-            dict[str, str]: Mapping of terms to their contextual meanings.
+            Self: Validated summary response instance.
+
+        Raises:
+            ValueError: If chapters overlap, are out of order, or exceed video duration bounds.
         """
-        return {item.term: item.meaning for item in self.domain_glossary}
+        if not self.chapters:
+            return self
+
+        prev_end_ms: int | None = None
+        for i, chapter in enumerate(self.chapters):
+            start_ms = parse_timestamp_string_ms(chapter.start)
+            end_ms = parse_timestamp_string_ms(chapter.end)
+            if prev_end_ms is not None and start_ms < prev_end_ms:
+                prev = self.chapters[i - 1]
+                raise ValueError(
+                    f"Chapter {i} ('{chapter.title}' starting at {chapter.start}) overlaps or precedes "
+                    f"chapter {i - 1} ('{prev.title}' ending at {prev.end})."
+                )
+            prev_end_ms = end_ms
+
+        context = info.context or {}
+        duration_ms = context.get("video_duration_ms")
+        buffer_ms = context.get("validation_buffer_ms")
+        if duration_ms is not None and buffer_ms is not None:
+            for i, chapter in enumerate(self.chapters):
+                if parse_timestamp_string_ms(chapter.start) >= duration_ms:
+                    raise ValueError(
+                        f"Chapter {i} start time ({chapter.start}) must precede duration "
+                        f"({format_ms_timestamp(duration_ms)})."
+                    )
+            validate_duration_bound(
+                self.chapters,
+                duration_ms,
+                buffer_ms,
+                item_label="Chapter",
+            )
+
+        return self
 
 
 class SummaryJob(AiJob):
     """Job container holding global summary state for an entire video."""
 
+    task_type: ClassVar[TaskType] = TaskType.SUMMARY
     prompt_version_field: ClassVar[str] = "summary_prompt_version"
     prompt_version: ClassVar[int] = SUMMARY_PROMPT_VERSION
 
-    video_duration_ms: PositiveInt = Field(description="Total video duration in milliseconds.")
     summary_prompt_version: int = Field(
         default=SUMMARY_PROMPT_VERSION,
         description="Prompt version employed for this summary response.",
+    )
+    model_name: str = Field(
+        default="gemini-3.5-flash-lite",
+        description="Gemini model identifier.",
+    )
+    agentic_video: bool = Field(
+        default=True,
+        description="Whether to enable agentic video exploration.",
     )
     response: SummaryAiResponse | None = Field(
         default=None,
@@ -208,18 +277,9 @@ class SummaryJob(AiJob):
         Returns:
             SummaryAiResponse: Parsed AI summary response.
         """
-        prompt = get_summary_prompt(user_context=self.user_context)
-        res = await ctx.executor.run_structured(
-            prompt=prompt,
-            media_path=ctx.media_path,
-            video_duration_ms=self.video_duration_ms,
+        return await self._run_structured(
+            ctx=ctx,
+            prompt=get_summary_prompt(user_context=self.user_context),
             response_type=SummaryAiResponse,
-            model_name=ctx.executor.ai_settings.model_summary,
-            service_tier=ctx.executor.ai_settings.service_tier_summary,
             tools=ctx.search_providers,
-            agentic_video=ctx.executor.ai_settings.agentic_video_summary,
-            task_label="summary",
         )
-        self.response = res
-        self.total_attempts += 1
-        return res

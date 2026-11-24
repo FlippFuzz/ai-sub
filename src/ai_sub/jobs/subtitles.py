@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import string
-from pathlib import Path
 from textwrap import dedent
 from typing import Any, ClassVar, Self
 
@@ -12,21 +11,22 @@ from pydantic import (
     ConfigDict,
     Field,
     NonNegativeInt,
-    PositiveInt,
     ValidationInfo,
+    ValidatorFunctionWrapHandler,
+    field_validator,
     model_validator,
 )
 from pydantic.json_schema import SkipJsonSchema
 from pysubs2 import SSAEvent, SSAFile
 
-from ai_sub.jobs.base import (
+from ai_sub.jobs.job_base import (
     AiJob,
     CleanTimestamp,
     Prompt,
+    TaskType,
     WorkerContext,
-    format_ms_timestamp,
+    build_user_prompt,
     parse_timestamp_string_ms,
-    serialize_prompt_context,
     validate_duration_bound,
 )
 from ai_sub.jobs.summary import SummaryAiResponse
@@ -116,42 +116,37 @@ def get_subtitles_prompt(
     Returns:
         Prompt: Configured system and user prompt pair.
     """
-    parts = [
-        "<task>",
-        "  Generate precise, audio-synchronized subtitles and identify any musical performances for the provided video segment.",  # noqa: E501
-        "</task>",
-    ]
-    if segment_duration_ms > 0:
-        start_tc = format_ms_timestamp(segment_offset_ms)
-        end_tc = format_ms_timestamp(segment_offset_ms + segment_duration_ms)
-        parts.extend(
-            [
-                "<segment_time_window>",
-                f"  This video segment covers {start_tc} to {end_tc} of the full video.",
-                "  The <global_video_summary> references absolute full-video timestamps.",
-                "  CRITICAL: All output timestamps (start, end, s, e) MUST be local timecodes relative to this file",
-                "  starting at 00:00.000. Never use full-video absolute timestamps in your output.",
-                "</segment_time_window>",
-            ]
-        )
-    if user_context and user_context.strip():
-        parts.extend(
-            [
-                "<user_provided_context>",
-                f"  {user_context.strip()}",
-                "</user_provided_context>",
-            ]
-        )
-    if global_summary:
-        summary_json = serialize_prompt_context(global_summary)
-        parts.extend(
-            [
-                "<global_video_summary>",
-                f"  {summary_json}",
-                "</global_video_summary>",
-            ]
-        )
-    return Prompt(system=_SUBTITLES_SYSTEM_TEMPLATE, user="\n".join(parts))
+    user_prompt = build_user_prompt(
+        task_lines=[
+            "Generate precise, audio-synchronized subtitles and identify any musical performances for the provided video segment.",  # noqa: E501
+        ],
+        user_context=user_context,
+        global_summary=global_summary,
+        segment_offset_ms=segment_offset_ms,
+        segment_duration_ms=segment_duration_ms,
+        include_local_timecode_note=True,
+    )
+    return Prompt(system=_SUBTITLES_SYSTEM_TEMPLATE, user=user_prompt)
+
+
+def _validate_time_range(start: str, end: str, label: str) -> None:
+    """Validates that start and end parse as timecodes with start strictly preceding end.
+
+    Args:
+        start: Start timecode string.
+        end: End timecode string.
+        label: Item label for error messages.
+
+    Raises:
+        ValueError: If timestamp parsing fails or start is not strictly before end.
+    """
+    try:
+        start_ms = parse_timestamp_string_ms(start)
+        end_ms = parse_timestamp_string_ms(end)
+        if start_ms >= end_ms:
+            raise ValueError(f"Start time ({start}) must precede end time ({end})")
+    except ValueError as e:
+        raise ValueError(f"Invalid timestamp in {label}: {e}") from e
 
 
 class DetectedMusicalPerformance(BaseModel):
@@ -167,6 +162,16 @@ class DetectedMusicalPerformance(BaseModel):
     )
     start: CleanTimestamp = Field(description="Approximate start timecode within this segment (e.g. '00:15').")
     end: CleanTimestamp = Field(description="Approximate end timecode within this segment (e.g. '03:45').")
+
+    @model_validator(mode="after")
+    def validate_timestamps(self) -> Self:
+        """Validates that start timecode precedes end timecode.
+
+        Returns:
+            Self: Validated musical performance block.
+        """
+        _validate_time_range(self.start, self.end, "detected musical performance")
+        return self
 
 
 class Subtitles(BaseModel):
@@ -185,17 +190,8 @@ class Subtitles(BaseModel):
 
         Returns:
             Self: Validated subtitle block.
-
-        Raises:
-            ValueError: If timestamp format is invalid or start time is not strictly before end time.
         """
-        try:
-            start_ms = parse_timestamp_string_ms(self.start)
-            end_ms = parse_timestamp_string_ms(self.end)
-            if start_ms >= end_ms:
-                raise ValueError(f"Start time ({self.start}) must precede end time ({self.end})")
-        except ValueError as e:
-            raise ValueError(f"Invalid timestamp in subtitle: {e}") from e
+        _validate_time_range(self.start, self.end, "subtitle")
         return self
 
 
@@ -228,10 +224,18 @@ class BaseSubtitleAiResponse(BaseModel):
             en_text = item.english.strip()
             og_text = item.original.strip()
 
-            en_norm = en_text.casefold().translate(translator)
-            og_norm = og_text.casefold().translate(translator)
+            if not og_text and not en_text:
+                continue
 
-            text = og_text if en_norm == og_norm else f"{og_text}\n{en_text}"
+            if not og_text:
+                text = en_text
+            elif not en_text:
+                text = og_text
+            else:
+                en_norm = en_text.casefold().translate(translator)
+                og_norm = og_text.casefold().translate(translator)
+                text = og_text if en_norm == og_norm else f"{og_text}\n{en_text}"
+
             subs.append(SSAEvent(start=start, end=end, text=text))
 
         return subs
@@ -262,11 +266,32 @@ class SubtitlesAiResponse(BaseSubtitleAiResponse):
         description="Chronological list of detected vocal musical performances or songs. Empty if none.",
     )
 
+    @model_validator(mode="after")
+    def validate_performance_durations(self, info: ValidationInfo) -> Self:
+        """Validates detected musical performance bounds against segment duration if context is provided.
+
+        Args:
+            info: Pydantic validation context.
+
+        Returns:
+            Self: Validated instance.
+        """
+        context = info.context or {}
+        duration_ms = context.get("video_duration_ms")
+        buffer_ms = context.get("validation_buffer_ms")
+        if duration_ms is not None and buffer_ms is not None and self.detected_musical_performances:
+            validate_duration_bound(
+                self.detected_musical_performances,
+                duration_ms,
+                buffer_ms,
+                item_label="Musical performance",
+            )
+        return self
+
 
 class BaseSubtitleJob(AiJob):
-    """Base job container holding common subtitle state and export routines."""
+    """Base job container holding common segment subtitle state."""
 
-    video_duration_ms: PositiveInt = Field(description="Segment duration in milliseconds.")
     segment_offset_ms: NonNegativeInt = Field(
         default=0,
         description="Absolute start offset of this segment in milliseconds.",
@@ -275,24 +300,39 @@ class BaseSubtitleJob(AiJob):
         default=None,
         description="Optional global summary context from phase 1.",
     )
-    response: BaseSubtitleAiResponse | None = Field(
-        default=None,
-        description="Structured subtitle response once generated.",
-    )
 
-    def save_srt(self, srt_path: Path) -> None:
-        """Saves current subtitle response as an SRT file.
+    @field_validator("global_summary", mode="wrap")
+    @classmethod
+    def _validate_global_summary(
+        cls,
+        value: Any,
+        handler: ValidatorFunctionWrapHandler,
+        info: ValidationInfo,
+    ) -> SummaryAiResponse | None:
+        """Validates global_summary without applying segment-level video_duration_ms bounds.
 
         Args:
-            srt_path: Destination file path.
+            value: Raw global_summary input value.
+            handler: Default Pydantic field validator handler.
+            info: Outer Pydantic validation context.
+
+        Returns:
+            SummaryAiResponse | None: Validated global summary or None.
         """
-        if self.response:
-            self.response.get_ssafile().save(str(srt_path))
+        if value is None:
+            return None
+        context = info.context
+        if isinstance(context, dict) and "video_duration_ms" in context:
+            # Strip the segment's video_duration_ms so full-video chapters survive segment checkpoint loads.
+            summary_context = {k: v for k, v in context.items() if k != "video_duration_ms"} or None
+            return SummaryAiResponse.model_validate(value, context=summary_context)
+        return handler(value)
 
 
 class SubtitlesJob(BaseSubtitleJob):
     """Job container holding generated subtitle state for a video segment."""
 
+    task_type: ClassVar[TaskType] = TaskType.SUBTITLES
     prompt_version_field: ClassVar[str] = "subtitles_prompt_version"
     prompt_version: ClassVar[int] = SUBTITLES_PROMPT_VERSION
 
@@ -320,17 +360,8 @@ class SubtitlesJob(BaseSubtitleJob):
             segment_offset_ms=self.segment_offset_ms,
             segment_duration_ms=self.video_duration_ms,
         )
-        res = await ctx.executor.run_structured(
+        return await self._run_structured(
+            ctx=ctx,
             prompt=prompt,
-            media_path=ctx.media_path,
-            video_duration_ms=self.video_duration_ms,
             response_type=SubtitlesAiResponse,
-            model_name=ctx.executor.ai_settings.model_subtitles,
-            service_tier=ctx.executor.ai_settings.service_tier_subtitles,
-            tools=None,
-            agentic_video=ctx.executor.ai_settings.agentic_video_subtitles,
-            task_label="subtitles",
         )
-        self.response = res
-        self.total_attempts += 1
-        return res

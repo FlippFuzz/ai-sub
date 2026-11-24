@@ -12,7 +12,8 @@ from typing import Any
 import logfire
 from rich.console import Console
 
-from ai_sub.config import LoggingSettings, Settings
+from ai_sub.config import LoggingSettings
+from ai_sub.standalone_config import StandaloneLoggingSettings
 
 
 class RichConsoleLogfireWriter(io.TextIOBase):
@@ -64,14 +65,14 @@ def get_app_version() -> str:
 
 
 def setup_logging(
-    settings: Settings | LoggingSettings,
+    settings: LoggingSettings,
     console: Console | None = None,
     service_name: str | None = None,
 ) -> None:
     """Configures Logfire telemetry, OpenTelemetry instrumentation, and console output.
 
     Args:
-        settings: Application or logging settings.
+        settings: Logging settings configuration.
         console: Optional Rich console for synchronized terminal rendering.
         service_name: Optional custom service name (defaults to machine hostname).
     """
@@ -85,28 +86,23 @@ def setup_logging(
     os.environ.setdefault("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "SPAN_ONLY")
     os.environ.setdefault("OTEL_SEMCONV_STABILITY_OPT_IN", "gen_ai_latest_experimental")
 
-    log_cfg = settings.log if isinstance(settings, Settings) else settings
-
     output_stream: Any = None
-    if console is not None and log_cfg.progress:
+    if console is not None and isinstance(settings, StandaloneLoggingSettings) and settings.progress:
         output_stream = RichConsoleLogfireWriter(console)
 
     # 1. Main Logfire client (Handles high-level spans and user logs for the terminal console)
     logfire.configure(
         console=logfire.ConsoleOptions(
             output=output_stream,
-            min_log_level=log_cfg.level,
-            include_timestamps=log_cfg.timestamps,
+            min_log_level=settings.level,
+            include_timestamps=settings.timestamps,
         ),
         service_name=resolved_service,
         service_version=app_version,
         send_to_logfire="if-token-present",
-        scrubbing=None if log_cfg.scrub else False,
+        scrubbing=None if settings.scrub else False,
         distributed_tracing=True,
     )
-
-    # Completely suppress noisy FastAPI instrumentation
-    logfire.suppress_scopes("fastapi")
 
     # 2. Silent Logfire client for low-level SDK and HTTP tracing (Google GenAI, HTTPX)
     silent_telemetry_client = logfire.configure(
@@ -115,9 +111,12 @@ def setup_logging(
         service_name=resolved_service,
         service_version=app_version,
         send_to_logfire="if-token-present",
-        scrubbing=None if log_cfg.scrub else False,
+        scrubbing=None if settings.scrub else False,
         distributed_tracing=True,
     )
+
+    # 3. Completely suppress noisy FastAPI instrumentation that is generated even without being explicitly enabled.
+    logfire.suppress_scopes("fastapi")
 
     silent_telemetry_client.instrument_httpx(capture_all=True)
     silent_telemetry_client.instrument_google_genai()
