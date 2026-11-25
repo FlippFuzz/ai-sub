@@ -19,6 +19,7 @@ from pysubs2 import SSAEvent, SSAFile
 
 from ai_sub.config import (
     ReencodeSettings,
+    RetryPolicy,
     RetrySettings,
     SearchSettings,
     SplittingSettings,
@@ -351,6 +352,23 @@ class Pipeline(BaseModel):
     summary: SummaryState = Field(default_factory=SummaryState, description="Whole-video summary unit state.")
     segments: list[SegmentState] = Field(default_factory=list, description="Ordered per-segment state machines.")
 
+    def get_retry_settings(self, task_type: TaskType) -> RetryPolicy:
+        """Resolves the effective retry policy for a pipeline task type based on its configured model.
+
+        Args:
+            task_type: AI task type (SUMMARY, SUBTITLES, or LYRICS).
+
+        Returns:
+            RetryPolicy: Effective retry policy for the stage's model.
+        """
+        if task_type == TaskType.SUMMARY:
+            model = self.summary_config.model
+        elif task_type == TaskType.SUBTITLES:
+            model = self.subtitles_config.model
+        else:
+            model = self.lyrics_config.model
+        return self.retry_settings.resolve_for_model(model)
+
     @property
     def summary_aborted(self) -> bool:
         """Whether the summary stage permanently failed and aborted pipeline execution.
@@ -647,20 +665,20 @@ class Pipeline(BaseModel):
         self,
         job: AiJob,
         fallback_attempts: int,
+        max_runs: int,
     ) -> tuple[int, int, float | Literal["keyframes"] | None, bool]:
         """Resolves fallback tier, attempt count, target FPS, and exhaustion from an incomplete checkpoint.
 
         Args:
             job: Loaded incomplete AiJob checkpoint (response is None).
             fallback_attempts: Configured fallback tier count for this stage.
+            max_runs: Maximum non-retryable attempts per FPS tier.
 
         Returns:
             tuple[int, int, float | Literal["keyframes"] | None, bool]:
                 (fallback_tier, tier_attempts, target_fps, exhausted).
         """
-        was_exhausted = job.exhausted or (
-            job.tier_attempts >= self.retry_settings.maxruns and job.fallback_tier >= fallback_attempts
-        )
+        was_exhausted = job.exhausted or (job.tier_attempts >= max_runs and job.fallback_tier >= fallback_attempts)
         return job.fallback_tier, job.tier_attempts, job.target_fps, was_exhausted
 
     def _checkpoint_matches(
@@ -707,6 +725,9 @@ class Pipeline(BaseModel):
         """
         summary_fallbacks = self.reencode_settings.summary.fallback.attempts
         segment_fallbacks = self.reencode_settings.segment.fallback.attempts
+        summary_max_runs = self.get_retry_settings(TaskType.SUMMARY).maxruns
+        subtitles_max_runs = self.get_retry_settings(TaskType.SUBTITLES).maxruns
+        lyrics_max_runs = self.get_retry_settings(TaskType.LYRICS).maxruns
 
         if self.summary_enabled:
             summary_file = self.job_dir / f"summary.{self.summary_shortcode}.yaml"
@@ -720,7 +741,9 @@ class Pipeline(BaseModel):
                     self.summary.target_fps = loaded_summary.target_fps
                     logfire.debug(f"Loaded existing summary from {summary_file.name}")
                 else:
-                    tier, attempts, fps, exhausted = self._restore_failure_state(loaded_summary, summary_fallbacks)
+                    tier, attempts, fps, exhausted = self._restore_failure_state(
+                        loaded_summary, summary_fallbacks, summary_max_runs
+                    )
                     self.summary.fallback_tier = tier
                     self.summary.tier_attempts = attempts
                     self.summary.target_fps = fps
@@ -781,11 +804,13 @@ class Pipeline(BaseModel):
                         seg.lyrics_response = loaded_lyr.response
                         seg.lyrics_tier_attempts = loaded_lyr.tier_attempts
                     else:
-                        _, attempts, _, exhausted = self._restore_failure_state(loaded_lyr, 0)
+                        _, attempts, _, exhausted = self._restore_failure_state(loaded_lyr, 0, lyrics_max_runs)
                         seg.lyrics_tier_attempts = attempts
                         seg.lyrics_exhausted = exhausted
             else:
-                tier, attempts, fps, exhausted = self._restore_failure_state(loaded_sub, segment_fallbacks)
+                tier, attempts, fps, exhausted = self._restore_failure_state(
+                    loaded_sub, segment_fallbacks, subtitles_max_runs
+                )
                 seg.fallback_tier = tier
                 seg.target_fps = fps
                 seg.subtitles_tier_attempts = attempts
@@ -977,7 +1002,8 @@ class Pipeline(BaseModel):
             return None
 
         media_state, cfg, source_path, _, attempts, concluded = self._fallback_stage_context(task_type, seg)
-        if concluded or attempts + 1 < self.retry_settings.maxruns:
+        max_runs = self.get_retry_settings(task_type).maxruns
+        if concluded or attempts + 1 < max_runs:
             return None
         if media_state.fallback_tier != 0 or cfg.fallback.attempts <= 0 or cfg.fps != "keyframes":
             return None
@@ -1203,6 +1229,7 @@ class Pipeline(BaseModel):
         current_tier = media_state.fallback_tier
         current_target = media_state.target_fps
         existing_media = media_state.media_path
+        max_runs = self.get_retry_settings(task_type).maxruns
 
         if current_tier < cfg.fallback.attempts:
             next_fps = await _compute_next_fallback_fps(
@@ -1255,7 +1282,7 @@ class Pipeline(BaseModel):
         self._save_checkpoint(task_type, seg)
         if log_context:
             suffix = " Aborting." if is_summary else ""
-            logfire.error(f"{label} exhausted all {self.retry_settings.maxruns} run(s) across all FPS tiers.{suffix}")
+            logfire.error(f"{label} exhausted all {max_runs} run(s) across all FPS tiers.{suffix}")
         return FailureOutcome(
             action="exhausted",
             fallback_tier=current_tier,
@@ -1442,7 +1469,7 @@ class Pipeline(BaseModel):
         Raises:
             ValueError: If segment_index is missing for a segment task.
         """
-        max_runs = self.retry_settings.maxruns
+        max_runs = self.get_retry_settings(task_type).maxruns
         seg: SegmentState | None = None
         if task_type in (TaskType.SUBTITLES, TaskType.LYRICS):
             if segment_index is None:
@@ -1530,6 +1557,8 @@ class Pipeline(BaseModel):
         else:
             search_dump = {"tools": self.search_tools}
 
+        retry_exclude = None if self.retry_settings.models else {"models": True}
+
         return {
             "ai": {
                 "model_summary": self.summary_config.model if self.summary_enabled else None,
@@ -1546,7 +1575,7 @@ class Pipeline(BaseModel):
             },
             "reencode": self.reencode_settings.model_dump(mode="json"),
             "split": self.split_settings.model_dump(mode="json"),
-            "retry": self.retry_settings.model_dump(mode="json"),
+            "retry": self.retry_settings.model_dump(mode="json", exclude=retry_exclude),
             "context": self.user_context,
         }
 

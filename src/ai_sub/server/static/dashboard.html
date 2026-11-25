@@ -867,10 +867,11 @@
         const showLyrAttempts =
           !["waiting", "skipped", "disabled"].includes(seg.lyrics_status) ||
           seg.lyrics_tier_attempts > 0
+        const lyrMaxRuns = seg.lyrics_max_runs ?? seg.max_runs
         const lyrAttempt = resolveAttempt(
           ["completed", "in_progress"].includes(seg.lyrics_status),
           seg.lyrics_tier_attempts,
-          seg.max_runs,
+          lyrMaxRuns,
         )
 
         const songsHtml =
@@ -915,7 +916,7 @@
               <div>
                 <div class="section-kicker">Lyrics Stage</div>
                 <div>${esc(lyrDetail)}</div>
-                ${showLyrAttempts ? `<div class="muted" style="font-size:12px;">Attempt ${lyrAttempt}/${seg.max_runs}</div>` : ""}
+                ${showLyrAttempts ? `<div class="muted" style="font-size:12px;">Attempt ${lyrAttempt}/${lyrMaxRuns}</div>` : ""}
               </div>
               <div>
                 <div class="section-kicker">Detected Singing</div>

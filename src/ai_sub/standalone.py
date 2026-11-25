@@ -158,7 +158,7 @@ async def _run_job(
                 executor=executor,
                 media_path=pipeline.get_job_media_path(job),
                 search_providers=providers,
-                retry_settings=pipeline.retry_settings,
+                retry_settings=pipeline.get_retry_settings(job.task_type),
                 validation_buffer_ms=pipeline.validation_buffer_ms,
             )
             return job, await job.execute(ctx), None

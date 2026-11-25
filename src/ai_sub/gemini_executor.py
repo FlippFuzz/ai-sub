@@ -26,7 +26,7 @@ from httpx2 import TimeoutException, TransportError
 from pydantic import BaseModel, ValidationError
 from pyrate_limiter import Duration, Limiter, limiter_factory
 
-from ai_sub.config import AiSettings, RetrySettings, ServiceTier
+from ai_sub.config import AiSettings, RetryPolicy, ServiceTier
 from ai_sub.jobs.job_base import Prompt
 from ai_sub.search.search_base import BaseSearchProvider
 
@@ -341,7 +341,7 @@ class GeminiExecutor:
     """Unified client orchestrating Gemini Files API uploads, quota tracking, and Interactions generation."""
 
     ai_settings: AiSettings
-    default_retry_settings: RetrySettings
+    default_retry_settings: RetryPolicy
     _client: genai.Client
     _quota_exhausted: dict[str, bool]
     _request_limiters: dict[str, Limiter]
@@ -349,18 +349,18 @@ class GeminiExecutor:
     _last_cleanup_time: float
     _cleanup_lock: asyncio.Lock
 
-    def __init__(self, ai_settings: AiSettings, retry_settings: RetrySettings | None = None) -> None:
+    def __init__(self, ai_settings: AiSettings, retry_settings: RetryPolicy | None = None) -> None:
         """Initializes the Gemini executor with disabled SDK retries for custom orchestration.
 
         Args:
             ai_settings: AI engine configuration settings.
-            retry_settings: Optional default retry policy. Defaults to RetrySettings().
+            retry_settings: Optional default retry policy. Defaults to RetryPolicy().
 
         Raises:
             ValueError: If the Google Gemini API key is missing.
         """
         self.ai_settings = ai_settings
-        self.default_retry_settings = retry_settings or RetrySettings()
+        self.default_retry_settings = retry_settings or RetryPolicy()
 
         if self.ai_settings.key is None:
             raise ValueError("Google Gemini API key is missing.")
@@ -399,19 +399,21 @@ class GeminiExecutor:
         Returns:
             tuple[Limiter, Limiter]: Request rate limiter and token rate limiter.
         """
-        if model_id not in self._request_limiters:
-            self._request_limiters[model_id] = limiter_factory.create_inmemory_limiter(
-                rate_per_duration=self.ai_settings.rpm, duration=Duration.MINUTE
+        limiter_key = model_id.strip().lower()
+        if limiter_key not in self._request_limiters:
+            rpm, tpm = self.ai_settings.resolve_rate_limits(limiter_key)
+            self._request_limiters[limiter_key] = limiter_factory.create_inmemory_limiter(
+                rate_per_duration=rpm, duration=Duration.MINUTE
             )
-            self._token_limiters[model_id] = limiter_factory.create_inmemory_limiter(
-                rate_per_duration=self.ai_settings.tpm, duration=Duration.MINUTE
+            self._token_limiters[limiter_key] = limiter_factory.create_inmemory_limiter(
+                rate_per_duration=tpm, duration=Duration.MINUTE
             )
-        return self._request_limiters[model_id], self._token_limiters[model_id]
+        return self._request_limiters[limiter_key], self._token_limiters[limiter_key]
 
     async def _retry_operation(
         self,
         operation: Callable[[int, int], Awaitable[R]],
-        retry: RetrySettings,
+        retry: RetryPolicy,
         op_label: str,
         model_id: str | None = None,
     ) -> R:
@@ -507,7 +509,7 @@ class GeminiExecutor:
     async def ensure_file_uploaded(
         self,
         file_path: Path,
-        retry_settings: RetrySettings | None = None,
+        retry_settings: RetryPolicy | None = None,
     ) -> types.File:
         """Verifies remote file presence, performing upload and status polling as needed.
 
@@ -903,7 +905,7 @@ class GeminiExecutor:
         media_name: str,
         video_duration_ms: int,
         validation_buffer_ms: int,
-        retry: RetrySettings,
+        retry: RetryPolicy,
         validation_context: dict[str, Any] | None = None,
     ) -> T:
         """Executes a single end-to-end multi-turn interaction session until final model output is validated.
@@ -1037,7 +1039,7 @@ class GeminiExecutor:
         tools: Sequence[Callable[..., Any] | dict[str, Any] | BaseSearchProvider] | None = None,
         agentic_video: bool = False,
         task_label: str | None = None,
-        retry_settings: RetrySettings | None = None,
+        retry_settings: RetryPolicy | None = None,
         validation_buffer_ms: int = 2000,
         validation_context: dict[str, Any] | None = None,
     ) -> T:
@@ -1075,8 +1077,9 @@ class GeminiExecutor:
         effective_retry = retry_settings or self.default_retry_settings
         remote_file = await self.ensure_file_uploaded(media_path, retry_settings=effective_retry)
 
+        _, model_tpm = self.ai_settings.resolve_rate_limits(model_id)
         tokens = _calculate_tokens(prompt, video_duration_ms)
-        token_weight = max(1, min(tokens, self.ai_settings.tpm))
+        token_weight = max(1, min(tokens, model_tpm))
 
         media_input: dict[str, Any] = {"type": "video", "uri": remote_file.uri, "mime_type": remote_file.mime_type}
         if agentic_video:

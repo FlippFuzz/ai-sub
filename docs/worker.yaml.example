@@ -38,6 +38,10 @@ ai:
   # baseurl: "https://your-custom-gemini-proxy.com"
   rpm: 4
   tpm: 250000
+  # models:                    # Optional per-model rate limit overrides (omitted fields inherit above)
+  #   gemini-3.5-flash-lite:
+  #     rpm: 15
+  #     tpm: 1000000
 
   storage:
     max: "15GB"

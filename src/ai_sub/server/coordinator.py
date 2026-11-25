@@ -245,7 +245,8 @@ def _build_segment_info(
     pipe: Pipeline,
     seg_tasks: dict[tuple[TaskType, int], ServerTask],
     active_reencode_segments: set[int],
-    max_runs: int,
+    subtitles_max_runs: int,
+    lyrics_max_runs: int,
     max_segment_fallbacks: int,
     now: float,
 ) -> dict[str, Any]:
@@ -256,7 +257,8 @@ def _build_segment_info(
         pipe: Owning pipeline state machine.
         seg_tasks: Lookup table of segment ServerTasks keyed by (task_type, segment_index).
         active_reencode_segments: Indices of segments actively running FFmpeg compression.
-        max_runs: Configured maximum non-retryable runs per FPS tier.
+        subtitles_max_runs: Configured maximum non-retryable runs per FPS tier for subtitles.
+        lyrics_max_runs: Configured maximum non-retryable runs for lyrics refinement.
         max_segment_fallbacks: Configured maximum fallback FPS tiers for segments.
         now: Current Unix epoch timestamp.
 
@@ -310,7 +312,8 @@ def _build_segment_info(
         "lyrics_status": lyr_status,
         "lyrics_tier_attempts": seg.lyrics_tier_attempts,
         "lyrics_line_count": lyr_line_count,
-        "max_runs": max_runs,
+        "max_runs": subtitles_max_runs,
+        "lyrics_max_runs": lyrics_max_runs,
         "active_task_type": active_task.task_type.value if active_task else None,
         "active_worker_id": active_task.worker_id if active_task else None,
         "active_elapsed_s": int(now - active_task.claimed_at) if active_task and active_task.claimed_at else None,
@@ -329,7 +332,9 @@ def _build_stages_info(runner: ComboRunner, pipe: Pipeline, now: float) -> dict[
     Returns:
         dict[str, Any]: Stage progress mapping and per-segment details.
     """
-    max_runs = pipe.retry_settings.maxruns
+    summary_max_runs = pipe.get_retry_settings(TaskType.SUMMARY).maxruns
+    subtitles_max_runs = pipe.get_retry_settings(TaskType.SUBTITLES).maxruns
+    lyrics_max_runs = pipe.get_retry_settings(TaskType.LYRICS).maxruns
     max_summary_fallbacks = pipe.reencode_settings.summary.fallback.attempts
     max_segment_fallbacks = pipe.reencode_settings.segment.fallback.attempts
 
@@ -381,7 +386,8 @@ def _build_stages_info(runner: ComboRunner, pipe: Pipeline, now: float) -> dict[
             pipe=pipe,
             seg_tasks=seg_tasks,
             active_reencode_segments=runner.active_reencode_segments,
-            max_runs=max_runs,
+            subtitles_max_runs=subtitles_max_runs,
+            lyrics_max_runs=lyrics_max_runs,
             max_segment_fallbacks=max_segment_fallbacks,
             now=now,
         )
@@ -409,7 +415,7 @@ def _build_stages_info(runner: ComboRunner, pipe: Pipeline, now: float) -> dict[
             "fallback_tier": sum_state.fallback_tier,
             "max_fallback_tiers": max_summary_fallbacks,
             "tier_attempts": sum_state.tier_attempts,
-            "max_runs": max_runs,
+            "max_runs": summary_max_runs,
             "preview": summary_preview,
         },
         "reencoding": {
@@ -935,7 +941,7 @@ class ComboRunnersCoordinator:
                 return True
 
             outcome = await runner.on_task_failed(task.task_id, fallback_base_fps=fallback_base_fps)
-            max_runs = self.settings.retry.maxruns
+            max_runs = self.settings.retry.resolve_for_model(task.model).maxruns
 
             if outcome.action == "fallback_reencode":
                 fps_str = f"{outcome.target_fps:.4g}" if outcome.target_fps is not None else "unknown"

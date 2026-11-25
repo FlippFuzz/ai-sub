@@ -144,6 +144,69 @@ def merge_section_defaults(val: Any, section_defaults: dict[str, dict[str, Any]]
     return updated
 
 
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Deep-merges an override dict onto base defaults, ignoring None override entries.
+
+    Args:
+        base: Parent default dictionary.
+        override: Child override dictionary.
+
+    Returns:
+        dict[str, Any]: Combined dictionary preserving parent defaults for omitted or None keys.
+    """
+    merged = dict(base)
+    for k, v in override.items():
+        if v is None:
+            continue
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _deep_merge_dicts(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
+
+def _merge_model_overrides(val: Any, inherited_keys: tuple[str, ...]) -> Any:
+    """Normalizes per-model mapping keys and inherits parent defaults into each model entry.
+
+    Args:
+        val: Raw input dictionary before Pydantic validation.
+        inherited_keys: Parent field names propagated as defaults into each entry under 'models'.
+
+    Returns:
+        Any: Normalized dictionary with merged per-model entries, or original input.
+
+    Raises:
+        ValueError: If any model key in 'models' is blank or duplicates another after normalization.
+    """
+    if not isinstance(val, dict) or "models" not in val:
+        return val
+
+    raw_models = val["models"]
+    if raw_models is None:
+        return {**val, "models": {}}
+    if not isinstance(raw_models, dict):
+        return val
+
+    base_defaults = {k: val[k] for k in inherited_keys if k in val and val[k] is not None}
+    normalized_models: dict[str, Any] = {}
+
+    for raw_key, raw_entry in raw_models.items():
+        clean_key = str(raw_key).strip().lower()
+        if not clean_key:
+            raise ValueError("Model override key in 'models' must not be empty.")
+        if clean_key in normalized_models:
+            raise ValueError(f"Duplicate model key '{clean_key}' in 'models'.")
+
+        if raw_entry is None:
+            normalized_models[clean_key] = _deep_merge_dicts(base_defaults, {})
+        elif isinstance(raw_entry, dict):
+            normalized_models[clean_key] = _deep_merge_dicts(base_defaults, raw_entry)
+        else:
+            normalized_models[clean_key] = raw_entry
+
+    return {**val, "models": normalized_models}
+
+
 class BaseConfigModel(BaseModel):
     """Shared base model for nested configuration sections."""
 
@@ -379,8 +442,8 @@ class BackoffSettings(BaseConfigModel):
         return min(self.maxwait.total_seconds(), effective) + random.uniform(0, 1)
 
 
-class RetrySettings(BaseConfigModel):
-    """Retry parameters for retryable API failures, output validation, and cross-run limits."""
+class RetryPolicy(BaseConfigModel):
+    """Resolved retry parameters for API turns, output validation, and cross-run limits."""
 
     perturn: NonNegativeInt = Field(
         default=5,
@@ -398,6 +461,47 @@ class RetrySettings(BaseConfigModel):
         default_factory=BackoffSettings,
         description="Exponential backoff settings for API and validation retries.",
     )
+
+
+class RetrySettings(RetryPolicy):
+    """Top-level retry policy with optional per-model overrides inheriting defaults."""
+
+    models: dict[str, RetryPolicy] = Field(
+        default_factory=dict,
+        description="Optional per-model retry overrides inheriting unspecified fields from top-level defaults.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_model_retries(cls, val: Any) -> Any:
+        """Normalizes model keys and inherits top-level retry defaults into per-model policies.
+
+        Args:
+            val: Raw input dictionary before validation.
+
+        Returns:
+            Any: Normalized dictionary with per-model retry defaults merged.
+        """
+        return _merge_model_overrides(val, ("perturn", "validation", "maxruns", "backoff"))
+
+    def resolve_for_model(self, model_name: str) -> RetryPolicy:
+        """Resolves the effective retry policy for a Gemini model, falling back to top-level defaults.
+
+        Args:
+            model_name: Gemini model identifier.
+
+        Returns:
+            RetryPolicy: Resolved retry policy for the target model.
+        """
+        clean = model_name.strip().lower()
+        if clean in self.models:
+            return self.models[clean]
+        return RetryPolicy(
+            perturn=self.perturn,
+            validation=self.validation,
+            maxruns=self.maxruns,
+            backoff=self.backoff.model_copy(),
+        )
 
 
 def _default_search_tools() -> list[SearchTool]:
@@ -675,7 +779,20 @@ class StageModelsMixin(BaseConfigModel):
         )
 
 
-class AiSettings(BaseConfigModel):
+class RateLimitPolicy(BaseConfigModel):
+    """Per-minute request and token rate limit configuration."""
+
+    rpm: PositiveInt = Field(
+        default=4,
+        description="Maximum Requests Per Minute (RPM) allowed per model.",
+    )
+    tpm: PositiveInt = Field(
+        default=250000,
+        description="Maximum Tokens Per Minute (TPM) allowed per model.",
+    )
+
+
+class AiSettings(RateLimitPolicy):
     """Configuration for the Google Gemini execution engine, rate limits, storage, and search."""
 
     key: SecretStr | None = Field(
@@ -686,13 +803,9 @@ class AiSettings(BaseConfigModel):
         default=None,
         description="Optional custom base URL or proxy for Google Gemini API calls.",
     )
-    rpm: PositiveInt = Field(
-        default=4,
-        description="Maximum Requests Per Minute (RPM) allowed per model.",
-    )
-    tpm: PositiveInt = Field(
-        default=250000,
-        description="Maximum Tokens Per Minute (TPM) allowed per model.",
+    models: dict[str, RateLimitPolicy] = Field(
+        default_factory=dict,
+        description="Optional per-model RPM/TPM rate limit overrides inheriting defaults from 'ai'.",
     )
     storage: StorageSettings = Field(
         default_factory=StorageSettings,
@@ -702,6 +815,19 @@ class AiSettings(BaseConfigModel):
         default_factory=SearchSettings,
         description="Web search configuration for lyrics and metadata retrieval.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _merge_model_limits(cls, val: Any) -> Any:
+        """Normalizes model keys and inherits top-level rpm/tpm defaults into per-model rate limits.
+
+        Args:
+            val: Raw input dictionary before validation.
+
+        Returns:
+            Any: Normalized dictionary with per-model rate limit defaults merged.
+        """
+        return _merge_model_overrides(val, ("rpm", "tpm"))
 
     @model_validator(mode="after")
     def _apply_env_fallbacks(self) -> Self:
@@ -715,3 +841,18 @@ class AiSettings(BaseConfigModel):
         if self.baseurl is None and (val := _get_env_value("GEMINI_BASE_URL")):
             self.baseurl = HttpUrl(val)
         return self
+
+    def resolve_rate_limits(self, model_name: str) -> tuple[int, int]:
+        """Resolves effective (rpm, tpm) limits for a Gemini model, falling back to top-level defaults.
+
+        Args:
+            model_name: Gemini model identifier.
+
+        Returns:
+            tuple[int, int]: Effective (rpm, tpm) limits for the target model.
+        """
+        clean = model_name.strip().lower()
+        if clean in self.models:
+            entry = self.models[clean]
+            return entry.rpm, entry.tpm
+        return self.rpm, self.tpm

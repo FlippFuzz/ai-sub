@@ -28,13 +28,14 @@ All standalone settings can be configured via command-line arguments (e.g., `--a
 
 Engine settings are shared across standalone (`ai-sub`) and workers (`ai-sub-worker` under `ai:` with `AISUBWORKER_AI_*`). Validation buffer (`buffer`) and stage model configs (`summary`, `subtitles`, `lyrics`) apply to standalone mode (workers receive `coordinator.validationbuffer` from the server).
 
-| Argument                 | Environment Variable                                 | Description                                                                  | Default  |
-| :----------------------- | :--------------------------------------------------- | :--------------------------------------------------------------------------- | :------- |
-| `--ai.key <key>`         | `AISUB_AI_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Google Gemini API key.                                                       | _None_   |
-| `--ai.baseurl <url>`     | `AISUB_AI_BASEURL` / `GEMINI_BASE_URL`               | Optional custom base URL or proxy for Google Gemini API calls.               | _None_   |
-| `--ai.rpm <int>`         | `AISUB_AI_RPM`                                       | Maximum Requests Per Minute (RPM) allowed per model.                         | `4`      |
-| `--ai.tpm <int>`         | `AISUB_AI_TPM`                                       | Maximum Tokens Per Minute (TPM) allowed per model.                           | `250000` |
-| `--ai.buffer <duration>` | `AISUB_AI_BUFFER`                                    | Allowed tolerance buffer for subtitle timestamps exceeding segment duration. | `2` (2s) |
+| Argument                 | Environment Variable                                 | Description                                                                                                                                     | Default  |
+| :----------------------- | :--------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------- | :------- |
+| `--ai.key <key>`         | `AISUB_AI_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Google Gemini API key.                                                                                                                          | _None_   |
+| `--ai.baseurl <url>`     | `AISUB_AI_BASEURL` / `GEMINI_BASE_URL`               | Optional custom base URL or proxy for Google Gemini API calls.                                                                                  | _None_   |
+| `--ai.rpm <int>`         | `AISUB_AI_RPM`                                       | Maximum Requests Per Minute (RPM) allowed per model.                                                                                            | `4`      |
+| `--ai.tpm <int>`         | `AISUB_AI_TPM`                                       | Maximum Tokens Per Minute (TPM) allowed per model.                                                                                              | `250000` |
+| `--ai.models <dict>`     | `AISUB_AI_MODELS`                                    | Optional JSON map of per-model `rpm`/`tpm` overrides inheriting unspecified fields from `ai` (e.g. `'{"gemini-3.5-flash-lite": {"rpm": 15}}'`). | `{}`     |
+| `--ai.buffer <duration>` | `AISUB_AI_BUFFER`                                    | Allowed tolerance buffer for subtitle timestamps exceeding segment duration.                                                                    | `2` (2s) |
 
 ### Per-Stage Models (`--ai.{summary,subtitles,lyrics}.*`)
 
@@ -130,14 +131,15 @@ Engine settings are shared across standalone (`ai-sub`) and workers (`ai-sub-wor
 
 ## Retry Settings (`--retry.*`)
 
-| Argument                             | Environment Variable             | Description                                                                   | Default    |
-| :----------------------------------- | :------------------------------- | :---------------------------------------------------------------------------- | :--------- |
-| `--retry.perturn <int>`              | `AISUB_RETRY_PERTURN`            | Maximum retries per API turn on transient network, rate-limit, or 5xx errors. | `5`        |
-| `--retry.validation <int>`           | `AISUB_RETRY_VALIDATION`         | Maximum full-session retries per run when AI output fails schema validation.  | `3`        |
-| `--retry.maxruns <int>`              | `AISUB_RETRY_MAXRUNS`            | Maximum non-retryable failed runs per FPS tier before fallback or exhaustion. | `3`        |
-| `--retry.backoff.multiplier <float>` | `AISUB_RETRY_BACKOFF_MULTIPLIER` | Exponential backoff multiplier between retry attempts.                        | `2.0`      |
-| `--retry.backoff.minwait <duration>` | `AISUB_RETRY_BACKOFF_MINWAIT`    | Minimum backoff wait duration.                                                | `30` (30s) |
-| `--retry.backoff.maxwait <duration>` | `AISUB_RETRY_BACKOFF_MAXWAIT`    | Maximum backoff wait duration.                                                | `300` (5m) |
+| Argument                             | Environment Variable             | Description                                                                                                 | Default    |
+| :----------------------------------- | :------------------------------- | :---------------------------------------------------------------------------------------------------------- | :--------- |
+| `--retry.perturn <int>`              | `AISUB_RETRY_PERTURN`            | Maximum retries per API turn on transient network, rate-limit, or 5xx errors.                               | `5`        |
+| `--retry.validation <int>`           | `AISUB_RETRY_VALIDATION`         | Maximum full-session retries per run when AI output fails schema validation.                                | `3`        |
+| `--retry.maxruns <int>`              | `AISUB_RETRY_MAXRUNS`            | Maximum non-retryable failed runs per FPS tier before fallback or exhaustion.                               | `3`        |
+| `--retry.backoff.multiplier <float>` | `AISUB_RETRY_BACKOFF_MULTIPLIER` | Exponential backoff multiplier between retry attempts.                                                      | `2.0`      |
+| `--retry.backoff.minwait <duration>` | `AISUB_RETRY_BACKOFF_MINWAIT`    | Minimum backoff wait duration.                                                                              | `30` (30s) |
+| `--retry.backoff.maxwait <duration>` | `AISUB_RETRY_BACKOFF_MAXWAIT`    | Maximum backoff wait duration.                                                                              | `300` (5m) |
+| `--retry.models <dict>`              | `AISUB_RETRY_MODELS`             | Optional JSON map of per-model retry overrides inheriting unspecified fields from top-level retry defaults. | `{}`       |
 
 ---
 

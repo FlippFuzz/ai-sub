@@ -23,7 +23,7 @@ from pydantic import (
     ValidationError,
 )
 
-from ai_sub.config import RetrySettings, ServiceTier, atomic_write_text
+from ai_sub.config import RetryPolicy, ServiceTier, atomic_write_text
 
 if TYPE_CHECKING:
     from ai_sub.gemini_executor import GeminiExecutor
@@ -292,7 +292,7 @@ class WorkerContext:
     executor: GeminiExecutor
     media_path: Path
     search_providers: list[BaseSearchProvider] = field(default_factory=list)
-    retry_settings: RetrySettings | None = None
+    retry_settings: RetryPolicy | None = None
     validation_buffer_ms: int = 2000
 
 

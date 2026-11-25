@@ -76,7 +76,7 @@ class ServerTask(BaseModel):
             "user_context": pipeline.user_context,
             "search_tools": search_tools,
             "validation_buffer": validation_buffer,
-            "retry": retry,
+            "retry": retry.resolve_for_model(self.model),
         }
 
         if self.task_type == TaskType.SUMMARY:

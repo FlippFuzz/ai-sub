@@ -25,6 +25,13 @@ retry:
     multiplier: 2.0
     minwait: 30                # Seconds
     maxwait: 300               # Seconds
+  # models:                    # Optional per-model overrides (omitted fields inherit defaults above)
+  #   gemini-3.5-flash-lite:
+  #     perturn: 30
+  #     backoff:
+  #       multiplier: 1.5
+  #       minwait: 5
+  #       maxwait: 30
 
 # Git Repository Synchronization Settings
 git:

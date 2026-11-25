@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ai_sub.config import RetrySettings, ServiceTier
+from ai_sub.config import RetryPolicy, ServiceTier
 from ai_sub.jobs.job_base import TaskType
 from ai_sub.jobs.lyrics import LyricsJob
 from ai_sub.jobs.subtitles import DetectedMusicalPerformance, Subtitles, SubtitlesJob
@@ -74,8 +74,8 @@ class TaskClaimResponse(BaseModel):
         default=timedelta(seconds=2),
         description="Allowed subtitle timestamp overflow tolerance buffer configured by the server.",
     )
-    retry: RetrySettings = Field(
-        default_factory=RetrySettings,
+    retry: RetryPolicy = Field(
+        default_factory=RetryPolicy,
         description="Task execution retry and backoff policy configured by the server.",
     )
 
