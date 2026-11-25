@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import shutil
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -44,6 +45,8 @@ from ai_sub.video import (
     sanitize_filename,
     split_video,
 )
+
+_MD_ESCAPE_RE = re.compile(r"([\\*_`\[\]<>~])")
 
 
 @dataclass(frozen=True)
@@ -174,6 +177,113 @@ def _append_segment_events(
         )
 
 
+def _collapse_ws(text: str) -> str:
+    """Collapses internal whitespace and line breaks into single spaces.
+
+    Args:
+        text: Input string to normalize.
+
+    Returns:
+        str: Trimmed single-line text.
+    """
+    return " ".join(text.split())
+
+
+def _escape_md(text: str) -> str:
+    """Escapes inline Markdown and HTML-triggering characters for Jellyfin overview rendering.
+
+    Args:
+        text: Raw text string.
+
+    Returns:
+        str: Markdown-escaped string.
+    """
+    return _MD_ESCAPE_RE.sub(r"\\\1", text)
+
+
+def _build_nfo_plot(summary: SummaryAiResponse) -> str:
+    """Formats all global summary sections into a Markdown Jellyfin `<plot>` string.
+
+    Args:
+        summary: Phase 1 global video summary containing overview, chapters, entities, and glossary.
+
+    Returns:
+        str: Formatted plot text, or empty string if all sections are empty.
+    """
+    sections: list[str] = []
+
+    raw_summary = summary.overall_summary.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if raw_summary:
+        # Preserve paragraph breaks while escaping inline syntax and accidental ATX headings.
+        lines = [line.strip() for line in raw_summary.splitlines()]
+        normalized = re.sub(r"\n{2,}", "\n\n", "\n".join(lines))
+        clean_summary = re.sub(r"(?m)^(#{1,6})(?=\s|$)", r"\\\1", _escape_md(normalized))
+        sections.append(clean_summary)
+
+    chapter_lines: list[str] = []
+    for ch in summary.chapters:
+        ch_title = _escape_md(_collapse_ws(ch.title))
+        if not ch_title:
+            continue
+        start = _escape_md(_collapse_ws(ch.start))
+        end = _escape_md(_collapse_ws(ch.end))
+        header = f"**{start}–{end} — {ch_title}**" if (start and end) else f"**{ch_title}**"
+
+        song_title = _escape_md(_collapse_ws(ch.song_title)) if ch.song_title else ""
+        song_artist = _escape_md(_collapse_ws(ch.song_artist)) if ch.song_artist else ""
+        if song_title and song_artist:
+            song_part = f" [🎵 {song_title} — {song_artist}]"
+        elif song_title or song_artist:
+            song_part = f" [🎵 {song_title or song_artist}]"
+        else:
+            song_part = ""
+
+        desc = _escape_md(_collapse_ws(ch.description))
+        chapter_lines.append(f"- {header}{song_part}: {desc}" if desc else f"- {header}{song_part}")
+
+    if chapter_lines:
+        sections.append("\n".join([f"### Chapters ({len(chapter_lines)})", *chapter_lines]))
+
+    entity_lines: list[str] = []
+    entity_count = 0
+    for ent in summary.entities:
+        name = _escape_md(_collapse_ws(ent.name))
+        if not name:
+            continue
+        entity_count += 1
+        head = f"- **{name}**"
+        if ent.original_name and (orig := _escape_md(_collapse_ws(ent.original_name))):
+            head += f" ({orig})"
+        if ent.role_or_affiliation and (role := _escape_md(_collapse_ws(ent.role_or_affiliation))):
+            head += f" — {role}"
+        entity_lines.append(head)
+
+        for label, raw_val in (
+            ("Lore", ent.persona_lore),
+            ("Speech", ent.speech_patterns_or_ticks),
+            ("Visuals", ent.visual_cues),
+        ):
+            if raw_val and (val := _escape_md(_collapse_ws(raw_val))):
+                entity_lines.append(f"  - {label}: {val}")
+
+    if entity_count > 0:
+        sections.append("\n".join([f"### Entities ({entity_count})", *entity_lines]))
+
+    glossary_lines: list[str] = []
+    for item in summary.domain_glossary:
+        term = _escape_md(_collapse_ws(item.term))
+        meaning = _escape_md(_collapse_ws(item.meaning))
+        if term and meaning:
+            glossary_lines.append(f"- **{term}**: {meaning}")
+        elif term or meaning:
+            glossary_lines.append(f"- {term or meaning}")
+
+    if glossary_lines:
+        sections.append("\n".join([f"### Domain Glossary ({len(glossary_lines)})", *glossary_lines]))
+
+    return "\n\n".join(sections)
+
+
 def _build_nfo_xml(summary: SummaryAiResponse, title: str | None = None) -> str:
     """Builds a Jellyfin-compatible Movie NFO XML string from a global summary response.
 
@@ -190,7 +300,7 @@ def _build_nfo_xml(summary: SummaryAiResponse, title: str | None = None) -> str:
         title_el = ET.SubElement(root, "title")
         title_el.text = clean_title
 
-    if plot_text := summary.overall_summary.strip():
+    if plot_text := _build_nfo_plot(summary):
         plot_el = ET.SubElement(root, "plot")
         plot_el.text = plot_text
 
