@@ -75,13 +75,14 @@ reencode:
 
   summary:
     threshold: "500MB"         # 0 disables initial re-encoding
-    fps: "keyframes"           # "keyframes" or numeric FPS (e.g. 1.0)
+    fps: "keyframes"           # "keyframes", numeric FPS (e.g. 1.0), or 0 (audio-only)
     height: 360
     bitrate: "35KB"            # Bytes per second (35KB = 280 kbps)
     tolerance: 0.1             # Seconds
     fallback:
-      attempts: 5              # 0 disables fallback re-encoding
-      multiplier: 2.0          # Divides base FPS per fallback tier
+      enabled: true            # false disables fallback re-encoding
+      minfps: 0.005            # Below this FPS, fallback switches to 0 fps (audio-only)
+      divisor: 4.0             # Divides base FPS per fallback tier
 
   segment:
     threshold: "50MB"          # 0 disables initial re-encoding
@@ -90,8 +91,9 @@ reencode:
     bitrate: "35KB"
     tolerance: 0.1
     fallback:
-      attempts: 5
-      multiplier: 2.0
+      enabled: true
+      minfps: 0.01
+      divisor: 4.0
 
 # Segmentation / Splitting Settings
 split:

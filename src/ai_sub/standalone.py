@@ -198,9 +198,9 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
         sum_reencode = settings.reencode.summary
         seg_reencode = settings.reencode.segment
         reencode_possible = bool(
-            (use_summary and (sum_reencode.threshold > 0 or sum_reencode.fallback.attempts > 0))
-            or seg_reencode.threshold > 0
-            or seg_reencode.fallback.attempts > 0
+            (use_summary and ((sum_reencode.threshold > 0 and sum_reencode.fps != 0) or sum_reencode.fallback.enabled))
+            or (seg_reencode.threshold > 0 and seg_reencode.fps != 0)
+            or seg_reencode.fallback.enabled
         )
         if reencode_possible:
             _, _, encoder = await init_ffmpeg_engine(settings.reencode.encoder)

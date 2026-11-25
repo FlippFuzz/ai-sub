@@ -286,7 +286,7 @@ async def _get_vfr_flag() -> str:
 
 
 async def get_video_duration_ms(video_path: Path) -> int:
-    """Calculates the duration of a video file in milliseconds.
+    """Calculates the duration of a media file in milliseconds.
 
     Args:
         video_path: Path to the target media file.
@@ -313,15 +313,21 @@ async def get_video_duration_ms(video_path: Path) -> int:
         return int(float(stdout.strip()) * 1000)
     except (subprocess.CalledProcessError, ValueError) as e:
         logfire.exception(f"Could not determine duration for {video_path.name}")
-        raise RuntimeError(f"Could not determine duration for video file: {video_path.name}") from e
+        raise RuntimeError(f"Could not determine duration for media file: {video_path.name}") from e
 
 
-async def _run_ffprobe_video_entry(video_path: Path, entry: str, *extra_args: str) -> str:
-    """Queries a single video stream field via ffprobe and returns its first non-empty line.
+async def _run_ffprobe_stream_entry(
+    media_path: Path,
+    stream_selector: str,
+    entry: str,
+    *extra_args: str,
+) -> str:
+    """Queries a single stream field via ffprobe and returns its first non-empty line.
 
     Args:
-        video_path: Path to the target media file.
-        entry: FFprobe stream entry name (e.g. 'avg_frame_rate', 'nb_read_frames').
+        media_path: Path to the target media file.
+        stream_selector: FFprobe stream specifier (e.g. 'v:0' or 'a:0').
+        entry: FFprobe stream entry name (e.g. 'avg_frame_rate', 'codec_type').
         *extra_args: Optional additional ffprobe flags placed before '-select_streams'.
 
     Returns:
@@ -334,15 +340,44 @@ async def _run_ffprobe_video_entry(video_path: Path, entry: str, *extra_args: st
         "error",
         *extra_args,
         "-select_streams",
-        "v:0",
+        stream_selector,
         "-show_entries",
         f"stream={entry}",
         "-of",
         "default=noprint_wrappers=1:nokey=1",
-        str(video_path),
+        str(media_path),
     ]
     stdout = await _run_ffmpeg(cmd)
     return next((line.strip() for line in stdout.splitlines() if line.strip()), "")
+
+
+async def _has_stream(media_path: Path, stream_selector: str) -> bool:
+    """Checks whether a media file contains at least one stream matching stream_selector.
+
+    Args:
+        media_path: Path to the target media file.
+        stream_selector: FFprobe stream specifier (e.g. 'a:0' or 'v:0').
+
+    Returns:
+        bool: True if a matching stream is present, False otherwise.
+    """
+    try:
+        entry = await _run_ffprobe_stream_entry(media_path, stream_selector, "codec_type")
+        return bool(entry)
+    except Exception:
+        return False
+
+
+async def has_audio_stream(media_path: Path) -> bool:
+    """Checks whether a media file contains an audio stream.
+
+    Args:
+        media_path: Path to the target media file.
+
+    Returns:
+        bool: True if an audio stream is present, False otherwise.
+    """
+    return await _has_stream(media_path, "a:0")
 
 
 async def get_video_fps(video_path: Path, entry: str = "avg_frame_rate") -> float:
@@ -359,7 +394,7 @@ async def get_video_fps(video_path: Path, entry: str = "avg_frame_rate") -> floa
         RuntimeError: If the framerate cannot be determined.
     """
     try:
-        first_line = await _run_ffprobe_video_entry(video_path, entry)
+        first_line = await _run_ffprobe_stream_entry(video_path, "v:0", entry)
         num, den = map(int, first_line.split("/"))
         return num / den
     except (subprocess.CalledProcessError, ValueError, ZeroDivisionError) as e:
@@ -384,8 +419,9 @@ async def get_keyframe_fps(video_path: Path) -> float:
         raise RuntimeError(f"Invalid video duration ({duration_ms}ms) for {video_path.name}")
 
     try:
-        first_line = await _run_ffprobe_video_entry(
+        first_line = await _run_ffprobe_stream_entry(
             video_path,
+            "v:0",
             "nb_read_frames",
             "-skip_frame",
             "nokey",
@@ -475,11 +511,11 @@ async def is_valid_reencoded_file(
     Args:
         input_path: Source input media file path.
         output_path: Candidate re-encoded media file path.
-        fps: Target framerate in FPS or 'keyframes' for native VFR keyframes.
+        fps: Target framerate in FPS (0 for audio-only) or 'keyframes' for native VFR keyframes.
         duration_tolerance_ms: Allowed duration variance in milliseconds. Defaults to 100.
 
     Returns:
-        bool: True if output file exists, is non-empty, and matches duration and FPS criteria; False otherwise.
+        bool: True if output file exists, is non-empty, and matches duration and stream criteria; False otherwise.
     """
     if not output_path.is_file() or output_path.stat().st_size == 0:
         return False
@@ -490,6 +526,22 @@ async def is_valid_reencoded_file(
         pass
 
     try:
+        if fps == 0:
+            has_audio, has_video = await asyncio.gather(
+                _has_stream(output_path, "a:0"),
+                _has_stream(output_path, "v:0"),
+            )
+            if not has_audio or has_video:
+                return False
+            input_duration, output_duration = await asyncio.gather(
+                get_video_duration_ms(input_path),
+                get_video_duration_ms(output_path),
+            )
+            if output_duration <= 0:
+                return False
+            # Allow extra 100ms slack for AAC 1024-sample frame priming and split-boundary audio-video drift
+            return abs(output_duration - input_duration) <= duration_tolerance_ms + 100
+
         if fps == "keyframes":
             if input_path.is_file() and output_path.stat().st_size == input_path.stat().st_size:
                 return False
@@ -734,14 +786,14 @@ async def reencode_video(
     duration_tolerance_ms: int = 100,
     keyframe_only: bool = False,
 ) -> None:
-    """Compresses a video segment or full video using low framerates or keyframes and downscaled resolution.
+    """Compresses a video segment or full video using low framerates, keyframes, or audio-only extraction.
 
     Encodes atomically via a temporary file and validates output before replacing output_path.
 
     Args:
         input_path: Source video media path.
         output_path: Destination path for compressed output.
-        fps: Target framerate in FPS, or 'keyframes' to keep native keyframes without frame duplication.
+        fps: Target framerate in FPS (0 for audio-only), or 'keyframes' to keep native keyframes.
         height: Target height resolution.
         bitrate: Target video bitrate in bytes per second.
         encoder: Encoder codec to employ.
@@ -749,7 +801,7 @@ async def reencode_video(
         keyframe_only: Whether to decode only keyframes from the input video.
 
     Raises:
-        RuntimeError: If the re-encoded output fails duration or framerate validation.
+        RuntimeError: If audio-only encoding lacks an audio stream or output fails validation.
         subprocess.CalledProcessError: If FFmpeg re-encoding fails.
     """
     if await is_valid_reencoded_file(
@@ -761,53 +813,73 @@ async def reencode_video(
         logfire.info(f"Reusing existing valid compressed media: {output_path.name}")
         return
 
+    if fps == 0 and not await has_audio_stream(input_path):
+        raise RuntimeError(f"Cannot encode audio-only for {input_path.name}: no audio stream found.")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_output = output_path.with_name(f".{output_path.stem}.{uuid.uuid4().hex[:8]}.tmp{output_path.suffix}")
 
     ffmpeg_bin, _ = ensure_ffmpeg()
-    video_bits_per_sec = bitrate * 8
     audio_args = ["-c:a", "aac", "-b:a", "64k", "-ac", "1", "-ar", "16000"]
 
-    decode_keyframes = keyframe_only or fps == "keyframes"
-    input_args = ["-skip_frame", "nokey"] if decode_keyframes else []
-
-    if fps == "keyframes":
-        vf_filter = f"scale=-2:{height}"
-        video_rate_args = [await _get_vfr_flag(), "vfr"]
+    if fps == 0:
+        cmd = [
+            ffmpeg_bin,
+            "-nostdin",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-map",
+            "0:a:0",
+            *audio_args,
+            str(temp_output),
+        ]
     else:
-        vf_filter = f"scale=-2:{height},fps={fps}" if decode_keyframes else f"fps={fps},scale=-2:{height}"
-        video_rate_args = ["-g", str(max(1, int(fps * 10)))]
+        video_bits_per_sec = bitrate * 8
+        decode_keyframes = keyframe_only or fps == "keyframes"
+        input_args = ["-skip_frame", "nokey"] if decode_keyframes else []
 
-    cmd = [
-        ffmpeg_bin,
-        "-nostdin",
-        "-y",
-        "-loglevel",
-        "error",
-        "-nostats",
-        *input_args,
-        "-i",
-        str(input_path),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        "-vf",
-        vf_filter,
-        "-c:v",
-        encoder,
-        "-pix_fmt",
-        "yuv420p",
-        *video_rate_args,
-        "-b:v",
-        str(video_bits_per_sec),
-        "-maxrate",
-        str(video_bits_per_sec),
-        "-bufsize",
-        str(video_bits_per_sec * 2),
-        *audio_args,
-        str(temp_output),
-    ]
+        if fps == "keyframes":
+            vf_filter = f"scale=-2:{height}"
+            video_rate_args = [await _get_vfr_flag(), "vfr"]
+        else:
+            vf_filter = f"scale=-2:{height},fps={fps}" if decode_keyframes else f"fps={fps},scale=-2:{height}"
+            video_rate_args = ["-g", str(max(1, int(fps * 10)))]
+
+        cmd = [
+            ffmpeg_bin,
+            "-nostdin",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostats",
+            *input_args,
+            "-i",
+            str(input_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-vf",
+            vf_filter,
+            "-c:v",
+            encoder,
+            "-pix_fmt",
+            "yuv420p",
+            *video_rate_args,
+            "-b:v",
+            str(video_bits_per_sec),
+            "-maxrate",
+            str(video_bits_per_sec),
+            "-bufsize",
+            str(video_bits_per_sec * 2),
+            *audio_args,
+            str(temp_output),
+        ]
 
     try:
         await _run_ffmpeg(cmd)

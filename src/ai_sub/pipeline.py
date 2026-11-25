@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Literal, Self
 
 import logfire
-from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt, PositiveFloat, PositiveInt
+from pydantic import BaseModel, ConfigDict, Field, NonNegativeFloat, NonNegativeInt, PositiveInt
 from pysubs2 import SSAEvent, SSAFile
 
 from ai_sub.config import (
@@ -41,6 +41,7 @@ from ai_sub.video import (
     get_keyframe_fps,
     get_video_duration_ms,
     get_video_fps,
+    has_audio_stream,
     is_valid_reencoded_file,
     sanitize_filename,
     split_video,
@@ -59,6 +60,16 @@ class FailureOutcome:
     tier_attempts: int = 0
 
 
+@dataclass(frozen=True)
+class FallbackProbeSpec:
+    """Descriptor specifying which FFprobe checks should run off-lock before advancing fallback tiers."""
+
+    source_path: Path
+    keyframe_media: Path | None = None
+    probe_keyframe_fps: bool = False
+    probe_audio: bool = False
+
+
 class MediaStageState(BaseModel):
     """Shared media preparation and FPS fallback state for a summary or segment unit."""
 
@@ -66,9 +77,9 @@ class MediaStageState(BaseModel):
 
     media_ready: bool = Field(default=False, description="Whether media is ready for AI inference.")
     media_path: Path | None = Field(default=None, description="Path to active compressed or raw media.")
-    target_fps: PositiveFloat | Literal["keyframes"] | None = Field(
+    target_fps: NonNegativeFloat | Literal["keyframes"] | None = Field(
         default=None,
-        description="Target FPS or 'keyframes' for re-encoding, or None if using raw media.",
+        description="Target FPS (0 for audio-only) or 'keyframes' for re-encoding, or None if using raw media.",
     )
     fallback_tier: NonNegativeInt = Field(default=0, description="Active fallback FPS tier index.")
 
@@ -349,7 +360,7 @@ def _resolve_target_fps(
         source_path: Input media file path to evaluate against threshold.
 
     Returns:
-        float | Literal["keyframes"] | None: Target FPS or 'keyframes' if re-encoding is needed, or None for raw.
+        float | Literal["keyframes"] | None: Target FPS (0 for audio-only) or 'keyframes', or None for raw.
     """
     if fallback_tier > 0 and current_target is not None:
         return current_target
@@ -386,6 +397,28 @@ async def probe_keyframe_base_fps(
     return 1.0
 
 
+async def probe_fallback_info(spec: FallbackProbeSpec) -> tuple[float | None, bool | None]:
+    """Runs FFprobe keyframe-FPS and audio-stream checks concurrently off-lock.
+
+    Args:
+        spec: Probe descriptor produced by Pipeline.get_fallback_probe_spec().
+
+    Returns:
+        tuple[float | None, bool | None]: (probed_base_fps, has_audio) matching the requested flags.
+    """
+    if spec.probe_keyframe_fps and spec.probe_audio:
+        base_fps, has_audio = await asyncio.gather(
+            probe_keyframe_base_fps(spec.source_path, keyframe_media=spec.keyframe_media),
+            has_audio_stream(spec.source_path),
+        )
+        return base_fps, has_audio
+    if spec.probe_keyframe_fps:
+        return await probe_keyframe_base_fps(spec.source_path, keyframe_media=spec.keyframe_media), None
+    if spec.probe_audio:
+        return None, await has_audio_stream(spec.source_path)
+    return None, None
+
+
 async def _compute_next_fallback_fps(
     cfg: StageReencodeSettings,
     current_tier: int,
@@ -393,19 +426,21 @@ async def _compute_next_fallback_fps(
     existing_media: Path | None,
     source_path: Path,
     probed_base_fps: float | None = None,
-) -> float:
-    """Computes the target FPS for the next fallback re-encoding tier.
+    has_audio: bool | None = None,
+) -> float | None:
+    """Computes the target FPS for the next fallback tier, snapping below minfps to 0.0 (audio-only).
 
     Args:
-        cfg: Stage re-encoding settings containing base FPS and fallback multiplier.
+        cfg: Stage re-encoding settings containing base FPS, minfps floor, and divisor.
         current_tier: Current fallback tier index before incrementing.
         current_target: Active FPS or 'keyframes' target at the current tier.
         existing_media: Compressed media path from the current tier, if present.
         source_path: Uncompressed source video path.
         probed_base_fps: Optional pre-probed base keyframe FPS computed outside locks. Defaults to None.
+        has_audio: Optional pre-probed audio-stream presence flag computed outside locks. Defaults to None.
 
     Returns:
-        float: Target FPS for the next fallback tier.
+        float | None: Next FPS target (0.0 for audio-only), or None if no audio stream exists for 0 fps.
     """
     if probed_base_fps is not None:
         base_fps = probed_base_fps
@@ -417,7 +452,12 @@ async def _compute_next_fallback_fps(
     else:
         base_fps = float(cfg.fps)
 
-    return base_fps / float(cfg.fallback.multiplier)
+    candidate_fps = base_fps / float(cfg.fallback.divisor)
+    if candidate_fps >= cfg.fallback.minfps:
+        return candidate_fps
+
+    audio_available = has_audio if has_audio is not None else await has_audio_stream(source_path)
+    return 0.0 if audio_available else None
 
 
 class Pipeline(BaseModel):
@@ -736,6 +776,25 @@ class Pipeline(BaseModel):
         """
         return seg.raw_path.stem.removesuffix(f"_{self.media_tag}")
 
+    def _reencoded_output_path(
+        self,
+        target_fps: float | Literal["keyframes"] | None,
+        seg: SegmentState | None = None,
+    ) -> Path:
+        """Returns the compressed media file path (.m4a for audio-only 0 fps, .mp4 otherwise).
+
+        Args:
+            target_fps: Target FPS, 'keyframes', or None.
+            seg: Target segment state, or None for the summary proxy. Defaults to None.
+
+        Returns:
+            Path: Destination path for the compressed media output.
+        """
+        ext = ".m4a" if target_fps == 0 else ".mp4"
+        if seg is None:
+            return self.job_dir / f"reencoded_summary_{self.media_tag}{ext}"
+        return self.job_dir / f"reencoded_{seg.raw_path.stem}{ext}"
+
     def _fallback_stage_context(
         self,
         task_type: TaskType,
@@ -774,21 +833,22 @@ class Pipeline(BaseModel):
     def _restore_failure_state(
         self,
         job: AiJob,
-        fallback_attempts: int,
+        fallback_enabled: bool,
         max_runs: int,
     ) -> tuple[int, int, float | Literal["keyframes"] | None, bool]:
         """Resolves fallback tier, attempt count, target FPS, and exhaustion from an incomplete checkpoint.
 
         Args:
             job: Loaded incomplete AiJob checkpoint (response is None).
-            fallback_attempts: Configured fallback tier count for this stage.
+            fallback_enabled: Whether FPS fallback is enabled for this stage.
             max_runs: Maximum non-retryable attempts per FPS tier.
 
         Returns:
             tuple[int, int, float | Literal["keyframes"] | None, bool]:
                 (fallback_tier, tier_attempts, target_fps, exhausted).
         """
-        was_exhausted = job.exhausted or (job.tier_attempts >= max_runs and job.fallback_tier >= fallback_attempts)
+        at_terminal_tier = (not fallback_enabled) or (job.target_fps == 0)
+        was_exhausted = job.exhausted or (job.tier_attempts >= max_runs and at_terminal_tier)
         return job.fallback_tier, job.tier_attempts, job.target_fps, was_exhausted
 
     def _checkpoint_matches(
@@ -833,8 +893,8 @@ class Pipeline(BaseModel):
         changes between runs; invalidation is scoped to prompt versions, stage model names,
         source video identity/duration, segment boundaries, and upstream stage outputs.
         """
-        summary_fallbacks = self.reencode_settings.summary.fallback.attempts
-        segment_fallbacks = self.reencode_settings.segment.fallback.attempts
+        summary_fallback_enabled = self.reencode_settings.summary.fallback.enabled
+        segment_fallback_enabled = self.reencode_settings.segment.fallback.enabled
         summary_max_runs = self.get_retry_settings(TaskType.SUMMARY).maxruns
         subtitles_max_runs = self.get_retry_settings(TaskType.SUBTITLES).maxruns
         lyrics_max_runs = self.get_retry_settings(TaskType.LYRICS).maxruns
@@ -852,7 +912,7 @@ class Pipeline(BaseModel):
                     logfire.debug(f"Loaded existing summary from {summary_file.name}")
                 else:
                     tier, attempts, fps, exhausted = self._restore_failure_state(
-                        loaded_summary, summary_fallbacks, summary_max_runs
+                        loaded_summary, summary_fallback_enabled, summary_max_runs
                     )
                     self.summary.fallback_tier = tier
                     self.summary.tier_attempts = attempts
@@ -914,12 +974,12 @@ class Pipeline(BaseModel):
                         seg.lyrics_response = loaded_lyr.response
                         seg.lyrics_tier_attempts = loaded_lyr.tier_attempts
                     else:
-                        _, attempts, _, exhausted = self._restore_failure_state(loaded_lyr, 0, lyrics_max_runs)
+                        _, attempts, _, exhausted = self._restore_failure_state(loaded_lyr, False, lyrics_max_runs)
                         seg.lyrics_tier_attempts = attempts
                         seg.lyrics_exhausted = exhausted
             else:
                 tier, attempts, fps, exhausted = self._restore_failure_state(
-                    loaded_sub, segment_fallbacks, subtitles_max_runs
+                    loaded_sub, segment_fallback_enabled, subtitles_max_runs
                 )
                 seg.fallback_tier = tier
                 seg.target_fps = fps
@@ -993,15 +1053,24 @@ class Pipeline(BaseModel):
             state: MediaStageState,
             cfg: StageReencodeSettings,
             source_path: Path,
-            encoded_path: Path,
-            is_summary: bool = False,
+            seg: SegmentState | None = None,
         ) -> None:
+            is_summary = seg is None
             desired_fps = _resolve_target_fps(state.target_fps, state.fallback_tier, cfg, source_path)
+            if desired_fps == 0 and state.fallback_tier == 0 and not await has_audio_stream(source_path):
+                logfire.warning(
+                    f"Cannot use 0 fps (audio-only) for {source_path.name}: no audio stream found. Falling back to raw."
+                )
+                desired_fps = None
+
             state.target_fps = desired_fps
             if desired_fps is None:
                 state.media_path = await self._link_raw_summary_proxy() if is_summary else source_path
                 state.media_ready = True
-            elif await is_valid_reencoded_file(
+                return
+
+            encoded_path = self._reencoded_output_path(desired_fps, seg)
+            if await is_valid_reencoded_file(
                 input_path=source_path,
                 output_path=encoded_path,
                 fps=desired_fps,
@@ -1021,8 +1090,6 @@ class Pipeline(BaseModel):
                     self.summary,
                     self.reencode_settings.summary,
                     self.raw_video_path,
-                    self.job_dir / f"reencoded_summary_{self.media_tag}.mp4",
-                    is_summary=True,
                 )
 
         seg_cfg = self.reencode_settings.segment
@@ -1030,12 +1097,12 @@ class Pipeline(BaseModel):
 
         async def _check_segment(seg: SegmentState) -> None:
             async with probe_sem:
-                out_p = self.job_dir / f"reencoded_{seg.raw_path.stem}.mp4"
                 if self._is_segment_ai_concluded(seg):
+                    out_p = self._reencoded_output_path(seg.target_fps, seg)
                     seg.media_path = out_p if out_p.is_file() else seg.raw_path
                     seg.media_ready = True
                     return
-                await _check_stage_media(seg, seg_cfg, seg.raw_path, out_p)
+                await _check_stage_media(seg, seg_cfg, seg.raw_path, seg=seg)
 
         await asyncio.gather(*(_check_segment(seg) for seg in self.segments))
 
@@ -1090,19 +1157,19 @@ class Pipeline(BaseModel):
             return seg.media_path or seg.raw_path
         return self.raw_video_path
 
-    def get_fallback_probe_paths(
+    def get_fallback_probe_spec(
         self,
         task_type: TaskType,
         segment_index: int | None = None,
-    ) -> tuple[Path, Path | None] | None:
-        """Returns (source_path, keyframe_media) if the next failure triggers keyframe FPS probing.
+    ) -> FallbackProbeSpec | None:
+        """Builds an off-lock FFprobe spec if the next failure triggers keyframe or audio checks.
 
         Args:
             task_type: AI stage about to record a non-retryable failure.
             segment_index: Zero-based segment index for segment stages. Defaults to None.
 
         Returns:
-            tuple[Path, Path | None] | None: Paths to probe outside coordinator locks, or None.
+            FallbackProbeSpec | None: Probe specification to execute outside coordinator locks, or None.
         """
         if task_type == TaskType.SUMMARY:
             seg = None
@@ -1113,17 +1180,32 @@ class Pipeline(BaseModel):
 
         media_state, cfg, source_path, _, attempts, concluded = self._fallback_stage_context(task_type, seg)
         max_runs = self.get_retry_settings(task_type).maxruns
-        if concluded or attempts + 1 < max_runs:
-            return None
-        if media_state.fallback_tier != 0 or cfg.fallback.attempts <= 0 or cfg.fps != "keyframes":
+        if concluded or attempts + 1 < max_runs or not cfg.fallback.enabled or media_state.target_fps == 0:
             return None
 
-        keyframe_media = (
-            media_state.media_path
-            if media_state.target_fps == "keyframes" and media_state.media_path is not None
-            else None
-        )
-        return source_path, keyframe_media
+        need_kf = media_state.fallback_tier == 0 and cfg.fps == "keyframes"
+        if need_kf:
+            keyframe_media = (
+                media_state.media_path
+                if media_state.target_fps == "keyframes" and media_state.media_path is not None
+                else None
+            )
+            return FallbackProbeSpec(
+                source_path=source_path,
+                keyframe_media=keyframe_media,
+                probe_keyframe_fps=True,
+                probe_audio=True,
+            )
+
+        if media_state.fallback_tier > 0 and isinstance(media_state.target_fps, (int, float)):
+            known_base = float(media_state.target_fps)
+        else:
+            known_base = float(cfg.fps)
+
+        if (known_base / float(cfg.fallback.divisor)) < cfg.fallback.minfps:
+            return FallbackProbeSpec(source_path=source_path, probe_audio=True)
+
+        return None
 
     def _build_reencode_job(
         self,
@@ -1256,7 +1338,7 @@ class Pipeline(BaseModel):
                 self._build_reencode_job(
                     name="summary_proxy",
                     input_file=self.raw_video_path,
-                    output_file=self.job_dir / f"reencoded_summary_{self.media_tag}.mp4",
+                    output_file=self._reencoded_output_path(self.summary.target_fps),
                     media_state=self.summary,
                     cfg=self.reencode_settings.summary,
                     is_summary_proxy=True,
@@ -1271,7 +1353,7 @@ class Pipeline(BaseModel):
                     self._build_reencode_job(
                         name=f"{self._segment_yaml_stem(seg)}_reencode",
                         input_file=seg.raw_path,
-                        output_file=self.job_dir / f"reencoded_{seg.raw_path.stem}.mp4",
+                        output_file=self._reencoded_output_path(seg.target_fps, seg),
                         media_state=seg,
                         cfg=seg_cfg,
                         is_summary_proxy=False,
@@ -1322,14 +1404,16 @@ class Pipeline(BaseModel):
         seg: SegmentState | None = None,
         log_context: str | None = None,
         fallback_base_fps: float | None = None,
+        has_audio: bool | None = None,
     ) -> FailureOutcome:
-        """Advances a stage to the next fallback FPS tier or marks it exhausted, persisting to disk.
+        """Advances a stage to the next fallback FPS tier (down to 0 fps audio-only) or marks it exhausted.
 
         Args:
             task_type: Target AI stage (SUMMARY or SUBTITLES).
             seg: Target segment state when task_type is SUBTITLES. Defaults to None.
             log_context: Optional failure threshold description to log. Defaults to None.
             fallback_base_fps: Optional pre-probed base FPS for tier-0 keyframes fallback. Defaults to None.
+            has_audio: Optional pre-probed audio-stream presence flag. Defaults to None.
 
         Returns:
             FailureOutcome: Resulting state transition.
@@ -1341,7 +1425,8 @@ class Pipeline(BaseModel):
         existing_media = media_state.media_path
         max_runs = self.get_retry_settings(task_type).maxruns
 
-        if current_tier < cfg.fallback.attempts:
+        next_fps: float | None = None
+        if cfg.fallback.enabled and current_target != 0:
             next_fps = await _compute_next_fallback_fps(
                 cfg=cfg,
                 current_tier=current_tier,
@@ -1349,7 +1434,10 @@ class Pipeline(BaseModel):
                 existing_media=existing_media,
                 source_path=source_path,
                 probed_base_fps=fallback_base_fps,
+                has_audio=has_audio,
             )
+
+        if next_fps is not None:
             # Remove stale compressed output so the next fallback tier always encodes cleanly
             if (
                 existing_media is not None
@@ -1375,7 +1463,8 @@ class Pipeline(BaseModel):
 
             self._save_checkpoint(task_type, seg)
             if log_context:
-                logfire.warning(f"{label} {log_context}; falling back to {next_fps:.4g} fps (tier {next_tier}).")
+                target_desc = "0 fps (audio-only)" if next_fps == 0 else f"{next_fps:.4g} fps"
+                logfire.warning(f"{label} {log_context}; falling back to {target_desc} (tier {next_tier}).")
             return FailureOutcome(
                 action="fallback_reencode",
                 fallback_tier=next_tier,
@@ -1565,6 +1654,7 @@ class Pipeline(BaseModel):
         task_type: TaskType,
         segment_index: int | None = None,
         fallback_base_fps: float | None = None,
+        has_audio: bool | None = None,
     ) -> FailureOutcome:
         """Records a non-retryable AI failure, advancing to fallback FPS or marking exhausted.
 
@@ -1572,6 +1662,7 @@ class Pipeline(BaseModel):
             task_type: AI stage that encountered a non-retryable failure.
             segment_index: Zero-based segment index for SUBTITLES or LYRICS. Defaults to None.
             fallback_base_fps: Optional pre-probed base FPS for tier-0 keyframes fallback. Defaults to None.
+            has_audio: Optional pre-probed audio-stream presence flag. Defaults to None.
 
         Returns:
             FailureOutcome: State transition indicating whether to retry, re-encode at lower FPS, or exhaust.
@@ -1633,6 +1724,7 @@ class Pipeline(BaseModel):
                 seg=seg,
                 log_context=f"reached {max_runs} non-retryable failure(s)",
                 fallback_base_fps=fallback_base_fps,
+                has_audio=has_audio,
             )
 
         self._save_checkpoint(task_type, seg)

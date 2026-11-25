@@ -156,6 +156,7 @@ def get_lyrics_prompt(
     global_summary: SummaryAiResponse | None = None,
     segment_offset_ms: int = 0,
     segment_duration_ms: int = 0,
+    audio_only: bool = False,
 ) -> Prompt:
     """Generates the prompt for musical subtitle refinement.
 
@@ -167,6 +168,7 @@ def get_lyrics_prompt(
         global_summary: Optional global summary model. Defaults to None.
         segment_offset_ms: Absolute start time offset in milliseconds. Defaults to 0.
         segment_duration_ms: Duration of this segment in milliseconds. Defaults to 0.
+        audio_only: Whether the media input is audio-only without video frames. Defaults to False.
 
     Returns:
         Prompt: Configured system and user prompt pair.
@@ -184,6 +186,7 @@ def get_lyrics_prompt(
             ("initial_search_results", initial_search_results),
             ("draft_subtitles_to_refine", draft_subtitles),
         ],
+        audio_only=audio_only,
     )
     return Prompt(system=_LYRICS_SYSTEM_TEMPLATE, user=user_prompt)
 
@@ -288,6 +291,7 @@ class LyricsJob(BaseSubtitleJob):
             global_summary=self.global_summary,
             segment_offset_ms=self.segment_offset_ms,
             segment_duration_ms=self.video_duration_ms,
+            audio_only=self.target_fps == 0,
         )
         return await self._run_structured(
             ctx=ctx,

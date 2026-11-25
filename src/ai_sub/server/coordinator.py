@@ -15,7 +15,7 @@ from typing import Any, Literal
 import logfire
 from pydantic import ValidationError
 
-from ai_sub.pipeline import MediaStageState, Pipeline, SegmentState, probe_keyframe_base_fps
+from ai_sub.pipeline import FallbackProbeSpec, MediaStageState, Pipeline, SegmentState, probe_fallback_info
 from ai_sub.protocol import (
     TaskClaimResponse,
     TaskType,
@@ -27,7 +27,7 @@ from ai_sub.server.server_config import ServerSettings
 from ai_sub.telemetry import get_app_version
 
 _PUSH_RETRY_COOLDOWN_S = 60.0
-_ProbeContext = tuple[tuple[Path, Path | None], ServerTask, int, int | None]
+_ProbeContext = tuple[FallbackProbeSpec, ServerTask, int, int | None]
 
 
 def _escape_sql_literal(value: str) -> str:
@@ -247,7 +247,6 @@ def _build_segment_info(
     active_reencode_segments: set[int],
     subtitles_max_runs: int,
     lyrics_max_runs: int,
-    max_segment_fallbacks: int,
     now: float,
 ) -> dict[str, Any]:
     """Builds dashboard inspection and matrix telemetry for a single video segment.
@@ -259,7 +258,6 @@ def _build_segment_info(
         active_reencode_segments: Indices of segments actively running FFmpeg compression.
         subtitles_max_runs: Configured maximum non-retryable runs per FPS tier for subtitles.
         lyrics_max_runs: Configured maximum non-retryable runs for lyrics refinement.
-        max_segment_fallbacks: Configured maximum fallback FPS tiers for segments.
         now: Current Unix epoch timestamp.
 
     Returns:
@@ -304,7 +302,6 @@ def _build_segment_info(
         "is_encoding": is_encoding,
         "target_fps": seg.target_fps,
         "fallback_tier": seg.fallback_tier,
-        "max_fallback_tiers": max_segment_fallbacks,
         "subtitles_status": sub_status,
         "subtitles_tier_attempts": seg.subtitles_tier_attempts,
         "subtitles_line_count": sub_line_count,
@@ -335,8 +332,6 @@ def _build_stages_info(runner: ComboRunner, pipe: Pipeline, now: float) -> dict[
     summary_max_runs = pipe.get_retry_settings(TaskType.SUMMARY).maxruns
     subtitles_max_runs = pipe.get_retry_settings(TaskType.SUBTITLES).maxruns
     lyrics_max_runs = pipe.get_retry_settings(TaskType.LYRICS).maxruns
-    max_summary_fallbacks = pipe.reencode_settings.summary.fallback.attempts
-    max_segment_fallbacks = pipe.reencode_settings.segment.fallback.attempts
 
     summary_task: ServerTask | None = None
     seg_tasks: dict[tuple[TaskType, int], ServerTask] = {}
@@ -388,7 +383,6 @@ def _build_stages_info(runner: ComboRunner, pipe: Pipeline, now: float) -> dict[
             active_reencode_segments=runner.active_reencode_segments,
             subtitles_max_runs=subtitles_max_runs,
             lyrics_max_runs=lyrics_max_runs,
-            max_segment_fallbacks=max_segment_fallbacks,
             now=now,
         )
         for seg in pipe.segments
@@ -413,7 +407,6 @@ def _build_stages_info(runner: ComboRunner, pipe: Pipeline, now: float) -> dict[
             "logfire_query": _format_logfire_query(summary_task) if summary_task else None,
             "target_fps": sum_state.target_fps,
             "fallback_tier": sum_state.fallback_tier,
-            "max_fallback_tiers": max_summary_fallbacks,
             "tier_attempts": sum_state.tier_attempts,
             "max_runs": summary_max_runs,
             "preview": summary_preview,
@@ -884,6 +877,7 @@ class ComboRunnersCoordinator:
         error_message: str | None = None,
         is_retryable: bool = False,
         fallback_base_fps: float | None = None,
+        has_audio: bool | None = None,
     ) -> bool:
         """Processes task failure and updates lease state while lock is held.
 
@@ -894,6 +888,7 @@ class ComboRunnersCoordinator:
             error_message: Optional error details. Defaults to None.
             is_retryable: Whether failure is retryable and exempt from attempt counting. Defaults to False.
             fallback_base_fps: Optional pre-probed base FPS for tier-0 keyframes fallback. Defaults to None.
+            has_audio: Optional pre-probed audio-stream presence flag. Defaults to None.
 
         Returns:
             bool: True indicating the task failure was processed.
@@ -940,12 +935,21 @@ class ComboRunnersCoordinator:
                 fail_span.set_attribute("result", task.status.value)
                 return True
 
-            outcome = await runner.on_task_failed(task.task_id, fallback_base_fps=fallback_base_fps)
+            outcome = await runner.on_task_failed(
+                task.task_id,
+                fallback_base_fps=fallback_base_fps,
+                has_audio=has_audio,
+            )
             max_runs = self.settings.retry.resolve_for_model(task.model).maxruns
 
             if outcome.action == "fallback_reencode":
-                fps_str = f"{outcome.target_fps:.4g}" if outcome.target_fps is not None else "unknown"
-                detail = f"{detail}\n-> Falling back to {fps_str} fps (tier {outcome.fallback_tier})"
+                if outcome.target_fps == 0:
+                    fps_str = "0 fps (audio-only)"
+                elif outcome.target_fps is not None:
+                    fps_str = f"{outcome.target_fps:.4g} fps"
+                else:
+                    fps_str = "unknown fps"
+                detail = f"{detail}\n-> Falling back to {fps_str} (tier {outcome.fallback_tier})"
             elif outcome.action == "exhausted":
                 detail = f"{detail}\n-> Exhausted all {max_runs} run(s) and fallback FPS tiers."
                 logfire.error(f"Task '{task.task_id}' marked FAILED after exhausting retries and fallback tiers.")
@@ -970,25 +974,25 @@ class ComboRunnersCoordinator:
         runner: ComboRunner,
         task: ServerTask,
     ) -> _ProbeContext | None:
-        """Captures off-lock probe paths, task instance, claim generation, and stage tier while refreshing heartbeat.
+        """Captures off-lock probe spec, task instance, claim generation, and stage tier while refreshing heartbeat.
 
         Args:
             runner: Owning ComboRunner instance.
             task: Claimed ServerTask instance.
 
         Returns:
-            _ProbeContext | None: (probe_paths, task, claim_generation, current_tier) if probing is needed, else None.
+            _ProbeContext | None: (probe_spec, task, claim_generation, current_tier) if probing is needed, else None.
         """
         if runner.pipeline is None:
             return None
-        probe_paths = runner.pipeline.get_fallback_probe_paths(task.task_type, task.segment_index)
-        if probe_paths is None:
+        probe_spec = runner.pipeline.get_fallback_probe_spec(task.task_type, task.segment_index)
+        if probe_spec is None:
             return None
         stage_state = _get_stage_media_state(runner.pipeline, task)
         expected_tier = stage_state.fallback_tier if stage_state is not None else None
         # Refresh heartbeat so the lease sweeper does not reclaim the task while probing off-lock
         task.last_heartbeat = time()
-        return probe_paths, task, task.claim_generation, expected_tier
+        return probe_spec, task, task.claim_generation, expected_tier
 
     async def _fail_or_prepare_probe_locked(
         self,
@@ -999,7 +1003,7 @@ class ComboRunnersCoordinator:
         error_message: str | None,
         is_retryable: bool,
     ) -> tuple[bool, _ProbeContext | None]:
-        """Records failure immediately under lock, or prepares off-lock probe context for tier-0 keyframes.
+        """Records failure immediately under lock, or prepares off-lock probe context for fallback checks.
 
         Args:
             runner: Owning ComboRunner instance.
@@ -1035,7 +1039,7 @@ class ComboRunnersCoordinator:
         is_retryable: bool,
         probe_ctx: _ProbeContext,
     ) -> bool:
-        """Probes keyframe FPS off-lock, re-verifies lease ownership, and records task failure.
+        """Probes keyframe FPS and audio presence off-lock, re-verifies lease ownership, and records task failure.
 
         Args:
             task_id: Unique task identifier.
@@ -1044,13 +1048,13 @@ class ComboRunnersCoordinator:
             reason: Error code or exception description.
             error_message: Optional error details.
             is_retryable: Whether failure is retryable.
-            probe_ctx: Tuple of (probe_paths, expected_task, expected_generation, expected_tier).
+            probe_ctx: Tuple of (probe_spec, expected_task, expected_generation, expected_tier).
 
         Returns:
             bool: True if failure was recorded, False if the lease or tier became stale while probing.
         """
-        probe_paths, expected_task, expected_generation, expected_tier = probe_ctx
-        fallback_base_fps = await probe_keyframe_base_fps(*probe_paths)
+        probe_spec, expected_task, expected_generation, expected_tier = probe_ctx
+        fallback_base_fps, has_audio = await probe_fallback_info(probe_spec)
 
         async with self._lock:
             claimed = self._get_claimed_task(
@@ -1076,6 +1080,7 @@ class ComboRunnersCoordinator:
                 error_message=error_message,
                 is_retryable=is_retryable,
                 fallback_base_fps=fallback_base_fps,
+                has_audio=has_audio,
             )
 
     async def complete_task(
@@ -1087,7 +1092,7 @@ class ComboRunnersCoordinator:
         """Records task completion and persists the result to disk.
 
         Checkpoint persistence errors (OSError) propagate without failing or revoking the lease so
-        workers can retry submission without rerunning inference. Keyframe probing triggered by
+        workers can retry submission without rerunning inference. Fallback probing triggered by
         validation failures runs outside self._lock and revalidates claim generation and tier.
 
         Args:
@@ -1174,8 +1179,8 @@ class ComboRunnersCoordinator:
     ) -> bool:
         """Handles task failure, releasing the lease or marking permanently failed.
 
-        Any keyframe probing needed for tier-0 fallback is executed outside self._lock and
-        revalidates claim generation and tier before applying the outcome.
+        Any fallback probing needed is executed outside self._lock and revalidates claim
+        generation and tier before applying the outcome.
 
         Args:
             task_id: Unique task identifier.

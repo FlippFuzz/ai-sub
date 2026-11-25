@@ -84,6 +84,7 @@ class ServerTask(BaseModel):
                 video_duration_ms=pipeline.duration_ms,
                 agentic_video=pipeline.summary_config.agentic,
                 service_tier=pipeline.summary_config.tier,
+                target_fps=pipeline.summary.target_fps,
                 **common,
             )
 
@@ -92,6 +93,7 @@ class ServerTask(BaseModel):
         common["video_duration_ms"] = seg.duration_ms
         common["segment_offset_ms"] = seg.offset_ms
         common["global_summary"] = pipeline.summary.response
+        common["target_fps"] = seg.target_fps
 
         if self.task_type == TaskType.SUBTITLES:
             return TaskClaimResponse(

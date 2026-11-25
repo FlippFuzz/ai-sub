@@ -189,7 +189,7 @@ Inside the temporary directory (`tmp_<video_name>`), AI Sub generates standalone
 - `part_<index>.subtitles.<subtitles_lineage>.yaml`: Caches raw segment dialogue transcription, timing, and active fallback FPS tier (e.g., `part_000.subtitles.g35l-g4h.yaml`, or `part_000.subtitles.g4h.yaml` when summary is disabled).
 - `part_<index>.lyrics.<lyrics_lineage>.yaml`: Caches refined song lyrics and translations when musical performances are detected (e.g., `part_000.lyrics.g35l-g4h-g35l.yaml`).
 
-You can re-run `ai-sub` as many times as needed—completed units are skipped automatically while incomplete units are retried. State files from mismatched prompt versions (or stale upstream outputs) are automatically rejected and overwritten. After `retry.maxruns` (default `3`) non-retryable failures at a tier, the unit automatically steps down to a lower FPS fallback tier on the next run before stopping. Summary and segment fallback settings are controlled separately: `reencode.summary.fallback.attempts` and `reencode.summary.fallback.multiplier` govern the whole-video summary proxy, while `reencode.segment.fallback.attempts` and `reencode.segment.fallback.multiplier` govern individual video chunks (each tier divides FPS by the stage's `multiplier`, up to `attempts` tiers). Delete a specific `.yaml` state file to force regeneration of that unit.
+You can re-run `ai-sub` as many times as needed—completed units are skipped automatically while incomplete units are retried. State files from mismatched prompt versions (or stale upstream outputs) are automatically rejected and overwritten. After `retry.maxruns` (default `3`) non-retryable failures at a tier, the unit automatically steps down to a lower FPS fallback tier on the next run; once the next FPS drops below `minfps`, it falls back to `0` fps (`.m4a` audio-only, when an audio stream exists) as a final tier before stopping. Summary and segment fallback settings are controlled separately via `reencode.summary.fallback.{enabled,minfps,divisor}` (default `minfps: 0.005`) and `reencode.segment.fallback.{enabled,minfps,divisor}` (default `minfps: 0.01`, `divisor: 4.0`). Delete a specific `.yaml` state file to force regeneration of that unit.
 
 ---
 
@@ -206,4 +206,4 @@ For complete setup instructions (systemd services, Nginx reverse proxy, Basic Au
 
 ## Configuration
 
-For advanced settings (such as custom frame rates, fallback FPS multipliers, custom models, rate limits, per-stage agentic video toggles, and storage cleanup rules), refer to [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md:1).
+For advanced settings (such as custom frame rates, fallback FPS divisors, custom models, rate limits, per-stage agentic video toggles, and storage cleanup rules), refer to [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md:1).

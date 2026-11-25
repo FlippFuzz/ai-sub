@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, NonNegativeFloat
 
 from ai_sub.config import RetryPolicy, ServiceTier
 from ai_sub.jobs.job_base import TaskType
@@ -70,6 +70,10 @@ class TaskClaimResponse(BaseModel):
         default=None,
         description="Optional Google Gemini service tier.",
     )
+    target_fps: NonNegativeFloat | Literal["keyframes"] | None = Field(
+        default=None,
+        description="Active FPS or 'keyframes' target for this task, or None if using raw media.",
+    )
     validation_buffer: timedelta = Field(
         default=timedelta(seconds=2),
         description="Allowed subtitle timestamp overflow tolerance buffer configured by the server.",
@@ -94,6 +98,7 @@ class TaskClaimResponse(BaseModel):
             "model_name": self.model,
             "service_tier": self.service_tier,
             "agentic_video": self.agentic_video,
+            "target_fps": self.target_fps,
         }
         if self.task_type == TaskType.SUMMARY:
             return SummaryJob(name="summary", **common)

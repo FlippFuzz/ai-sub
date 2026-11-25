@@ -17,8 +17,8 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    NonNegativeFloat,
     NonNegativeInt,
-    PositiveFloat,
     PositiveInt,
     ValidationError,
 )
@@ -223,6 +223,7 @@ def build_user_prompt(
     segment_duration_ms: int = 0,
     include_local_timecode_note: bool = False,
     extra_sections: Sequence[tuple[str, Any]] = (),
+    audio_only: bool = False,
 ) -> str:
     """Assembles an XML-sectioned user prompt from common pipeline inputs.
 
@@ -235,6 +236,7 @@ def build_user_prompt(
         include_local_timecode_note: Whether to include local-timecode instructions inside the window tag.
             Defaults to False.
         extra_sections: Additional (tag, content_or_model) pairs appended after global summary. Defaults to ().
+        audio_only: Whether the media input is audio-only without video frames. Defaults to False.
 
     Returns:
         str: Formatted user prompt string.
@@ -247,6 +249,15 @@ def build_user_prompt(
         parts.append(f"</{tag}>")
 
     _append("task", *task_lines)
+
+    if audio_only:
+        _append(
+            "audio_only_mode",
+            "Only the audio track is provided (0 FPS fallback; no video frames are present).",
+            "Ignore system instructions referring to video frames, agentic video exploration, visual cues,",
+            "and unread on-screen text tags ([Sign: ...], [Title: ...], [Text: ...]).",
+            "Rely strictly on the audio stream alongside any context, summary, or search tools provided.",
+        )
 
     if segment_duration_ms > 0:
         start_tc = format_ms_timestamp(segment_offset_ms, include_hours=True)
@@ -339,9 +350,9 @@ class AiJob(BaseJob):
         default=0,
         description="Non-retryable failure attempts recorded at the current FPS tier.",
     )
-    target_fps: PositiveFloat | Literal["keyframes"] | None = Field(
+    target_fps: NonNegativeFloat | Literal["keyframes"] | None = Field(
         default=None,
-        description="Active FPS or 'keyframes' target for this job, or None if using raw media.",
+        description="Active FPS (0 for audio-only) or 'keyframes' target for this job, or None if using raw media.",
     )
     exhausted: bool = Field(
         default=False,

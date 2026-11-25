@@ -600,9 +600,9 @@
         if (fps == null) return "Raw (no reencode)"
         if (fps === "keyframes") return "Keyframes"
         const num = Number(fps)
-        return Number.isFinite(num)
-          ? `${Number(num.toFixed(4))} fps`
-          : String(fps)
+        if (!Number.isFinite(num)) return String(fps)
+        if (num === 0) return "0 fps (Audio only)"
+        return `${Number(num.toFixed(4))} fps`
       }
 
       const pct = (done, total, unit) =>
@@ -911,7 +911,7 @@
               <div>
                 <div class="section-kicker">Subtitles Stage</div>
                 <div>${esc(subDetail)}</div>
-                <div class="muted" style="font-size:12px;">Fallback: Tier ${seg.fallback_tier}/${seg.max_fallback_tiers} · Attempt ${subAttempt}/${seg.max_runs}</div>
+                <div class="muted" style="font-size:12px;">Fallback: Tier ${seg.fallback_tier} · Attempt ${subAttempt}/${seg.max_runs}</div>
               </div>
               <div>
                 <div class="section-kicker">Lyrics Stage</div>
@@ -943,7 +943,7 @@
           sum.tier_attempts,
           sum.max_runs,
         )
-        const sumFallbackMeta = `Fallback: Tier ${sum.fallback_tier}/${sum.max_fallback_tiers} · Attempt ${sumAttempt}/${sum.max_runs}`
+        const sumFallbackMeta = `Fallback: Tier ${sum.fallback_tier} · Attempt ${sumAttempt}/${sum.max_runs}`
 
         let sumText = `Waiting for worker · ${sumFps} · ${sumFallbackMeta}`
         if (!sum.enabled) sumText = "Disabled"

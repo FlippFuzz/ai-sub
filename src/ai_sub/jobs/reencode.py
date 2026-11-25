@@ -5,19 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, NonNegativeInt, PositiveFloat, PositiveInt
+from pydantic import Field, NonNegativeFloat, NonNegativeInt, PositiveInt
 
 from ai_sub.jobs.job_base import BaseJob
 from ai_sub.video import reencode_video
 
 
 class ReencodeJob(BaseJob):
-    """Represents a video segment or proxy compression task using FFmpeg."""
+    """Represents a video segment, proxy, or audio-only compression task using FFmpeg."""
 
     input_file: Path = Field(description="Source video segment or raw video path.")
     output_file: Path = Field(description="Destination path for the compressed output.")
-    fps: PositiveFloat | Literal["keyframes"] = Field(
-        description="Target framerate in FPS, or 'keyframes' for native keyframe extraction.",
+    fps: NonNegativeFloat | Literal["keyframes"] = Field(
+        description="Target framerate in FPS (0 for audio-only), or 'keyframes' for native keyframe extraction.",
     )
     height: PositiveInt = Field(description="Target resolution height in pixels.")
     bitrate: PositiveInt = Field(description="Target video bitrate in bytes per second.")
@@ -46,10 +46,10 @@ class ReencodeJob(BaseJob):
     )
 
     async def execute(self) -> Path:
-        """Executes FFmpeg re-encoding for this segment or proxy.
+        """Executes FFmpeg re-encoding for this segment, proxy, or audio-only extract.
 
         Returns:
-            Path: Path to the validated compressed video file.
+            Path: Path to the validated compressed output file.
         """
         await reencode_video(
             input_path=self.input_file,

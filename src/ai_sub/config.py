@@ -23,6 +23,7 @@ from pydantic import (
     ConfigDict,
     Field,
     HttpUrl,
+    NonNegativeFloat,
     NonNegativeInt,
     PositiveFloat,
     PositiveInt,
@@ -121,29 +122,6 @@ SearchToolList = Annotated[list[SearchTool], NoDecode, BeforeValidator(lambda va
 PathList = Annotated[list[Path], NoDecode, BeforeValidator(lambda val: _parse_list_items(val, Path))]
 
 
-def merge_section_defaults(val: Any, section_defaults: dict[str, dict[str, Any]]) -> Any:
-    """Strips None section entries and merges partial dicts with section-specific defaults.
-
-    Args:
-        val: Raw input mapping before Pydantic validation.
-        section_defaults: Mapping of field names to section-specific default dictionaries.
-
-    Returns:
-        Any: Normalized dictionary with section-specific defaults preserved, or original input.
-    """
-    if not isinstance(val, dict):
-        return val
-    updated = dict(val)
-    for field_name, defaults in section_defaults.items():
-        if field_name in updated:
-            raw_section = updated[field_name]
-            if raw_section is None:
-                updated.pop(field_name)
-            elif isinstance(raw_section, dict):
-                updated[field_name] = {**defaults, **raw_section}
-    return updated
-
-
 def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Deep-merges an override dict onto base defaults, ignoring None override entries.
 
@@ -163,6 +141,29 @@ def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[st
         else:
             merged[k] = v
     return merged
+
+
+def merge_section_defaults(val: Any, section_defaults: dict[str, dict[str, Any]]) -> Any:
+    """Strips None section entries and deep-merges partial dicts with section-specific defaults.
+
+    Args:
+        val: Raw input mapping before Pydantic validation.
+        section_defaults: Mapping of field names to section-specific default dictionaries.
+
+    Returns:
+        Any: Normalized dictionary with section-specific defaults preserved, or original input.
+    """
+    if not isinstance(val, dict):
+        return val
+    updated = dict(val)
+    for field_name, defaults in section_defaults.items():
+        if field_name in updated:
+            raw_section = updated[field_name]
+            if raw_section is None:
+                updated.pop(field_name)
+            elif isinstance(raw_section, dict):
+                updated[field_name] = _deep_merge_dicts(defaults, raw_section)
+    return updated
 
 
 def _merge_model_overrides(val: Any, inherited_keys: tuple[str, ...]) -> Any:
@@ -645,13 +646,17 @@ class SearchSettings(BaseConfigModel):
 class FallbackSettings(BaseConfigModel):
     """Fallback FPS step-down rules triggered after repeated non-retryable failures."""
 
-    attempts: NonNegativeInt = Field(
-        default=5,
-        description="Number of fallback FPS re-encoding tiers (0 disables fallback re-encoding).",
+    enabled: bool = Field(
+        default=True,
+        description="Whether fallback FPS re-encoding is enabled.",
     )
-    multiplier: Annotated[float, Gt(1.0)] = Field(
-        default=2.0,
-        description="Divisor multiplier applied per tier (base_fps / multiplier ** tier).",
+    minfps: PositiveFloat = Field(
+        default=0.01,
+        description="Minimum video FPS floor; below this FPS, fallback switches to 0 fps (audio-only).",
+    )
+    divisor: Annotated[float, Gt(1.0)] = Field(
+        default=4.0,
+        description="Divisor applied per tier (base_fps / divisor ** tier).",
     )
 
 
@@ -662,9 +667,9 @@ class StageReencodeSettings(BaseConfigModel):
         default=ByteSize(0),
         description="Minimum file size triggering initial re-encoding (0 disables initial re-encoding).",
     )
-    fps: PositiveFloat | Literal["keyframes"] = Field(
+    fps: NonNegativeFloat | Literal["keyframes"] = Field(
         default=1.0,
-        description="Target framerate in FPS, or 'keyframes' to extract native keyframes only.",
+        description="Target framerate in FPS (0 for audio-only), or 'keyframes' to extract native keyframes only.",
     )
     height: PositiveInt = Field(
         default=360,
@@ -695,6 +700,7 @@ class ReencodeSettings(BaseConfigModel):
         default_factory=lambda: StageReencodeSettings(
             threshold=ByteSize(300_000_000),
             fps="keyframes",
+            fallback=FallbackSettings(minfps=0.005),
         ),
         description="Re-encoding rules for the whole-video summary proxy.",
     )
@@ -702,6 +708,7 @@ class ReencodeSettings(BaseConfigModel):
         default_factory=lambda: StageReencodeSettings(
             threshold=ByteSize(0),
             fps=1.0,
+            fallback=FallbackSettings(minfps=0.01),
         ),
         description="Re-encoding rules for individual video chunk segments.",
     )
@@ -720,8 +727,16 @@ class ReencodeSettings(BaseConfigModel):
         return merge_section_defaults(
             val,
             {
-                "summary": {"threshold": ByteSize(300_000_000), "fps": "keyframes"},
-                "segment": {"threshold": ByteSize(0), "fps": 1.0},
+                "summary": {
+                    "threshold": ByteSize(300_000_000),
+                    "fps": "keyframes",
+                    "fallback": {"minfps": 0.005},
+                },
+                "segment": {
+                    "threshold": ByteSize(0),
+                    "fps": 1.0,
+                    "fallback": {"minfps": 0.01},
+                },
             },
         )
 

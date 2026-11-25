@@ -36,6 +36,17 @@ R = TypeVar("R")
 # Matches managed segment chunks, re-encoded outputs, and summary proxies
 MANAGED_PATTERN = re.compile(r"^(?:reencoded_)?(?:part_\d{3,}|summary)_[A-Za-z0-9_-]+\.[^./]+$")
 
+_AUDIO_MIME_TYPES: dict[str, str] = {
+    ".m4a": "audio/m4a",
+    ".aac": "audio/aac",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/opus",
+    ".flac": "audio/flac",
+    ".wav": "audio/wav",
+    ".weba": "audio/webm",
+}
+
 _RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
 # Transient/server Interactions API error codes (plus standard gRPC aliases); all other codes are non-retryable
@@ -76,6 +87,25 @@ class InteractionFailedError(Exception):
         """
         super().__init__(message)
         self.retryable = retryable
+
+
+def _resolve_media_mime_type(file_path: Path) -> str:
+    """Resolves a Gemini-compatible MIME type for local video or audio files.
+
+    Prefers explicit audio container mappings so extensions like '.m4a' map to 'audio/m4a'
+    rather than OS-dependent 'audio/mp4' entries rejected by the Interactions API.
+
+    Args:
+        file_path: Path to the local media file.
+
+    Returns:
+        str: MIME type string defaulting to 'video/mp4'.
+    """
+    suffix = file_path.suffix.lower()
+    if audio_mime := _AUDIO_MIME_TYPES.get(suffix):
+        return audio_mime
+    content_type, _ = mimetypes.guess_type(str(file_path))
+    return content_type or "video/mp4"
 
 
 def _extract_status_code(e: Exception) -> int | None:
@@ -192,17 +222,19 @@ def _get_file_timestamp(remote_file: types.File) -> float:
     return 0.0
 
 
-def _calculate_tokens(text_prompt: Prompt, video_duration_ms: int) -> int:
-    """Estimates tokens consumed by text prompts and video duration for rate limiting.
+def _calculate_tokens(text_prompt: Prompt, media_duration_ms: int, is_audio: bool = False) -> int:
+    """Estimates tokens consumed by text prompts and media duration for rate limiting.
 
     Args:
         text_prompt: Combined system and user prompt.
-        video_duration_ms: Video segment duration in milliseconds.
+        media_duration_ms: Media segment duration in milliseconds.
+        is_audio: Whether the media input is audio-only (32 tokens/s vs 300 tokens/s). Defaults to False.
 
     Returns:
         int: Estimated token count.
     """
-    return len(text_prompt.system) + len(text_prompt.user) + int((video_duration_ms / 1000) * 300)
+    tokens_per_sec = 32 if is_audio else 300
+    return len(text_prompt.system) + len(text_prompt.user) + int((media_duration_ms / 1000) * tokens_per_sec)
 
 
 def _is_daily_quota_exceeded(e: Exception) -> bool:
@@ -591,8 +623,7 @@ class GeminiExecutor:
                         except OSError:
                             pass
 
-                content_type, _ = mimetypes.guess_type(str(file_path))
-                resolved_mime = content_type or "video/mp4"
+                resolved_mime = _resolve_media_mime_type(file_path)
 
                 try:
                     with logfire.span("Uploading {filename} to Gemini Files API", filename=file_path.name):
@@ -743,7 +774,7 @@ class GeminiExecutor:
             kwargs["service_tier"] = service_tier
 
         # Acquire token budget before request slot so a long TPM wait does not hold and expire an RPM slot
-        # early before the HTTP request actually fires. Full video tokens are conservatively charged on
+        # early before the HTTP request actually fires. Full media tokens are conservatively charged on
         # every API turn (including continuations and retries) to protect daily free-tier request quotas.
         await tok_limiter.try_acquire_async("tpm", weight=token_weight)
         await req_limiter.try_acquire_async("rpm")
@@ -1047,13 +1078,13 @@ class GeminiExecutor:
 
         Args:
             prompt: Instructions containing system and user prompts.
-            media_path: Path to the local video segment.
+            media_path: Path to the local video or audio-only media file.
             video_duration_ms: Duration in milliseconds for token rate calculations.
             response_type: Expected Pydantic model response schema.
             model_name: Gemini model identifier (e.g., 'gemini-3.8-flash').
             service_tier: Optional Gemini service tier.
             tools: Sequence of callable tools, tool dicts, or BaseSearchProvider instances.
-            agentic_video: Whether to enable Agentic Video Understanding.
+            agentic_video: Whether to enable Agentic Video Understanding (ignored for audio-only media).
             task_label: Optional label for display in turn spans.
             retry_settings: Optional task-specific retry policy overriding default settings.
             validation_buffer_ms: Allowed subtitle timestamp overflow tolerance in milliseconds. Defaults to 2000.
@@ -1077,13 +1108,27 @@ class GeminiExecutor:
         effective_retry = retry_settings or self.default_retry_settings
         remote_file = await self.ensure_file_uploaded(media_path, retry_settings=effective_retry)
 
+        effective_mime = _AUDIO_MIME_TYPES.get(media_path.suffix.lower()) or remote_file.mime_type or "video/mp4"
+        is_audio = effective_mime.startswith("audio/")
+
         _, model_tpm = self.ai_settings.resolve_rate_limits(model_id)
-        tokens = _calculate_tokens(prompt, video_duration_ms)
+        tokens = _calculate_tokens(prompt, video_duration_ms, is_audio=is_audio)
         token_weight = max(1, min(tokens, model_tpm))
 
-        media_input: dict[str, Any] = {"type": "video", "uri": remote_file.uri, "mime_type": remote_file.mime_type}
-        if agentic_video:
-            media_input["processing"] = "agentic"
+        if is_audio:
+            media_input: dict[str, Any] = {
+                "type": "audio",
+                "uri": remote_file.uri,
+                "mime_type": effective_mime,
+            }
+        else:
+            media_input = {
+                "type": "video",
+                "uri": remote_file.uri,
+                "mime_type": effective_mime,
+            }
+            if agentic_video:
+                media_input["processing"] = "agentic"
 
         initial_input = [media_input, {"type": "text", "text": prompt.user}]
         gemini_tools, dispatch_map = self._setup_tools(tools)

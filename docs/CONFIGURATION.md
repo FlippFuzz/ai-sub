@@ -87,15 +87,16 @@ Engine settings are shared across standalone (`ai-sub`) and workers (`ai-sub-wor
 
 ### Stage Re-Encoding (`--reencode.summary.*` and `--reencode.segment.*`)
 
-| Argument                                         | Environment Variable                         | Description                                                                                       | Default                                 |
-| :----------------------------------------------- | :------------------------------------------- | :------------------------------------------------------------------------------------------------ | :-------------------------------------- |
-| `--reencode.<stage>.threshold <bytesize>`        | `AISUB_REENCODE_<STAGE>_THRESHOLD`           | Minimum file size triggering initial re-encoding (`0` disables initial re-encoding).              | `300MB` (summary) / `0` (segment)       |
-| `--reencode.<stage>.fps <float\|keyframes>`      | `AISUB_REENCODE_<STAGE>_FPS`                 | Target framerate in FPS, or `keyframes` to extract native keyframes without frame duplication.    | `keyframes` (summary) / `1.0` (segment) |
-| `--reencode.<stage>.height <int>`                | `AISUB_REENCODE_<STAGE>_HEIGHT`              | Target resolution height in pixels (aspect ratio is preserved).                                   | `360`                                   |
-| `--reencode.<stage>.bitrate <bytesize>`          | `AISUB_REENCODE_<STAGE>_BITRATE`             | Target video bitrate in bytes per second (e.g., `35KB` = 280 kbps; `b` denotes bytes, not bits).  | `35KB`                                  |
-| `--reencode.<stage>.tolerance <duration>`        | `AISUB_REENCODE_<STAGE>_TOLERANCE`           | Allowed duration divergence for re-encoded output.                                                | `0.1` (100ms)                           |
-| `--reencode.<stage>.fallback.attempts <int>`     | `AISUB_REENCODE_<STAGE>_FALLBACK_ATTEMPTS`   | Number of fallback FPS re-encoding tiers triggered after `retry.maxruns` failures (`0` disables). | `5`                                     |
-| `--reencode.<stage>.fallback.multiplier <float>` | `AISUB_REENCODE_<STAGE>_FALLBACK_MULTIPLIER` | Divisor applied per fallback tier (`base_fps / multiplier ** tier`, must be `> 1.0`).             | `2.0`                                   |
+| Argument                                      | Environment Variable                      | Description                                                                                                   | Default                                 |
+| :-------------------------------------------- | :---------------------------------------- | :------------------------------------------------------------------------------------------------------------ | :-------------------------------------- |
+| `--reencode.<stage>.threshold <bytesize>`     | `AISUB_REENCODE_<STAGE>_THRESHOLD`        | Minimum file size triggering initial re-encoding (`0` disables initial re-encoding).                          | `300MB` (summary) / `0` (segment)       |
+| `--reencode.<stage>.fps <float\|keyframes>`   | `AISUB_REENCODE_<STAGE>_FPS`              | Target framerate in FPS (`0` for audio-only), or `keyframes` to extract native keyframes without duplication. | `keyframes` (summary) / `1.0` (segment) |
+| `--reencode.<stage>.height <int>`             | `AISUB_REENCODE_<STAGE>_HEIGHT`           | Target resolution height in pixels (aspect ratio is preserved).                                               | `360`                                   |
+| `--reencode.<stage>.bitrate <bytesize>`       | `AISUB_REENCODE_<STAGE>_BITRATE`          | Target video bitrate in bytes per second (e.g., `35KB` = 280 kbps; `b` denotes bytes, not bits).              | `35KB`                                  |
+| `--reencode.<stage>.tolerance <duration>`     | `AISUB_REENCODE_<STAGE>_TOLERANCE`        | Allowed duration divergence for re-encoded output.                                                            | `0.1` (100ms)                           |
+| `--reencode.<stage>.fallback.enabled <bool>`  | `AISUB_REENCODE_<STAGE>_FALLBACK_ENABLED` | Whether fallback FPS re-encoding is enabled after `retry.maxruns` failures.                                   | `True`                                  |
+| `--reencode.<stage>.fallback.minfps <float>`  | `AISUB_REENCODE_<STAGE>_FALLBACK_MINFPS`  | Minimum video FPS floor; below this FPS, fallback switches to `0` fps (audio-only).                           | `0.005` (summary) / `0.01` (segment)    |
+| `--reencode.<stage>.fallback.divisor <float>` | `AISUB_REENCODE_<STAGE>_FALLBACK_DIVISOR` | Divisor applied per fallback tier (`base_fps / divisor ** tier`, must be `> 1.0`).                            | `4.0`                                   |
 
 ---
 

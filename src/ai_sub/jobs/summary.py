@@ -78,11 +78,12 @@ _SUMMARY_SYSTEM_TEMPLATE = dedent(
 ).strip()
 
 
-def get_summary_prompt(user_context: str | None = None) -> Prompt:
+def get_summary_prompt(user_context: str | None = None, audio_only: bool = False) -> Prompt:
     """Generates the prompt for Phase 1 whole-video summary and knowledge indexing.
 
     Args:
         user_context: Optional background text or directives supplied by the user.
+        audio_only: Whether the media input is audio-only without video frames. Defaults to False.
 
     Returns:
         Prompt: Configured system and user prompt pair.
@@ -95,6 +96,7 @@ def get_summary_prompt(user_context: str | None = None) -> Prompt:
             "and compile game mechanics and glossary terminology for accurate downstream subtitle translation.",
         ],
         user_context=user_context,
+        audio_only=audio_only,
     )
     return Prompt(system=_SUMMARY_SYSTEM_TEMPLATE, user=user_prompt)
 
@@ -269,7 +271,7 @@ class SummaryJob(AiJob):
     )
 
     async def execute(self, ctx: WorkerContext) -> SummaryAiResponse:
-        """Executes whole-video summary analysis using agentic or static video inspection.
+        """Executes whole-video summary analysis using agentic, static, or audio-only inspection.
 
         Args:
             ctx: Worker runtime context containing executor and search providers.
@@ -279,7 +281,7 @@ class SummaryJob(AiJob):
         """
         return await self._run_structured(
             ctx=ctx,
-            prompt=get_summary_prompt(user_context=self.user_context),
+            prompt=get_summary_prompt(user_context=self.user_context, audio_only=self.target_fps == 0),
             response_type=SummaryAiResponse,
             tools=ctx.search_providers,
         )

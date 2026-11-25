@@ -595,12 +595,14 @@ class ComboRunner:
         self,
         task_id: str,
         fallback_base_fps: float | None = None,
+        has_audio: bool | None = None,
     ) -> FailureOutcome:
         """Handles a non-retryable task failure, transitioning pipeline state or triggering FPS fallback.
 
         Args:
             task_id: Unique task identifier.
             fallback_base_fps: Optional pre-probed base FPS for tier-0 keyframes fallback. Defaults to None.
+            has_audio: Optional pre-probed audio-stream presence flag. Defaults to None.
 
         Returns:
             FailureOutcome: Resulting state transition from Pipeline.record_failure().
@@ -614,6 +616,7 @@ class ComboRunner:
             task_type=task.task_type,
             segment_index=task.segment_index,
             fallback_base_fps=fallback_base_fps,
+            has_audio=has_audio,
         )
 
         if outcome.action == "retry":
