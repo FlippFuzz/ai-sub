@@ -355,6 +355,21 @@ class LoggingSettings(BaseConfigModel):
         default=True,
         description="Whether to scrub sensitive API keys and secrets from logs.",
     )
+    token: SecretStr | None = Field(
+        default=None,
+        description="Logfire write token.",
+    )
+
+    @model_validator(mode="after")
+    def _apply_env_fallbacks(self) -> Self:
+        """Populates unprefixed Logfire write token from environment variables or .env when unset.
+
+        Returns:
+            Self: Validated instance.
+        """
+        if self.token is None and (val := _get_env_value("LOGFIRE_TOKEN")):
+            self.token = SecretStr(val)
+        return self
 
 
 class StorageSettings(BaseConfigModel):

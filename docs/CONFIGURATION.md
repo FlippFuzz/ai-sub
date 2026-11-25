@@ -145,9 +145,10 @@ Engine settings are shared across standalone (`ai-sub`) and workers (`ai-sub-wor
 
 ## Logging Settings (`--log.*`)
 
-| Argument                  | Environment Variable   | Description                                                | Default |
-| :------------------------ | :--------------------- | :--------------------------------------------------------- | :------ |
-| `--log.level <level>`     | `AISUB_LOG_LEVEL`      | Minimum log level to output.                               | `info`  |
-| `--log.timestamps <bool>` | `AISUB_LOG_TIMESTAMPS` | Whether to prefix console log lines with timestamps.       | `False` |
-| `--log.scrub <bool>`      | `AISUB_LOG_SCRUB`      | Whether to scrub sensitive API keys and secrets from logs. | `True`  |
-| `--log.progress <bool>`   | `AISUB_LOG_PROGRESS`   | Whether to display live Rich progress bars.                | `True`  |
+| Argument                  | Environment Variable                | Description                                                | Default |
+| :------------------------ | :---------------------------------- | :--------------------------------------------------------- | :------ |
+| `--log.level <level>`     | `AISUB_LOG_LEVEL`                   | Minimum log level to output.                               | `info`  |
+| `--log.timestamps <bool>` | `AISUB_LOG_TIMESTAMPS`              | Whether to prefix console log lines with timestamps.       | `False` |
+| `--log.scrub <bool>`      | `AISUB_LOG_SCRUB`                   | Whether to scrub sensitive API keys and secrets from logs. | `True`  |
+| `--log.token <token>`     | `AISUB_LOG_TOKEN` / `LOGFIRE_TOKEN` | Logfire write token.                                       | _None_  |
+| `--log.progress <bool>`   | `AISUB_LOG_PROGRESS`                | Whether to display live Rich progress bars.                | `True`  |

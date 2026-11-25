@@ -31,6 +31,7 @@ log:
   level: "info"
   timestamps: false
   scrub: true
+  # token: null                # Optional Logfire write token (or set LOGFIRE_TOKEN)
 
 # AI Execution Engine & Auxiliary Providers
 ai:

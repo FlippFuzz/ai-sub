@@ -90,8 +90,11 @@ def setup_logging(
     if console is not None and isinstance(settings, StandaloneLoggingSettings) and settings.progress:
         output_stream = RichConsoleLogfireWriter(console)
 
+    token = settings.token.get_secret_value() if settings.token is not None else None
+
     # 1. Main Logfire client (Handles high-level spans and user logs for the terminal console)
     logfire.configure(
+        token=token,
         console=logfire.ConsoleOptions(
             output=output_stream,
             min_log_level=settings.level,
@@ -107,6 +110,7 @@ def setup_logging(
     # 2. Silent Logfire client for low-level SDK and HTTP tracing (Google GenAI, HTTPX)
     silent_telemetry_client = logfire.configure(
         local=True,
+        token=token,
         console=False,
         service_name=resolved_service,
         service_version=app_version,
