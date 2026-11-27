@@ -664,54 +664,29 @@
 
       function formatFpsAndSpf(fps) {
         const num = Number(fps)
-        const fpsStr = formatFpsRate(num)
-        const spfStr = formatNumber(1 / num, 2)
-        return `${fpsStr} fps, ${spfStr}s/frame`
+        return `${formatFpsRate(num)} fps, ${formatNumber(1 / num, 2)}s/frame`
       }
 
-      function formatEncoding(encoding, fps) {
-        const hasFps = fps != null && Number.isFinite(Number(fps))
-        const fpsNum = hasFps ? Number(fps) : null
+      function formatEncoding(
+        encoding,
+        fps,
+        rawEmpty = "Raw (no reencode)",
+        unknownLabel = "Re-encoded",
+      ) {
+        const fpsNum =
+          fps != null && Number.isFinite(Number(fps)) ? Number(fps) : null
+        const positive = fpsNum != null && fpsNum > 0
 
         if (encoding === "raw") {
-          return fpsNum != null && fpsNum > 0
-            ? `Raw (${formatFpsRate(fpsNum)} fps)`
-            : "Raw (no reencode)"
+          return positive ? `Raw (${formatFpsRate(fpsNum)} fps)` : rawEmpty
         }
         if (encoding === "keyframes") {
-          return fpsNum != null && fpsNum > 0
+          return positive
             ? `Keyframes (${formatFpsAndSpf(fpsNum)})`
             : "Keyframes"
         }
-        if (encoding === "audio" || fpsNum === 0) {
-          return "0 fps, audio-only"
-        }
-        if (fpsNum != null && fpsNum > 0) {
-          return formatFpsAndSpf(fpsNum)
-        }
-        return "Re-encoded"
-      }
-
-      function formatTierPillLabel(tier) {
-        const hasFps = tier.fps != null && Number.isFinite(Number(tier.fps))
-        const fpsNum = hasFps ? Number(tier.fps) : null
-        if (tier.encoding === "raw") {
-          return fpsNum != null && fpsNum > 0
-            ? `Raw (${formatFpsRate(fpsNum)} fps)`
-            : "Raw"
-        }
-        if (tier.encoding === "keyframes") {
-          return fpsNum != null && fpsNum > 0
-            ? `Keyframes (${formatFpsAndSpf(fpsNum)})`
-            : "Keyframes"
-        }
-        if (tier.encoding === "audio" || fpsNum === 0) {
-          return "0 fps, audio-only"
-        }
-        if (fpsNum != null && fpsNum > 0) {
-          return formatFpsAndSpf(fpsNum)
-        }
-        return `Fallback ${tier.tier}`
+        if (encoding === "audio" || fpsNum === 0) return "0 fps, audio-only"
+        return positive ? formatFpsAndSpf(fpsNum) : unknownLabel
       }
 
       function renderTierLadder(tiers) {
@@ -719,7 +694,12 @@
         const items = tiers
           .map((t) => {
             const cls = `tier-pill tier-pill-${esc(t.status)}`
-            const label = formatTierPillLabel(t)
+            const label = formatEncoding(
+              t.encoding,
+              t.fps,
+              "Raw",
+              `Fallback ${t.tier}`,
+            )
             const tip = `Tier ${t.tier} (${titleCase(t.status)})`
             return `<span class="${cls} mono" title="${esc(tip)}">${esc(label)}</span>`
           })

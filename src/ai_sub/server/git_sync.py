@@ -1,4 +1,4 @@
-"""Git repository synchronization, directory layout, and channel README indexing for ai-sub-server."""
+"""Git repository synchronization and archive directory layout for ai-sub-server."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -21,11 +20,11 @@ from git import Repo
 from git.exc import GitCommandError, InvalidGitRepositoryError, NoSuchPathError
 
 from ai_sub.config import atomic_write_text
+from ai_sub.server.readme import update_channel_readme
 from ai_sub.server.server_config import GitConfig
 from ai_sub.shortcode import parse_subtitle_track, subtitle_track_sort_key
 
 os.environ["GIT_TERMINAL_PROMPT"] = "0"
-JST = timezone(timedelta(hours=9))
 _MAX_REBASE_STEPS = 50
 _URL_CREDS_RE = re.compile(r"(https?://)[^/?#\s]+@", re.IGNORECASE)
 
@@ -208,34 +207,18 @@ class GitSyncManager:
         except Exception:
             return False
 
-    def _remote_branch_exists(self, repo: Repo, branch: str) -> bool:
-        """Checks whether origin/<branch> exists in the local remote-tracking refs.
+    def _ref_exists(self, repo: Repo, ref: str) -> bool:
+        """Checks whether a Git ref resolves locally.
 
         Args:
             repo: Active GitPython Repo instance.
-            branch: Branch name to verify.
+            ref: Full Git ref path to verify (e.g. 'refs/remotes/origin/main').
 
         Returns:
-            bool: True if refs/remotes/origin/<branch> exists; False otherwise.
+            bool: True if the ref exists; False otherwise.
         """
         try:
-            repo.git.rev_parse("--verify", f"refs/remotes/origin/{branch}")
-            return True
-        except GitCommandError:
-            return False
-
-    def _local_branch_exists(self, repo: Repo, branch: str) -> bool:
-        """Checks whether refs/heads/<branch> already exists locally.
-
-        Args:
-            repo: Active GitPython Repo instance.
-            branch: Branch name to verify.
-
-        Returns:
-            bool: True if the local branch exists; False otherwise.
-        """
-        try:
-            repo.git.rev_parse("--verify", f"refs/heads/{branch}")
+            repo.git.rev_parse("--verify", ref)
             return True
         except GitCommandError:
             return False
@@ -257,7 +240,7 @@ class GitSyncManager:
         except TypeError:
             current = ""
         if current != branch:
-            if self._local_branch_exists(repo, branch):
+            if self._ref_exists(repo, f"refs/heads/{branch}"):
                 repo.git.checkout(branch)
             else:
                 repo.git.checkout("-b", branch)
@@ -292,25 +275,23 @@ class GitSyncManager:
                 repo.git.reset("--hard", "HEAD")
             repo.git.clean("-fd")
 
-    def _has_unpushed_commits(self, repo: Repo, branch: str) -> tuple[bool, int]:
-        """Checks whether local HEAD contains commits not yet present on origin/<branch>.
+    def _unpushed_commit_count(self, repo: Repo, branch: str) -> int:
+        """Counts local HEAD commits not yet present on origin/<branch>.
 
         Args:
             repo: Active GitPython Repo instance.
             branch: Target remote branch name.
 
         Returns:
-            tuple[bool, int]: (has_unpushed_commits, count).
+            int: Number of unpushed commits on HEAD.
         """
         if not self._has_head(repo):
-            return False, 0
-        if not self._remote_branch_exists(repo, branch):
+            return 0
+        if not self._ref_exists(repo, f"refs/remotes/origin/{branch}"):
             count_str = repo.git.rev_list("HEAD", count=True).strip()
-            count = int(count_str) if count_str else 1
-            return count > 0, count
+            return int(count_str) if count_str else 1
         count_str = repo.git.rev_list(f"origin/{branch}..HEAD", count=True).strip()
-        count = int(count_str) if count_str else 0
-        return count > 0, count
+        return int(count_str) if count_str else 0
 
     def _pull_rebase_with_readme_resolution(self, repo: Repo, branch: str) -> None:
         """Pulls and rebases onto origin/<branch>, auto-resolving channel README.md conflicts.
@@ -356,27 +337,26 @@ class GitSyncManager:
                     unmerged_output = repo.git.diff("-z", "--diff-filter=U", "--name-only")
                     unmerged_files = [f for f in unmerged_output.split("\0") if f]
 
-                    # Resolve conflicts dynamically if the single conflicted file is an uploader README.md
-                    if (
-                        len(unmerged_files) == 1
-                        and unmerged_files[0].endswith("/README.md")
-                        and unmerged_files[0].count("/") == 1
-                    ):
-                        conflicted_readme = unmerged_files[0]
-                        conflicted_uploader = conflicted_readme.split("/")[0]
-                        self._update_channel_readme_sync(conflicted_uploader)
-                        repo.git.add(conflicted_readme)
+                    # Resolve conflicts dynamically if every conflicted file is an uploader README.md
+                    if unmerged_files and all(f.endswith("/README.md") and f.count("/") == 1 for f in unmerged_files):
+                        for conflicted_readme in unmerged_files:
+                            conflicted_uploader = conflicted_readme.split("/")[0]
+                            update_channel_readme(self.local_repo_dir / conflicted_uploader, self.player_base_url)
+                            repo.git.add("-A", conflicted_readme)
+
+                        rebase_action = "--continue" if repo.git.diff("--cached", "--name-only").strip() else "--skip"
+                        resolved_label = ", ".join(unmerged_files)
                         prev_marker = _rebase_marker()
                         try:
-                            repo.git.rebase("--continue", env={**os.environ, "GIT_EDITOR": editor_cmd})
-                            logfire.info(f"Continued rebase after resolving {conflicted_readme} conflict.")
+                            repo.git.rebase(rebase_action, env={**os.environ, "GIT_EDITOR": editor_cmd})
+                            logfire.info(f"Rebase {rebase_action} succeeded after resolving {resolved_label}.")
                         except GitCommandError as cont_err:
                             if _is_rebasing(repo):
                                 new_marker = _rebase_marker()
                                 if new_marker is not None and new_marker != prev_marker:
                                     continue
                             raise RuntimeError(
-                                f"Git rebase --continue failed: {self._sanitize_error(cont_err)}"
+                                f"Git rebase {rebase_action} failed: {self._sanitize_error(cont_err)}"
                             ) from cont_err
                     else:
                         logfire.warning(
@@ -541,14 +521,14 @@ class GitSyncManager:
                     )
                     return self._scan_completed_cache_sync()
 
-                if self._remote_branch_exists(repo, branch):
+                if self._ref_exists(repo, f"refs/remotes/origin/{branch}"):
                     self._reset_dirty_worktree(
                         repo,
                         "Cleaning leftover uncommitted changes in local git repo before syncing.",
                     )
                     self._ensure_head_on_branch(repo, branch)
-                    has_unpushed, unpushed_count = self._has_unpushed_commits(repo, branch)
-                    if has_unpushed:
+                    unpushed_count = self._unpushed_commit_count(repo, branch)
+                    if unpushed_count:
                         logfire.warning(
                             f"Preserving {unpushed_count} unpushed local commit(s) on '{branch}'; "
                             f"rebasing onto origin/{branch}..."
@@ -564,8 +544,8 @@ class GitSyncManager:
                         logfire.info(f"Git repo successfully updated to origin/{branch}.")
                 else:
                     self._ensure_head_on_branch(repo, branch)
-                    has_unpushed, unpushed_count = self._has_unpushed_commits(repo, branch)
-                    if has_unpushed:
+                    unpushed_count = self._unpushed_commit_count(repo, branch)
+                    if unpushed_count:
                         logfire.info(
                             f"Remote branch origin/{branch} does not exist yet; "
                             f"preserving {unpushed_count} local commit(s)."
@@ -580,7 +560,7 @@ class GitSyncManager:
         try:
             repo = Repo.clone_from(auth_url, self.local_repo_dir)
             self._configure_repo(repo)
-            if self._remote_branch_exists(repo, branch):
+            if self._ref_exists(repo, f"refs/remotes/origin/{branch}"):
                 repo.git.checkout("-B", branch, f"origin/{branch}")
                 logfire.info(f"Git repository successfully cloned on branch '{branch}'.")
             else:
@@ -677,143 +657,6 @@ class GitSyncManager:
 
         return subtitles
 
-    def _update_channel_readme_sync(self, uploader: str) -> None:
-        """Regenerates the channel README.md index by scanning all video_meta.json files in v/.
-
-        Args:
-            uploader: Channel or uploader identifier.
-        """
-        uploader_dir = self.local_repo_dir / uploader
-        v_base_dir = uploader_dir / "v"
-        if not v_base_dir.is_dir():
-            return
-
-        entries: list[dict[str, Any]] = []
-
-        for v_dir in sorted(v_base_dir.iterdir(), key=lambda p: p.name):
-            if not v_dir.is_dir() or v_dir.name.startswith("."):
-                continue
-
-            meta_file = v_dir / "video_meta.json"
-            meta_data: dict[str, Any] = {}
-            if meta_file.is_file():
-                try:
-                    with open(meta_file, "r", encoding="utf-8") as f:
-                        loaded = json.load(f)
-                        if isinstance(loaded, dict):
-                            meta_data = loaded
-                except Exception as e:
-                    logfire.warning(f"Failed to read {meta_file}: {e}")
-
-            vid = str(meta_data.get("video_id") or v_dir.name)
-            title = str(meta_data.get("title") or vid)
-            source_type = str(meta_data.get("source_type") or "youtube")
-            ch_name = str(meta_data["channel_name"]).strip() if meta_data.get("channel_name") else None
-
-            try:
-                timestamp = int(meta_data.get("timestamp") or 0)
-            except (ValueError, TypeError):
-                timestamp = 0
-
-            date_str = "Unknown"
-            if timestamp > 0:
-                try:
-                    dt = datetime.fromtimestamp(timestamp, tz=JST)
-                    # Non-breaking hyphens prevent the date from awkwardly splitting across lines
-                    date_str = dt.strftime("%Y-%m-%d").replace("-", "&#8209;")
-                except Exception:
-                    date_str = "Unknown"
-
-            best_model_label = "-"
-            best_version_str = ""
-            subtitles_list = meta_data.get("subtitles")
-            if isinstance(subtitles_list, list) and subtitles_list:
-                first_track = subtitles_list[0]
-                if isinstance(first_track, dict):
-                    track_path = first_track.get("path")
-                    if track_path:
-                        track_info = parse_subtitle_track(track_path)
-                        best_model_label = track_info.display_label
-                        best_version_str = track_info.prompt_version_str
-
-            entries.append(
-                {
-                    "video_id": vid,
-                    "title": title,
-                    "channel_name": ch_name,
-                    "source_type": source_type,
-                    "timestamp": timestamp,
-                    "date_str": date_str,
-                    "best_model_label": best_model_label,
-                    "best_version_str": best_version_str,
-                }
-            )
-
-        if not entries:
-            readme_path = uploader_dir / "README.md"
-            if readme_path.is_file():
-                try:
-                    readme_path.unlink()
-                except OSError:
-                    pass
-            return
-
-        entries.sort(key=lambda x: (x["timestamp"], x["video_id"]), reverse=True)
-        channel_display_name = next((e["channel_name"] for e in entries if e["channel_name"]), uploader)
-
-        lines: list[str] = [
-            f"# {channel_display_name}",
-            "",
-            "| Date (JST) | Thumbnail | Title | Best Model |",
-            "| :---: | :---: | :--- | :---: |",
-        ]
-
-        clean_player_url = self.player_base_url.rstrip("/")
-        encoded_uploader = urllib.parse.quote(uploader, safe="")
-
-        for item in entries:
-            clean_title = (
-                (item["title"] or item["video_id"])
-                .replace("\\", "\\\\")
-                .replace("[", "\\[")
-                .replace("]", "\\]")
-                .replace("|", "\\|")
-                .replace("\n", " ")
-                .replace("\r", " ")
-                .strip()
-            )
-            vid = item["video_id"]
-            encoded_vid = urllib.parse.quote(vid, safe="")
-            model_label = item["best_model_label"]
-            version_str = item["best_version_str"]
-
-            if item["source_type"] == "youtube":
-                yt_url = f"https://youtu.be/{encoded_vid}"
-                p_url = f"{clean_player_url}/?uploader={encoded_uploader}&v={encoded_vid}"
-                thumb_cell = (
-                    f'<a href="{yt_url}">'
-                    f'<img src="https://i.ytimg.com/vi/{encoded_vid}/mqdefault.jpg" width="100" /></a>'
-                )
-                title_cell = f"[{clean_title}]({p_url})"
-            else:
-                thumb_cell = "-"
-                title_cell = clean_title
-
-            if model_label != "-":
-                # Use non-breaking hyphens so lineage shortcodes stay on a single line
-                safe_label = model_label.replace("-", "&#8209;")
-                cell_content = f"{safe_label}<br>{version_str}" if version_str else safe_label
-                model_cell = f"[{cell_content}](./v/{encoded_vid})"
-            else:
-                model_cell = "-"
-
-            lines.append(f"| {item['date_str']} | {thumb_cell} | {title_cell} | {model_cell} |")
-
-        lines.append("")
-        readme_path = uploader_dir / "README.md"
-        atomic_write_text(readme_path, "\n".join(lines))
-        logfire.info(f"Updated channel README at {readme_path.name}")
-
     def _sync_remote_before_write(self, repo: Repo, branch: str) -> bool:
         """Pulls any upstream remote updates (e.g. WebUI deletions) before copying new artifacts.
 
@@ -832,7 +675,7 @@ class GitSyncManager:
         try:
             old_head = repo.head.commit.hexsha if self._has_head(repo) else None
             repo.git.fetch("origin", "--prune")
-            if self._remote_branch_exists(repo, branch):
+            if self._ref_exists(repo, f"refs/remotes/origin/{branch}"):
                 self._ensure_head_on_branch(repo, branch)
                 self._pull_rebase_with_readme_resolution(repo, branch)
                 new_head = repo.head.commit.hexsha if self._has_head(repo) else None
@@ -936,7 +779,7 @@ class GitSyncManager:
             f"Saved clean public metadata with {len(clean_meta['subtitles'])} subtitle track(s) to {target_meta.name}"
         )
 
-        self._update_channel_readme_sync(uploader)
+        update_channel_readme(uploader_dir, self.player_base_url)
         is_yt = clean_meta.get("source_type") == "youtube"
         single_entry: _CacheUpdate = (video_id, full_shortcode, uploader, is_yt)
 
@@ -961,8 +804,8 @@ class GitSyncManager:
                 commit_sha = repo.head.commit.hexsha[:8]
                 logfire.info(f"Committed changes ({commit_sha}): '{commit_msg}'")
             else:
-                has_unpushed, unpushed_count = self._has_unpushed_commits(repo, branch)
-                if has_unpushed:
+                unpushed_count = self._unpushed_commit_count(repo, branch)
+                if unpushed_count:
                     logfire.info(
                         f"No new working tree changes to commit, but found {unpushed_count} "
                         "unpublished local commit(s). Proceeding to push."
@@ -996,7 +839,7 @@ class GitSyncManager:
 
                 try:
                     repo.git.fetch("origin", "--prune")
-                    if self._remote_branch_exists(repo, branch):
+                    if self._ref_exists(repo, f"refs/remotes/origin/{branch}"):
                         old_head = repo.head.commit.hexsha if self._has_head(repo) else None
                         self._pull_rebase_with_readme_resolution(repo, branch)
                         new_head = repo.head.commit.hexsha if self._has_head(repo) else None

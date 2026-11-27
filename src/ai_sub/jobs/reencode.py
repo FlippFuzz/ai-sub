@@ -9,7 +9,7 @@ from typing import Literal
 from pydantic import Field, NonNegativeFloat, NonNegativeInt, PositiveInt
 
 from ai_sub.jobs.job_base import BaseJob
-from ai_sub.video import get_video_fps, reencode_video
+from ai_sub.video import reencode_video
 
 
 @dataclass(frozen=True)
@@ -55,12 +55,12 @@ class ReencodeJob(BaseJob):
     )
 
     async def execute(self) -> ReencodeResult:
-        """Executes FFmpeg re-encoding and resolves the effective output framerate.
+        """Executes FFmpeg re-encoding and returns the output path and effective framerate.
 
         Returns:
             ReencodeResult: Output file path and effective numeric framerate (0.0 for audio-only).
         """
-        await reencode_video(
+        effective_fps = await reencode_video(
             input_path=self.input_file,
             output_path=self.output_file,
             fps=self.fps,
@@ -70,5 +70,4 @@ class ReencodeJob(BaseJob):
             duration_tolerance_ms=self.duration_tolerance_ms,
             keyframe_only=self.keyframe_only,
         )
-        effective_fps = await get_video_fps(self.output_file) if self.fps == "keyframes" else float(self.fps)
         return ReencodeResult(path=self.output_file, fps=effective_fps)

@@ -39,6 +39,55 @@ class RunnerStatus(str, Enum):
     PUSH_FAILED = "push_failed"
 
 
+def _parse_resume_meta(
+    meta_file: Path,
+    folder_source_type: Literal["local", "youtube"],
+    default_id: str,
+) -> tuple[dict[str, Any], Path]:
+    """Reads and validates persisted job metadata for disk resumption.
+
+    Args:
+        meta_file: Path to the saved video_meta.json file.
+        folder_source_type: Source type inferred from parent directory ('local' or 'youtube').
+        default_id: Fallback video ID and title derived from job directory name.
+
+    Returns:
+        tuple[dict[str, Any], Path]: Normalized metadata dictionary and existing raw media file path.
+
+    Raises:
+        ValueError: If metadata fields or raw media paths are invalid or missing.
+    """
+    with open(meta_file, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if not isinstance(meta, dict):
+        raise ValueError("invalid metadata object")
+
+    raw_path_str = str(meta.get("raw_path") or "")
+    raw_path = Path(raw_path_str) if raw_path_str else None
+    if not raw_path or not raw_path.is_file():
+        raise ValueError("missing raw video")
+
+    raw_ts = meta.get("timestamp", 0)
+    if isinstance(raw_ts, bool):
+        raise ValueError("invalid timestamp")
+    timestamp = int(raw_ts)
+
+    source_type = meta.get("source_type", folder_source_type)
+    if source_type not in ("local", "youtube"):
+        raise ValueError(f"invalid source_type {source_type!r}")
+
+    channel_raw = meta.get("channel_name")
+    parsed_meta = {
+        "video_id": str(meta.get("video_id") or default_id),
+        "uploader": str(meta.get("uploader") or "unknown"),
+        "channel_name": str(channel_raw) if channel_raw is not None else None,
+        "title": str(meta.get("title") or default_id),
+        "source_type": source_type,
+        "timestamp": timestamp,
+    }
+    return parsed_meta, raw_path
+
+
 class ComboRunner:
     """Manages an independent combination runner restricted to 1 active video."""
 
@@ -306,7 +355,6 @@ class ComboRunner:
         channel_name: str | None,
         source_type: Literal["local", "youtube"],
         timestamp: int,
-        user_context: str,
     ) -> Pipeline:
         """Initializes a Pipeline instance using this runner's model and processing configuration.
 
@@ -319,12 +367,12 @@ class ComboRunner:
             channel_name: Optional human-readable channel name.
             source_type: Ingestion source category ('local' or 'youtube').
             timestamp: Video publication or intake Unix timestamp.
-            user_context: Resolved user background context string.
 
         Returns:
             Pipeline: Initialized pipeline instance.
         """
         media_tag = video_id if source_type == "youtube" else compute_file_id_hash(raw_video_path.name)
+        user_context = self._build_user_context(title, uploader, channel_name, source_type)
         return await Pipeline.create(
             raw_video_path=raw_video_path,
             job_dir=job_dir,
@@ -516,7 +564,6 @@ class ComboRunner:
         )
         job_dir = self.get_job_dir(source_type, video_id)
         job_dir.mkdir(parents=True, exist_ok=True)
-        user_context = self._build_user_context(title, uploader, channel_name, source_type)
 
         with logfire.span(
             "Prepare Video for Runner: {video_id}",
@@ -533,7 +580,6 @@ class ComboRunner:
                 channel_name=channel_name,
                 source_type=source_type,
                 timestamp=timestamp,
-                user_context=user_context,
             )
 
             meta_file = job_dir / "video_meta.json"
@@ -664,114 +710,54 @@ class ComboRunner:
                 logfire.warning(message)
             await asyncio.to_thread(shutil.rmtree, target, ignore_errors=True)
 
+        def _get_mtime(job_dir: Path) -> float:
+            meta = job_dir / "video_meta.json"
+            try:
+                return (meta if meta.is_file() else job_dir).stat().st_mtime
+            except OSError:
+                return 0.0
+
         with logfire.span("Disk Resume Check: {combo}", combo=self.config.name) as resume_span:
-            job_dirs: list[tuple[Literal["local", "youtube"], Path]] = []
+            valid_candidates: list[tuple[Path, dict[str, Any], Path]] = []
             for stype in ("local", "youtube"):
                 source_dir = self.work_dir / stype
                 if not source_dir.is_dir():
                     continue
-                for d in source_dir.iterdir():
-                    if d.is_dir():
-                        job_dirs.append((stype, d))
-
-            if not job_dirs:
-                self.status = RunnerStatus.IDLE
-                self.preparing_video_info = None
-                resume_span.set_attribute("result", "idle")
-                return False
-
-            def _get_mtime(d: Path) -> float:
-                meta = d / "video_meta.json"
-                target = meta if meta.is_file() else d
-                try:
-                    return target.stat().st_mtime
-                except OSError:
-                    return 0.0
-
-            valid_candidates: list[tuple[Path, dict[str, Any], Path]] = []
-            for folder_source_type, d in job_dirs:
-                meta_file = d / "video_meta.json"
-                if not meta_file.is_file():
-                    await _purge_dir(
-                        d,
-                        f"Purging stale folder without metadata: {folder_source_type}/{d.name} in {self.config.name}",
-                        info=True,
-                    )
-                    continue
-
-                try:
-                    with open(meta_file, "r", encoding="utf-8") as f:
-                        meta = json.load(f)
-                    if not isinstance(meta, dict):
-                        await _purge_dir(d, f"Purging job folder with invalid metadata: {folder_source_type}/{d.name}")
+                for job_dir in source_dir.iterdir():
+                    if not job_dir.is_dir():
                         continue
-
-                    raw_path_str = str(meta.get("raw_path") or "")
-                    raw_path = Path(raw_path_str) if raw_path_str else None
-                    if not raw_path or not raw_path.is_file():
+                    meta_file = job_dir / "video_meta.json"
+                    if not meta_file.is_file():
                         await _purge_dir(
-                            d,
-                            f"Purging job folder with missing raw video: {folder_source_type}/{d.name} "
-                            f"in {self.config.name}",
+                            job_dir,
+                            f"Purging stale folder without metadata: {stype}/{job_dir.name} in {self.config.name}",
+                            info=True,
                         )
                         continue
-
-                    raw_ts = meta.get("timestamp", 0)
-                    if isinstance(raw_ts, bool):
-                        await _purge_dir(d, f"Purging job folder with invalid timestamp: {folder_source_type}/{d.name}")
-                        continue
-                    timestamp = int(raw_ts)
-
-                    source_type = meta.get("source_type", folder_source_type)
-                    if source_type not in ("local", "youtube"):
+                    try:
+                        parsed_meta, raw_path = _parse_resume_meta(meta_file, stype, job_dir.name)
+                        valid_candidates.append((job_dir, parsed_meta, raw_path))
+                    except Exception as e:
                         await _purge_dir(
-                            d,
-                            f"Purging job folder with invalid source_type {source_type!r}: "
-                            f"{folder_source_type}/{d.name}",
+                            job_dir,
+                            f"Purging invalid job folder: {stype}/{job_dir.name} in {self.config.name} ({e})",
                         )
-                        continue
-
-                    channel_raw = meta.get("channel_name")
-                    parsed_meta = {
-                        "video_id": str(meta.get("video_id") or d.name),
-                        "uploader": str(meta.get("uploader") or "unknown"),
-                        "channel_name": str(channel_raw) if channel_raw is not None else None,
-                        "title": str(meta.get("title") or d.name),
-                        "source_type": source_type,
-                        "timestamp": timestamp,
-                    }
-                    valid_candidates.append((d, parsed_meta, raw_path))
-                except Exception as e:
-                    await _purge_dir(
-                        d,
-                        f"Purging job folder with corrupt metadata: {folder_source_type}/{d.name} ({e})",
-                    )
 
             valid_candidates.sort(key=lambda item: _get_mtime(item[0]), reverse=True)
 
             resumed: tuple[Pipeline, Path] | None = None
             failed_resume_dirs: set[Path] = set()
-
             for job_dir, meta, raw_path in valid_candidates:
-                video_id = meta["video_id"]
-                uploader = meta["uploader"]
-                channel_name = meta["channel_name"]
-                title = meta["title"]
-                source_type = meta["source_type"]
-                timestamp = meta["timestamp"]
-                user_context = self._build_user_context(title, uploader, channel_name, source_type)
-
                 try:
                     pipeline = await self._create_pipeline(
                         raw_video_path=raw_path,
                         job_dir=job_dir,
-                        video_id=video_id,
-                        title=title,
-                        uploader=uploader,
-                        channel_name=channel_name,
-                        source_type=source_type,
-                        timestamp=timestamp,
-                        user_context=user_context,
+                        video_id=meta["video_id"],
+                        title=meta["title"],
+                        uploader=meta["uploader"],
+                        channel_name=meta["channel_name"],
+                        source_type=meta["source_type"],
+                        timestamp=meta["timestamp"],
                     )
                     resumed = (pipeline, job_dir)
                     break
@@ -784,12 +770,12 @@ class ComboRunner:
             if resumed is None:
                 self.status = RunnerStatus.IDLE
                 self.preparing_video_info = None
-                resume_span.set_attribute("result", "no_valid_video_found")
+                resume_span.set_attribute("result", "no_valid_video_found" if valid_candidates else "idle")
                 return False
 
-            pipeline, job_dir = resumed
+            pipeline, active_dir = resumed
             for cand_dir, _, _ in valid_candidates:
-                if cand_dir != job_dir and cand_dir not in failed_resume_dirs:
+                if cand_dir != active_dir and cand_dir not in failed_resume_dirs:
                     await _purge_dir(
                         cand_dir,
                         f"Purging older job folder: {cand_dir.parent.name}/{cand_dir.name} in {self.config.name}",

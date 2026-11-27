@@ -233,17 +233,10 @@ def _get_default_pipelines() -> list[PipelineConfig]:
         list[PipelineConfig]: Standard default pipelines.
     """
     return [
-        PipelineConfig(
-            name="combo_40f",
-            summary=StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
-            subtitles=StageExecutionConfig(model="gemini-4-hydrogen", agentic=False),
-            lyrics=StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
-        ),
+        PipelineConfig(name="combo_40f"),
         PipelineConfig(
             name="combo_35l",
-            summary=StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
-            subtitles=StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=False),
-            lyrics=StageExecutionConfig(model="gemini-3.5-flash-lite", agentic=True),
+            subtitles=StageExecutionConfig(model="gemini-3.5-flash-lite"),
         ),
     ]
 

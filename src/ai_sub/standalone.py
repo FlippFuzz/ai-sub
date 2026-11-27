@@ -33,6 +33,7 @@ from ai_sub.jobs import (
     SummaryJob,
     WorkerContext,
 )
+from ai_sub.nfo import write_nfo
 from ai_sub.pipeline import Pipeline
 from ai_sub.search import BaseSearchProvider, create_search_providers, order_lyrics_providers
 from ai_sub.standalone_config import StandaloneSettings
@@ -417,7 +418,7 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
             logfire.info(f"Subtitles written to {g.name}")
 
         if settings.nfo and use_summary:
-            if nfo_path := pipeline.write_nfo(output_dir=out_dir, filename_stem=input_video_path.stem):
+            if nfo_path := write_nfo(pipeline, output_dir=out_dir, filename_stem=input_video_path.stem):
                 logfire.info(f"NFO written to {nfo_path.name}")
 
         if not pipeline.is_done():

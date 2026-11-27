@@ -1,4 +1,4 @@
-"""Central server coordinator managing combination runners, worker task leases, and telemetry."""
+"""Central server coordinator managing combination runners and worker task leases."""
 
 from __future__ import annotations
 
@@ -15,68 +15,17 @@ from typing import Any, Literal
 import logfire
 from pydantic import ValidationError
 
-from ai_sub.pipeline import (
-    FallbackProbeSpec,
-    MediaStageState,
-    Pipeline,
-    SegmentState,
-    build_fallback_tiers,
-    probe_fallback_info,
-)
-from ai_sub.protocol import (
-    TaskClaimResponse,
-    TaskType,
-)
+from ai_sub.nfo import write_nfo
+from ai_sub.pipeline import FallbackProbeSpec, probe_fallback_info
+from ai_sub.protocol import TaskClaimResponse, TaskType
 from ai_sub.server.combo_runner import ComboRunner, RunnerStatus
+from ai_sub.server.dashboard import build_dashboard_data, format_logfire_query
 from ai_sub.server.git_sync import GitSyncManager, redact_url_credentials
 from ai_sub.server.models import ActivityEvent, ServerTask, TaskStatus
 from ai_sub.server.server_config import ServerSettings
-from ai_sub.telemetry import get_app_version
 
 _PUSH_RETRY_COOLDOWN_S = 60.0
 _ProbeContext = tuple[FallbackProbeSpec, ServerTask, int, int | None]
-
-
-def _escape_sql_literal(value: str) -> str:
-    """Escapes single quotes for SQL string literals.
-
-    Args:
-        value: Raw string value.
-
-    Returns:
-        str: SQL-escaped string content without surrounding quotes.
-    """
-    return value.replace("'", "''")
-
-
-def _format_logfire_query(task: ServerTask) -> str:
-    """Formats the Logfire search query for a server task using its unique task ID.
-
-    Args:
-        task: Target server task instance.
-
-    Returns:
-        str: Formatted Logfire search query string.
-    """
-    return f"attributes->>'task_id' = '{_escape_sql_literal(task.task_id)}'"
-
-
-def _format_chunk_logfire_query(*tasks: ServerTask | None) -> str | None:
-    """Formats a Logfire search query matching all existing tasks for a chunk.
-
-    Args:
-        *tasks: Candidate ServerTask instances associated with the chunk.
-
-    Returns:
-        str | None: Formatted Logfire search query string, or None if no tasks exist.
-    """
-    existing = [t for t in tasks if t is not None]
-    if not existing:
-        return None
-    if len(existing) == 1:
-        return _format_logfire_query(existing[0])
-    quoted = ", ".join(f"'{_escape_sql_literal(t.task_id)}'" for t in existing)
-    return f"attributes->>'task_id' IN ({quoted})"
 
 
 def _plural(count: int, singular: str, plural: str | None = None) -> str:
@@ -117,23 +66,6 @@ def _release_task_lease(task: ServerTask) -> None:
     task.last_heartbeat = None
 
 
-def _get_stage_media_state(pipeline: Pipeline, task: ServerTask) -> MediaStageState | None:
-    """Returns the SummaryState or SegmentState associated with a server task.
-
-    Args:
-        pipeline: Active Pipeline instance.
-        task: Server task belonging to the pipeline.
-
-    Returns:
-        MediaStageState | None: Active stage media state, or None if unavailable.
-    """
-    if task.task_type == TaskType.SUMMARY:
-        return pipeline.summary
-    if task.segment_index is not None and 0 <= task.segment_index < len(pipeline.segments):
-        return pipeline.segments[task.segment_index]
-    return None
-
-
 def _build_completion_detail(task_type: TaskType, result: dict[str, Any]) -> str | None:
     """Builds a concise activity detail summary from a completed task result payload.
 
@@ -156,304 +88,6 @@ def _build_completion_detail(task_type: TaskType, result: dict[str, Any]) -> str
         lyr_len = len(result.get("subs", result.get("subtitles", [])))
         return f"Lyrics: {_plural(lyr_len, 'line')} refined"
     return None
-
-
-def _get_summary_status(pipe: Pipeline, is_claimed: bool, is_encoding: bool) -> str:
-    """Computes the dashboard display status for the whole-video summary stage.
-
-    Args:
-        pipe: Active Pipeline state machine.
-        is_claimed: Whether a summary task is currently leased to a worker.
-        is_encoding: Whether the summary proxy is currently compressing locally.
-
-    Returns:
-        str: Canonical summary status label.
-    """
-    if not pipe.summary_enabled:
-        return "disabled"
-    if pipe.summary.response is not None:
-        return "completed"
-    if pipe.summary.exhausted:
-        return "failed"
-    if is_claimed:
-        return "claimed"
-    if is_encoding:
-        return "encoding"
-    return "pending"
-
-
-def _get_segment_statuses(
-    pipe: Pipeline,
-    seg: SegmentState,
-    is_encoding: bool,
-    active_task_type: TaskType | None,
-) -> tuple[str, str, str]:
-    """Derives matrix, subtitles, and lyrics dashboard statuses for a segment.
-
-    Args:
-        pipe: Owning Pipeline state machine.
-        seg: Target segment state.
-        is_encoding: Whether the segment is currently compressing locally.
-        active_task_type: Currently leased AI task type for this segment, if any.
-
-    Returns:
-        tuple[str, str, str]: (matrix_status, subtitles_status, lyrics_status).
-    """
-    sub_claimed = active_task_type == TaskType.SUBTITLES
-    lyr_claimed = active_task_type == TaskType.LYRICS
-    needs_lyrics = pipe.segment_needs_lyrics(seg)
-
-    if seg.subtitles_exhausted:
-        matrix_status = "failed"
-    elif sub_claimed:
-        matrix_status = "subtitles_running"
-    elif lyr_claimed:
-        matrix_status = "lyrics_running"
-    elif seg.subtitles_response is not None:
-        if not needs_lyrics or seg.lyrics_response is not None:
-            matrix_status = "done"
-        elif seg.lyrics_exhausted:
-            matrix_status = "draft_fallback"
-        else:
-            matrix_status = "lyrics_pending"
-    elif is_encoding:
-        matrix_status = "encoding"
-    elif seg.media_ready:
-        matrix_status = "ready"
-    else:
-        matrix_status = "pending"
-
-    sub_status = (
-        "completed"
-        if seg.subtitles_response is not None
-        else ("failed" if seg.subtitles_exhausted else ("in_progress" if sub_claimed else "pending"))
-    )
-
-    if not pipe.lyrics_enabled:
-        lyr_status = "disabled"
-    elif seg.subtitles_exhausted or (seg.subtitles_response is not None and not needs_lyrics):
-        lyr_status = "skipped"
-    elif seg.subtitles_response is None:
-        lyr_status = "waiting"
-    elif seg.lyrics_response is not None:
-        lyr_status = "completed"
-    elif seg.lyrics_exhausted:
-        lyr_status = "draft_fallback"
-    elif lyr_claimed:
-        lyr_status = "in_progress"
-    else:
-        lyr_status = "pending"
-
-    return matrix_status, sub_status, lyr_status
-
-
-def _build_segment_info(
-    seg: SegmentState,
-    pipe: Pipeline,
-    seg_tasks: dict[tuple[TaskType, int], ServerTask],
-    active_reencode_segments: set[int],
-    subtitles_max_runs: int,
-    lyrics_max_runs: int,
-    now: float,
-) -> dict[str, Any]:
-    """Builds dashboard inspection and matrix telemetry for a single video segment.
-
-    Args:
-        seg: Target segment state machine.
-        pipe: Owning pipeline state machine.
-        seg_tasks: Lookup table of segment ServerTasks keyed by (task_type, segment_index).
-        active_reencode_segments: Indices of segments actively running FFmpeg compression.
-        subtitles_max_runs: Configured maximum non-retryable runs per FPS tier for subtitles.
-        lyrics_max_runs: Configured maximum non-retryable runs for lyrics refinement.
-        now: Current Unix epoch timestamp.
-
-    Returns:
-        dict[str, Any]: Structured segment matrix and inspector dictionary.
-    """
-    sub_task = seg_tasks.get((TaskType.SUBTITLES, seg.index))
-    lyr_task = seg_tasks.get((TaskType.LYRICS, seg.index))
-    is_encoding = seg.index in active_reencode_segments
-    sub_claimed = sub_task is not None and sub_task.status == TaskStatus.CLAIMED
-    lyr_claimed = lyr_task is not None and lyr_task.status == TaskStatus.CLAIMED
-    active_task = sub_task if sub_claimed else (lyr_task if lyr_claimed else None)
-
-    matrix_status, sub_status, lyr_status = _get_segment_statuses(
-        pipe=pipe,
-        seg=seg,
-        is_encoding=is_encoding,
-        active_task_type=active_task.task_type if active_task else None,
-    )
-
-    detected_songs: list[dict[str, Any]] = []
-    sub_line_count: int | None = None
-    if seg.subtitles_response is not None:
-        sub_line_count = len(seg.subtitles_response.subtitles)
-        detected_songs = [
-            {
-                "title": perf.title,
-                "artist": perf.artist,
-                "start": perf.start,
-                "end": perf.end,
-            }
-            for perf in seg.subtitles_response.detected_musical_performances
-        ]
-
-    lyr_line_count: int | None = len(seg.lyrics_response.subtitles) if seg.lyrics_response is not None else None
-
-    return {
-        "index": seg.index,
-        "offset_ms": seg.offset_ms,
-        "duration_ms": seg.duration_ms,
-        "matrix_status": matrix_status,
-        "media_ready": seg.media_ready,
-        "is_encoding": is_encoding,
-        "fps": seg.fps,
-        "encoding": seg.encoding,
-        "fallback_tier": seg.fallback_tier,
-        "fallback_tiers": build_fallback_tiers(
-            seg,
-            pipe.reencode_settings.segment,
-            seg.raw_path,
-            exhausted=seg.subtitles_exhausted,
-        ),
-        "subtitles_status": sub_status,
-        "subtitles_tier_attempts": seg.subtitles_tier_attempts,
-        "subtitles_line_count": sub_line_count,
-        "detected_songs": detected_songs,
-        "lyrics_status": lyr_status,
-        "lyrics_tier_attempts": seg.lyrics_tier_attempts,
-        "lyrics_line_count": lyr_line_count,
-        "max_runs": subtitles_max_runs,
-        "lyrics_max_runs": lyrics_max_runs,
-        "active_task_type": active_task.task_type.value if active_task else None,
-        "active_worker_id": active_task.worker_id if active_task else None,
-        "active_elapsed_s": int(now - active_task.claimed_at) if active_task and active_task.claimed_at else None,
-        "logfire_query": _format_chunk_logfire_query(sub_task, lyr_task),
-    }
-
-
-def _build_stages_info(runner: ComboRunner, pipe: Pipeline, now: float) -> dict[str, Any]:
-    """Computes per-stage progress counters, summary preview, and segment matrix for a dashboard card.
-
-    Args:
-        runner: Active ComboRunner instance.
-        pipe: Active Pipeline state machine.
-        now: Current Unix epoch timestamp.
-
-    Returns:
-        dict[str, Any]: Stage progress mapping and per-segment details.
-    """
-    summary_max_runs = pipe.get_retry_settings(TaskType.SUMMARY).maxruns
-    subtitles_max_runs = pipe.get_retry_settings(TaskType.SUBTITLES).maxruns
-    lyrics_max_runs = pipe.get_retry_settings(TaskType.LYRICS).maxruns
-
-    summary_task: ServerTask | None = None
-    seg_tasks: dict[tuple[TaskType, int], ServerTask] = {}
-    sub_prog = 0
-    lyr_prog = 0
-
-    for t in runner.tasks.values():
-        if t.task_type == TaskType.SUMMARY:
-            summary_task = t
-        elif t.segment_index is not None:
-            seg_tasks[(t.task_type, t.segment_index)] = t
-            if t.status == TaskStatus.CLAIMED:
-                if t.task_type == TaskType.SUBTITLES:
-                    sub_prog += 1
-                elif t.task_type == TaskType.LYRICS:
-                    lyr_prog += 1
-
-    sum_state = pipe.summary
-    sum_done = 1 if sum_state.response is not None else 0
-    sum_claimed = summary_task is not None and summary_task.status == TaskStatus.CLAIMED
-    summary_preview = (
-        sum_state.response.model_dump(
-            mode="json",
-            exclude={
-                "thoughts": True,
-                "entities": {"__all__": {"persona_lore", "visual_cues"}},
-            },
-        )
-        if sum_state.response is not None
-        else None
-    )
-
-    total_chunks = len(pipe.segments)
-    reencode_done = sum(1 for seg in pipe.segments if seg.media_ready)
-    reencode_fallback_count = sum(1 for seg in pipe.segments if seg.fallback_tier > 0)
-    sub_done = sum(1 for seg in pipe.segments if seg.subtitles_response is not None)
-    sub_failed = sum(1 for seg in pipe.segments if seg.subtitles_exhausted)
-    lyr_total = sum(1 for seg in pipe.segments if pipe.segment_needs_lyrics(seg))
-    lyr_done = sum(1 for seg in pipe.segments if seg.lyrics_response is not None)
-    lyr_concluded = sum(
-        1 for seg in pipe.segments if pipe.segment_needs_lyrics(seg) and pipe.segment_lyrics_concluded(seg)
-    )
-
-    segments_info = [
-        _build_segment_info(
-            seg=seg,
-            pipe=pipe,
-            seg_tasks=seg_tasks,
-            active_reencode_segments=runner.active_reencode_segments,
-            subtitles_max_runs=subtitles_max_runs,
-            lyrics_max_runs=lyrics_max_runs,
-            now=now,
-        )
-        for seg in pipe.segments
-    ]
-
-    return {
-        "summary": {
-            "enabled": pipe.summary_enabled,
-            "done": sum_done,
-            "in_progress": 1 if sum_claimed else 0,
-            "is_encoding": runner.active_summary_reencode,
-            "exhausted": sum_state.exhausted,
-            "status": _get_summary_status(
-                pipe,
-                is_claimed=sum_claimed,
-                is_encoding=runner.active_summary_reencode,
-            ),
-            "worker_id": summary_task.worker_id if sum_claimed and summary_task else None,
-            "elapsed_s": (
-                int(now - summary_task.claimed_at) if sum_claimed and summary_task and summary_task.claimed_at else None
-            ),
-            "logfire_query": _format_logfire_query(summary_task) if summary_task else None,
-            "fps": sum_state.fps,
-            "encoding": sum_state.encoding,
-            "fallback_tier": sum_state.fallback_tier,
-            "fallback_tiers": build_fallback_tiers(
-                sum_state,
-                pipe.reencode_settings.summary,
-                pipe.raw_video_path,
-                exhausted=sum_state.exhausted,
-            ),
-            "tier_attempts": sum_state.tier_attempts,
-            "max_runs": summary_max_runs,
-            "preview": summary_preview,
-        },
-        "reencoding": {
-            "total": total_chunks,
-            "done": reencode_done,
-            "in_progress": len(runner.active_reencode_segments),
-            "fallback_count": reencode_fallback_count,
-        },
-        "subtitles": {
-            "total": total_chunks,
-            "done": sub_done,
-            "failed": sub_failed,
-            "in_progress": sub_prog,
-        },
-        "lyrics": {
-            "enabled": pipe.lyrics_enabled,
-            "total": lyr_total,
-            "done": lyr_done,
-            "failed": max(0, lyr_concluded - lyr_done),
-            "in_progress": lyr_prog,
-            "skipped": pipe.lyrics_enabled and (sub_done + sub_failed) == total_chunks and lyr_total == 0,
-        },
-        "segments": segments_info,
-    }
 
 
 class ComboRunnersCoordinator:
@@ -628,7 +262,7 @@ class ComboRunnersCoordinator:
             video_id=task.video_id,
             duration_s=round(duration_s, 1) if duration_s is not None else None,
             detail=detail,
-            logfire_query=_format_logfire_query(task),
+            logfire_query=format_logfire_query(task),
         )
 
         runner_log = self.runner_activity_logs.setdefault(
@@ -991,10 +625,7 @@ class ComboRunnersCoordinator:
             return True
 
     @staticmethod
-    def _prepare_probe_context(
-        runner: ComboRunner,
-        task: ServerTask,
-    ) -> _ProbeContext | None:
+    def _prepare_probe_context(runner: ComboRunner, task: ServerTask) -> _ProbeContext | None:
         """Captures off-lock probe spec, task instance, claim generation, and stage tier while refreshing heartbeat.
 
         Args:
@@ -1009,55 +640,19 @@ class ComboRunnersCoordinator:
         probe_spec = runner.pipeline.get_fallback_probe_spec(task.task_type, task.segment_index)
         if probe_spec is None:
             return None
-        stage_state = _get_stage_media_state(runner.pipeline, task)
+        stage_state = runner.pipeline.get_stage_media_state(task.task_type, task.segment_index)
         expected_tier = stage_state.fallback_tier if stage_state is not None else None
         # Refresh heartbeat so the lease sweeper does not reclaim the task while probing off-lock
         task.last_heartbeat = time()
         return probe_spec, task, task.claim_generation, expected_tier
 
-    async def _fail_or_prepare_probe_locked(
-        self,
-        runner: ComboRunner,
-        task: ServerTask,
-        worker_id: str,
-        reason: str,
-        error_message: str | None,
-        is_retryable: bool,
-    ) -> tuple[bool, _ProbeContext | None]:
-        """Records failure immediately under lock, or prepares off-lock probe context for fallback checks.
-
-        Args:
-            runner: Owning ComboRunner instance.
-            task: Affected server task.
-            worker_id: Worker reporting the failure.
-            reason: Error code or exception description.
-            error_message: Optional error details.
-            is_retryable: Whether failure is retryable and exempt from attempt counting.
-
-        Returns:
-            tuple[bool, _ProbeContext | None]:
-                (recorded, None) when handled immediately, or (False, probe_ctx) when off-lock probing is needed.
-        """
-        probe_ctx = self._prepare_probe_context(runner, task) if not is_retryable else None
-        if probe_ctx is not None:
-            return False, probe_ctx
-        recorded = await self._fail_task_locked(
-            task=task,
-            worker_id=worker_id,
-            reason=reason,
-            error_message=error_message,
-            is_retryable=is_retryable,
-        )
-        return recorded, None
-
-    async def _fail_task_with_probe(
+    async def _finish_failure_with_probe(
         self,
         task_id: str,
         worker_id: str,
         action: str,
         reason: str,
         error_message: str | None,
-        is_retryable: bool,
         probe_ctx: _ProbeContext,
     ) -> bool:
         """Probes keyframe FPS and audio presence off-lock, re-verifies lease ownership, and records task failure.
@@ -1068,7 +663,6 @@ class ComboRunnersCoordinator:
             action: Operation label for stale-probe rejection logs.
             reason: Error code or exception description.
             error_message: Optional error details.
-            is_retryable: Whether failure is retryable.
             probe_ctx: Tuple of (probe_spec, expected_task, expected_generation, expected_tier).
 
         Returns:
@@ -1089,7 +683,11 @@ class ComboRunnersCoordinator:
                 return False
 
             runner, task = claimed
-            stage_state = _get_stage_media_state(runner.pipeline, task) if runner.pipeline is not None else None
+            stage_state = (
+                runner.pipeline.get_stage_media_state(task.task_type, task.segment_index)
+                if runner.pipeline is not None
+                else None
+            )
             if stage_state is None or stage_state.fallback_tier != expected_tier:
                 logfire.warning(f"Discarding stale {action.lower()} probe for '{task_id}': stage tier changed.")
                 return False
@@ -1099,7 +697,7 @@ class ComboRunnersCoordinator:
                 worker_id=worker_id,
                 reason=reason,
                 error_message=error_message,
-                is_retryable=is_retryable,
+                is_retryable=False,
                 fallback_base_fps=fallback_base_fps,
                 has_audio=has_audio,
             )
@@ -1155,15 +753,14 @@ class ComboRunnersCoordinator:
                     comp_span.set_attribute("error", str(val_err))
                     val_error_detail = str(val_err)
                     val_error_msg = f"Server validation error: {val_error_detail}"
-                    _, probe_ctx = await self._fail_or_prepare_probe_locked(
-                        runner,
-                        task,
-                        worker_id,
-                        reason="EXECUTION_ERROR",
-                        error_message=val_error_msg,
-                        is_retryable=False,
-                    )
-                    if probe_ctx is None:
+                    if (probe_ctx := self._prepare_probe_context(runner, task)) is None:
+                        await self._fail_task_locked(
+                            task=task,
+                            worker_id=worker_id,
+                            reason="EXECUTION_ERROR",
+                            error_message=val_error_msg,
+                            is_retryable=False,
+                        )
                         return False, val_error_detail
                 else:
                     self._log_activity(
@@ -1175,17 +772,16 @@ class ComboRunnersCoordinator:
                     )
                     comp_span.set_attribute("result", "accepted")
                     comp_span.set_attribute("duration_s", round(duration, 1))
-                    logfire.info(f"Task '{task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
+                    logfire.info(f"Task '{task.task_id}' COMPLETED by '{worker_id}' ({duration:.1f}s).")
                     return True, None
 
         assert probe_ctx is not None and val_error_detail is not None
-        recorded = await self._fail_task_with_probe(
+        recorded = await self._finish_failure_with_probe(
             task_id=task_id,
             worker_id=worker_id,
             action="Validation failure",
             reason="EXECUTION_ERROR",
             error_message=val_error_msg,
-            is_retryable=False,
             probe_ctx=probe_ctx,
         )
         return False, (val_error_detail if recorded else None)
@@ -1219,24 +815,21 @@ class ComboRunnersCoordinator:
                 return False
 
             runner, task = claimed
-            recorded, probe_ctx = await self._fail_or_prepare_probe_locked(
-                runner,
-                task,
-                worker_id,
-                reason=reason,
-                error_message=error_message,
-                is_retryable=is_retryable,
-            )
-            if probe_ctx is None:
-                return recorded
+            if is_retryable or (probe_ctx := self._prepare_probe_context(runner, task)) is None:
+                return await self._fail_task_locked(
+                    task=task,
+                    worker_id=worker_id,
+                    reason=reason,
+                    error_message=error_message,
+                    is_retryable=is_retryable,
+                )
 
-        return await self._fail_task_with_probe(
+        return await self._finish_failure_with_probe(
             task_id=task_id,
             worker_id=worker_id,
             action="Failure report",
             reason=reason,
             error_message=error_message,
-            is_retryable=is_retryable,
             probe_ctx=probe_ctx,
         )
 
@@ -1331,7 +924,7 @@ class ComboRunnersCoordinator:
                     video_id=pipe.video_id,
                 ):
                     generated_srts = await asyncio.to_thread(pipe.finalize, allow_partial=True)
-                    nfo_file = await asyncio.to_thread(pipe.write_nfo) if self.settings.coordinator.nfo else None
+                    nfo_file = await asyncio.to_thread(write_nfo, pipe) if self.settings.coordinator.nfo else None
             except Exception as e:
                 logfire.error(f"Output finalization failed for '{runner.config.name}': {e}")
                 async with self._lock:
@@ -1434,67 +1027,11 @@ class ComboRunnersCoordinator:
         Returns:
             dict[str, Any]: Complete dashboard state dictionary.
         """
-        now = time()
-        pipeline_data = []
-
-        for name, runner in self.runners.items():
-            active_info = None
-            stages_info = None
-            pipe = runner.pipeline
-
-            if pipe is not None:
-                active_info = {
-                    "video_id": pipe.video_id,
-                    "title": pipe.title,
-                    "uploader": pipe.uploader,
-                    "channel_name": pipe.channel_name,
-                    "duration_ms": pipe.duration_ms,
-                    "source_type": pipe.source_type,
-                }
-                stages_info = _build_stages_info(runner, pipe, now)
-
-            tasks_list: list[dict[str, Any]] = []
-            for t in runner.tasks.values():
-                if t.status != TaskStatus.CLAIMED:
-                    continue
-                stage_state = _get_stage_media_state(pipe, t) if pipe is not None else None
-                tasks_list.append(
-                    {
-                        "task_id": t.task_id,
-                        "type": t.task_type.value,
-                        "worker_id": t.worker_id,
-                        "elapsed_s": int(now - t.claimed_at) if t.claimed_at else None,
-                        "fallback_tier": stage_state.fallback_tier if stage_state is not None else 0,
-                        "fps": stage_state.fps if stage_state is not None else None,
-                        "encoding": stage_state.encoding if stage_state is not None else "raw",
-                        "logfire_query": _format_logfire_query(t),
-                    }
-                )
-
-            q_info = pipeline_queues.get(name, {"total_count": 0, "items": []})
-            pipeline_data.append(
-                {
-                    "name": name,
-                    "status": runner.status.value,
-                    "models": {
-                        "summary": runner.config.summary.model,
-                        "subtitles": runner.config.subtitles.model,
-                        "lyrics": runner.config.lyrics.model,
-                    },
-                    "active_video": active_info,
-                    "preparing_video": runner.preparing_video_info,
-                    "stages": stages_info,
-                    "tasks": tasks_list,
-                    "queue_total": q_info.get("total_count", 0),
-                    "next_in_queue": q_info.get("items", []),
-                    "recent_activity": [event.model_dump() for event in self.runner_activity_logs.get(name, [])],
-                }
-            )
-
-        return {
-            "server_version": get_app_version(),
-            "git_repo_url": self._get_public_git_repo_url(),
-            "youtube_cooldown": youtube_cooldown or {"in_cooldown": False},
-            "total_tracked_videos": total_tracked_videos,
-            "pipelines": pipeline_data,
-        }
+        return build_dashboard_data(
+            runners=self.runners,
+            runner_activity_logs=self.runner_activity_logs,
+            pipeline_queues=pipeline_queues,
+            git_repo_url=self._get_public_git_repo_url(),
+            youtube_cooldown=youtube_cooldown,
+            total_tracked_videos=total_tracked_videos,
+        )

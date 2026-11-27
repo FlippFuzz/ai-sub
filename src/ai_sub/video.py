@@ -380,7 +380,7 @@ async def has_audio_stream(media_path: Path) -> bool:
     return await _has_stream(media_path, "a:0")
 
 
-async def get_video_fps(video_path: Path, entry: str = "avg_frame_rate") -> float:
+async def get_video_fps(video_path: Path, entry: str = "avg_frame_rate") -> float | None:
     """Probes a framerate stream entry (e.g., 'avg_frame_rate' or 'r_frame_rate') using ffprobe.
 
     Args:
@@ -388,37 +388,33 @@ async def get_video_fps(video_path: Path, entry: str = "avg_frame_rate") -> floa
         entry: FFprobe stream entry name to inspect. Defaults to 'avg_frame_rate'.
 
     Returns:
-        float: Probed framerate in frames per second.
-
-    Raises:
-        RuntimeError: If the framerate cannot be determined.
+        float | None: Positive framerate in frames per second, or None if unavailable.
     """
     try:
         first_line = await _run_ffprobe_stream_entry(video_path, "v:0", entry)
         num, den = map(int, first_line.split("/"))
-        return num / den
-    except (subprocess.CalledProcessError, ValueError, ZeroDivisionError) as e:
-        logfire.exception(f"Could not determine {entry} for {video_path.name}")
-        raise RuntimeError(f"Could not determine {entry} for video file: {video_path.name}") from e
+        fps = num / den
+        return fps if fps > 0 else None
+    except (subprocess.CalledProcessError, OSError, ValueError, ZeroDivisionError) as e:
+        logfire.debug(f"Could not determine {entry} for {video_path.name}: {e}")
+        return None
 
 
-async def get_keyframe_fps(video_path: Path) -> float:
+async def get_keyframe_fps(video_path: Path) -> float | None:
     """Probes the effective keyframe rate (keyframes per second) of a video file.
 
     Args:
         video_path: Path to the target video file.
 
     Returns:
-        float: Average keyframe rate in frames per second.
-
-    Raises:
-        RuntimeError: If keyframe count or duration cannot be probed.
+        float | None: Positive average keyframe rate in frames per second, or None if unavailable.
     """
-    duration_ms = await get_video_duration_ms(video_path)
-    if duration_ms <= 0:
-        raise RuntimeError(f"Invalid video duration ({duration_ms}ms) for {video_path.name}")
-
     try:
+        duration_ms = await get_video_duration_ms(video_path)
+        if duration_ms <= 0:
+            logfire.warning(f"Invalid video duration ({duration_ms}ms) for {video_path.name}")
+            return None
+
         first_line = await _run_ffprobe_stream_entry(
             video_path,
             "v:0",
@@ -428,12 +424,13 @@ async def get_keyframe_fps(video_path: Path) -> float:
             "-count_frames",
         )
         keyframe_count = int(first_line)
-    except (subprocess.CalledProcessError, ValueError) as e:
-        logfire.exception(f"Could not determine keyframe rate for {video_path.name}")
-        raise RuntimeError(f"Could not determine keyframe rate for video file: {video_path.name}") from e
+    except Exception as e:
+        logfire.warning(f"Could not determine keyframe rate for {video_path.name}: {e}")
+        return None
 
     if keyframe_count <= 0:
-        raise RuntimeError(f"Keyframe count must be positive for video file: {video_path.name}")
+        logfire.warning(f"Keyframe count must be positive for video file: {video_path.name}")
+        return None
     return keyframe_count / (duration_ms / 1000.0)
 
 
@@ -500,13 +497,13 @@ def _check_reencoded_duration(
     return -max_undershoot <= diff <= max_overshoot
 
 
-async def is_valid_reencoded_file(
+async def validate_reencoded_file(
     input_path: Path,
     output_path: Path,
     fps: float | Literal["keyframes"],
     duration_tolerance_ms: int = 100,
-) -> bool:
-    """Verifies whether an existing re-encoded file matches input duration and expected framerate.
+) -> tuple[bool, float | None]:
+    """Validates an existing re-encoded file and returns its effective framerate when valid.
 
     Args:
         input_path: Source input media file path.
@@ -515,13 +512,13 @@ async def is_valid_reencoded_file(
         duration_tolerance_ms: Allowed duration variance in milliseconds. Defaults to 100.
 
     Returns:
-        bool: True if output file exists, is non-empty, and matches duration and stream criteria; False otherwise.
+        tuple[bool, float | None]: (is_valid, effective_fps) where effective_fps is populated when valid.
     """
     if not output_path.is_file() or output_path.stat().st_size == 0:
-        return False
+        return False, None
     try:
         if os.path.samefile(input_path, output_path):
-            return False
+            return False, None
     except OSError:
         pass
 
@@ -532,30 +529,33 @@ async def is_valid_reencoded_file(
                 _has_stream(output_path, "v:0"),
             )
             if not has_audio or has_video:
-                return False
+                return False, None
             input_duration, output_duration = await asyncio.gather(
                 get_video_duration_ms(input_path),
                 get_video_duration_ms(output_path),
             )
             if output_duration <= 0:
-                return False
+                return False, None
             # Allow extra 100ms slack for AAC 1024-sample frame priming and split-boundary audio-video drift
-            return abs(output_duration - input_duration) <= duration_tolerance_ms + 100
+            valid = abs(output_duration - input_duration) <= duration_tolerance_ms + 100
+            return valid, 0.0 if valid else None
 
         if fps == "keyframes":
             if input_path.is_file() and output_path.stat().st_size == input_path.stat().st_size:
-                return False
+                return False, None
             input_duration, output_duration, avg_fps = await asyncio.gather(
                 get_video_duration_ms(input_path),
                 get_video_duration_ms(output_path),
                 get_video_fps(output_path),
             )
-            return avg_fps > 0 and _check_reencoded_duration(
+            if avg_fps is not None and _check_reencoded_duration(
                 input_duration,
                 output_duration,
                 avg_fps,
                 duration_tolerance_ms,
-            )
+            ):
+                return True, avg_fps
+            return False, None
 
         input_duration, output_duration, r_fps, avg_fps = await asyncio.gather(
             get_video_duration_ms(input_path),
@@ -563,29 +563,32 @@ async def is_valid_reencoded_file(
             get_video_fps(output_path, "r_frame_rate"),
             get_video_fps(output_path),
         )
+        if r_fps is None or avg_fps is None:
+            return False, None
         if not _check_reencoded_duration(input_duration, output_duration, fps, duration_tolerance_ms):
-            return False
+            return False, None
 
         # Validate target FPS against r_frame_rate (constant stream rate) and avg_frame_rate
         # using a tight relative tolerance so closely spaced fallback FPS tiers remain distinct.
         fps_tol = max(1e-9, fps * 0.02)
         if abs(fps - r_fps) < fps_tol or abs(fps - avg_fps) < fps_tol:
-            return True
+            return True, float(fps)
 
         # Short tail clips emit few frames (including 1 frame when expected < 0.45);
         # match FFmpeg vf_fps round-to-nearest bounds without accepting higher-FPS tier files.
         duration_s = output_duration / 1000.0
-        if duration_s > 0 and avg_fps > 0 and 0 < (fps * duration_s) < 5.0:
+        if duration_s > 0 and 0 < (fps * duration_s) < 5.0:
             if r_fps <= fps + fps_tol or abs(r_fps - avg_fps) < max(1e-6, avg_fps * 1e-3):
                 expected = fps * duration_s
                 actual_frames = round(avg_fps * duration_s)
                 lo = max(1, math.floor(expected + 0.45))
                 hi = max(1, math.floor(expected + 0.55))
-                return lo <= actual_frames <= hi
+                if lo <= actual_frames <= hi:
+                    return True, float(fps)
 
-        return False
+        return False, None
     except Exception:
-        return False
+        return False, None
 
 
 def _find_split_segments(output_dir: Path, ext: str, media_tag: str) -> list[Path]:
@@ -659,6 +662,7 @@ async def split_video(
     split_duration_s: int,
     media_tag: str,
     duration_tolerance_ms: int = 100,
+    input_duration_ms: int | None = None,
 ) -> list[Path]:
     """Splits an input video into uniform segments using FFmpeg stream copying.
 
@@ -671,7 +675,8 @@ async def split_video(
         output_dir: Directory where segments will be saved.
         split_duration_s: Target segment length in seconds.
         media_tag: Video ID or filename hash appended to each segment filename.
-        duration_tolerance_ms: Allowed total duration variance in milliseconds.
+        duration_tolerance_ms: Allowed total duration variance in milliseconds. Defaults to 100.
+        input_duration_ms: Optional pre-probed duration of input_video in milliseconds. Defaults to None.
 
     Returns:
         list[Path]: Numerically sorted list of generated segment paths.
@@ -683,11 +688,12 @@ async def split_video(
     ext = input_video.suffix
     existing_segments = _find_split_segments(output_dir, ext, media_tag)
     split_meta_path = output_dir / f".split_{media_tag}.json"
-    input_duration: int | None = None
+    input_duration = input_duration_ms
 
     if existing_segments:
         try:
-            input_duration = await get_video_duration_ms(input_video)
+            if input_duration is None:
+                input_duration = await get_video_duration_ms(input_video)
             durations = await asyncio.gather(*(get_video_duration_ms(s) for s in existing_segments))
             total_segment_duration = sum(durations)
             threshold = duration_tolerance_ms * len(existing_segments)
@@ -785,7 +791,7 @@ async def reencode_video(
     encoder: str,
     duration_tolerance_ms: int = 100,
     keyframe_only: bool = False,
-) -> None:
+) -> float:
     """Compresses a video segment or full video using low framerates, keyframes, or audio-only extraction.
 
     Encodes atomically via a temporary file and validates output before replacing output_path.
@@ -800,18 +806,22 @@ async def reencode_video(
         duration_tolerance_ms: Allowed duration variance in milliseconds.
         keyframe_only: Whether to decode only keyframes from the input video.
 
+    Returns:
+        float: Effective output framerate in FPS (0.0 for audio-only).
+
     Raises:
         RuntimeError: If audio-only encoding lacks an audio stream or output fails validation.
         subprocess.CalledProcessError: If FFmpeg re-encoding fails.
     """
-    if await is_valid_reencoded_file(
+    reused, reused_fps = await validate_reencoded_file(
         input_path=input_path,
         output_path=output_path,
         fps=fps,
         duration_tolerance_ms=duration_tolerance_ms,
-    ):
+    )
+    if reused and reused_fps is not None:
         logfire.info(f"Reusing existing valid compressed media: {output_path.name}")
-        return
+        return reused_fps
 
     if fps == 0 and not await has_audio_stream(input_path):
         raise RuntimeError(f"Cannot encode audio-only for {input_path.name}: no audio stream found.")
@@ -883,14 +893,16 @@ async def reencode_video(
 
     try:
         await _run_ffmpeg(cmd)
-        if not await is_valid_reencoded_file(
+        valid, encoded_fps = await validate_reencoded_file(
             input_path=input_path,
             output_path=temp_output,
             fps=fps,
             duration_tolerance_ms=duration_tolerance_ms,
-        ):
+        )
+        if not valid or encoded_fps is None:
             raise RuntimeError(f"Re-encoded output failed validation for {input_path.name} at {fps} fps.")
         os.replace(temp_output, output_path)
+        return encoded_fps
     except subprocess.CalledProcessError as e:
         logfire.exception(f"FFmpeg re-encoding failed for {input_path.name}. Stderr: {e.stderr}")
         raise

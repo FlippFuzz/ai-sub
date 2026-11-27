@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
-import re
 import shutil
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,12 +26,12 @@ from ai_sub.config import (
     atomic_write_text,
 )
 from ai_sub.gemini_executor import calculate_sha256_hex
-from ai_sub.jobs.job_base import AiJob, BaseJob, EncodingMode, TaskType, parse_timestamp_string_ms
+from ai_sub.jobs.job_base import AiJob, BaseJob, EncodingMode, TaskType
 from ai_sub.jobs.lyrics import LYRICS_PROMPT_VERSION, LyricsAiResponse, LyricsJob
 from ai_sub.jobs.reencode import ReencodeJob, ReencodeResult
 from ai_sub.jobs.subtitles import SUBTITLES_PROMPT_VERSION, SubtitlesAiResponse, SubtitlesJob
 from ai_sub.jobs.summary import SUMMARY_PROMPT_VERSION, SummaryAiResponse, SummaryJob
-from ai_sub.shortcode import generate_full_shortcode, parse_subtitle_track
+from ai_sub.shortcode import generate_full_shortcode
 from ai_sub.telemetry import get_app_version
 from ai_sub.video import (
     compute_file_id_hash,
@@ -42,12 +39,10 @@ from ai_sub.video import (
     get_video_duration_ms,
     get_video_fps,
     has_audio_stream,
-    is_valid_reencoded_file,
     sanitize_filename,
     split_video,
+    validate_reencoded_file,
 )
-
-_MD_ESCAPE_RE = re.compile(r"([\\*_`\[\]<>~])")
 
 
 @dataclass(frozen=True)
@@ -71,6 +66,18 @@ class FallbackProbeSpec:
     probe_audio: bool = False
 
 
+@dataclass(frozen=True)
+class _StageContext:
+    """Resolved stage references for fallback probing and failure transitions."""
+
+    state: MediaStageState
+    cfg: StageReencodeSettings
+    source_path: Path
+    label: str
+    tier_attempts: int
+    concluded: bool
+
+
 class MediaStageState(BaseModel):
     """Shared media preparation and FPS fallback state for a summary or segment unit."""
 
@@ -81,6 +88,10 @@ class MediaStageState(BaseModel):
     fps: NonNegativeFloat | None = Field(
         default=None,
         description="Active media framerate in FPS (0.0 for audio-only), or None if not yet probed.",
+    )
+    base_fps: NonNegativeFloat | None = Field(
+        default=None,
+        description="In-memory tier-0 keyframe/base FPS preserved across fallback steps for dashboard display.",
     )
     encoding: EncodingMode = Field(
         default="raw",
@@ -181,266 +192,6 @@ def _append_segment_events(
         )
 
 
-def _collapse_ws(text: str) -> str:
-    """Collapses internal whitespace and line breaks into single spaces.
-
-    Args:
-        text: Input string to normalize.
-
-    Returns:
-        str: Trimmed single-line text.
-    """
-    return " ".join(text.split())
-
-
-def _escape_md(text: str) -> str:
-    """Escapes inline Markdown and HTML-triggering characters for Jellyfin overview rendering.
-
-    Args:
-        text: Raw text string.
-
-    Returns:
-        str: Markdown-escaped string.
-    """
-    return _MD_ESCAPE_RE.sub(r"\\\1", text)
-
-
-def _format_number(value: float, decimals: int = 6) -> str:
-    """Formats a float with bounded decimal precision and stripped trailing zeros.
-
-    Args:
-        value: Numeric value to format.
-        decimals: Maximum decimal places before stripping zeros. Defaults to 6.
-
-    Returns:
-        str: Clean numeric string.
-    """
-    rounded = round(value, decimals)
-    if rounded == 0:
-        return "0"
-    return f"{rounded:.{decimals}f}".rstrip("0").rstrip(".")
-
-
-def _format_fps_value(fps: float) -> str:
-    """Formats an FPS value concisely while keeping small fallback fractions exact.
-
-    Args:
-        fps: Framerate in frames per second.
-
-    Returns:
-        str: Formatted numeric FPS string.
-    """
-    return _format_number(fps, decimals=2 if fps >= 1.0 else 6)
-
-
-def _format_fps_and_spf(fps: float) -> str:
-    """Formats a positive framerate alongside its seconds-per-frame interval for NFO output.
-
-    Args:
-        fps: Positive framerate in frames per second.
-
-    Returns:
-        str: Formatted string such as '0.25 fps (4s/frame)'.
-    """
-    fps_str = _format_fps_value(fps)
-    spf_str = _format_number(1.0 / fps, decimals=2)
-    return f"{fps_str} fps ({spf_str}s/frame)"
-
-
-def _format_time_range(start_ms: int, end_ms: int) -> str:
-    """Formats a millisecond interval as 'MM:SS–MM:SS' or 'HH:MM:SS–HH:MM:SS'.
-
-    Args:
-        start_ms: Start offset in milliseconds.
-        end_ms: End offset in milliseconds.
-
-    Returns:
-        str: Formatted time window string.
-    """
-    start_s = max(0, round(start_ms / 1000))
-    end_s = max(start_s, round(end_ms / 1000))
-    use_hours = end_s >= 3600
-
-    def _fmt(sec: int) -> str:
-        if use_hours:
-            h, rem = divmod(sec, 3600)
-            m, s = divmod(rem, 60)
-            return f"{h:02d}:{m:02d}:{s:02d}"
-        m, s = divmod(sec, 60)
-        return f"{m:02d}:{s:02d}"
-
-    return f"{_fmt(start_s)}–{_fmt(end_s)}"
-
-
-def _format_encoding_label(encoding: EncodingMode, fps: float | None, fallback_tier: int = 0) -> str:
-    """Formats a stage's encoding mode, FPS, and fallback status for NFO metadata.
-
-    Args:
-        encoding: Media encoding mode ('raw', 'keyframes', 'reencoded', or 'audio').
-        fps: Active numeric FPS, or None if unavailable.
-        fallback_tier: Fallback tier index (0 = initial, 1+ = fallback). Defaults to 0.
-
-    Returns:
-        str: Human-readable encoding description.
-    """
-    suffix = " [fallback]" if fallback_tier > 0 else ""
-    if encoding == "raw":
-        return f"raw ({_format_fps_value(fps)} fps)" if fps is not None and fps > 0 else "raw"
-    if encoding == "keyframes":
-        if fps is not None and fps > 0:
-            fps_str = _format_fps_value(fps)
-            spf_str = _format_number(1.0 / fps, decimals=2)
-            return f"keyframes ({fps_str} fps, {spf_str}s/frame)"
-        return "keyframes"
-    if encoding == "audio" or fps == 0:
-        return f"0 fps (audio-only){suffix}"
-    if fps is not None and fps > 0:
-        return f"{_format_fps_and_spf(fps)}{suffix}"
-    return f"reencoded{suffix}"
-
-
-def _build_nfo_plot(summary: SummaryAiResponse, processing_details: str | None = None) -> str:
-    """Formats all global summary sections and optional processing details into a Markdown Jellyfin `<plot>`.
-
-    Args:
-        summary: Phase 1 global video summary containing overview, chapters, entities, and glossary.
-        processing_details: Optional pre-formatted Markdown section appended at the end. Defaults to None.
-
-    Returns:
-        str: Formatted plot text, or empty string if all sections are empty.
-    """
-    sections: list[str] = []
-
-    raw_summary = summary.overall_summary.replace("\r\n", "\n").replace("\r", "\n").strip()
-    if raw_summary:
-        # Preserve paragraph breaks while escaping inline syntax and accidental ATX headings.
-        lines = [line.strip() for line in raw_summary.splitlines()]
-        normalized = re.sub(r"\n{2,}", "\n\n", "\n".join(lines))
-        clean_summary = re.sub(r"(?m)^(#{1,6})(?=\s|$)", r"\\\1", _escape_md(normalized))
-        sections.append(clean_summary)
-
-    chapter_lines: list[str] = []
-    for ch in summary.chapters:
-        ch_title = _escape_md(_collapse_ws(ch.title))
-        if not ch_title:
-            continue
-        start = _escape_md(_collapse_ws(ch.start))
-        end = _escape_md(_collapse_ws(ch.end))
-        header = f"**{start}–{end} — {ch_title}**" if (start and end) else f"**{ch_title}**"
-
-        song_title = _escape_md(_collapse_ws(ch.song_title)) if ch.song_title else ""
-        song_artist = _escape_md(_collapse_ws(ch.song_artist)) if ch.song_artist else ""
-        if song_title and song_artist:
-            song_part = f" [🎵 {song_title} — {song_artist}]"
-        elif song_title or song_artist:
-            song_part = f" [🎵 {song_title or song_artist}]"
-        else:
-            song_part = ""
-
-        desc = _escape_md(_collapse_ws(ch.description))
-        chapter_lines.append(f"- {header}{song_part}: {desc}" if desc else f"- {header}{song_part}")
-
-    if chapter_lines:
-        sections.append("\n".join([f"### Chapters ({len(chapter_lines)})", *chapter_lines]))
-
-    entity_lines: list[str] = []
-    entity_count = 0
-    for ent in summary.entities:
-        name = _escape_md(_collapse_ws(ent.name))
-        if not name:
-            continue
-        entity_count += 1
-        head = f"- **{name}**"
-        if ent.original_name and (orig := _escape_md(_collapse_ws(ent.original_name))):
-            head += f" ({orig})"
-        if ent.role_or_affiliation and (role := _escape_md(_collapse_ws(ent.role_or_affiliation))):
-            head += f" — {role}"
-        entity_lines.append(head)
-
-        for label, raw_val in (
-            ("Lore", ent.persona_lore),
-            ("Speech", ent.speech_patterns_or_ticks),
-            ("Visuals", ent.visual_cues),
-        ):
-            if raw_val and (val := _escape_md(_collapse_ws(raw_val))):
-                entity_lines.append(f"  - {label}: {val}")
-
-    if entity_count > 0:
-        sections.append("\n".join([f"### Entities ({entity_count})", *entity_lines]))
-
-    glossary_lines: list[str] = []
-    for item in summary.domain_glossary:
-        term = _escape_md(_collapse_ws(item.term))
-        meaning = _escape_md(_collapse_ws(item.meaning))
-        if term and meaning:
-            glossary_lines.append(f"- **{term}**: {meaning}")
-        elif term or meaning:
-            glossary_lines.append(f"- {term or meaning}")
-
-    if glossary_lines:
-        sections.append("\n".join([f"### Domain Glossary ({len(glossary_lines)})", *glossary_lines]))
-
-    if processing_details and processing_details.strip():
-        sections.append(processing_details.strip())
-
-    return "\n\n".join(sections)
-
-
-def _build_nfo_xml(
-    summary: SummaryAiResponse,
-    title: str | None = None,
-    processing_details: str | None = None,
-) -> str:
-    """Builds a Jellyfin-compatible Movie NFO XML string from a global summary response.
-
-    Args:
-        summary: Phase 1 global video summary containing plot and chapter timeline.
-        title: Optional video title to expose in `<title>`. Omitted when None.
-        processing_details: Optional Markdown processing details appended to `<plot>`. Defaults to None.
-
-    Returns:
-        str: Formatted UTF-8 XML document string.
-    """
-    root = ET.Element("movie")
-
-    if title and (clean_title := title.strip()):
-        title_el = ET.SubElement(root, "title")
-        title_el.text = clean_title
-
-    if plot_text := _build_nfo_plot(summary, processing_details=processing_details):
-        plot_el = ET.SubElement(root, "plot")
-        plot_el.text = plot_text
-
-    chapter_entries: list[tuple[str, int]] = []
-    prev_start_s: int | None = None
-    for ch in summary.chapters:
-        ch_title = ch.title.strip()
-        if not ch_title:
-            continue
-        try:
-            start_ms = parse_timestamp_string_ms(ch.start)
-        except ValueError:
-            continue
-
-        raw_s = start_ms // 1000
-        if prev_start_s is not None and raw_s <= prev_start_s:
-            start_s = max(prev_start_s + 1, math.ceil(start_ms / 1000))
-        else:
-            start_s = raw_s
-
-        prev_start_s = start_s
-        chapter_entries.append((ch_title, start_s))
-
-    if chapter_entries:
-        chapters_el = ET.SubElement(root, "chapters")
-        for ch_title, start_s in chapter_entries:
-            ET.SubElement(chapters_el, "chapter", name=ch_title, start=str(start_s))
-
-    ET.indent(root, space="  ")
-    body = ET.tostring(root, encoding="unicode", short_empty_elements=False)
-    return f'<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n{body}\n'
-
-
 def _resolve_stage_encoding(
     current_encoding: EncodingMode,
     current_fps: float | None,
@@ -475,21 +226,30 @@ def _resolve_stage_encoding(
     return "raw", current_fps if current_encoding == "raw" else None
 
 
-async def _probe_fps_safe(media_path: Path) -> float | None:
-    """Probes average video framerate via ffprobe, returning None on failure.
+def _resolve_known_base_fps(
+    cfg: StageReencodeSettings,
+    fallback_tier: int,
+    encoding: EncodingMode,
+    fps: float | None,
+) -> float | None:
+    """Returns the current tier's numeric FPS when known without probing keyframes.
 
     Args:
-        media_path: Path to the target video file.
+        cfg: Re-encoding settings for the stage.
+        fallback_tier: Current fallback tier index.
+        encoding: Current media encoding mode.
+        fps: Current numeric FPS if known, or None.
 
     Returns:
-        float | None: Positive framerate in FPS, or None if unavailable.
+        float | None: Numeric FPS at the current tier, or None if keyframes must be probed.
     """
-    try:
-        probed = await get_video_fps(media_path)
-        return probed if probed > 0 else None
-    except Exception as e:
-        logfire.warning(f"Could not probe FPS for {media_path.name}: {e}")
-        return None
+    if fallback_tier > 0 and fps is not None:
+        return float(fps)
+    if encoding == "keyframes" and fps is not None:
+        return float(fps)
+    if cfg.fps != "keyframes":
+        return float(cfg.fps)
+    return None
 
 
 async def probe_keyframe_base_fps(
@@ -505,18 +265,14 @@ async def probe_keyframe_base_fps(
     Returns:
         float: Positive keyframe rate in FPS (defaults to 1.0 if probing fails).
     """
-    try:
-        if keyframe_media is not None and keyframe_media.is_file():
-            probed_fps = await get_video_fps(keyframe_media)
-        else:
-            probed_fps = await get_keyframe_fps(source_path)
-        if probed_fps > 0:
-            return probed_fps
-        logfire.warning(
-            f"Probed non-positive keyframe rate ({probed_fps}) for {source_path.name}; defaulting base FPS to 1.0."
-        )
-    except Exception as e:
-        logfire.warning(f"Failed to probe keyframe rate for {source_path.name} ({e}); defaulting base FPS to 1.0.")
+    if keyframe_media is not None and keyframe_media.is_file():
+        probed_fps = await get_video_fps(keyframe_media)
+    else:
+        probed_fps = await get_keyframe_fps(source_path)
+
+    if probed_fps is not None:
+        return probed_fps
+    logfire.warning(f"Could not probe keyframe rate for {source_path.name}; defaulting base FPS to 1.0.")
     return 1.0
 
 
@@ -551,7 +307,7 @@ async def _compute_next_fallback_fps(
     source_path: Path,
     probed_base_fps: float | None = None,
     has_audio: bool | None = None,
-) -> float | None:
+) -> tuple[float | None, float]:
     """Computes the target FPS for the next fallback tier, snapping below minfps to 0.0 (audio-only).
 
     Args:
@@ -565,126 +321,27 @@ async def _compute_next_fallback_fps(
         has_audio: Optional pre-probed audio-stream presence flag computed outside locks. Defaults to None.
 
     Returns:
-        float | None: Next FPS target (0.0 for audio-only), or None if no audio stream exists for 0 fps.
+        tuple[float | None, float]: (next_fps, tier0_base_fps) where next_fps is None if no audio stream exists.
     """
-    if probed_base_fps is not None:
-        base_fps = probed_base_fps
-    elif current_tier > 0 and current_fps is not None:
-        base_fps = float(current_fps)
-    elif current_encoding == "keyframes" and current_fps is not None:
-        base_fps = float(current_fps)
-    elif cfg.fps == "keyframes":
-        keyframe_media = existing_media if current_encoding == "keyframes" else None
-        base_fps = await probe_keyframe_base_fps(source_path, keyframe_media=keyframe_media)
+    divisor = float(cfg.fallback.divisor)
+    known = _resolve_known_base_fps(cfg, current_tier, current_encoding, current_fps)
+    if known is not None:
+        step_fps = known
+        tier0_base = known * (divisor**current_tier)
     else:
-        base_fps = float(cfg.fps)
+        if probed_base_fps is not None:
+            tier0_base = probed_base_fps
+        else:
+            keyframe_media = existing_media if current_encoding == "keyframes" else None
+            tier0_base = await probe_keyframe_base_fps(source_path, keyframe_media=keyframe_media)
+        step_fps = tier0_base / (divisor**current_tier)
 
-    candidate_fps = base_fps / float(cfg.fallback.divisor)
+    candidate_fps = step_fps / divisor
     if candidate_fps >= cfg.fallback.minfps:
-        return candidate_fps
+        return candidate_fps, tier0_base
 
     audio_available = has_audio if has_audio is not None else await has_audio_stream(source_path)
-    return 0.0 if audio_available else None
-
-
-def build_fallback_tiers(
-    state: MediaStageState,
-    cfg: StageReencodeSettings,
-    source_path: Path,
-    exhausted: bool = False,
-) -> list[dict[str, Any]]:
-    """Builds the ordered fallback tier progression for dashboard display when in fallback.
-
-    Runs synchronously using cached state and config math without spawning subprocesses.
-
-    Args:
-        state: Active summary or segment media state.
-        cfg: Re-encoding settings for this stage.
-        source_path: Uncompressed source media path for tier-0 threshold check.
-        exhausted: Whether this stage has exhausted all retries and fallback tiers. Defaults to False.
-
-    Returns:
-        list[dict[str, Any]]: Ordered list of tier dicts, or empty list when not in fallback.
-    """
-    if state.fallback_tier <= 0:
-        return []
-
-    divisor = float(cfg.fallback.divisor)
-    minfps = float(cfg.fallback.minfps)
-
-    try:
-        was_raw = cfg.threshold == 0 or source_path.stat().st_size < cfg.threshold
-    except OSError:
-        was_raw = cfg.threshold == 0
-
-    base_fps: float | None = None
-    if cfg.fps != "keyframes":
-        base_fps = float(cfg.fps)
-    elif state.fps is not None and state.fps > 0:
-        base_fps = float(state.fps) * (divisor**state.fallback_tier)
-
-    tiers: list[dict[str, Any]] = []
-
-    def _status(tier_idx: int) -> str:
-        if tier_idx < state.fallback_tier:
-            return "failed"
-        if tier_idx == state.fallback_tier:
-            return "exhausted" if exhausted else "active"
-        return "upcoming"
-
-    tier0_encoding: EncodingMode = "raw" if was_raw else ("keyframes" if cfg.fps == "keyframes" else "reencoded")
-    tiers.append(
-        {
-            "tier": 0,
-            "encoding": tier0_encoding,
-            "fps": None if was_raw else base_fps,
-            "status": _status(0),
-        }
-    )
-
-    if base_fps is not None and base_fps > 0:
-        for tier_idx in range(1, 21):
-            candidate = base_fps / (divisor**tier_idx)
-            if candidate >= minfps:
-                tiers.append(
-                    {
-                        "tier": tier_idx,
-                        "encoding": "reencoded",
-                        "fps": candidate,
-                        "status": _status(tier_idx),
-                    }
-                )
-            else:
-                if not (exhausted and state.fallback_tier < tier_idx):
-                    tiers.append(
-                        {
-                            "tier": tier_idx,
-                            "encoding": "audio",
-                            "fps": 0.0,
-                            "status": _status(tier_idx),
-                        }
-                    )
-                break
-    else:
-        for tier_idx in range(1, state.fallback_tier):
-            tiers.append(
-                {
-                    "tier": tier_idx,
-                    "encoding": "reencoded",
-                    "fps": None,
-                    "status": "failed",
-                }
-            )
-        tiers.append(
-            {
-                "tier": state.fallback_tier,
-                "encoding": state.encoding,
-                "fps": state.fps,
-                "status": _status(state.fallback_tier),
-            }
-        )
-
-    return tiers
+    return (0.0 if audio_available else None), tier0_base
 
 
 class Pipeline(BaseModel):
@@ -799,6 +456,26 @@ class Pipeline(BaseModel):
             return True
         return seg.lyrics_response is not None or seg.lyrics_exhausted
 
+    def get_stage_media_state(
+        self,
+        task_type: TaskType,
+        segment_index: int | None = None,
+    ) -> MediaStageState | None:
+        """Returns the SummaryState or SegmentState associated with a task type and segment index.
+
+        Args:
+            task_type: Target AI stage (SUMMARY, SUBTITLES, or LYRICS).
+            segment_index: Zero-based segment index for segment stages. Defaults to None.
+
+        Returns:
+            MediaStageState | None: Active stage media state, or None if unavailable.
+        """
+        if task_type == TaskType.SUMMARY:
+            return self.summary
+        if segment_index is not None and 0 <= segment_index < len(self.segments):
+            return self.segments[segment_index]
+        return None
+
     @classmethod
     async def create(
         cls,
@@ -889,6 +566,7 @@ class Pipeline(BaseModel):
             split_duration_s=split_duration_s,
             media_tag=resolved_tag,
             duration_tolerance_ms=split_tolerance_ms,
+            input_duration_ms=total_duration_ms,
         )
         if not all_segments:
             raise RuntimeError(f"No video segments produced for {raw_resolved.name}.")
@@ -1022,11 +700,7 @@ class Pipeline(BaseModel):
             return self.job_dir / f"reencoded_summary_{self.media_tag}{ext}"
         return self.job_dir / f"reencoded_{seg.raw_path.stem}{ext}"
 
-    def _fallback_stage_context(
-        self,
-        task_type: TaskType,
-        seg: SegmentState | None,
-    ) -> tuple[MediaStageState, StageReencodeSettings, Path, str, int, bool]:
+    def _fallback_stage_context(self, task_type: TaskType, seg: SegmentState | None) -> _StageContext:
         """Resolves media state, re-encode rules, source path, label, attempts, and conclusion flag for a stage.
 
         Args:
@@ -1034,27 +708,26 @@ class Pipeline(BaseModel):
             seg: Target segment state when task_type is SUBTITLES.
 
         Returns:
-            tuple[MediaStageState, StageReencodeSettings, Path, str, int, bool]:
-                (media_state, reencode_cfg, source_path, label, tier_attempts, is_concluded).
+            _StageContext: Resolved stage references and failure status.
         """
         if task_type == TaskType.SUMMARY:
             s = self.summary
-            return (
-                s,
-                self.reencode_settings.summary,
-                self.raw_video_path,
-                "Summary",
-                s.tier_attempts,
-                s.response is not None or s.exhausted,
+            return _StageContext(
+                state=s,
+                cfg=self.reencode_settings.summary,
+                source_path=self.raw_video_path,
+                label="Summary",
+                tier_attempts=s.tier_attempts,
+                concluded=s.response is not None or s.exhausted,
             )
         assert seg is not None
-        return (
-            seg,
-            self.reencode_settings.segment,
-            seg.raw_path,
-            f"Subtitles for '{self._segment_yaml_stem(seg)}'",
-            seg.subtitles_tier_attempts,
-            seg.subtitles_response is not None or seg.subtitles_exhausted,
+        return _StageContext(
+            state=seg,
+            cfg=self.reencode_settings.segment,
+            source_path=seg.raw_path,
+            label=f"Subtitles for '{self._segment_yaml_stem(seg)}'",
+            tier_attempts=seg.subtitles_tier_attempts,
+            concluded=seg.subtitles_response is not None or seg.subtitles_exhausted,
         )
 
     def _restore_failure_state(
@@ -1277,20 +950,34 @@ class Pipeline(BaseModel):
 
         return proxy_path
 
+    @staticmethod
+    def _record_keyframe_base_fps(state: MediaStageState, cfg: StageReencodeSettings) -> None:
+        """Populates in-memory base_fps for keyframes stages when recoverable from current FPS."""
+        if state.base_fps is None and state.fps is not None and state.fps > 0 and cfg.fps == "keyframes":
+            if state.encoding == "keyframes":
+                state.base_fps = float(state.fps)
+            elif state.fallback_tier > 0:
+                state.base_fps = float(state.fps) * (float(cfg.fallback.divisor) ** state.fallback_tier)
+
     async def _prepare_media_states(self) -> None:
         """Evaluates media compression needs, validates existing encoded files, and probes missing FPS."""
 
-        async def _fill_missing_fps(state: MediaStageState, source_path: Path, seg: SegmentState | None) -> None:
-            if state.fps is not None:
-                return
-            if state.encoding == "audio":
-                state.fps = 0.0
-            elif state.encoding == "raw":
-                state.fps = await _probe_fps_safe(source_path)
-            elif state.encoding == "keyframes":
-                kf_path = self._reencoded_output_path("keyframes", seg)
-                if kf_path.is_file():
-                    state.fps = await _probe_fps_safe(kf_path)
+        async def _fill_missing_fps(
+            state: MediaStageState,
+            cfg: StageReencodeSettings,
+            source_path: Path,
+            seg: SegmentState | None,
+        ) -> None:
+            if state.fps is None:
+                if state.encoding == "audio":
+                    state.fps = 0.0
+                elif state.encoding == "raw":
+                    state.fps = await get_video_fps(source_path)
+                elif state.encoding == "keyframes":
+                    kf_path = self._reencoded_output_path("keyframes", seg)
+                    if kf_path.is_file():
+                        state.fps = await get_video_fps(kf_path)
+            self._record_keyframe_base_fps(state, cfg)
 
         async def _check_stage_media(
             state: MediaStageState,
@@ -1317,39 +1004,44 @@ class Pipeline(BaseModel):
             if desired_encoding == "raw":
                 state.media_path = await self._link_raw_summary_proxy() if is_summary else source_path
                 state.media_ready = True
-                state.fps = desired_fps if desired_fps is not None else await _probe_fps_safe(source_path)
+                state.fps = desired_fps if desired_fps is not None else await get_video_fps(source_path)
                 return
 
             encoded_path = self._reencoded_output_path(desired_encoding, seg)
             if desired_encoding == "keyframes":
+                numeric_fps: float | None = None
                 validate_fps: float | Literal["keyframes"] = "keyframes"
             elif desired_encoding == "audio":
+                numeric_fps = 0.0
                 validate_fps = 0.0
             else:
                 assert desired_fps is not None
-                validate_fps = float(desired_fps)
+                numeric_fps = float(desired_fps)
+                validate_fps = numeric_fps
 
-            if await is_valid_reencoded_file(
+            valid, probed_fps = await validate_reencoded_file(
                 input_path=source_path,
                 output_path=encoded_path,
                 fps=validate_fps,
                 duration_tolerance_ms=int(cfg.tolerance.total_seconds() * 1000),
-            ):
+            )
+            if valid:
                 state.media_path = encoded_path
                 state.media_ready = True
-                if desired_encoding == "keyframes":
-                    state.fps = desired_fps if desired_fps is not None else await _probe_fps_safe(encoded_path)
-                else:
-                    state.fps = float(validate_fps)
+                state.fps = (
+                    (desired_fps if desired_fps is not None else probed_fps) if numeric_fps is None else numeric_fps
+                )
             else:
                 state.media_path = None
                 state.media_ready = False
-                state.fps = None if desired_encoding == "keyframes" else float(validate_fps)
+                state.fps = numeric_fps
+
+            self._record_keyframe_base_fps(state, cfg)
 
         if self.summary_enabled:
             if self.summary.response is not None or self.summary.exhausted:
                 self.summary.media_ready = True
-                await _fill_missing_fps(self.summary, self.raw_video_path, None)
+                await _fill_missing_fps(self.summary, self.reencode_settings.summary, self.raw_video_path, None)
             else:
                 await _check_stage_media(
                     self.summary,
@@ -1366,7 +1058,7 @@ class Pipeline(BaseModel):
                     out_p = self._reencoded_output_path(seg.encoding, seg)
                     seg.media_path = out_p if (seg.encoding != "raw" and out_p.is_file()) else seg.raw_path
                     seg.media_ready = True
-                    await _fill_missing_fps(seg, seg.raw_path, seg)
+                    await _fill_missing_fps(seg, seg_cfg, seg.raw_path, seg)
                     return
                 await _check_stage_media(seg, seg_cfg, seg.raw_path, seg=seg)
 
@@ -1444,38 +1136,32 @@ class Pipeline(BaseModel):
         else:
             return None
 
-        media_state, cfg, source_path, _, attempts, concluded = self._fallback_stage_context(task_type, seg)
+        ctx = self._fallback_stage_context(task_type, seg)
         max_runs = self.get_retry_settings(task_type).maxruns
-        if concluded or attempts + 1 < max_runs or not cfg.fallback.enabled or media_state.encoding == "audio":
+        if ctx.concluded or ctx.tier_attempts + 1 < max_runs or not ctx.cfg.fallback.enabled:
+            return None
+        if ctx.state.encoding == "audio":
             return None
 
-        need_kf = (
-            media_state.fallback_tier == 0
-            and cfg.fps == "keyframes"
-            and not (media_state.encoding == "keyframes" and media_state.fps is not None)
+        known_base = _resolve_known_base_fps(
+            ctx.cfg,
+            ctx.state.fallback_tier,
+            ctx.state.encoding,
+            ctx.state.fps,
         )
-        if need_kf:
+        if known_base is None:
             keyframe_media = (
-                media_state.media_path
-                if media_state.encoding == "keyframes" and media_state.media_path is not None
-                else None
+                ctx.state.media_path if ctx.state.encoding == "keyframes" and ctx.state.media_path is not None else None
             )
             return FallbackProbeSpec(
-                source_path=source_path,
+                source_path=ctx.source_path,
                 keyframe_media=keyframe_media,
                 probe_keyframe_fps=True,
                 probe_audio=True,
             )
 
-        if media_state.fallback_tier > 0 and media_state.fps is not None:
-            known_base = float(media_state.fps)
-        elif media_state.encoding == "keyframes" and media_state.fps is not None:
-            known_base = float(media_state.fps)
-        else:
-            known_base = float(cfg.fps)
-
-        if (known_base / float(cfg.fallback.divisor)) < cfg.fallback.minfps:
-            return FallbackProbeSpec(source_path=source_path, probe_audio=True)
+        if (known_base / float(ctx.cfg.fallback.divisor)) < ctx.cfg.fallback.minfps:
+            return FallbackProbeSpec(source_path=ctx.source_path, probe_audio=True)
 
         return None
 
@@ -1699,32 +1385,34 @@ class Pipeline(BaseModel):
         Returns:
             FailureOutcome: Resulting state transition.
         """
-        media_state, cfg, source_path, label, tier_attempts, _ = self._fallback_stage_context(task_type, seg)
+        ctx = self._fallback_stage_context(task_type, seg)
         is_summary = task_type == TaskType.SUMMARY
-        current_tier = media_state.fallback_tier
-        current_encoding = media_state.encoding
-        current_fps = media_state.fps
-        existing_media = media_state.media_path
+        current_tier = ctx.state.fallback_tier
+        current_encoding = ctx.state.encoding
+        current_fps = ctx.state.fps
+        existing_media = ctx.state.media_path
         max_runs = self.get_retry_settings(task_type).maxruns
 
         next_fps: float | None = None
-        if cfg.fallback.enabled and current_encoding != "audio":
-            next_fps = await _compute_next_fallback_fps(
-                cfg=cfg,
+        if ctx.cfg.fallback.enabled and current_encoding != "audio":
+            next_fps, tier0_base = await _compute_next_fallback_fps(
+                cfg=ctx.cfg,
                 current_tier=current_tier,
                 current_encoding=current_encoding,
                 current_fps=current_fps,
                 existing_media=existing_media,
-                source_path=source_path,
+                source_path=ctx.source_path,
                 probed_base_fps=fallback_base_fps,
                 has_audio=has_audio,
             )
+            if ctx.state.base_fps is None and ctx.cfg.fps == "keyframes":
+                ctx.state.base_fps = tier0_base
 
         if next_fps is not None:
             # Remove stale compressed output so the next fallback tier always encodes cleanly
             if (
                 existing_media is not None
-                and existing_media != source_path
+                and existing_media != ctx.source_path
                 and existing_media.name.startswith("reencoded_")
                 and existing_media.is_file()
             ):
@@ -1735,11 +1423,11 @@ class Pipeline(BaseModel):
 
             next_tier = current_tier + 1
             next_encoding: EncodingMode = "audio" if next_fps == 0 else "reencoded"
-            media_state.fallback_tier = next_tier
-            media_state.encoding = next_encoding
-            media_state.fps = float(next_fps)
-            media_state.media_path = None
-            media_state.media_ready = False
+            ctx.state.fallback_tier = next_tier
+            ctx.state.encoding = next_encoding
+            ctx.state.fps = float(next_fps)
+            ctx.state.media_path = None
+            ctx.state.media_ready = False
             if is_summary:
                 self.summary.tier_attempts = 0
             else:
@@ -1749,7 +1437,7 @@ class Pipeline(BaseModel):
             self._save_checkpoint(task_type, seg)
             if log_context:
                 target_desc = "0 fps (audio-only)" if next_encoding == "audio" else f"{next_fps:.4g} fps"
-                logfire.warning(f"{label} {log_context}; falling back to {target_desc} (tier {next_tier}).")
+                logfire.warning(f"{ctx.label} {log_context}; falling back to {target_desc} (tier {next_tier}).")
             return FailureOutcome(
                 action="fallback_reencode",
                 fallback_tier=next_tier,
@@ -1767,13 +1455,13 @@ class Pipeline(BaseModel):
         self._save_checkpoint(task_type, seg)
         if log_context:
             suffix = " Aborting." if is_summary else ""
-            logfire.error(f"{label} exhausted all {max_runs} run(s) across all FPS tiers.{suffix}")
+            logfire.error(f"{ctx.label} exhausted all {max_runs} run(s) across all FPS tiers.{suffix}")
         return FailureOutcome(
             action="exhausted",
             fallback_tier=current_tier,
             fps=current_fps,
             encoding=current_encoding,
-            tier_attempts=tier_attempts,
+            tier_attempts=ctx.tier_attempts,
         )
 
     def complete_reencode(self, job: ReencodeJob, media_path: Path, fps: float | None = None) -> None:
@@ -1794,6 +1482,8 @@ class Pipeline(BaseModel):
             media_state.media_ready = True
             if fps is not None:
                 media_state.fps = fps
+                if job.fps == "keyframes" and fps > 0:
+                    media_state.base_fps = fps
             elif job.fps != "keyframes":
                 media_state.fps = float(job.fps)
 
@@ -1826,39 +1516,10 @@ class Pipeline(BaseModel):
             media_state.media_path = await self._link_raw_summary_proxy() if job.is_summary_proxy else job.input_file
             media_state.media_ready = True
             media_state.encoding = "raw"
-            media_state.fps = await _probe_fps_safe(raw_source)
+            media_state.fps = await get_video_fps(raw_source)
             return FailureOutcome(action="retry")
 
         return await self._advance_or_exhaust_stage(task_type, seg=seg)
-
-    def _commit_stage_checkpoint(
-        self,
-        state: SummaryState | SegmentState,
-        resp_attr: str,
-        exhausted_attr: str,
-        resp: BaseModel,
-        task_type: TaskType,
-        seg: SegmentState | None = None,
-    ) -> None:
-        """Commits a validated AI response and persists its YAML checkpoint with rollback on failure.
-
-        Args:
-            state: Target SummaryState or SegmentState instance.
-            resp_attr: Attribute name holding the response object.
-            exhausted_attr: Attribute name holding the exhausted flag.
-            resp: Validated AI response model.
-            task_type: Completed AI stage type.
-            seg: Segment state for segment stages. Defaults to None.
-        """
-        prev = (getattr(state, resp_attr), getattr(state, exhausted_attr))
-        setattr(state, resp_attr, resp)
-        setattr(state, exhausted_attr, False)
-        try:
-            self._save_checkpoint(task_type, seg)
-        except Exception:
-            setattr(state, resp_attr, prev[0])
-            setattr(state, exhausted_attr, prev[1])
-            raise
 
     def complete_ai_task(
         self,
@@ -1906,7 +1567,15 @@ class Pipeline(BaseModel):
         resp = (
             result_data if isinstance(result_data, resp_cls) else resp_cls.model_validate(result_data, context=val_ctx)
         )
-        self._commit_stage_checkpoint(state, resp_attr, exhausted_attr, resp, task_type, seg)
+        prev = (getattr(state, resp_attr), getattr(state, exhausted_attr))
+        setattr(state, resp_attr, resp)
+        setattr(state, exhausted_attr, False)
+        try:
+            self._save_checkpoint(task_type, seg)
+        except Exception:
+            setattr(state, resp_attr, prev[0])
+            setattr(state, exhausted_attr, prev[1])
+            raise
 
     def complete_job(self, job: BaseJob, result_data: Any) -> None:
         """Completes a typed Job instance returned by get_pending_jobs().
@@ -2005,11 +1674,11 @@ class Pipeline(BaseModel):
         if task_type not in (TaskType.SUMMARY, TaskType.SUBTITLES):
             return FailureOutcome(action="ignored")
 
-        media_state, _, _, _, prev_attempts, concluded = self._fallback_stage_context(task_type, seg)
-        if concluded:
+        ctx = self._fallback_stage_context(task_type, seg)
+        if ctx.concluded:
             return FailureOutcome(action="ignored")
 
-        tier_attempts = prev_attempts + 1
+        tier_attempts = ctx.tier_attempts + 1
         if task_type == TaskType.SUMMARY:
             self.summary.tier_attempts = tier_attempts
         else:
@@ -2028,9 +1697,9 @@ class Pipeline(BaseModel):
         self._save_checkpoint(task_type, seg)
         return FailureOutcome(
             action="retry",
-            fallback_tier=media_state.fallback_tier,
-            fps=media_state.fps,
-            encoding=media_state.encoding,
+            fallback_tier=ctx.state.fallback_tier,
+            fps=ctx.state.fps,
+            encoding=ctx.state.encoding,
             tier_attempts=tier_attempts,
         )
 
@@ -2079,108 +1748,6 @@ class Pipeline(BaseModel):
             "retry": self.retry_settings.model_dump(mode="json", exclude=retry_exclude),
             "context": self.user_context,
         }
-
-    def _build_nfo_processing_details(self) -> str:
-        """Formats lineage, encoding, failures, and in-progress segments into a Markdown NFO section.
-
-        Returns:
-            str: Formatted '### Processing Details' Markdown section.
-        """
-        track_info = parse_subtitle_track(self.full_shortcode)
-        lineage = (
-            f"{track_info.models_shortcode} ({track_info.prompt_version_str})"
-            if track_info.prompt_version_str
-            else track_info.models_shortcode
-        )
-        lines: list[str] = [
-            "### Processing Details",
-            f"- **Lineage**: {_escape_md(lineage)}",
-            "- **Encoding**",
-        ]
-
-        if self.summary_enabled:
-            sum_window = _format_time_range(0, self.duration_ms)
-            sum_desc = _format_encoding_label(self.summary.encoding, self.summary.fps, self.summary.fallback_tier)
-            lines.append(f"  - summary ({sum_window}): {_escape_md(sum_desc)}")
-
-        other_counts: dict[str, int] = {}
-        for seg in self.segments:
-            if seg.fallback_tier > 0:
-                stem = self._segment_yaml_stem(seg)
-                window = _format_time_range(seg.offset_ms, seg.offset_ms + seg.duration_ms)
-                desc = _format_encoding_label(seg.encoding, seg.fps, seg.fallback_tier)
-                lines.append(f"  - {_escape_md(stem)} ({window}): {_escape_md(desc)}")
-            else:
-                label = "raw" if seg.encoding == "raw" else _format_encoding_label(seg.encoding, seg.fps)
-                other_counts[label] = other_counts.get(label, 0) + 1
-
-        if other_counts:
-            if len(other_counts) == 1:
-                other_summary = next(iter(other_counts))
-            else:
-                parts = [
-                    f"{count} raw" if label == "raw" else f"{count} at {label}" for label, count in other_counts.items()
-                ]
-                other_summary = ", ".join(parts)
-            lines.append(f"  - Other segments: {_escape_md(other_summary)}")
-
-        failure_lines: list[str] = []
-        in_progress_lines: list[str] = []
-        for seg in self.segments:
-            stem = self._segment_yaml_stem(seg)
-            window = _format_time_range(seg.offset_ms, seg.offset_ms + seg.duration_ms)
-            prefix = f"  - {_escape_md(stem)} ({window})"
-
-            if seg.subtitles_exhausted:
-                failure_lines.append(f"{prefix}: Subtitles failed")
-            elif seg.lyrics_exhausted:
-                failure_lines.append(f"{prefix}: Lyrics failed (draft preserved)")
-
-            if not self._is_segment_ai_concluded(seg):
-                stage_label = "Subtitles pending" if not self.segment_subtitles_concluded(seg) else "Lyrics pending"
-                in_progress_lines.append(f"{prefix}: {stage_label}")
-
-        if failure_lines:
-            lines.append("- **Failures**")
-            lines.extend(failure_lines)
-        else:
-            lines.append("- **Failures**: None")
-
-        if in_progress_lines:
-            lines.append("- **In Progress**")
-            lines.extend(in_progress_lines)
-
-        return "\n".join(lines)
-
-    def write_nfo(
-        self,
-        output_dir: Path | None = None,
-        filename_stem: str | None = None,
-    ) -> Path | None:
-        """Writes a Jellyfin-compatible .nfo metadata file from the Phase 1 global summary.
-
-        Args:
-            output_dir: Destination directory for the .nfo file. Defaults to job_dir.
-            filename_stem: Base filename stem for the .nfo output. Defaults to self.filename_stem.
-
-        Returns:
-            Path | None: Path to the written .nfo file, or None if summary data is unavailable.
-        """
-        if self.summary.response is None:
-            logfire.warning(f"Skipping .nfo generation for '{self.video_id}': global summary is unavailable.")
-            return None
-
-        target_dir = output_dir if output_dir is not None else self.job_dir
-        stem = filename_stem if filename_stem is not None else self.filename_stem
-        nfo_path = target_dir / f"{stem}.nfo"
-
-        xml_content = _build_nfo_xml(
-            summary=self.summary.response,
-            title=self.title if self.source_type == "youtube" else None,
-            processing_details=self._build_nfo_processing_details(),
-        )
-        atomic_write_text(nfo_path, xml_content)
-        return nfo_path
 
     def finalize(
         self,

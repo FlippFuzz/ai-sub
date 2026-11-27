@@ -161,14 +161,14 @@ def _is_bot_detection_error(err_msg: str) -> bool:
         bool: True if bot block or rate-limiting is detected, False otherwise.
     """
     lower = err_msg.lower()
-    return (
-        "not a bot" in lower
-        or "confirm you’re not a bot" in lower
-        or "confirm you're not a bot" in lower
-        or "confirm you are not a bot" in lower
-        or "http error 429" in lower
-        or "too many requests" in lower
-        or "recaptcha" in lower
+    return any(
+        marker in lower
+        for marker in (
+            "not a bot",
+            "http error 429",
+            "too many requests",
+            "recaptcha",
+        )
     )
 
 
@@ -258,38 +258,70 @@ class YouTubeClient:
         self._channel_map = ChannelMap(root={})
         self._load_channel_map()
 
-        if config.urls and config.potdir is not None:
-            pot_path = config.potdir if config.potdir.is_absolute() else base_work_dir / config.potdir
-            self._pot_server_dir = self._ensure_pot_provider(pot_path)
+        node_bin = shutil.which("node")
+        ffmpeg_bin, _ = ensure_ffmpeg()
+        npm_bin: str | None = None
+        npx_bin: str | None = None
+        pot_plugin_ver: str | None = None
+
+        if config.urls:
+            npm_bin = shutil.which("npm")
+            npx_bin = shutil.which("npx")
+            try:
+                pot_plugin_ver = importlib.metadata.version("bgutil-ytdlp-pot-provider")
+            except Exception:
+                pot_plugin_ver = None
+
+            if config.potdir is not None:
+                pot_path = config.potdir if config.potdir.is_absolute() else base_work_dir / config.potdir
+                self._pot_server_dir = self._ensure_pot_provider(
+                    pot_path,
+                    node_bin=node_bin,
+                    npm_bin=npm_bin,
+                    npx_bin=npx_bin,
+                    target_version=pot_plugin_ver,
+                )
+            else:
+                self._pot_server_dir = None
         else:
             self._pot_server_dir = None
 
-        self._base_ydl_opts = self._build_base_ydl_opts()
+        self._base_ydl_opts = self._build_base_ydl_opts(ffmpeg_bin=ffmpeg_bin, node_bin=node_bin)
         if config.urls:
-            self._log_startup_diagnostics()
+            self._log_startup_diagnostics(
+                node_bin=node_bin,
+                npm_bin=npm_bin,
+                npx_bin=npx_bin,
+                ffmpeg_bin=ffmpeg_bin,
+                pot_plugin_ver=pot_plugin_ver,
+            )
 
-    def _ensure_pot_provider(self, pot_dir: Path) -> Path | None:
+    def _ensure_pot_provider(
+        self,
+        pot_dir: Path,
+        *,
+        node_bin: str | None,
+        npm_bin: str | None,
+        npx_bin: str | None,
+        target_version: str | None,
+    ) -> Path | None:
         """Clones, syncs tags, and compiles bgutil-ytdlp-pot-provider once at startup.
 
         Leaves existing non-empty non-git directories intact rather than overwriting them.
 
         Args:
             pot_dir: Directory where the PO token provider repository is located.
+            node_bin: Resolved Node.js binary path, or None.
+            npm_bin: Resolved npm binary path, or None.
+            npx_bin: Resolved npx binary path, or None.
+            target_version: Installed bgutil-ytdlp-pot-provider package version, or None.
 
         Returns:
             Path | None: Server home directory if built and valid, None otherwise.
         """
-        node_bin = shutil.which("node")
-        npm_bin = shutil.which("npm")
-        npx_bin = shutil.which("npx")
         if not (node_bin and npm_bin and npx_bin):
             logfire.warning("Node.js, npm, or npx not found in PATH. Skipping PO token provider.")
             return None
-
-        try:
-            target_version = importlib.metadata.version("bgutil-ytdlp-pot-provider")
-        except Exception:
-            target_version = None
 
         repo_url = "https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git"
         server_dir = pot_dir / "server"
@@ -356,8 +388,12 @@ class YouTubeClient:
 
         return None
 
-    def _build_base_ydl_opts(self) -> dict[str, Any]:
+    def _build_base_ydl_opts(self, *, ffmpeg_bin: str, node_bin: str | None) -> dict[str, Any]:
         """Constructs base yt-dlp parameters including PO token server and FFmpeg path.
+
+        Args:
+            ffmpeg_bin: Path or command name for FFmpeg.
+            node_bin: Resolved Node.js binary path, or None.
 
         Returns:
             dict[str, Any]: Base yt-dlp configuration options dictionary.
@@ -366,8 +402,6 @@ class YouTubeClient:
         if self._pot_server_dir and self._pot_server_dir.exists():
             extractor_args["youtubepot-bgutilscript"] = {"server_home": [str(self._pot_server_dir.resolve())]}
 
-        ffmpeg_bin, _ = ensure_ffmpeg()
-        node_bin = shutil.which("node")
         opts: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
@@ -385,22 +419,28 @@ class YouTubeClient:
 
         return opts
 
-    def _log_startup_diagnostics(self) -> None:
-        """Logs binaries, cookies, proxy, and PO token setup once upon startup."""
-        node_bin = shutil.which("node")
-        npm_bin = shutil.which("npm")
-        npx_bin = shutil.which("npx")
-        ffmpeg_bin, _ = ensure_ffmpeg()
+    def _log_startup_diagnostics(
+        self,
+        *,
+        node_bin: str | None,
+        npm_bin: str | None,
+        npx_bin: str | None,
+        ffmpeg_bin: str,
+        pot_plugin_ver: str | None,
+    ) -> None:
+        """Logs binaries, cookies, proxy, and PO token setup once upon startup.
 
+        Args:
+            node_bin: Resolved Node.js binary path, or None.
+            npm_bin: Resolved npm binary path, or None.
+            npx_bin: Resolved npx binary path, or None.
+            ffmpeg_bin: Path or command name for FFmpeg.
+            pot_plugin_ver: Installed bgutil-ytdlp-pot-provider version, or None.
+        """
         cookie_p = self.config.cookiefile
         cookie_resolved = cookie_p.resolve() if cookie_p else None
         cookie_exists = bool(cookie_resolved and cookie_resolved.is_file())
         masked_proxy = redact_url_credentials(str(self.config.proxy)) if self.config.proxy else "None"
-
-        try:
-            pot_plugin_ver = importlib.metadata.version("bgutil-ytdlp-pot-provider")
-        except Exception:
-            pot_plugin_ver = "NOT_INSTALLED"
 
         with logfire.span(
             "YouTube Ingestion Startup Diagnostics",
@@ -412,7 +452,7 @@ class YouTubeClient:
             cookie_exists=cookie_exists,
             proxy=masked_proxy,
             pot_enabled=self.config.potdir is not None,
-            pot_plugin_version=pot_plugin_ver,
+            pot_plugin_version=pot_plugin_ver or "NOT_INSTALLED",
             pot_server_dir=str(self._pot_server_dir) if self._pot_server_dir else "None",
         ):
             if not cookie_exists and cookie_p:
@@ -696,7 +736,7 @@ class YouTubeClient:
                                 if vid in skip_ids and availability is None:
                                     continue
                                 title = str(entry.get("title") or "Unknown")
-                                if title in ["[Deleted video]", "[Private video]", "[Unavailable video]"]:
+                                if title in ("[Deleted video]", "[Private video]", "[Unavailable video]"):
                                     continue
                                 if entry.get("live_status") not in (None, "not_live", "was_live"):
                                     if is_single_video:

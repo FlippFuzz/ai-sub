@@ -80,6 +80,7 @@ class WorkerRunner:
     _tasks_completed_per_model: dict[str, int]
     _active_tasks_per_model: dict[str, int]
     _claim_polls_per_model: dict[str, int]
+    _error_retry_slots: int
     _last_busy_timestamp: float
     _deadline: float | None
     _version_mismatch: bool
@@ -104,6 +105,7 @@ class WorkerRunner:
         self._tasks_completed_per_model = {model: 0 for model in unique_models}
         self._active_tasks_per_model = {model: 0 for model in unique_models}
         self._claim_polls_per_model = {model: 0 for model in unique_models}
+        self._error_retry_slots = 0
         self._last_busy_timestamp = monotonic()
         self._deadline = None
         self._version_mismatch = False
@@ -171,14 +173,15 @@ class WorkerRunner:
 
         Args:
             timeout_s: Timeout duration in seconds.
-            ignore_polls: Whether to ignore in-flight claim polls (used for error timeouts). Defaults to False.
+            ignore_polls: Whether to ignore in-flight claim polls and error retries (used for error timeouts).
+                Defaults to False.
 
         Returns:
             bool: True if no blocking work remains and elapsed idle time reached timeout_s.
         """
         if sum(self._active_tasks_per_model.values()) > 0:
             return False
-        if not ignore_polls and sum(self._claim_polls_per_model.values()) > 0:
+        if not ignore_polls and (sum(self._claim_polls_per_model.values()) > 0 or self._error_retry_slots > 0):
             return False
         return (monotonic() - self._last_busy_timestamp) >= timeout_s
 
@@ -483,6 +486,57 @@ class WorkerRunner:
                     is_retryable=is_retryable,
                 )
 
+    def _try_idle_shutdown(
+        self,
+        model: str,
+        slot_label: str,
+        timeout_s: float,
+        is_error: bool,
+    ) -> bool:
+        """Checks stop flags and idle/error deadlines, setting shutdown if triggered (caller holds _cond).
+
+        Args:
+            model: Model identifier bound to this slot.
+            slot_label: Display label for logs.
+            timeout_s: Maximum idle or error duration before shutting down the worker.
+            is_error: True if evaluating an error timeout; False on idle poll timeout.
+
+        Returns:
+            bool: True if the slot should stop polling and exit; False otherwise.
+        """
+        if self._should_stop(model):
+            self._cond.notify_all()
+            return True
+
+        idle_timeout_s = self.settings.idletimeout.total_seconds()
+        if not is_error and self._idle_draining and self._is_idle_timed_out(idle_timeout_s):
+            elapsed = monotonic() - self._last_busy_timestamp
+            logfire.info(
+                f"[{slot_label}] All slots have been idle for {elapsed / 60:.1f}m "
+                f"(timeout: {idle_timeout_s / 60:.1f}m). Shutting down worker."
+            )
+            self._shutdown = True
+            self._cond.notify_all()
+            return True
+
+        if not self._is_idle_timed_out(timeout_s, ignore_polls=is_error):
+            return False
+
+        elapsed = monotonic() - self._last_busy_timestamp
+        if is_error:
+            logfire.error(
+                f"[{slot_label}] Server unreachable or failing claims for {elapsed:.1f}s. Shutting down worker."
+            )
+            self._fatal_error = True
+        else:
+            logfire.info(
+                f"[{slot_label}] All slots have been idle for {elapsed / 60:.1f}m "
+                f"(timeout: {timeout_s / 60:.1f}m). Shutting down worker."
+            )
+        self._shutdown = True
+        self._cond.notify_all()
+        return True
+
     async def _wait_after_poll(
         self,
         model: str,
@@ -494,7 +548,7 @@ class WorkerRunner:
         """Handles idle/error timeout checks and backoff waiting after an empty or failed poll (caller holds _cond).
 
         Stops issuing new polls once the idle deadline has expired with no active tasks,
-        draining any outstanding claim polls before shutting down.
+        draining any outstanding claim polls or error retries before shutting down.
 
         Args:
             model: Model identifier bound to this slot.
@@ -506,65 +560,32 @@ class WorkerRunner:
         Returns:
             bool: True if the slot should stop polling and exit; False to retry polling.
         """
-        idle_timeout_s = self.settings.idletimeout.total_seconds()
-
-        def _shutdown_if_timed_out() -> bool:
-            if self._idle_draining and self._is_idle_timed_out(idle_timeout_s):
-                elapsed = monotonic() - self._last_busy_timestamp
-                logfire.info(
-                    f"[{slot_label}] All slots have been idle for {elapsed / 60:.1f}m "
-                    f"(timeout: {idle_timeout_s / 60:.1f}m). Shutting down worker."
-                )
-                self._shutdown = True
-                self._cond.notify_all()
+        while True:
+            if self._try_idle_shutdown(model, slot_label, timeout_s, is_error):
                 return True
-            if not self._is_idle_timed_out(timeout_s, ignore_polls=is_error):
-                return False
+
+            active_count = sum(self._active_tasks_per_model.values())
+            poll_count = sum(self._claim_polls_per_model.values())
+            has_pending_polls = poll_count > 0 or self._error_retry_slots > 0
             elapsed = monotonic() - self._last_busy_timestamp
-            if is_error:
-                logfire.error(
-                    f"[{slot_label}] Server unreachable or failing claims for {elapsed:.1f}s. Shutting down worker."
-                )
-                self._fatal_error = True
-            else:
-                logfire.info(
-                    f"[{slot_label}] All slots have been idle for {elapsed / 60:.1f}m "
-                    f"(timeout: {timeout_s / 60:.1f}m). Shutting down worker."
-                )
-            self._shutdown = True
-            self._cond.notify_all()
-            return True
 
-        def _update_idle_draining() -> bool:
-            if (
-                not is_error
-                and sum(self._active_tasks_per_model.values()) == 0
-                and sum(self._claim_polls_per_model.values()) > 0
-                and (monotonic() - self._last_busy_timestamp) >= timeout_s
+            if not is_error and (
+                self._idle_draining or (active_count == 0 and has_pending_polls and elapsed >= timeout_s)
             ):
-                self._idle_draining = True
-            return self._idle_draining
+                if not self._idle_draining:
+                    self._idle_draining = True
+                    self._cond.notify_all()
+                await self._cond.wait()
+                continue
 
-        if self._should_stop(model):
-            self._cond.notify_all()
-            return True
-        if _shutdown_if_timed_out():
-            return True
-
-        if not _update_idle_draining():
-            wait_s = poll_interval_s
-            if sum(self._active_tasks_per_model.values()) == 0:
-                wait_s = min(poll_interval_s, max(0.0, timeout_s - (monotonic() - self._last_busy_timestamp)))
-
-            self._cond.notify_all()
+            wait_s = min(poll_interval_s, max(0.0, timeout_s - elapsed)) if active_count == 0 else poll_interval_s
             deadline = monotonic() + max(0.0, wait_s)
             if self._deadline is not None:
                 deadline = min(deadline, self._deadline)
 
-            while (
-                not self._should_stop(model)
-                and not self._idle_draining
-                and (is_error or not self._is_idle_timed_out(timeout_s))
+            self._cond.notify_all()
+            while not self._should_stop(model) and (
+                is_error or (not self._idle_draining and not self._is_idle_timed_out(timeout_s))
             ):
                 remaining = deadline - monotonic()
                 if remaining <= 0:
@@ -575,22 +596,20 @@ class WorkerRunner:
                 except TimeoutError:
                     break
 
-        if self._should_stop(model):
-            self._cond.notify_all()
-            return True
-        if _shutdown_if_timed_out():
-            return True
-
-        if _update_idle_draining():
-            self._cond.notify_all()
-            while not self._should_stop(model) and self._idle_draining:
-                if _shutdown_if_timed_out():
-                    return True
-                await self._cond.wait()
-            if self._should_stop(model) or _shutdown_if_timed_out():
+            if self._try_idle_shutdown(model, slot_label, timeout_s, is_error):
                 return True
 
-        return False
+            if not is_error and (
+                self._idle_draining
+                or (
+                    sum(self._active_tasks_per_model.values()) == 0
+                    and (sum(self._claim_polls_per_model.values()) > 0 or self._error_retry_slots > 0)
+                    and (monotonic() - self._last_busy_timestamp) >= timeout_s
+                )
+            ):
+                continue
+
+            return False
 
     async def _model_slot_loop(
         self,
@@ -601,9 +620,9 @@ class WorkerRunner:
     ) -> None:
         """Independent execution loop dedicated to a single model concurrency slot.
 
-        Separates poll reservations (_claim_polls_per_model) from executing tasks
-        (_active_tasks_per_model) so overlapping polls do not mask idle/error deadlines,
-        and drains in-flight claims cleanly without issuing new polls past shutdown.
+        Separates poll reservations (_claim_polls_per_model) and transient error retries
+        (_error_retry_slots) from executing tasks (_active_tasks_per_model) so overlapping
+        polls or errors neither mask deadlines nor cause premature idle exits.
 
         Args:
             model: Target Gemini model identifier assigned to this slot.
@@ -615,91 +634,112 @@ class WorkerRunner:
         idle_timeout_seconds = self.settings.idletimeout.total_seconds()
         error_timeout_seconds = idle_timeout_seconds if idle_timeout_seconds > 0 else 15.0
         poll_seconds = self.settings.pollinterval.total_seconds()
+        slot_in_error = False
 
-        while True:
-            async with self._cond:
-                while not self._should_stop(model) and (self._idle_draining or self._is_model_poll_capped(model)):
-                    await self._cond.wait()
+        try:
+            while True:
+                async with self._cond:
+                    while not self._should_stop(model) and (self._idle_draining or self._is_model_poll_capped(model)):
+                        await self._cond.wait()
 
-                if self._deadline is not None and monotonic() >= self._deadline and not self._shutdown:
-                    max_dur_m = self.settings.maxduration.total_seconds() / 60.0
-                    logfire.info(
-                        f"[{slot_label}] Maximum run duration ({max_dur_m:.1f}m) reached. Draining slot and exiting."
-                    )
-                    self._shutdown = True
-                    self._cond.notify_all()
-
-                if self._should_stop(model):
-                    if model in self._exhausted_models:
-                        logfire.info(f"[{slot_label}] Model quota exhausted. Exiting slot.")
-                    elif self._is_model_done(model):
+                    if self._deadline is not None and monotonic() >= self._deadline and not self._shutdown:
+                        max_dur_m = self.settings.maxduration.total_seconds() / 60.0
                         logfire.info(
-                            f"[{slot_label}] Reached max tasks limit ({self.settings.maxtasks}) "
-                            f"for model '{model}'. Exiting slot."
+                            f"[{slot_label}] Maximum run duration ({max_dur_m:.1f}m) reached. "
+                            "Draining slot and exiting."
                         )
-                    break
+                        self._shutdown = True
+                        self._cond.notify_all()
 
-                self._claim_polls_per_model[model] = self._claim_polls_per_model.get(model, 0) + 1
-
-            claim = None
-            claim_failed = False
-            try:
-                claim = await self.client.claim_task(
-                    worker_id=self.settings.id,
-                    models=[model],
-                    search_tools=[str(t) for t in self.settings.ai.search.tools],
-                )
-            except VersionMismatchError as e:
-                logfire.error(
-                    f"[{slot_label}] ai-sub package version mismatch: {e}. "
-                    "Shutting down worker so worker.sh can update to latest version."
-                )
-                await self._shutdown_from_poll(model, version_mismatch=True)
-                break
-            except HTTPStatusError as e:
-                if e.response.status_code in (401, 403, 404):
-                    logfire.error(
-                        f"[{slot_label}] Server rejected task claim with HTTP {e.response.status_code}: {e}. "
-                        "Check serverurl and serverauth. Shutting down worker."
-                    )
-                    await self._shutdown_from_poll(model, fatal_error=True)
-                    break
-                claim_failed = True
-                logfire.warning(f"[{slot_label}] Failed to claim task from server: {e}. Retrying in 5s...")
-            except Exception as e:
-                claim_failed = True
-                logfire.warning(f"[{slot_label}] Failed to claim task from server: {e}. Retrying in 5s...")
-
-            if claim_failed:
-                async with self._cond:
-                    self._claim_polls_per_model[model] = max(0, self._claim_polls_per_model[model] - 1)
-                    if await self._wait_after_poll(model, slot_label, 5.0, error_timeout_seconds, is_error=True):
+                    if self._should_stop(model):
+                        if model in self._exhausted_models:
+                            logfire.info(f"[{slot_label}] Model quota exhausted. Exiting slot.")
+                        elif self._is_model_done(model):
+                            logfire.info(
+                                f"[{slot_label}] Reached max tasks limit ({self.settings.maxtasks}) "
+                                f"for model '{model}'. Exiting slot."
+                            )
                         break
-                continue
 
-            if claim is not None:
-                async with self._cond:
-                    self._claim_polls_per_model[model] = max(0, self._claim_polls_per_model[model] - 1)
-                    self._active_tasks_per_model[model] = self._active_tasks_per_model.get(model, 0) + 1
-                    self._fatal_error = False
-                    self._idle_draining = False
-                    self._last_busy_timestamp = monotonic()
-                    self._cond.notify_all()
+                    self._claim_polls_per_model[model] = self._claim_polls_per_model.get(model, 0) + 1
+
+                claim = None
+                claim_failed = False
                 try:
-                    await self._process_claimed_task(claim, model, slot_id, executor, search_providers)
-                finally:
+                    claim = await self.client.claim_task(
+                        worker_id=self.settings.id,
+                        models=[model],
+                        search_tools=[str(t) for t in self.settings.ai.search.tools],
+                    )
+                except VersionMismatchError as e:
+                    logfire.error(
+                        f"[{slot_label}] ai-sub package version mismatch: {e}. "
+                        "Shutting down worker so worker.sh can update to latest version."
+                    )
+                    await self._shutdown_from_poll(model, version_mismatch=True)
+                    break
+                except HTTPStatusError as e:
+                    if e.response.status_code in (401, 403, 404):
+                        logfire.error(
+                            f"[{slot_label}] Server rejected task claim with HTTP {e.response.status_code}: {e}. "
+                            "Check serverurl and serverauth. Shutting down worker."
+                        )
+                        await self._shutdown_from_poll(model, fatal_error=True)
+                        break
+                    claim_failed = True
+                    logfire.warning(f"[{slot_label}] Failed to claim task from server: {e}. Retrying in 5s...")
+                except Exception as e:
+                    claim_failed = True
+                    logfire.warning(f"[{slot_label}] Failed to claim task from server: {e}. Retrying in 5s...")
+
+                if claim_failed:
                     async with self._cond:
-                        self._active_tasks_per_model[model] = max(0, self._active_tasks_per_model[model] - 1)
+                        self._claim_polls_per_model[model] = max(0, self._claim_polls_per_model[model] - 1)
+                        if not slot_in_error:
+                            slot_in_error = True
+                            self._error_retry_slots += 1
+                        if await self._wait_after_poll(model, slot_label, 5.0, error_timeout_seconds, is_error=True):
+                            break
+                        if not self._should_stop(model):
+                            self._idle_draining = False
+                    continue
+
+                if claim is not None:
+                    async with self._cond:
+                        self._claim_polls_per_model[model] = max(0, self._claim_polls_per_model[model] - 1)
+                        if slot_in_error:
+                            slot_in_error = False
+                            self._error_retry_slots = max(0, self._error_retry_slots - 1)
+                        self._active_tasks_per_model[model] = self._active_tasks_per_model.get(model, 0) + 1
+                        self._fatal_error = False
                         self._idle_draining = False
                         self._last_busy_timestamp = monotonic()
                         self._cond.notify_all()
-                continue
+                    try:
+                        await self._process_claimed_task(claim, model, slot_id, executor, search_providers)
+                    finally:
+                        async with self._cond:
+                            self._active_tasks_per_model[model] = max(0, self._active_tasks_per_model[model] - 1)
+                            self._idle_draining = False
+                            self._last_busy_timestamp = monotonic()
+                            self._cond.notify_all()
+                    continue
 
-            # claim is None (HTTP 204): release poll reservation and check idle timeout against active tasks
-            async with self._cond:
-                self._claim_polls_per_model[model] = max(0, self._claim_polls_per_model[model] - 1)
-                if await self._wait_after_poll(model, slot_label, poll_seconds, idle_timeout_seconds, is_error=False):
-                    break
+                # claim is None (HTTP 204): release poll reservation and check idle timeout against active tasks
+                async with self._cond:
+                    self._claim_polls_per_model[model] = max(0, self._claim_polls_per_model[model] - 1)
+                    if slot_in_error:
+                        slot_in_error = False
+                        self._error_retry_slots = max(0, self._error_retry_slots - 1)
+                    if await self._wait_after_poll(
+                        model, slot_label, poll_seconds, idle_timeout_seconds, is_error=False
+                    ):
+                        break
+        finally:
+            if slot_in_error:
+                async with self._cond:
+                    self._error_retry_slots = max(0, self._error_retry_slots - 1)
+                    self._cond.notify_all()
 
     async def run(self) -> int:
         """Executes concurrent per-model worker slots until queues are drained or quotas are exhausted.

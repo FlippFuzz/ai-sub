@@ -33,6 +33,8 @@ from ai_sub.jobs.summary import SummaryAiResponse
 
 SUBTITLES_PROMPT_VERSION = 19
 
+_PUNCT_TRANSLATOR = str.maketrans("", "", string.punctuation)
+
 _SUBTITLES_SYSTEM_TEMPLATE = dedent(
     """
     <role>
@@ -219,7 +221,6 @@ class BaseSubtitleAiResponse(BaseModel):
             SSAFile: Parsed subtitle file container.
         """
         subs = SSAFile()
-        translator = str.maketrans("", "", string.punctuation)
 
         for item in self.subtitles:
             start = parse_timestamp_string_ms(item.start)
@@ -235,8 +236,8 @@ class BaseSubtitleAiResponse(BaseModel):
             elif not en_text:
                 text = og_text
             else:
-                en_norm = en_text.casefold().translate(translator)
-                og_norm = og_text.casefold().translate(translator)
+                en_norm = " ".join(en_text.casefold().translate(_PUNCT_TRANSLATOR).split())
+                og_norm = " ".join(og_text.casefold().translate(_PUNCT_TRANSLATOR).split())
                 text = og_text if en_norm == og_norm else f"{og_text}\n{en_text}"
 
             subs.append(SSAEvent(start=start, end=end, text=text))

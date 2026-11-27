@@ -72,7 +72,7 @@ def _get_env_value(*names: str) -> str | None:
 
 
 def _parse_string_list(val: Any) -> list[str] | Any:
-    """Parses a list of strings from a Python list, JSON array, or comma-separated string.
+    """Parses a list of strings from None, a Python list, JSON array, or comma-separated string.
 
     Args:
         val: Raw input value from environment variable, CLI, or YAML.
@@ -80,6 +80,8 @@ def _parse_string_list(val: Any) -> list[str] | Any:
     Returns:
         list[str] | Any: Normalized list of strings or unparsed raw input.
     """
+    if val is None:
+        return []
     if isinstance(val, str):
         v = val.strip()
         if v.startswith("[") and v.endswith("]"):
@@ -791,20 +793,20 @@ class StageModelsMixin(BaseConfigModel):
     @model_validator(mode="before")
     @classmethod
     def _apply_stage_agentic_defaults(cls, val: Any) -> Any:
-        """Strips null stage entries and defaults summary and lyrics agentic to True when omitted.
+        """Strips null stage entries and populates default models and agentic flags when omitted.
 
         Args:
             val: Raw stage model settings dictionary before validation.
 
         Returns:
-            Any: Normalized dictionary with null stages stripped and stage-appropriate agentic defaults.
+            Any: Normalized dictionary with null stages stripped and stage-appropriate defaults.
         """
         return merge_section_defaults(
             val,
             {
-                "summary": {"agentic": True},
-                "subtitles": {},
-                "lyrics": {"agentic": True},
+                "summary": {"model": "gemini-3.5-flash-lite", "agentic": True},
+                "subtitles": {"model": "gemini-4-hydrogen"},
+                "lyrics": {"model": "gemini-3.5-flash-lite", "agentic": True},
             },
         )
 
