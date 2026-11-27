@@ -79,7 +79,6 @@ class IngestionManager:
     _youtube_cooldown_until: float
     _youtube_cooldown_reason: str | None
     _last_idle_summary: dict[str, str]
-    _loop: asyncio.AbstractEventLoop | None
     _cooldown_wake_task: asyncio.Task[None] | None
     _files_rescan_task: asyncio.Task[None] | None
     _youtube_rescan_task: asyncio.Task[None] | None
@@ -118,7 +117,6 @@ class IngestionManager:
         self._youtube_cooldown_until = 0.0
         self._youtube_cooldown_reason = None
         self._last_idle_summary = {}
-        self._loop = None
         self._cooldown_wake_task = None
         self._files_rescan_task = None
         self._youtube_rescan_task = None
@@ -204,16 +202,14 @@ class IngestionManager:
                 await self.feed_idle_runners()
             except asyncio.CancelledError:
                 pass
+            finally:
+                if self._cooldown_wake_task is asyncio.current_task():
+                    self._cooldown_wake_task = None
 
-        def _schedule() -> None:
-            if self._stopped:
-                return
-            if self._cooldown_wake_task and not self._cooldown_wake_task.done():
-                self._cooldown_wake_task.cancel()
-            self._cooldown_wake_task = asyncio.create_task(_wake_on_cooldown_expiry())
-
-        if self._loop is not None and self._loop.is_running():
-            self._loop.call_soon_threadsafe(_schedule)
+        current = asyncio.current_task()
+        if self._cooldown_wake_task and not self._cooldown_wake_task.done() and self._cooldown_wake_task is not current:
+            self._cooldown_wake_task.cancel()
+        self._cooldown_wake_task = asyncio.create_task(_wake_on_cooldown_expiry())
 
     def _scan_watch_folders(self) -> dict[str, DiscoveredVideo]:
         """Scans watched directories recursively for video media files off-thread without mutating shared state.
@@ -530,9 +526,11 @@ class IngestionManager:
                         self._download_members_only_ids.add(video.video_id)
                         self.youtube_videos.pop(video.video_id, None)
                         logfire.info(f"Ignoring members-only video '{video.title}' ({video.video_id}).")
-                    elif e.reason == "Post-live processing":
+                    elif e.reason in ("Post-live processing", "Live / Upcoming"):
                         self.youtube_videos.pop(video.video_id, None)
-                        logfire.info(f"Ignoring post-live video '{video.title}' ({video.video_id}) until next scan.")
+                        logfire.info(
+                            f"Ignoring {e.reason.lower()} video '{video.title}' ({video.video_id}) until next scan."
+                        )
                     else:
                         video.status = "unplayable"
                         video.error_reason = e.reason
@@ -680,7 +678,6 @@ class IngestionManager:
     async def start(self) -> None:
         """Starts the ingestion manager with an initial scan, followed by periodic delta intake loops."""
         self._stopped = False
-        self._loop = asyncio.get_running_loop()
 
         if self.config.files.folders:
             await self._scan_watch_folders_async()

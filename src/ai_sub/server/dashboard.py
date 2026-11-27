@@ -90,6 +90,8 @@ def build_fallback_tiers(
     base_fps: float | None = None
     if cfg.fps != "keyframes":
         base_fps = float(cfg.fps)
+    elif state.base_fps is not None and state.base_fps > 0:
+        base_fps = float(state.base_fps)
     elif state.fps is not None and state.fps > 0:
         base_fps = float(state.fps) * (divisor**state.fallback_tier)
 

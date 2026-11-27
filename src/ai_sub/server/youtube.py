@@ -719,7 +719,6 @@ class YouTubeClient:
                             is_single_video = entries_raw is None
                             entries_iterable = [result] if is_single_video else cast(Any, entries_raw)
                             url_discovered_count = 0
-                            skipped_live_single = False
 
                             for entry in entries_iterable:
                                 if not entry:
@@ -739,8 +738,6 @@ class YouTubeClient:
                                 if title in ("[Deleted video]", "[Private video]", "[Unavailable video]"):
                                     continue
                                 if entry.get("live_status") not in (None, "not_live", "was_live"):
-                                    if is_single_video:
-                                        skipped_live_single = True
                                     continue
                                 if "/shorts/" in (entry.get("url") or entry.get("webpage_url") or ""):
                                     continue
@@ -770,8 +767,7 @@ class YouTubeClient:
                                 url_discovered_count += 1
 
                             url_span.set_attribute("discovered_count", url_discovered_count)
-                            if not skipped_live_single:
-                                completed_urls[url] = now_ts
+                            completed_urls[url] = now_ts
                         except YouTubeBotDetectionError:
                             url_span.set_attribute("error", "bot_detection")
                             raise

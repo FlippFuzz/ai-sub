@@ -927,8 +927,12 @@
       }
 
       function renderChunkInspector(pipeName, seg) {
-        const startS = Math.floor((seg.offset_ms || 0) / 1000)
-        const endS = startS + Math.floor((seg.duration_ms || 0) / 1000)
+        const offsetMs = seg.offset_ms || 0
+        const startS = Math.max(0, Math.round(offsetMs / 1000))
+        const endS = Math.max(
+          startS,
+          Math.round((offsetMs + (seg.duration_ms || 0)) / 1000),
+        )
         const useHours = endS >= 3600
         const windowText = `${formatTimestamp(startS, useHours)} – ${formatTimestamp(endS, useHours)}`
 

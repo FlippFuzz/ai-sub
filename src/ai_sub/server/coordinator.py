@@ -852,7 +852,7 @@ class ComboRunnersCoordinator:
 
         Args:
             runner: Combination runner to clear and reset.
-            purge_disk: Whether to delete the active job directory on disk. Defaults to True.
+            purge_disk: Whether the active job directory should be purged on disk. Defaults to True.
         """
         await runner.stop_background_tasks()
         async with self._lock:
@@ -897,6 +897,7 @@ class ComboRunnersCoordinator:
             self._finalizing_runners.add(runner.config.name)
             runner.status = RunnerStatus.FINALIZING
 
+        stage = "Finalization"
         try:
             pipe = runner.pipeline
             assert pipe is not None
@@ -917,45 +918,37 @@ class ComboRunnersCoordinator:
 
             logfire.info(f"Runner '{runner.config.name}' finalizing for '{pipe.title}'...")
 
-            try:
-                with logfire.span(
-                    "Stitch Subtitles: {video_id}",
-                    combo=runner.config.name,
-                    video_id=pipe.video_id,
-                ):
-                    generated_srts = await asyncio.to_thread(pipe.finalize, allow_partial=True)
-                    nfo_file = await asyncio.to_thread(write_nfo, pipe) if self.settings.coordinator.nfo else None
-            except Exception as e:
-                logfire.error(f"Output finalization failed for '{runner.config.name}': {e}")
-                async with self._lock:
-                    runner.status = RunnerStatus.PUSH_FAILED
-                    self._push_retry_after[runner.config.name] = monotonic() + _PUSH_RETRY_COOLDOWN_S
-                return False
+            stage = "Output finalization"
+            with logfire.span(
+                "Stitch Subtitles: {video_id}",
+                combo=runner.config.name,
+                video_id=pipe.video_id,
+            ):
+                generated_srts = await asyncio.to_thread(pipe.finalize, allow_partial=True)
+                nfo_file = await asyncio.to_thread(write_nfo, pipe) if self.settings.coordinator.nfo else None
 
             yaml_files = list(pipe.job_dir.glob("*.yaml"))
             meta_file = pipe.job_dir / "video_meta.json"
-            try:
-                await self.git_sync.finalize_and_push(
-                    uploader=pipe.uploader,
-                    video_id=pipe.video_id,
-                    full_shortcode=runner.full_shortcode,
-                    srt_files=generated_srts,
-                    yaml_files=yaml_files,
-                    meta_file=meta_file if meta_file.is_file() else None,
-                    nfo_file=nfo_file,
-                )
-            except Exception as e:
-                logfire.error(f"Git push failed for '{runner.config.name}': {e}. Setting PUSH_FAILED.")
-                async with self._lock:
-                    runner.status = RunnerStatus.PUSH_FAILED
-                    self._push_retry_after[runner.config.name] = monotonic() + _PUSH_RETRY_COOLDOWN_S
-                return False
+            stage = "Git push"
+            await self.git_sync.finalize_and_push(
+                uploader=pipe.uploader,
+                video_id=pipe.video_id,
+                full_shortcode=runner.full_shortcode,
+                srt_files=generated_srts,
+                yaml_files=yaml_files,
+                meta_file=meta_file if meta_file.is_file() else None,
+                nfo_file=nfo_file,
+            )
 
+            stage = "Runner cleanup"
             await self._clear_runner_after_finalize(runner)
             logfire.info(f"Runner '{runner.config.name}' cleared and ready for next video.")
             return True
         except Exception as e:
-            logfire.exception(f"Unexpected error finalizing runner '{runner.config.name}': {e}")
+            if stage in ("Output finalization", "Git push"):
+                logfire.error(f"{stage} failed for '{runner.config.name}': {e}. Setting PUSH_FAILED.")
+            else:
+                logfire.exception(f"Unexpected error during {stage.lower()} for '{runner.config.name}': {e}")
             async with self._lock:
                 runner.status = RunnerStatus.PUSH_FAILED
                 self._push_retry_after[runner.config.name] = monotonic() + _PUSH_RETRY_COOLDOWN_S
