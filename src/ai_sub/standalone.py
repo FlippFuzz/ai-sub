@@ -257,7 +257,7 @@ async def run_pipeline(settings: StandaloneSettings) -> AiSubResult:
             )
 
             total_chunks = len(pipeline.segments)
-            segment_reencode_active = any(seg.target_fps is not None for seg in pipeline.segments)
+            segment_reencode_active = any(seg.encoding != "raw" for seg in pipeline.segments)
             with progress:
                 summary_tid: TaskID | None = progress.add_task("[yellow]Summary", total=1) if use_summary else None
                 reencode_tid: TaskID | None = (

@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 
 T = TypeVar("T", bound=BaseModel)
 
+EncodingMode = Literal["raw", "keyframes", "reencoded", "audio"]
+
 
 class TaskType(str, Enum):
     """Types of distributed AI tasks executed locally or by remote workers."""
@@ -342,6 +344,14 @@ class AiJob(BaseJob):
         default=None,
         description="Segment index if applicable.",
     )
+    fps: NonNegativeFloat | None = Field(
+        default=None,
+        description="Active media framerate in FPS (0.0 for audio-only), or None if not yet probed.",
+    )
+    encoding: EncodingMode = Field(
+        default="raw",
+        description="Active media encoding mode ('raw', 'keyframes', 'reencoded', or 'audio').",
+    )
     fallback_tier: NonNegativeInt = Field(
         default=0,
         description="Fallback re-encoding tier index (0 = initial run, 1+ = fallback FPS tier).",
@@ -349,10 +359,6 @@ class AiJob(BaseJob):
     tier_attempts: NonNegativeInt = Field(
         default=0,
         description="Non-retryable failure attempts recorded at the current FPS tier.",
-    )
-    target_fps: NonNegativeFloat | Literal["keyframes"] | None = Field(
-        default=None,
-        description="Active FPS (0 for audio-only) or 'keyframes' target for this job, or None if using raw media.",
     )
     exhausted: bool = Field(
         default=False,

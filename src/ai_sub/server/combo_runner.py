@@ -382,7 +382,7 @@ class ComboRunner:
                 elif job.segment_index is not None:
                     self.active_reencode_segments.add(job.segment_index)
                 try:
-                    out_path = await job.execute()
+                    reencode_res = await job.execute()
                 finally:
                     if job.is_summary_proxy:
                         self.active_summary_reencode = False
@@ -391,7 +391,7 @@ class ComboRunner:
 
             async with self.coordinator_lock:
                 if self.pipeline is pipeline:
-                    pipeline.complete_reencode(job, out_path)
+                    pipeline.complete_reencode(job, reencode_res.path, fps=reencode_res.fps)
                     self.sync_tasks_from_pipeline()
         except Exception as e:
             logfire.warning(f"Local re-encoding job '{job.name}' (tier {job.fallback_tier}) failed: {e}")

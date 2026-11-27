@@ -362,7 +362,7 @@ class SubtitlesJob(BaseSubtitleJob):
             global_summary=self.global_summary,
             segment_offset_ms=self.segment_offset_ms,
             segment_duration_ms=self.video_duration_ms,
-            audio_only=self.target_fps == 0,
+            audio_only=self.encoding == "audio",
         )
         return await self._run_structured(
             ctx=ctx,

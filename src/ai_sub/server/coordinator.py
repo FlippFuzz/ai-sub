@@ -15,7 +15,14 @@ from typing import Any, Literal
 import logfire
 from pydantic import ValidationError
 
-from ai_sub.pipeline import FallbackProbeSpec, MediaStageState, Pipeline, SegmentState, probe_fallback_info
+from ai_sub.pipeline import (
+    FallbackProbeSpec,
+    MediaStageState,
+    Pipeline,
+    SegmentState,
+    build_fallback_tiers,
+    probe_fallback_info,
+)
 from ai_sub.protocol import (
     TaskClaimResponse,
     TaskType,
@@ -300,8 +307,15 @@ def _build_segment_info(
         "matrix_status": matrix_status,
         "media_ready": seg.media_ready,
         "is_encoding": is_encoding,
-        "target_fps": seg.target_fps,
+        "fps": seg.fps,
+        "encoding": seg.encoding,
         "fallback_tier": seg.fallback_tier,
+        "fallback_tiers": build_fallback_tiers(
+            seg,
+            pipe.reencode_settings.segment,
+            seg.raw_path,
+            exhausted=seg.subtitles_exhausted,
+        ),
         "subtitles_status": sub_status,
         "subtitles_tier_attempts": seg.subtitles_tier_attempts,
         "subtitles_line_count": sub_line_count,
@@ -405,8 +419,15 @@ def _build_stages_info(runner: ComboRunner, pipe: Pipeline, now: float) -> dict[
                 int(now - summary_task.claimed_at) if sum_claimed and summary_task and summary_task.claimed_at else None
             ),
             "logfire_query": _format_logfire_query(summary_task) if summary_task else None,
-            "target_fps": sum_state.target_fps,
+            "fps": sum_state.fps,
+            "encoding": sum_state.encoding,
             "fallback_tier": sum_state.fallback_tier,
+            "fallback_tiers": build_fallback_tiers(
+                sum_state,
+                pipe.reencode_settings.summary,
+                pipe.raw_video_path,
+                exhausted=sum_state.exhausted,
+            ),
             "tier_attempts": sum_state.tier_attempts,
             "max_runs": summary_max_runs,
             "preview": summary_preview,
@@ -943,10 +964,10 @@ class ComboRunnersCoordinator:
             max_runs = self.settings.retry.resolve_for_model(task.model).maxruns
 
             if outcome.action == "fallback_reencode":
-                if outcome.target_fps == 0:
+                if outcome.encoding == "audio" or outcome.fps == 0:
                     fps_str = "0 fps (audio-only)"
-                elif outcome.target_fps is not None:
-                    fps_str = f"{outcome.target_fps:.4g} fps"
+                elif outcome.fps is not None:
+                    fps_str = f"{outcome.fps:.4g} fps"
                 else:
                     fps_str = "unknown fps"
                 detail = f"{detail}\n-> Falling back to {fps_str} (tier {outcome.fallback_tier})"
@@ -1444,7 +1465,8 @@ class ComboRunnersCoordinator:
                         "worker_id": t.worker_id,
                         "elapsed_s": int(now - t.claimed_at) if t.claimed_at else None,
                         "fallback_tier": stage_state.fallback_tier if stage_state is not None else 0,
-                        "target_fps": stage_state.target_fps if stage_state is not None else None,
+                        "fps": stage_state.fps if stage_state is not None else None,
+                        "encoding": stage_state.encoding if stage_state is not None else "raw",
                         "logfire_query": _format_logfire_query(t),
                     }
                 )

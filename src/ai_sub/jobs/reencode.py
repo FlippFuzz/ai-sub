@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, NonNegativeFloat, NonNegativeInt, PositiveInt
 
 from ai_sub.jobs.job_base import BaseJob
-from ai_sub.video import reencode_video
+from ai_sub.video import get_video_fps, reencode_video
+
+
+@dataclass(frozen=True)
+class ReencodeResult:
+    """Result returned upon completing a media re-encoding job."""
+
+    path: Path
+    fps: float
 
 
 class ReencodeJob(BaseJob):
@@ -45,11 +54,11 @@ class ReencodeJob(BaseJob):
         description="Fallback re-encoding tier index (0 = initial, 1+ = fallback FPS tier).",
     )
 
-    async def execute(self) -> Path:
-        """Executes FFmpeg re-encoding for this segment, proxy, or audio-only extract.
+    async def execute(self) -> ReencodeResult:
+        """Executes FFmpeg re-encoding and resolves the effective output framerate.
 
         Returns:
-            Path: Path to the validated compressed output file.
+            ReencodeResult: Output file path and effective numeric framerate (0.0 for audio-only).
         """
         await reencode_video(
             input_path=self.input_file,
@@ -61,4 +70,5 @@ class ReencodeJob(BaseJob):
             duration_tolerance_ms=self.duration_tolerance_ms,
             keyframe_only=self.keyframe_only,
         )
-        return self.output_file
+        effective_fps = await get_video_fps(self.output_file) if self.fps == "keyframes" else float(self.fps)
+        return ReencodeResult(path=self.output_file, fps=effective_fps)

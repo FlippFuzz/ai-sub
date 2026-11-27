@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, NonNegativeFloat
+from pydantic import BaseModel, ConfigDict, Field, NonNegativeFloat, NonNegativeInt
 
 from ai_sub.config import RetryPolicy, ServiceTier
-from ai_sub.jobs.job_base import TaskType
+from ai_sub.jobs.job_base import EncodingMode, TaskType
 from ai_sub.jobs.lyrics import LyricsJob
 from ai_sub.jobs.subtitles import DetectedMusicalPerformance, Subtitles, SubtitlesJob
 from ai_sub.jobs.summary import SummaryAiResponse, SummaryJob
@@ -70,9 +70,17 @@ class TaskClaimResponse(BaseModel):
         default=None,
         description="Optional Google Gemini service tier.",
     )
-    target_fps: NonNegativeFloat | Literal["keyframes"] | None = Field(
+    fps: NonNegativeFloat | None = Field(
         default=None,
-        description="Active FPS or 'keyframes' target for this task, or None if using raw media.",
+        description="Active media framerate in FPS (0.0 for audio-only), or None if not yet probed.",
+    )
+    encoding: EncodingMode = Field(
+        default="raw",
+        description="Active media encoding mode ('raw', 'keyframes', 'reencoded', or 'audio').",
+    )
+    fallback_tier: NonNegativeInt = Field(
+        default=0,
+        description="Fallback re-encoding tier index (0 = initial run, 1+ = fallback FPS tier).",
     )
     validation_buffer: timedelta = Field(
         default=timedelta(seconds=2),
@@ -98,7 +106,9 @@ class TaskClaimResponse(BaseModel):
             "model_name": self.model,
             "service_tier": self.service_tier,
             "agentic_video": self.agentic_video,
-            "target_fps": self.target_fps,
+            "fps": self.fps,
+            "encoding": self.encoding,
+            "fallback_tier": self.fallback_tier,
         }
         if self.task_type == TaskType.SUMMARY:
             return SummaryJob(name="summary", **common)

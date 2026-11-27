@@ -281,7 +281,7 @@ class SummaryJob(AiJob):
         """
         return await self._run_structured(
             ctx=ctx,
-            prompt=get_summary_prompt(user_context=self.user_context, audio_only=self.target_fps == 0),
+            prompt=get_summary_prompt(user_context=self.user_context, audio_only=self.encoding == "audio"),
             response_type=SummaryAiResponse,
             tools=ctx.search_providers,
         )

@@ -328,6 +328,9 @@
         font-weight: 600;
         min-width: 96px;
       }
+      .stage-sub-ladder {
+        padding-left: 106px;
+      }
       .summary-drawer {
         background: #0b1120;
         border: 1px solid var(--border);
@@ -440,6 +443,55 @@
         gap: 10px 16px;
         font-size: 13px;
       }
+      .fallback-ladder-wrap {
+        margin-top: 10px;
+        padding-top: 10px;
+        border-top: 1px solid var(--border);
+      }
+      .tier-ladder {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 5px;
+      }
+      .tier-pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        line-height: 1.4;
+        white-space: nowrap;
+      }
+      .tier-pill-failed {
+        background: rgba(148, 163, 184, 0.1);
+        color: #94a3b8;
+        border: 1px solid #334155;
+        text-decoration: line-through;
+        opacity: 0.7;
+      }
+      .tier-pill-active {
+        background: rgba(245, 158, 11, 0.25);
+        color: #fcd34d;
+        border: 1px solid rgba(245, 158, 11, 0.7);
+        font-weight: 700;
+      }
+      .tier-pill-exhausted {
+        background: rgba(239, 68, 68, 0.25);
+        color: #fca5a5;
+        border: 1px solid rgba(239, 68, 68, 0.7);
+        font-weight: 700;
+      }
+      .tier-pill-upcoming {
+        background: transparent;
+        color: #94a3b8;
+        border: 1px dashed #475569;
+      }
+      .tier-sep {
+        color: var(--muted);
+        font-size: 12px;
+        user-select: none;
+      }
       .leases-bar {
         display: flex;
         flex-wrap: wrap;
@@ -459,6 +511,9 @@
         }
         .active-models {
           text-align: left;
+        }
+        .stage-sub-ladder {
+          padding-left: 0;
         }
         th,
         td {
@@ -596,13 +651,80 @@
             })
           : "-"
 
-      function formatFps(fps) {
-        if (fps == null) return "Raw (no reencode)"
-        if (fps === "keyframes") return "Keyframes"
+      function formatNumber(value, decimals = 6) {
+        const num = Number(value)
+        if (!Number.isFinite(num)) return String(value ?? "")
+        return String(Number(num.toFixed(decimals)))
+      }
+
+      function formatFpsRate(fps) {
         const num = Number(fps)
-        if (!Number.isFinite(num)) return String(fps)
-        if (num === 0) return "0 fps (Audio only)"
-        return `${Number(num.toFixed(4))} fps`
+        return formatNumber(num, num >= 1 ? 2 : 6)
+      }
+
+      function formatFpsAndSpf(fps) {
+        const num = Number(fps)
+        const fpsStr = formatFpsRate(num)
+        const spfStr = formatNumber(1 / num, 2)
+        return `${fpsStr} fps, ${spfStr}s/frame`
+      }
+
+      function formatEncoding(encoding, fps) {
+        const hasFps = fps != null && Number.isFinite(Number(fps))
+        const fpsNum = hasFps ? Number(fps) : null
+
+        if (encoding === "raw") {
+          return fpsNum != null && fpsNum > 0
+            ? `Raw (${formatFpsRate(fpsNum)} fps)`
+            : "Raw (no reencode)"
+        }
+        if (encoding === "keyframes") {
+          return fpsNum != null && fpsNum > 0
+            ? `Keyframes (${formatFpsAndSpf(fpsNum)})`
+            : "Keyframes"
+        }
+        if (encoding === "audio" || fpsNum === 0) {
+          return "0 fps, audio-only"
+        }
+        if (fpsNum != null && fpsNum > 0) {
+          return formatFpsAndSpf(fpsNum)
+        }
+        return "Re-encoded"
+      }
+
+      function formatTierPillLabel(tier) {
+        const hasFps = tier.fps != null && Number.isFinite(Number(tier.fps))
+        const fpsNum = hasFps ? Number(tier.fps) : null
+        if (tier.encoding === "raw") {
+          return fpsNum != null && fpsNum > 0
+            ? `Raw (${formatFpsRate(fpsNum)} fps)`
+            : "Raw"
+        }
+        if (tier.encoding === "keyframes") {
+          return fpsNum != null && fpsNum > 0
+            ? `Keyframes (${formatFpsAndSpf(fpsNum)})`
+            : "Keyframes"
+        }
+        if (tier.encoding === "audio" || fpsNum === 0) {
+          return "0 fps, audio-only"
+        }
+        if (fpsNum != null && fpsNum > 0) {
+          return formatFpsAndSpf(fpsNum)
+        }
+        return `Fallback ${tier.tier}`
+      }
+
+      function renderTierLadder(tiers) {
+        if (!tiers?.length) return ""
+        const items = tiers
+          .map((t) => {
+            const cls = `tier-pill tier-pill-${esc(t.status)}`
+            const label = formatTierPillLabel(t)
+            const tip = `Tier ${t.tier} (${titleCase(t.status)})`
+            return `<span class="${cls} mono" title="${esc(tip)}">${esc(label)}</span>`
+          })
+          .join('<span class="tier-sep">›</span>')
+        return `<div class="tier-ladder">${items}</div>`
       }
 
       const pct = (done, total, unit) =>
@@ -830,7 +952,7 @@
         const useHours = endS >= 3600
         const windowText = `${formatTimestamp(startS, useHours)} – ${formatTimestamp(endS, useHours)}`
 
-        const fpsText = formatFps(seg.target_fps)
+        const encodingText = formatEncoding(seg.encoding, seg.fps)
         const mediaState = seg.is_encoding
           ? "Compressing locally"
           : seg.media_ready
@@ -888,6 +1010,11 @@
                   .join(" ")
               : '<span class="muted">None detected</span>'
 
+        const ladderHtml =
+          seg.fallback_tier > 0 && seg.fallback_tiers?.length > 0
+            ? `<div class="fallback-ladder-wrap"><div class="section-kicker" style="margin-bottom: 6px;">Fallback Progression</div>${renderTierLadder(seg.fallback_tiers)}</div>`
+            : ""
+
         const label = String(seg.index).padStart(3, "0")
         return `
           <div class="box-inner">
@@ -905,7 +1032,7 @@
             <div class="inspector-grid">
               <div>
                 <div class="section-kicker">Encoding &amp; Media</div>
-                <div>${esc(fpsText)}</div>
+                <div>${esc(encodingText)}</div>
                 <div class="muted" style="font-size:12px;">Media: ${esc(mediaState)}</div>
               </div>
               <div>
@@ -923,6 +1050,7 @@
                 <div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:2px;">${songsHtml}</div>
               </div>
             </div>
+            ${ladderHtml}
           </div>
         `
       }
@@ -937,7 +1065,7 @@
           segments = [],
         } = pipe.stages
 
-        const sumFps = formatFps(sum.target_fps)
+        const sumEncoding = formatEncoding(sum.encoding, sum.fps)
         const sumAttempt = resolveAttempt(
           sum.done > 0 || sum.in_progress > 0,
           sum.tier_attempts,
@@ -945,17 +1073,22 @@
         )
         const sumFallbackMeta = `Fallback: Tier ${sum.fallback_tier} · Attempt ${sumAttempt}/${sum.max_runs}`
 
-        let sumText = `Waiting for worker · ${sumFps} · ${sumFallbackMeta}`
+        let sumText = `Waiting for worker · ${sumEncoding} · ${sumFallbackMeta}`
         if (!sum.enabled) sumText = "Disabled"
         else if (sum.done > 0 && sum.preview)
-          sumText = `${sumFps} · ${sumFallbackMeta} · ${sum.preview.chapters.length} chapters · ${sum.preview.entities.length} entities · ${sum.preview.domain_glossary.length} glossary`
-        else if (sum.done > 0) sumText = `${sumFps} · ${sumFallbackMeta}`
+          sumText = `${sumEncoding} · ${sumFallbackMeta} · ${sum.preview.chapters.length} chapters · ${sum.preview.entities.length} entities · ${sum.preview.domain_glossary.length} glossary`
+        else if (sum.done > 0) sumText = `${sumEncoding} · ${sumFallbackMeta}`
         else if (sum.exhausted)
-          sumText = `Failed across all tiers · ${sumFps} · ${sumFallbackMeta}`
+          sumText = `Failed across all tiers · ${sumEncoding} · ${sumFallbackMeta}`
         else if (sum.in_progress > 0)
-          sumText = `Worker ${sum.worker_id} (${formatDuration(sum.elapsed_s)}) · ${sumFps} · ${sumFallbackMeta}`
+          sumText = `Worker ${sum.worker_id} (${formatDuration(sum.elapsed_s)}) · ${sumEncoding} · ${sumFallbackMeta}`
         else if (sum.is_encoding)
-          sumText = `Compressing proxy · ${sumFps} · ${sumFallbackMeta}`
+          sumText = `Compressing proxy · ${sumEncoding} · ${sumFallbackMeta}`
+
+        const sumLadderHtml =
+          sum.fallback_tier > 0 && sum.fallback_tiers?.length > 0
+            ? `<div class="stage-sub-ladder">${renderTierLadder(sum.fallback_tiers)}</div>`
+            : ""
 
         const encParts = [pct(reenc.done, reenc.total, "ready")]
         if (reenc.in_progress > 0)
@@ -1007,7 +1140,9 @@
             const selCls = seg.index === selectedIdx ? "selected" : ""
             const dot =
               seg.fallback_tier > 0 ? '<span class="fallback-dot"></span>' : ""
-            return `<button type="button" class="chunk-tile ${cls} ${selCls}" data-pipeline="${esc(pipe.name)}" data-chunk="${seg.index}" onclick="selectChunkTile(this)" title="Chunk #${label} · ${formatFps(seg.target_fps)}">${label}${dot}</button>`
+            const tierSuffix =
+              seg.fallback_tier > 0 ? ` (Tier ${seg.fallback_tier})` : ""
+            return `<button type="button" class="chunk-tile ${cls} ${selCls}" data-pipeline="${esc(pipe.name)}" data-chunk="${seg.index}" onclick="selectChunkTile(this)" title="Chunk #${label} · ${esc(formatEncoding(seg.encoding, seg.fps))}${esc(tierSuffix)}">${label}${dot}</button>`
           })
           .join("")
 
@@ -1026,7 +1161,7 @@
               const taskLabel = last === t.type ? t.type : `${t.type} ${last}`
               const tierTag =
                 t.fallback_tier > 0
-                  ? ` [T${t.fallback_tier}: ${formatFps(t.target_fps)}]`
+                  ? ` [T${t.fallback_tier}: ${formatEncoding(t.encoding, t.fps)}]`
                   : ""
               return `<span class="badge badge-claim mono badge-clickable" data-query="${esc(t.logfire_query || "")}" onclick="copyQueryFromData(this)" title="Click to copy Logfire query">${esc(taskLabel)}${esc(tierTag)} (${esc(t.worker_id)}) [${esc(formatDuration(t.elapsed_s))}] 📋</span>`
             })
@@ -1065,6 +1200,7 @@
                 ${sum.done > 0 && sum.preview ? `<button type="button" class="btn btn-sm" data-pipeline="${esc(pipe.name)}" onclick="toggleSummaryDrawer(this)">${isDrawerOpen ? "Hide Summary" : "View Summary"}</button>` : ""}
                 ${sum.in_progress > 0 ? queryButton(sum.logfire_query, "Query 📋", "Click to copy Logfire query for summary") : ""}
               </div>
+              ${sumLadderHtml}
               <div class="stage-line"><span class="stage-label">2. Encoding</span><span style="font-size:12px;">${encParts.join(" · ")}</span></div>
               <div class="stage-line"><span class="stage-label">3. Subtitles</span><span style="font-size:12px;">${subParts.join(" · ")}</span></div>
               <div class="stage-line"><span class="stage-label">4. Lyrics</span><span style="font-size:12px;">${lyrHtml}</span></div>
